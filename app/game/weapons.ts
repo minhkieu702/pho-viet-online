@@ -10,14 +10,15 @@ export type WeaponDef = {
   spread: number;
   range: number;
   force: number;
+  damage: number;
   description: string;
 };
 
 export const WEAPONS: WeaponDef[] = [
-  { id: 'fists', name: 'Tay không', price: 0, fireRate: 2.4, auto: false, pellets: 1, spread: 0, range: 2.2, force: 7, description: 'Đẩy ngã người đứng ngay trước mặt.' },
-  { id: 'pistol', name: 'Súng lục', price: 100, fireRate: 3.5, auto: false, pellets: 1, spread: 0.012, range: 48, force: 9, description: 'Gọn nhẹ, bắn từng phát chính xác.' },
-  { id: 'shotgun', name: 'Súng săn', price: 250, fireRate: 1.15, auto: false, pellets: 7, spread: 0.1, range: 24, force: 6.5, description: 'Tầm gần, một phát hất văng mục tiêu.' },
-  { id: 'smg', name: 'Tiểu liên', price: 400, fireRate: 11, auto: true, pellets: 1, spread: 0.045, range: 40, force: 5, description: 'Giữ chuột hoặc F để bắn liên tục.' },
+  { id: 'fists', name: 'Tay không', price: 0, fireRate: 2.4, auto: false, pellets: 1, spread: 0, range: 2.2, force: 7, damage: 34, description: 'Đẩy ngã người đứng ngay trước mặt.' },
+  { id: 'pistol', name: 'Súng lục', price: 100, fireRate: 3.5, auto: false, pellets: 1, spread: 0.012, range: 48, force: 9, damage: 34, description: 'Gọn nhẹ, bắn từng phát chính xác.' },
+  { id: 'shotgun', name: 'Súng săn', price: 250, fireRate: 1.15, auto: false, pellets: 7, spread: 0.1, range: 24, force: 6.5, damage: 15, description: 'Tầm gần, một phát hất văng mục tiêu.' },
+  { id: 'smg', name: 'Tiểu liên', price: 400, fireRate: 11, auto: true, pellets: 1, spread: 0.045, range: 40, force: 5, damage: 14, description: 'Giữ chuột hoặc F để bắn liên tục.' },
 ];
 
 /** Pay for one completed coffee delivery, in thousands of đồng. */

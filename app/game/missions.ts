@@ -1,6 +1,7 @@
 export type MissionId = 'coffee' | 'market' | 'post' | 'tour' | 'cleanup' | 'circuit';
 
 export type MissionTarget = { x: number; z: number };
+export type CoffeeDestination = MissionTarget & { name: string };
 
 export type MissionStep = {
   objective: string;
@@ -50,7 +51,7 @@ export type MissionEvent = {
 
 export type MissionController = {
   view(): MissionView;
-  select(id: MissionId): void;
+  select(id: MissionId, coffeeDestination?: CoffeeDestination): void;
   reset(): void;
   interact(player: MissionPlayer): MissionEvent | null;
   update(dtSeconds: number, player: MissionPlayer): MissionEvent | null;
@@ -61,7 +62,7 @@ export const MISSION_DEFS: readonly MissionDefinition[] = [
   {
     id: 'coffee',
     title: 'Cà phê sáng',
-    description: 'Nhận cà phê ở quán quen rồi giao đến khách bên bưu điện.',
+    description: 'Nhận cà phê ở quán quen rồi giao tận tay khách trong phố.',
     rewardCash: 100,
     rewardScore: 50,
     delivery: true,
@@ -153,10 +154,18 @@ export function createMissions(): MissionController {
   let elapsedSeconds = 0;
   const completedIds = new Set<MissionId>();
 
-  function select(id: MissionId) {
+  function select(id: MissionId, coffeeDestination?: CoffeeDestination) {
     const next = MISSION_DEFS.find((mission) => mission.id === id);
     if (!next) throw new RangeError(`Unknown mission: ${id}`);
-    definition = next;
+    definition = id === 'coffee' && coffeeDestination ? {
+      ...next,
+      steps: next.steps.map((objective, index) => index === 1 ? {
+        ...objective,
+        target: { x: coffeeDestination.x, z: coffeeDestination.z },
+        objective: `Mang cà phê đến ${coffeeDestination.name}, nhấn E để giao.`,
+        label: `Giao: ${coffeeDestination.name}`,
+      } : objective),
+    } : next;
     step = 0;
     status = 'active';
     started = false;

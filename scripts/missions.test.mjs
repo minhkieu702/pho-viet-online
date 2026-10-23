@@ -213,3 +213,24 @@ test('invalid mission selection does not destroy current progress', () => {
   assert.equal(missions.view().id, 'coffee');
   assert.equal(missions.view().step, 1);
 });
+
+test('custom coffee receiver is isolated to the selected run and reset restores the default route', () => {
+  const missions = createMissions();
+  const originalDefinition = structuredClone(MISSION_DEFS.find((mission) => mission.id === 'coffee'));
+  const destination = { x: -54, z: 54, name: 'chị Lan ở phố Tây' };
+  missions.select('coffee', destination);
+  missions.interact(atTarget(missions));
+  assert.deepEqual(missions.view().target, { x: -54, z: 54 });
+  assert.match(missions.view().objective, /chị Lan ở phố Tây/);
+  assert.match(missions.view().label, /chị Lan ở phố Tây/);
+  destination.x = 999;
+  assert.deepEqual(missions.view().target, { x: -54, z: 54 }, 'caller mutations cannot move the receiver');
+  assert.equal(missions.interact(player(54, -35)), null, 'default receiver cannot complete this custom run');
+  assert.deepEqual(missions.interact(atTarget(missions)).reward, { cash: 100, score: 50, delivery: true });
+  assert.deepEqual(MISSION_DEFS.find((mission) => mission.id === 'coffee'), originalDefinition);
+  missions.reset();
+  missions.interact(atTarget(missions));
+  assert.deepEqual(missions.view().target, originalDefinition.steps[1].target);
+  assert.equal(missions.view().objective, originalDefinition.steps[1].objective);
+  assert.equal(missions.view().label, originalDefinition.steps[1].label);
+});
