@@ -10,7 +10,7 @@ export function groundHeight(x: number, z: number) {
   return 0.1;
 }
 
-type Kind = 'box' | 'cylinder' | 'cone' | 'ball' | 'bead' | 'gable' | 'hip' | 'pyramid';
+type Kind = 'box' | 'cylinder' | 'cone' | 'ball' | 'bead' | 'gable' | 'hip' | 'pyramid' | 'puff' | 'trunk' | 'frond';
 /** Material families: each is one shared material, so colour variety costs no extra draw calls. */
 type Role = 'solid' | 'ground' | 'glass' | 'glassLit' | 'lamp' | 'lantern' | 'water';
 type ColorLike = string | THREE.Color;
@@ -23,6 +23,31 @@ const DOORS = ['#7a5a3f', '#5d7f86', '#8a6b4a', '#6c7a5a', '#4f6577', '#9b5b46']
 const SHUTTERS = ['#5f8f7a', '#7aa0b8', '#b0774f', '#6f8f5a', '#4f7a8a'];
 const FLOWERS = ['#ef8fb0', '#e5484d', '#f5c84a', '#f4f1e8', '#a07cc5', '#f08c3a', '#ff6f91'];
 const LEAVES = ['#689b6b', '#87b477', '#4f875c', '#5e9a5a', '#76a86a'];
+
+/**
+ * A palm frond along +x (length 1, rooted at the origin): it rises a little, then arches down, folds along
+ * the midrib and has a ragged leaflet edge. Both faces are modelled so it reads from above and below.
+ */
+function frondGeometry() {
+  const N = 8;
+  const station = (i: number) => {
+    const u = i / N;
+    const y = 0.18 * u - 0.55 * u * u;
+    const w = (0.035 + 0.19 * Math.sin(PI * Math.min(1, u * 1.06))) * (i % 2 ? 0.62 : 1);
+    return { mid: [u, y, 0], left: [u, y - w * 0.4, -w], right: [u, y - w * 0.4, w] };
+  };
+  const top: number[][] = [];
+  for (let i = 0; i < N; i++) {
+    const a = station(i), b = station(i + 1);
+    top.push(a.mid, b.left, a.left, a.mid, b.mid, b.left, a.mid, a.right, b.right, a.mid, b.right, b.mid);
+  }
+  const under = top.map(([x, y, z]) => [x, y - 0.012, z]);
+  for (let i = 0; i < under.length; i += 3) [under[i + 1], under[i + 2]] = [under[i + 2], under[i + 1]];
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute([...top, ...under].flat(), 3));
+  geometry.computeVertexNormals();
+  return geometry;
+}
 
 /** A roof prism with its ridge along x; `inset` > 0 hips the ends. Unit size, centred on the origin. */
 function roofGeometry(inset: number) {
@@ -64,6 +89,10 @@ export function buildWorld(scene: THREE.Scene) {
     gable: roofGeometry(0),
     hip: roofGeometry(0.28),
     pyramid: new THREE.ConeGeometry(Math.SQRT1_2, 1, 4, 1).rotateY(PI / 4),
+    // Foliage and wood: a soft twelve-sided leaf clump, a tapered trunk or branch, and a palm frond.
+    puff: new THREE.DodecahedronGeometry(1, 0),
+    trunk: new THREE.CylinderGeometry(0.62, 1, 1, 7),
+    frond: frondGeometry(),
   };
   geometries.push(...Object.values(primitives));
   const roles: Record<Role, THREE.MeshStandardMaterial> = {
@@ -229,71 +258,121 @@ export function buildWorld(scene: THREE.Scene) {
     box('#d5c7b3', t.x, 0.17, t.z, 2.5 * t.size, 0.28, 2.5 * t.size, 0, false, 'ground');
     box('#8a996e', t.x, 0.32, t.z, 2.1 * t.size, 0.05, 2.1 * t.size);
   }
+  const leafDark = new THREE.Color(), leafLight = new THREE.Color();
+  /** A green between shade and sunlight by height `f` in the crown, nudged in hue and lightness by `t`. */
+  const leaf = (dark: string, light: string, f: number, t: number) =>
+    leafDark.set(dark).lerp(leafLight.set(light), Math.min(1, Math.max(0, f))).clone()
+      .offsetHSL((t - 0.5) * 0.05, (t - 0.5) * 0.1, (((t * 7.31) % 1) - 0.5) * 0.07);
+  /** A tapered branch from a base point, heading `dir` (yaw) and leaning `lean` from vertical. */
+  function branch(bx: number, by: number, bz: number, radius: number, length: number, dir: number, lean: number, color: string, shadow = true) {
+    const dx = Math.sin(lean) * Math.cos(dir), dy = Math.cos(lean), dz = -Math.sin(lean) * Math.sin(dir);
+    shape('trunk', color, bx + dx * length / 2, by + dy * length / 2, bz + dz * length / 2, radius, length, radius, dir, -lean, shadow);
+  }
   function tree(t: Tree, street: boolean) {
     const { x, z, size: s, spin, tint } = t;
     const c = Math.cos(spin), sn = Math.sin(spin);
     const off = (dx: number, dz: number) => ({ x: x + dx * c + dz * sn, z: z - dx * sn + dz * c });
+    const jitter = (i: number) => hash(x * 0.37 + i, z * 0.61 - i, tint);
+    // A leaf clump in tree units: darker low in the crown, lighter on top, each one slightly different.
+    const clump = (dx: number, y: number, dz: number, r: number, h: number, dark: string, light: string, f: number, i: number, shadow = true) => {
+      const p = off(dx * s, dz * s);
+      shape('puff', leaf(dark, light, f, (tint + jitter(i) * 0.6) % 1), p.x, y * s, p.z, r * s, h * s, r * s * (0.9 + jitter(i + 9) * 0.2), spin + i * 1.7, 0, shadow);
+    };
     if (street && t.species !== 'palm' && t.species !== 'bamboo') streetPit(t);
     if (t.species === 'round') {
-      shape('cylinder', '#8e6549', x, 1.9 * s, z, 0.2 * s, 3.8 * s, 0.2 * s);
-      shape('ball', vary('#689b6b', tint), x, 4.6 * s, z, 2.15 * s, 2.35 * s, 2.15 * s, spin);
-      const a = off(-0.7 * s, 0.25), b = off(1.05 * s, -0.25), d = off(0.2 * s, 1.0 * s);
-      shape('ball', vary('#87b477', tint), a.x, 5.35 * s, a.z, 1.5 * s, 1.65 * s, 1.6 * s, spin);
-      shape('ball', vary('#4f875c', tint), b.x, 4.25 * s, b.z, 1.45 * s, 1.5 * s, 1.5 * s, spin);
-      shape('ball', vary('#7aac6c', tint), d.x, 5.0 * s, d.z, 1.2 * s, 1.25 * s, 1.2 * s, spin + 1);
+      // Sấu / me: a tapered trunk forking into a cloud of leaf clumps; some trees grow a little taller.
+      const k = 0.92 + tint * 0.16;
+      const bark = '#86604a';
+      shape('trunk', bark, x, 1.75 * s * k, z, 0.23 * s, 3.5 * s * k, 0.23 * s, spin);
+      shape('cone', bark, x, 0.2 * s, z, 0.4 * s, 0.4 * s, 0.4 * s, spin, 0, false);
+      const blobs: [number, number, number, number, number][] = [
+        [0, 4.7, 0, 2.0, 1.75], [-1.25, 4.35, 0.45, 1.35, 1.15], [1.3, 4.45, -0.3, 1.4, 1.2], [0.3, 4.25, 1.3, 1.3, 1.1],
+        [-0.35, 4.3, -1.3, 1.3, 1.1], [-0.55, 5.65, -0.2, 1.4, 1.2], [0.6, 5.85, 0.45, 1.15, 1.0],
+      ];
+      blobs.forEach(([dx, y, dz, r, h], i) => clump(dx, y * k, dz, r, h, '#44774f', '#8fbd78', (y - 4.2) / 1.7, i));
     } else if (t.species === 'layered') {
-      // Bàng: a straight trunk with flat, layered tiers, sometimes with a few red autumn leaves.
-      shape('cylinder', '#7d5c45', x, 2.6 * s, z, 0.19 * s, 5.2 * s, 0.19 * s);
-      const tiers: [number, number][] = [[3.3, 2.7], [4.35, 2.1], [5.3, 1.35]];
+      // Bàng: a straight trunk carrying flat, horizontal tiers of leaves; some trees turn red in the dry season.
+      const bark = '#7a5a45';
+      shape('trunk', bark, x, 2.8 * s, z, 0.2 * s, 5.6 * s, 0.2 * s, spin);
+      shape('cone', bark, x, 0.2 * s, z, 0.36 * s, 0.4 * s, 0.36 * s, spin, 0, false);
+      const autumn = tint > 0.8;
+      const tiers: [number, number][] = [[3.0, 2.8], [4.1, 2.2], [5.1, 1.55], [5.85, 0.9]];
       tiers.forEach(([y, r], i) => {
-        const p = off(0.35 * s * (i - 1), -0.25 * s * (i - 1));
-        shape('ball', vary(i === 1 ? '#5e9a5a' : '#6fa765', tint + i * 0.1), p.x, y * s, p.z, r * s, 0.5 * s, r * s * 0.92, spin + i);
-        const q = off(-0.6 * r * s, 0.4 * r * s);
-        shape('ball', vary(tint > 0.82 && i === 0 ? '#c0603d' : '#5a8f52', tint), q.x, (y + 0.1) * s, q.z, r * 0.6 * s, 0.42 * s, r * 0.55 * s, spin);
+        const f = i / 3;
+        clump(0.2 * (i - 1.5), y, -0.15 * (i - 1.5), r, 0.48, '#4a8250', '#86b56c', f, i * 3);
+        if (i === 3) return;
+        for (let k = 0; k < 2; k++) {
+          const a = i * 2.1 + k * PI + tint * 3;
+          const red = autumn && i < 2 && k === 0;
+          clump(Math.cos(a) * r * 0.62, y + 0.08, Math.sin(a) * r * 0.62, r * 0.55, 0.4, red ? '#b2502f' : '#4a8250', red ? '#e0884a' : '#86b56c', f + 0.15, i * 3 + k + 1);
+        }
       });
     } else if (t.species === 'tall') {
-      // Sao / dầu: tall clean trunk with a narrow crown.
-      shape('cylinder', '#8a6a52', x, 4.2 * s, z, 0.17 * s, 8.4 * s, 0.17 * s);
-      shape('ball', vary('#4c7a50', tint), x, 8.9 * s, z, 1.55 * s, 3.2 * s, 1.55 * s, spin);
-      const a = off(0.6 * s, 0.2 * s), b = off(-0.55 * s, -0.3 * s);
-      shape('ball', vary('#5b8c58', tint), a.x, 10.3 * s, a.z, 1.05 * s, 2.0 * s, 1.05 * s, spin);
-      shape('ball', vary('#456f49', tint), b.x, 7.4 * s, b.z, 1.2 * s, 1.5 * s, 1.2 * s, spin);
+      // Sao / dầu: a tall, pale, clean trunk with a narrow crown of stacked clumps.
+      const bark = '#8d7864';
+      shape('trunk', bark, x, 4.4 * s, z, 0.19 * s, 8.8 * s, 0.19 * s, spin);
+      shape('cone', bark, x, 0.22 * s, z, 0.34 * s, 0.44 * s, 0.34 * s, spin, 0, false);
+      const blobs: [number, number, number, number, number][] = [
+        [0, 8.5, 0, 1.45, 2.3], [0.55, 9.9, 0.2, 1.1, 1.7], [-0.6, 7.6, -0.35, 1.15, 1.3],
+        [0.2, 11.0, -0.15, 0.8, 1.2], [-0.45, 9.4, 0.6, 0.95, 1.4], [0.75, 8.0, -0.6, 0.9, 1.1],
+      ];
+      blobs.forEach(([dx, y, dz, r, h], i) => clump(dx, y, dz, r, h, '#3b6a45', '#74a265', (y - 7.4) / 3.6, i));
     } else if (t.species === 'flame') {
-      // Phượng vĩ: a spreading umbrella of green leaves covered in red-orange blossom.
-      shape('cylinder', '#7a5a48', x, 1.5 * s, z, 0.25 * s, 3 * s, 0.25 * s);
-      for (const k of [-1, 1]) {
-        const p = off(k * 0.65 * s, 0);
-        shape('cylinder', '#7a5a48', p.x, 3.35 * s, p.z, 0.14 * s, 1.8 * s, 0.14 * s, spin, k * 0.55);
+      // Phượng vĩ: a short trunk splitting into three limbs under a wide umbrella of leaves and red-orange blossom.
+      const bark = '#73563f';
+      shape('trunk', bark, x, 1.5 * s, z, 0.3 * s, 3 * s, 0.3 * s, spin);
+      shape('cone', bark, x, 0.22 * s, z, 0.5 * s, 0.44 * s, 0.5 * s, spin, 0, false);
+      for (let k = 0; k < 3; k++) branch(x, 2.8 * s, z, 0.15 * s, 2.3 * s, spin + k * 2.09, 0.85, bark);
+      // The umbrella: a domed core ringed by lower, drooping clumps that break up the outline.
+      clump(0, 4.45, 0, 2.5, 1.15, '#4b7a42', '#7fab5c', 0.55, 0);
+      clump(0.2, 5.0, -0.1, 1.7, 0.8, '#4b7a42', '#7fab5c', 1, 1);
+      for (let k = 0; k < 7; k++) {
+        const a = k * (PI * 2 / 7) + tint * 2;
+        const d = 2.3 + jitter(k) * 0.5;
+        clump(Math.cos(a) * d, 4.0 + jitter(k + 3) * 0.3, Math.sin(a) * d, 1.35 + jitter(k + 5) * 0.35, 0.8, '#4b7a42', '#7fab5c', 0.25, k + 2);
       }
-      for (const [dx, dz, r] of [[0, 0, 3.1], [1.4, 0.8, 2.1], [-1.5, -0.6, 2.2]]) {
-        const p = off(dx * s, dz * s);
-        shape('ball', vary('#5f8f4f', tint), p.x, 4.25 * s, p.z, r * s, 0.95 * s, r * s, spin);
-      }
+      // Blossom: many small red-orange clusters over the top and down the rim.
       const r = seeded(x * 31 + z * 17);
-      for (let i = 0; i < 9; i++) {
-        const a = r() * PI * 2, d = 0.6 + r() * 2.0;
-        shape('ball', pickOf(r, ['#e2462f', '#f0672f', '#d93a2a', '#f58a3a']), x + Math.sin(a) * d * s, (4.65 + r() * 0.35) * s, z + Math.cos(a) * d * s, (0.75 + r() * 0.45) * s, 0.42 * s, (0.75 + r() * 0.45) * s, a, 0, false);
+      for (let i = 0; i < 24; i++) {
+        const a = r() * PI * 2, d = 0.2 + r() * 3.0, w = (0.5 + r() * 0.4) * s;
+        const y = 5.72 - d * d * 0.12 + r() * 0.12;
+        shape('puff', pickOf(r, ['#e2462f', '#f0672f', '#d93a2a', '#f58a3a', '#ff7b47', '#c8352a']), x + Math.sin(a) * d * s, y * s, z + Math.cos(a) * d * s, w, 0.3 * s, w, a, 0, false);
       }
     } else if (t.species === 'palm') {
-      const lean = (tint - 0.5) * 0.16;
-      const top = off(Math.sin(lean) * 3.1 * s, 0);
-      shape('cylinder', '#b39b76', (x + top.x) / 2, 3.1 * s, (z + top.z) / 2, 0.22 * s, 6.2 * s, 0.22 * s, spin, -lean);
-      for (let i = 0; i < 6; i++) {
-        const a = i * PI / 3 + spin;
-        box(vary('#659671', tint), top.x + Math.sin(a) * 1.55 * s, 6.2 * s, top.z + Math.cos(a) * 1.55 * s, 0.85 * s, 0.18 * s, 3.8 * s, a);
-        shape('ball', vary('#759f75', tint), top.x + Math.sin(a) * 1.7 * s, 6 * s, top.z + Math.cos(a) * 1.7 * s, 0.65 * s, 0.25 * s, 1.1 * s, a);
+      // Cau / dừa: a ringed trunk curving gently, a crown of arching fronds and a few coconuts.
+      const lean = (tint - 0.5) * 0.24;
+      const H = 6.2 * s, N = 5;
+      const node = (k: number) => ({ o: Math.sin(lean) * H * (k / N) ** 2, y: H * k / N });
+      for (let k = 0; k < N; k++) {
+        const a = node(k), b = node(k + 1);
+        const bend = Math.atan2(b.o - a.o, b.y - a.y);
+        const mid = off((a.o + b.o) / 2, 0), ring = off(b.o, 0);
+        const radius = 0.24 * s * (1 - k * 0.07);
+        shape('cylinder', k % 2 ? '#b8a07a' : '#ab926d', mid.x, (a.y + b.y) / 2, mid.z, radius, Math.hypot(b.o - a.o, b.y - a.y) * 1.02, radius, spin, -bend);
+        if (k < N - 1) shape('cylinder', '#96805e', ring.x, b.y, ring.z, radius * 1.06, 0.08 * s, radius * 1.06, spin, -bend);
       }
-      for (let i = 0; i < 3; i++) shape('ball', '#7b5a36', top.x + Math.sin(i * 2.1) * 0.35, 5.75 * s, top.z + Math.cos(i * 2.1) * 0.35, 0.22, 0.24, 0.22, 0, 0, false);
+      const top = node(N), crown = off(top.o, 0);
+      shape('puff', '#6b7f45', crown.x, top.y + 0.05 * s, crown.z, 0.38 * s, 0.42 * s, 0.38 * s, spin, 0, false);
+      const r = seeded(x * 23 + z * 29);
+      for (let i = 0; i < 9; i++) {
+        const a = spin + i * (PI * 2 / 9) + (r() - 0.5) * 0.35;
+        const length = (2.9 + r() * 0.7) * s;
+        shape('frond', leaf('#3f7a48', '#6fa860', i % 2 ? 0.8 : 0.25, (tint + r() * 0.4) % 1), crown.x, top.y, crown.z, length, length, length * 0.95, a, (i % 2 ? 0.34 : -0.1) + (r() - 0.5) * 0.15);
+      }
+      for (let i = 0; i < 4; i++) shape('ball', '#7b5a36', crown.x + Math.sin(i * 1.7 + spin) * 0.32 * s, top.y - 0.3 * s, crown.z + Math.cos(i * 1.7 + spin) * 0.32 * s, 0.2 * s, 0.22 * s, 0.2 * s, 0, 0, false);
     } else {
-      // Bamboo clump.
-      shape('ball', '#7d8a5a', x, 0.2, z, 0.85 * s, 0.35, 0.85 * s, spin);
+      // Tre: a clump of culms leaning outward, with feathery leaf sprays towards their tips.
+      shape('puff', '#7d8a5a', x, 0.15, z, 0.9 * s, 0.32, 0.9 * s, spin, 0, false);
       const r = seeded(x * 13 + z * 7);
-      for (let i = 0; i < 6; i++) {
-        const a = spin + i * 1.05 + r() * 0.4, lean = 0.06 + r() * 0.12, h = (5.2 + r() * 2.6) * s;
-        const bx = x + Math.sin(a) * (0.25 + Math.sin(lean) * h / 2), bz = z + Math.cos(a) * (0.25 + Math.sin(lean) * h / 2);
-        shape('cylinder', i % 2 ? '#8fae5c' : '#7c9e4f', bx, h / 2, bz, 0.07, h, 0.07, a + HALF_PI, lean, false);
-        const tx = x + Math.sin(a) * (0.25 + Math.sin(lean) * h * 0.85), tz = z + Math.cos(a) * (0.25 + Math.sin(lean) * h * 0.85);
-        shape('ball', vary('#6fa04f', r()), tx, h * 0.86, tz, 0.75, 1.3, 0.75, a, 0, i === 0);
+      for (let i = 0; i < 7; i++) {
+        const a = spin + i * 0.9 + r() * 0.4, lean = 0.06 + r() * 0.14, h = (5.4 + r() * 2.8) * s;
+        const along = (d: number) => ({ x: x + Math.sin(a) * (0.22 + Math.sin(lean) * d), y: Math.cos(lean) * d, z: z + Math.cos(a) * (0.22 + Math.sin(lean) * d) });
+        const mid = along(h / 2);
+        shape('cylinder', i % 2 ? '#8fae5c' : '#7c9e4f', mid.x, mid.y, mid.z, 0.065, h, 0.065, a + HALF_PI, lean, false);
+        for (let k = 0; k < 3; k++) {
+          const n = along(h * (0.62 + k * 0.15)), out = 0.35 + k * 0.1;
+          shape('ball', leaf('#5a8c44', '#8fbb5e', k / 2, r()), n.x + Math.sin(a + k) * out, n.y - 0.15, n.z + Math.cos(a + k) * out, 0.85 - k * 0.12, 0.3, 0.42, a + k, 0.45, i === 0 && k === 0);
+        }
       }
     }
   }
@@ -781,7 +860,7 @@ export function buildWorld(scene: THREE.Scene) {
       const hx = ax + ((bx - ax) * t) / len, hz = az + ((bz - az) * t) / len;
       if (!softFree(hx, hz, 0.5)) continue;
       box(vary('#5f8f55', decor()), hx, 0.62, hz, bx === ax ? 0.8 : 1.15, 0.7, bx === ax ? 1.15 : 0.8);
-      shape('ball', vary('#6d9d5e', decor()), hx, 0.98, hz, 0.62, 0.32, 0.62, decor() * 3);
+      shape('puff', vary('#6d9d5e', decor()), hx, 0.98, hz, 0.62, 0.32, 0.62, decor() * 3);
       if (decor() < 0.3) flowers(hx, 1.08, hz, 3, 0.7, 0.7, Math.floor(hx * 100 + hz));
     }
   }
@@ -798,7 +877,10 @@ export function buildWorld(scene: THREE.Scene) {
       if (decor() < 0.5) {
         box('#8a6f52', fx, 0.15, fz, 1.4, 0.16, 0.9, 0, false);
         flowers(fx, 0.3, fz, 7, 1.2, 0.7, i * 97 + Math.floor(fx));
-      } else shape('ball', vary('#5f9a55', decor()), fx, 0.45, fz, 0.7, 0.55, 0.7, decor() * 3);
+      } else {
+        shape('puff', vary('#5f9a55', decor()), fx, 0.45, fz, 0.7, 0.55, 0.7, decor() * 3);
+        shape('puff', vary('#7fb06a', hash(fx, fz)), fx + 0.18, 0.78, fz - 0.12, 0.42, 0.34, 0.42, hash(fz, fx) * 3, 0, false);
+      }
     }
   }
   for (const y of SCENERY.yards) {
@@ -1040,8 +1122,12 @@ export function buildWorld(scene: THREE.Scene) {
   for (let i = 0; i < 46; i++) {
     const x = -300 + i * 13.3 + farTrees() * 6;
     const s = 0.9 + farTrees() * 0.5;
-    shape('cylinder', '#7a5a48', x, 1.6 * s, -211 - farTrees() * 8, 0.25 * s, 3.2 * s, 0.25 * s, 0, 0, false);
-    shape('ball', vary('#5f8f55', farTrees()), x, 4.6 * s, -211 - farTrees() * 8, 2.6 * s, 2.8 * s, 2.6 * s, farTrees() * 3, 0, false);
+    const tz = -211 - farTrees() * 8, tint = farTrees();
+    farTrees();
+    const yaw = farTrees() * 3;
+    shape('cylinder', '#7a5a48', x, 1.6 * s, tz, 0.25 * s, 3.2 * s, 0.25 * s, 0, 0, false);
+    shape('puff', leaf('#4f8049', '#78a564', 0.35, tint), x, 4.5 * s, tz, 2.6 * s, 2.4 * s, 2.6 * s, yaw, 0, false);
+    shape('puff', leaf('#4f8049', '#78a564', 0.95, tint), x + 0.8 * s, 5.9 * s, tz + 0.3 * s, 1.6 * s, 1.5 * s, 1.6 * s, yaw + 1, 0, false);
   }
   for (let i = 0; i < 26; i++) {
     const x = -260 + i * 21;
@@ -1080,8 +1166,10 @@ export function buildWorld(scene: THREE.Scene) {
       if (roads.some((r) => Math.abs(x - r) < 17 || Math.abs(z - r) < 17)) continue;
       if (edge() < 0.25) {
         const s = 1 + edge() * 0.5;
+        const tint = edge(), yaw = edge() * 3;
         shape('cylinder', '#7a5a48', x, 1.8 * s, z, 0.25 * s, 3.6 * s, 0.25 * s, 0, 0, false);
-        shape('ball', vary('#5f8f55', edge()), x, 5 * s, z, 2.8 * s, 3 * s, 2.8 * s, edge() * 3, 0, false);
+        shape('puff', leaf('#4f8049', '#7aa766', 0.35, tint), x, 4.9 * s, z, 2.8 * s, 2.6 * s, 2.8 * s, yaw, 0, false);
+        shape('puff', leaf('#4f8049', '#7aa766', 0.95, tint), x - 0.7 * s, 6.4 * s, z + 0.4 * s, 1.7 * s, 1.6 * s, 1.7 * s, yaw + 1, 0, false);
         continue;
       }
       const w = 9 + edge() * 5, d = 9 + edge() * 5, h = 7 + edge() * 15;

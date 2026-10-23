@@ -1,11 +1,12 @@
 import * as THREE from 'three';
 import type { Collider } from './world';
+import { FigureBatch, palette, figureMaterial, ragdollHeadGeometry, ragdollLimbGeometry, ragdollTorsoGeometry, styleOf } from './figures';
 
 /**
  * Verlet ragdolls with elbows and knees: 13 particles joined by distance constraints, heavier in the
  * torso than in the limbs. Limbs and heads can be torn off by violent hits; a torn part keeps its own
  * constraints and the stump bleeds for a while. Every body part of every ragdoll is an instance of
- * one of four shared meshes, so the whole pile costs four draw calls.
+ * one of three shared figure meshes (torso, head, limb), so the whole pile costs three draw calls.
  */
 export type RagdollLook = { shirt: string; pants: string; skin: string; hat?: string; helmet?: string };
 export type BodyPart = 'head' | 'armL' | 'armR' | 'legL' | 'legR';
@@ -69,24 +70,32 @@ const DRAG = 0.996;
 const RADIUS = 0.12;
 const MAX_BODIES = 18;
 const BOUND = 138;
-const BOXES_PER_BODY = 9;
+// Crowd-model units to ragdoll units across the torso, the head radius, and limbs a little slimmer than their physics thickness.
+const TORSO_WIDTH = 1.35;
+const HEAD_RADIUS = 0.34;
+const LIMB_SLIM = 0.85;
 
 export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground: (x: number, z: number) => number) {
-  const boxGeometry = new THREE.BoxGeometry(1, 1, 1);
-  const ballGeometry = new THREE.SphereGeometry(1, 10, 7);
-  const coneGeometry = new THREE.ConeGeometry(1, 1, 8);
-  const material = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.85 });
-  const boxes = new THREE.InstancedMesh(boxGeometry, material, MAX_BODIES * BOXES_PER_BODY);
-  const heads = new THREE.InstancedMesh(ballGeometry, material, MAX_BODIES);
-  const caps = new THREE.InstancedMesh(ballGeometry, material, MAX_BODIES);
-  const hats = new THREE.InstancedMesh(coneGeometry, material, MAX_BODIES);
+  const material = figureMaterial();
+  const torsos = new FigureBatch(ragdollTorsoGeometry(), material, MAX_BODIES);
+  const heads = new FigureBatch(ragdollHeadGeometry(), material, MAX_BODIES);
+  const limbs = new FigureBatch(ragdollLimbGeometry(), material, MAX_BODIES * LIMBS.length);
+  const batches = [torsos, heads, limbs];
   const hidden = new THREE.Matrix4().makeScale(0, 0, 0);
-  const color = new THREE.Color();
-  for (const mesh of [boxes, heads, caps, hats]) {
-    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    mesh.frustumCulled = false;
-    for (let i = 0; i < mesh.count; i++) { mesh.setMatrixAt(i, hidden); mesh.setColorAt(i, color.set('#ffffff')); }
-    scene.add(mesh);
+  // Packed palettes per slot: one for torso and head, one per limb segment (main colour, then hand or shoe).
+  const dress = Array.from({ length: MAX_BODIES }, () => ({ body: new Float32Array(16), limbs: LIMBS.map(() => new Float32Array(16)) }));
+  for (const batch of batches) {
+    for (let i = 0; i < batch.capacity; i++) batch.set(i, hidden, dress[0].body);
+    batch.end(0);
+    scene.add(batch.mesh);
+  }
+  // Only slots below the highest one in use are submitted to the GPU.
+  function commit() {
+    let drawn = 0;
+    for (const body of bodies) drawn = Math.max(drawn, body.slot + 1);
+    torsos.end(drawn);
+    heads.end(drawn);
+    limbs.end(drawn * LIMBS.length);
   }
   const bodies: RagdollBody[] = [];
   const freeSlots = Array.from({ length: MAX_BODIES }, (_, i) => MAX_BODIES - 1 - i);
@@ -132,23 +141,25 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     const segments = Int16Array.from(LIMBS.flatMap(([a, b]) => [a, b]));
     const slot = freeSlots.pop()!;
     const body: RagdollBody = { slot, pos, prev, sticks, rest, spacing, spacers, segments, scale, look, nearby: [], still: 0, asleep: false, removed: false, detached: new Set(), spare: JOINTS };
-    LIMBS.forEach(([, , part], k) => boxes.setColorAt(slot * BOXES_PER_BODY + 1 + k, color.set(look[part])));
-    boxes.setColorAt(slot * BOXES_PER_BODY, color.set(look.shirt));
-    heads.setColorAt(slot, color.set(look.skin));
-    caps.setColorAt(slot, color.set(look.helmet ?? '#000000'));
-    hats.setColorAt(slot, color.set(look.hat ?? '#000000'));
-    for (const mesh of [boxes, heads, caps, hats]) if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    // Dressed like the standing person: same hair, hat or helmet, sleeves and shoes.
+    const style = styleOf(look);
+    const d = dress[slot];
+    palette([look.shirt, look.pants, look.skin, style.hair, style.accent], style.mask, d.body);
+    const forearm = style.forearm === 'skin' ? look.skin : look.shirt, shin = style.shin === 'skin' ? look.skin : look.pants;
+    const ends = [[look.shirt, look.shirt], [forearm, look.skin], [look.shirt, look.shirt], [forearm, look.skin], [look.pants, look.pants], [shin, style.shoes], [look.pants, look.pants], [shin, style.shoes]];
+    ends.forEach((colors, k) => palette(colors, 0, d.limbs[k]));
     bodies.push(body);
     refreshNearby(body);
     sync(body);
+    commit();
     return body;
   }
 
   function hide(slot: number) {
-    for (let k = 0; k < BOXES_PER_BODY; k++) boxes.setMatrixAt(slot * BOXES_PER_BODY + k, hidden);
-    heads.setMatrixAt(slot, hidden);
-    caps.setMatrixAt(slot, hidden);
-    hats.setMatrixAt(slot, hidden);
+    const d = dress[slot];
+    torsos.set(slot, hidden, d.body);
+    heads.set(slot, hidden, d.body);
+    for (let k = 0; k < LIMBS.length; k++) limbs.set(slot * LIMBS.length + k, hidden, d.limbs[k]);
   }
 
   function remove(body: RagdollBody) {
@@ -159,7 +170,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     const index = bodies.indexOf(body);
     if (index >= 0) bodies.splice(index, 1);
     for (let i = stumps.length - 1; i >= 0; i--) if (stumps[i].body === body) stumps.splice(i, 1);
-    for (const mesh of [boxes, heads, caps, hats]) mesh.instanceMatrix.needsUpdate = true;
+    commit();
   }
 
   function center(body: RagdollBody, out: THREE.Vector3) {
@@ -334,13 +345,14 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     if (body.still > 70) body.asleep = true;
   }
 
-  function placeBox(index: number, a: THREE.Vector3, b: THREE.Vector3, thickness: number) {
+  function placeBox(index: number, a: THREE.Vector3, b: THREE.Vector3, thickness: number, look: Float32Array) {
     mid.copy(a).add(b).multiplyScalar(0.5);
     vb.subVectors(b, a);
     const length = vb.length() || 0.01;
     quat.setFromUnitVectors(UP, vb.divideScalar(length));
-    matrix.compose(mid, quat, size.set(thickness, length + thickness * 0.4, thickness));
-    boxes.setMatrixAt(index, matrix);
+    const width = thickness * LIMB_SLIM;
+    matrix.compose(mid, quat, size.set(width, length + thickness * 0.4, width));
+    limbs.set(index, matrix, look);
   }
 
   function sync(body: RagdollBody) {
@@ -357,24 +369,18 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     ax.crossVectors(ay, az);
     basis.makeBasis(ax, ay, az);
     torsoQuat.setFromRotationMatrix(basis);
-    matrix.compose(mid.set(tx, ty, tz), torsoQuat, size.set(0.9 * s, torsoLength + 0.3 * s, 0.5 * s));
-    boxes.setMatrixAt(slot * BOXES_PER_BODY, matrix);
+    const d = dress[slot];
+    // The torso geometry spans hip to shoulder joints over y = -0.5..0.5, so it stretches with the body.
+    matrix.compose(mid.set(tx, ty, tz), torsoQuat, size.set(TORSO_WIDTH * s, torsoLength, TORSO_WIDTH * s));
+    torsos.set(slot, matrix, d.body);
     // A torn-off head tumbles on its own instead of sharing the torso's orientation.
     const loose = body.detached.has('head');
     const headQuat = loose ? quat.setFromAxisAngle(UP, body.pos[HEAD * 3] * 3) : torsoQuat;
-    const upX = loose ? 0 : ay.x, upY = loose ? 1 : ay.y, upZ = loose ? 0 : ay.z;
+    // The head geometry carries its own hair, hat or helmet, so one instance follows the head particle.
     read(body, HEAD, va);
-    matrix.compose(va, headQuat, size.setScalar(0.38 * s));
-    heads.setMatrixAt(slot, matrix);
-    if (body.look.helmet) {
-      matrix.compose(mid.set(va.x + upX * 0.14 * s, va.y + upY * 0.14 * s, va.z + upZ * 0.14 * s), headQuat, size.set(0.405 * s, 0.26 * s, 0.405 * s));
-      caps.setMatrixAt(slot, matrix);
-    } else caps.setMatrixAt(slot, hidden);
-    if (body.look.hat) {
-      matrix.compose(mid.set(va.x + upX * 0.32 * s, va.y + upY * 0.32 * s, va.z + upZ * 0.32 * s), headQuat, size.set(0.6 * s, 0.34 * s, 0.6 * s));
-      hats.setMatrixAt(slot, matrix);
-    } else hats.setMatrixAt(slot, hidden);
-    LIMBS.forEach(([, , , thickness], k) => placeBox(slot * BOXES_PER_BODY + 1 + k, read(body, body.segments[k * 2], va), read(body, body.segments[k * 2 + 1], ax), thickness * s));
+    matrix.compose(va, headQuat, size.setScalar(HEAD_RADIUS * s));
+    heads.set(slot, matrix, d.body);
+    LIMBS.forEach(([, , , thickness], k) => placeBox(slot * LIMBS.length + k, read(body, body.segments[k * 2], va), read(body, body.segments[k * 2 + 1], ax), thickness * s, d.limbs[k]));
   }
 
   return {
@@ -417,15 +423,12 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
         // One last sync on the frame a body falls asleep, then it costs nothing.
         if (!body.asleep || body.still === 71) { sync(body); changed = true; if (body.asleep) body.still++; }
       }
-      if (changed) for (const mesh of [boxes, heads, caps, hats]) mesh.instanceMatrix.needsUpdate = true;
+      if (changed) commit();
     },
     dispose() {
-      for (const mesh of [boxes, heads, caps, hats]) { scene.remove(mesh); mesh.dispose(); }
+      for (const batch of batches) { scene.remove(batch.mesh); batch.dispose(); }
       bodies.length = 0;
       material.dispose();
-      boxGeometry.dispose();
-      ballGeometry.dispose();
-      coneGeometry.dispose();
     },
   };
 }

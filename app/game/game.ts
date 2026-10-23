@@ -113,39 +113,135 @@ function makeLabel(text: string, bg = '#253d35', fg = '#ffffff') {
 }
 
 function makePerson(color = '#e77641', riding = false, hair?: string) {
+  // Every moving part is one merged, vertex-coloured mesh (body, two legs, two arms, and a glossy helmet
+  // for the rider), so a person costs five or six draw calls however much detail it carries.
+  type Piece = { g: THREE.BufferGeometry; c: THREE.ColorRepresentation; at?: [number, number, number]; s?: number | [number, number, number]; r?: [number, number, number]; smooth?: boolean };
+  const tint = new THREE.Color(), m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), v = new THREE.Vector3(), sv = new THREE.Vector3();
+  const merge = (pieces: Piece[]) => {
+    const positions: number[] = [], normals: number[] = [], colors: number[] = [];
+    for (const p of pieces) {
+      const g = p.g.index ? p.g.toNonIndexed() : p.g;
+      if (g !== p.g) p.g.dispose();
+      if (!p.smooth) { g.deleteAttribute('normal'); g.computeVertexNormals(); }
+      const s = p.s ?? 1;
+      e.set(...(p.r ?? [0, 0, 0]));
+      g.applyMatrix4(m4.compose(v.set(...(p.at ?? [0, 0, 0])), q.setFromEuler(e), typeof s === 'number' ? sv.setScalar(s) : sv.set(...s)));
+      tint.set(p.c);
+      const pos = g.getAttribute('position'), nor = g.getAttribute('normal');
+      for (let i = 0; i < pos.count; i++) {
+        positions.push(pos.getX(i), pos.getY(i), pos.getZ(i));
+        normals.push(nor.getX(i), nor.getY(i), nor.getZ(i));
+        colors.push(tint.r, tint.g, tint.b);
+      }
+      g.dispose();
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+    return geometry;
+  };
+  const ball = (r: number, w = 10, h = 7, theta = Math.PI) => new THREE.SphereGeometry(r, w, h, 0, Math.PI * 2, 0, theta);
+  const tube = (top: number, bottom: number, height: number, seg = 10) => new THREE.CylinderGeometry(top, bottom, height, seg);
+  const block = (w: number, h: number, d: number) => new THREE.BoxGeometry(w, h, d);
+  const lathe = (profile: number[], seg = 12) => new THREE.LatheGeometry(profile.reduce<THREE.Vector2[]>((out, _, i) => (i % 2 ? out : [...out, new THREE.Vector2(profile[i], profile[i + 1])]), []), seg, Math.PI / seg);
+  const shade = (hex: string, k: number) => new THREE.Color(hex).multiplyScalar(k);
+  const SKIN = '#dca878', TROUSERS = '#293e4a', SHOE = '#f6ead2', HAIR = hair ?? '#2a2220';
+  const cloth = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, metalness: 0.03 });
+
+  // Head features in head units (radius 1, centred at HEAD), mapped onto the body.
+  const R = 0.38, HEAD = [0, 2.2, 0.02] as const, HIP = 1.04;
+  const h = (x: number, y: number, z: number): [number, number, number] => [HEAD[0] + x * R, HEAD[1] + y * R - HIP, HEAD[2] + z * R];
+  const hs = (s: number | [number, number, number]): [number, number, number] => (typeof s === 'number' ? [s * R, s * R, s * R] : [s[0] * R, s[1] * R, s[2] * R]);
+  const y = (value: number) => value - HIP;
+  const pieces: Piece[] = [
+    // Trousers, belt and a tapered shirt with a chest pocket and collar.
+    { g: lathe([0, 0.92, 0.33, 0.92, 0.37, 0.98, 0.375, 1.12, 0.36, 1.2, 0, 1.2]), c: TROUSERS, at: [0, y(0), 0], s: [1, 1, 0.64] },
+    { g: tube(0.374, 0.374, 0.075, 12), c: '#4a3828', at: [0, y(1.15), 0], s: [1, 1, 0.65] },
+    { g: block(0.1, 0.07, 0.03), c: '#d9b44a', at: [0, y(1.15), 0.245] },
+    { g: lathe([0, 1.17, 0.385, 1.17, 0.375, 1.3, 0.385, 1.46, 0.43, 1.64, 0.435, 1.76, 0.35, 1.86, 0.17, 1.93, 0, 1.93]), c: color, at: [0, y(0), 0], s: [1, 1, 0.62] },
+    { g: block(0.13, 0.13, 0.02), c: shade(color, 0.86), at: [0.18, y(1.53), 0.252], r: [-0.12, 0, 0] },
+    { g: tube(0.17, 0.2, 0.07, 10), c: shade(color, 0.85), at: [0, y(1.92), 0], s: [1, 1, 0.85] },
+    { g: tube(0.12, 0.13, 0.2, 10), c: SKIN, at: [0, y(2.0), 0] },
+    // Head: egg-shaped skull, ears, eyes, brows, nose and mouth.
+    { g: ball(1, 14, 11), c: SKIN, at: h(0, 0, 0), s: hs([1, 1.06, 0.98]), smooth: true },
+    { g: ball(0.2, 6, 5), c: shade(SKIN, 0.92), at: h(-0.97, -0.04, 0.02), s: hs([0.6, 1, 0.75]) },
+    { g: ball(0.2, 6, 5), c: shade(SKIN, 0.92), at: h(0.97, -0.04, 0.02), s: hs([0.6, 1, 0.75]) },
+    { g: ball(0.13, 8, 6), c: '#2a201b', at: h(-0.36, 0.03, 0.885), s: hs([0.95, 1.3, 0.5]) },
+    { g: ball(0.13, 8, 6), c: '#2a201b', at: h(0.36, 0.03, 0.885), s: hs([0.95, 1.3, 0.5]) },
+    { g: block(0.32, 0.075, 0.09), c: hair ?? '#3a2a22', at: h(-0.37, 0.33, 0.855), s: hs(1), r: [-0.25, 0, 0.1] },
+    { g: block(0.32, 0.075, 0.09), c: hair ?? '#3a2a22', at: h(0.37, 0.33, 0.855), s: hs(1), r: [-0.25, 0, -0.1] },
+    { g: ball(0.13, 6, 4), c: shade(SKIN, 0.97), at: h(0, -0.14, 0.95), s: hs([1, 0.85, 0.85]) },
+    { g: block(0.24, 0.05, 0.06), c: '#9b5a48', at: h(0, -0.43, 0.875), s: hs(1), r: [0.35, 0, 0] },
+  ];
+  if (hair) {
+    // Short hair: a chunky dome tilted back off the forehead, sideburns and a swept fringe.
+    pieces.push(
+      { g: ball(1.07, 14, 6, Math.PI * 0.56), c: HAIR, at: h(0, 0, 0), s: hs([1, 1.07, 0.99]), r: [-0.5, 0, 0] },
+      { g: block(0.14, 0.4, 0.3), c: HAIR, at: h(-0.93, -0.06, 0.22), s: hs(1), r: [0, -0.35, 0] },
+      { g: block(0.14, 0.4, 0.3), c: HAIR, at: h(0.93, -0.06, 0.22), s: hs(1), r: [0, 0.35, 0] },
+      { g: ball(0.5, 8, 5), c: HAIR, at: h(0.22, 0.6, 0.66), s: hs([1.4, 0.5, 0.75]), r: [-0.55, 0, -0.3] },
+    );
+  } else {
+    // The delivery rider's insulated box on shoulder straps.
+    pieces.push(
+      { g: block(0.6, 0.66, 0.34), c: '#365e52', at: [0, y(1.52), -0.43] },
+      { g: block(0.64, 0.08, 0.38), c: '#4c7a6b', at: [0, y(1.88), -0.43] },
+      { g: block(0.42, 0.13, 0.02), c: '#e7b04a', at: [0, y(1.56), -0.605] },
+      { g: block(0.06, 0.4, 0.035), c: '#2b4a40', at: [-0.22, y(1.68), 0.262], r: [0.1, 0, 0] },
+      { g: block(0.06, 0.4, 0.035), c: '#2b4a40', at: [0.22, y(1.68), 0.262], r: [0.1, 0, 0] },
+      { g: block(0.06, 0.035, 0.5), c: '#2b4a40', at: [-0.22, y(1.89), -0.02] },
+      { g: block(0.06, 0.035, 0.5), c: '#2b4a40', at: [0.22, y(1.89), -0.02] },
+    );
+  }
+  // The body pivots at the hip so a rider can lean forward; the head and helmet lean with it.
+  const body = new THREE.Mesh(merge(pieces), cloth);
+  body.position.y = HIP;
   const group = new THREE.Group();
-  const shirt = material(color);
-  const trousers = material('#293e4a');
-  const skin = material('#dca878');
-  const shoe = material('#f6ead2');
-  const helmet = material(hair ?? '#fff4dc', hair ? 0.9 : 0.45);
+  group.add(body);
+  if (!hair) {
+    // Motorbike half helmet with a peak and a stripe in the shirt colour.
+    const helmet = merge([
+      { g: ball(1.15, 14, 7, Math.PI * 0.52), c: '#fff4dc', at: h(0, 0.06, -0.02), s: hs([1, 1, 1.02]), r: [-0.3, 0, 0] },
+      { g: ball(1.17, 14, 7, Math.PI * 0.5), c: color, at: h(0, 0.06, -0.02), s: hs([0.2, 1, 1.03]), r: [-0.3, 0, 0] },
+      { g: new THREE.CylinderGeometry(0.85, 0.85, 0.07, 10, 1, false, -Math.PI / 2, Math.PI), c: '#e9dfc6', at: h(0, 0.36, 0.86), s: hs([1, 1, 0.6]), r: [0.15, 0, 0] },
+    ]);
+    body.add(new THREE.Mesh(helmet, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.05 })));
+  }
+  // Legs pivot at the hip: trousers with a cuff, and sneakers with laces in the shirt colour.
+  const leg = () => new THREE.Mesh(merge([
+    { g: ball(0.175, 10, 7), c: TROUSERS, at: [0, -0.03, 0] },
+    { g: tube(0.175, 0.15, 0.48), c: TROUSERS, at: [0, -0.24, 0] },
+    { g: tube(0.152, 0.128, 0.4), c: TROUSERS, at: [0, -0.64, 0] },
+    { g: tube(0.14, 0.14, 0.06), c: shade(TROUSERS, 0.8), at: [0, -0.82, 0] },
+    { g: block(0.24, 0.15, 0.4), c: SHOE, at: [0, -0.905, 0.07] },
+    { g: ball(0.12, 8, 5), c: SHOE, at: [0, -0.915, 0.25], s: [1, 0.62, 1.05] },
+    { g: block(0.26, 0.05, 0.47), c: '#c8b593', at: [0, -0.985, 0.085] },
+    { g: block(0.13, 0.025, 0.16), c: color, at: [0, -0.826, 0.12], r: [-0.25, 0, 0] },
+  ]), cloth);
   const limbLeft = new THREE.Group();
   const limbRight = new THREE.Group();
   limbLeft.position.set(-0.26, 1.04, 0);
   limbRight.position.set(0.26, 1.04, 0);
+  limbLeft.add(leg());
+  limbRight.add(leg());
   group.add(limbLeft, limbRight);
-  box(limbLeft, [0.32, 0.85, 0.36], [0, -0.43, 0], trousers);
-  box(limbRight, [0.32, 0.85, 0.36], [0, -0.43, 0], trousers);
-  box(limbLeft, [0.36, 0.19, 0.54], [0, -0.84, 0.09], shoe);
-  box(limbRight, [0.36, 0.19, 0.54], [0, -0.84, 0.09], shoe);
-  const body = box(group, [0.91, 0.91, 0.5], [0, 1.49, 0], shirt);
-  if (!hair) box(group, [0.5, 0.65, 0.22], [0, 1.5, -0.35], material('#365e52'));
-  sphere(group, 0.38, [0, 2.18, 0.03], skin);
-  const cap = sphere(group, 0.405, [0, 2.32, hair ? -0.04 : 0], helmet);
-  cap.scale.y = 0.65;
-  if (!hair) box(group, [0.55, 0.08, 0.22], [0, 2.28, 0.37], helmet);
-  box(group, [0.16, 0.08, 0.025], [-0.14, 2.19, 0.382], material('#3e342e'));
-  box(group, [0.16, 0.08, 0.025], [0.14, 2.19, 0.382], material('#3e342e'));
-  // Arms pivot at the shoulder so they can swing, steer, wave and aim.
+  // Arms pivot at the shoulder so they can swing, steer, wave and aim: short sleeve, forearm, hand and thumb.
+  const arm = (inward: number) => new THREE.Mesh(merge([
+    { g: ball(0.15, 10, 7), c: color, at: [0, -0.02, 0] },
+    { g: tube(0.15, 0.13, 0.36), c: color, at: [0, -0.18, 0] },
+    { g: tube(0.142, 0.142, 0.06), c: shade(color, 0.85), at: [0, -0.35, 0] },
+    { g: tube(0.105, 0.088, 0.3, 9), c: SKIN, at: [0, -0.5, 0] },
+    { g: ball(0.12, 9, 7), c: SKIN, at: [0, -0.725, 0.01], s: [0.88, 1.08, 0.95] },
+    { g: ball(0.05, 6, 4), c: SKIN, at: [inward * 0.08, -0.68, 0.07] },
+  ]), cloth);
   const armLeft = new THREE.Group();
   const armRight = new THREE.Group();
   armLeft.position.set(-0.57, 1.76, 0.04);
   armRight.position.set(0.57, 1.76, 0.04);
+  armLeft.add(arm(1));
+  armRight.add(arm(-1));
   group.add(armLeft, armRight);
-  box(armLeft, [0.26, 0.72, 0.3], [0, -0.36, 0], shirt);
-  box(armRight, [0.26, 0.72, 0.3], [0, -0.36, 0], shirt);
-  sphere(armLeft, 0.16, [0, -0.73, 0], skin);
-  sphere(armRight, 0.16, [0, -0.73, 0], skin);
   if (riding) {
     limbLeft.rotation.x = -0.65;
     limbRight.rotation.x = -0.65;

@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { BUILDINGS, POIS, type Building, type Poi } from './city';
 import { createNav, type Waypoint } from './nav';
 import type { createRagdolls, RagdollBody, RagdollLook } from './ragdoll';
+import { FIGURE, FigureBatch, PART, armGeometry, bodyGeometry, deriveStyle, figureMaterial, legGeometry, palette, setStyle } from './figures';
 
 type Ragdolls = ReturnType<typeof createRagdolls>;
 type Role = 'worker' | 'student' | 'retiree' | 'vendor' | 'owl' | 'gang' | 'thief';
@@ -42,7 +43,6 @@ const HIT_RADIUS = 0.38;
 const HEIGHT = 1.85;
 const MAX_HEALTH = 60;
 const GANG_HEALTH = 90;
-const BOXES = 5;
 export const GANGS = [
   { name: 'Rắn Đen', shirt: '#26262a', pants: '#3a1f1f', bandana: '#c0392b' },
   { name: 'Hổ Vàng', shirt: '#d8a020', pants: '#2b2b30', bandana: '#1f1f22' },
@@ -209,68 +209,66 @@ export function createNpcs(
   for (let k = 0; k < 2; k++) addNpc('thief', homes[k], [], { shirt: '#3d3d3d', pants: '#1f1f1f', skin: '#c58f69' });
   for (const thief of npcs.slice(crowd)) thief.state = 'away';
 
-  // Instanced rendering: torso, legs and arms are boxes; heads and hats have their own meshes.
-  const box = new THREE.BoxGeometry(1, 1, 1);
-  const ball = new THREE.IcosahedronGeometry(1, 1);
-  const cone = new THREE.ConeGeometry(1, 1, 8);
-  const material = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.9 });
-  const boxes = new THREE.InstancedMesh(box, material, npcs.length * BOXES);
-  const heads = new THREE.InstancedMesh(ball, material, npcs.length);
-  const hats = new THREE.InstancedMesh(cone, material, npcs.length);
-  const bandanas = new THREE.InstancedMesh(box, material, npcs.length);
-  const color = new THREE.Color();
-  npcs.forEach((npc, i) => {
-    (['shirt', 'pants', 'pants', 'shirt', 'shirt'] as const).forEach((part, k) => boxes.setColorAt(i * BOXES + k, color.set(npc.look[part])));
-    heads.setColorAt(i, color.set(npc.look.skin));
-    hats.setColorAt(i, color.set(npc.look.hat ?? '#e5cf92'));
-    bandanas.setColorAt(i, color.set(npc.gang >= 0 ? GANGS[npc.gang].bandana : '#000000'));
+  // Instanced rendering: a body (torso and head), legs and arms, each one figure mesh for the whole crowd.
+  // Everyone keeps a packed palette (clothes, skin, hair, hat or bandana); only people outdoors are drawn.
+  const material = figureMaterial();
+  const bodies = new FigureBatch(bodyGeometry('civil'), material, npcs.length);
+  const legs = new FigureBatch(legGeometry(), material, npcs.length * 2);
+  const arms = new FigureBatch(armGeometry(false), material, npcs.length * 2);
+  const dress = npcs.map((npc) => {
+    const { look } = npc;
+    const style = deriveStyle(look, npc.id, npc.role);
+    if (npc.gang >= 0) {
+      style.mask = (style.mask & ~PART.CONE) | PART.BANDANA;
+      style.accent = GANGS[npc.gang].bandana;
+    }
+    // Ragdolls of this person read the same style back from their look.
+    setStyle(look, style);
+    const shin = style.shin === 'skin' ? look.skin : look.pants;
+    return {
+      style,
+      body: palette([look.shirt, look.pants, look.skin, style.hair, style.accent], style.mask),
+      legs: palette([look.pants, shin, style.shoes], PART.STRAIGHT),
+      seated: palette([look.pants, shin, style.shoes], PART.BENT),
+      arms: palette([look.shirt, style.forearm === 'skin' ? look.skin : look.shirt, look.skin]),
+    };
   });
-  for (const mesh of [boxes, heads, hats, bandanas]) {
-    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    mesh.frustumCulled = false;
-    mesh.receiveShadow = true;
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-    scene.add(mesh);
+  for (const batch of [bodies, legs, arms]) {
+    batch.mesh.receiveShadow = true;
+    scene.add(batch.mesh);
   }
   const base = new THREE.Matrix4(), local = new THREE.Matrix4(), outM = new THREE.Matrix4();
-  const hidden = new THREE.Matrix4().makeScale(0, 0, 0);
-  const quat = new THREE.Quaternion(), pos = new THREE.Vector3(), size = new THREE.Vector3();
+  const quat = new THREE.Quaternion(), pos = new THREE.Vector3(), size = new THREE.Vector3(1, 1, 1);
   const xAxis = new THREE.Vector3(1, 0, 0), yAxis = new THREE.Vector3(0, 1, 0);
-  function place(mesh: THREE.InstancedMesh, index: number, x: number, y: number, z: number, sx: number, sy: number, sz: number, tilt = 0) {
-    local.compose(pos.set(x, y, z), quat.setFromAxisAngle(xAxis, tilt), size.set(sx, sy, sz));
-    mesh.setMatrixAt(index, outM.multiplyMatrices(base, local));
-  }
-  // A limb hanging from `pivot`, swung forward by `angle` around the x axis.
-  function limb(index: number, px: number, py: number, length: number, width: number, depth: number, angle: number) {
-    place(boxes, index, px, py - Math.cos(angle) * length / 2, -Math.sin(angle) * length / 2, width, length, depth, angle);
+  // A limb hanging from its pivot on the body, swung forward by `angle` around the x axis.
+  function limb(batch: FigureBatch, px: number, py: number, angle: number, look: Float32Array) {
+    local.compose(pos.set(px, py, 0), quat.setFromAxisAngle(xAxis, angle), size.set(1, 1, 1));
+    batch.push(outM.multiplyMatrices(base, local), look);
   }
   function visible(npc: Npc) { return npc.state !== 'inside' && npc.state !== 'down' && npc.state !== 'away'; }
   function draw(npc: Npc, i: number, time: number) {
-    if (!visible(npc)) {
-      for (let k = 0; k < BOXES; k++) boxes.setMatrixAt(i * BOXES + k, hidden);
-      heads.setMatrixAt(i, hidden); hats.setMatrixAt(i, hidden); bandanas.setMatrixAt(i, hidden);
-      return;
-    }
+    if (!visible(npc)) return;
+    const d = dress[i];
     const sit = npc.pose === 'sit';
-    base.compose(pos.set(npc.x, npc.y - (sit ? 0.36 : 0), npc.z), quat.setFromAxisAngle(yAxis, npc.yaw), size.setScalar(BODY_SCALE));
+    const { width, height } = d.style;
+    base.compose(
+      pos.set(npc.x, npc.y - (sit ? FIGURE.sitDrop * BODY_SCALE * height : 0), npc.z),
+      quat.setFromAxisAngle(yAxis, npc.yaw),
+      size.set(BODY_SCALE * width, BODY_SCALE * height, BODY_SCALE * width),
+    );
     const swing = npc.swing;
-    const legs = sit ? -1.45 : swing;
     let armL = -swing * 0.8, armR = swing * 0.8;
     if (npc.pose === 'hands') { armL = -2.85; armR = -2.85 + Math.sin(time * 9) * 0.08; }
     else if (npc.pose === 'run' && npc.state === 'fleeing') { armL = -2.4; armR = -2.5; }
     else if (npc.pose === 'fight') { armL = -1.3; armR = time % 1.1 < 0.25 ? -1.75 : -1.1; }
     else if (sit) { armL = -0.7; armR = -0.7; }
     else if (npc.pose === 'idle') { armL = Math.sin(time * 1.3 + npc.id) * 0.06; armR = -armL; }
-    place(boxes, i * BOXES, 0, 1.13, 0, 0.58, 0.78, 0.38);
-    limb(i * BOXES + 1, -0.16, 0.76, 0.7, 0.2, 0.23, sit ? legs : legs);
-    limb(i * BOXES + 2, 0.16, 0.76, 0.7, 0.2, 0.23, sit ? legs : -legs);
-    limb(i * BOXES + 3, -0.38, 1.47, 0.62, 0.15, 0.17, armL);
-    limb(i * BOXES + 4, 0.38, 1.47, 0.62, 0.15, 0.17, armR);
-    place(heads, i, 0, 1.85, 0, 0.28, 0.3, 0.28);
-    if (npc.look.hat) place(hats, i, 0, 2.14, 0, 0.52, 0.3, 0.52);
-    else hats.setMatrixAt(i, hidden);
-    if (npc.gang >= 0) place(bandanas, i, 0, 1.98, 0, 0.6, 0.09, 0.6);
-    else bandanas.setMatrixAt(i, hidden);
+    bodies.push(base, d.body);
+    // Seated people use the bent-knee legs, which already reach forward and down.
+    limb(legs, -FIGURE.hipX, FIGURE.hipY, sit ? 0 : swing, sit ? d.seated : d.legs);
+    limb(legs, FIGURE.hipX, FIGURE.hipY, sit ? 0 : -swing, sit ? d.seated : d.legs);
+    limb(arms, -FIGURE.shoulderX, FIGURE.shoulderY, armL, d.arms);
+    limb(arms, FIGURE.shoulderX, FIGURE.shoulderY, armR, d.arms);
   }
 
   // --- Scheduling -----------------------------------------------------------------------------
@@ -498,6 +496,7 @@ export function createNpcs(
         g.loiter = onTurf ? g.loiter + dt : Math.max(0, g.loiter - dt);
         if (g.loiter > 4) { provoke(g.index, 1, time); g.loiter = 0; }
       }
+      for (const batch of [bodies, legs, arms]) batch.begin();
       npcs.forEach((npc, i) => {
         // --- downed and away ---
         if (npc.state === 'down') {
@@ -664,18 +663,12 @@ export function createNpcs(
         }
         draw(npc, i, time);
       });
-      boxes.instanceMatrix.needsUpdate = true;
-      heads.instanceMatrix.needsUpdate = true;
-      hats.instanceMatrix.needsUpdate = true;
-      bandanas.instanceMatrix.needsUpdate = true;
+      for (const batch of [bodies, legs, arms]) batch.end();
       return events;
     },
     dispose() {
-      for (const mesh of [boxes, heads, hats, bandanas]) { scene.remove(mesh); mesh.dispose(); }
+      for (const batch of [bodies, legs, arms]) { scene.remove(batch.mesh); batch.dispose(); }
       material.dispose();
-      box.dispose();
-      ball.dispose();
-      cone.dispose();
     },
   };
 }
