@@ -1,13 +1,32 @@
 import * as THREE from 'three';
-import { BUILDINGS, COLLIDERS, LAMPS, PLOTS, SCENERY, pathClearance, type Building, type Plot, type Prop, type Rect, type Tree } from './city';
+import { BUILDINGS, COLLIDERS, LAMPS, PLOTS, ROADS, SCENERY, pathClearance, type Building, type Plot, type Prop, type Rect, type Tree } from './city';
 
 export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number };
 
-/** Walkable surface height: the park lawn and tiled square sit slightly above the street. */
+/** Sidewalks stand this much above the carriageway, behind a stone curb. */
+export const CURB_HEIGHT = 0.14;
+const ASPHALT_HALF = 7; // carriageway half-width
+const SIDEWALK_EDGE = 12.5; // the paved sidewalk runs from the curb to the house fronts
+const ROAD_SPACING = ROADS[1] - ROADS[0];
+const ROAD_FIRST = ROADS[0];
+const ROAD_LAST = ROADS[ROADS.length - 1];
+/** Distance from a coordinate to the nearest road centre line on that axis. */
+const roadDistance = (v: number) => Math.abs(v - Math.min(ROAD_LAST, Math.max(ROAD_FIRST, ROAD_FIRST + Math.round((v - ROAD_FIRST) / ROAD_SPACING) * ROAD_SPACING)));
+
+/** Whether a point is on a raised sidewalk (crossings over the carriageway stay at road level). */
+export function onSidewalk(x: number, z: number) {
+  const dz = roadDistance(z);
+  // North-south roads start at the riverside road, so south of it only the riverside sidewalk exists.
+  const dx = z > ROAD_FIRST ? roadDistance(x) : Infinity;
+  if (dz < ASPHALT_HALF || dx < ASPHALT_HALF) return false;
+  return dz < SIDEWALK_EDGE || dx < SIDEWALK_EDGE;
+}
+
+/** Walkable surface height: sidewalks, the park lawn and the tiled square sit above the street. */
 export function groundHeight(x: number, z: number) {
   if (x > 13 && x < 43 && z > -44 && z < -22) return 0.24;
   if (x > 14.5 && x < 43.5 && z > 29.5 && z < 46.5) return 0.27;
-  return 0.1;
+  return onSidewalk(x, z) ? 0.1 + CURB_HEIGHT : 0.1;
 }
 
 type Kind = 'box' | 'cylinder' | 'cone' | 'ball' | 'bead' | 'gable' | 'hip' | 'pyramid' | 'puff' | 'trunk' | 'frond';
@@ -71,6 +90,23 @@ const hash = (x: number, y: number, z = 0) => {
 };
 const centre = (r: Rect) => ({ x: (r.minX + r.maxX) / 2, z: (r.minZ + r.maxZ) / 2 });
 
+/** Whether the segment a->b passes through the box over `r` from the ground up to `top` (slab test). */
+function segmentHitsBlock(ax: number, ay: number, az: number, bx: number, by: number, bz: number, r: Rect, top: number) {
+  let near = 0, far = 1;
+  const slab = (origin: number, delta: number, lo: number, hi: number) => {
+    if (Math.abs(delta) < 1e-6) return origin >= lo && origin <= hi;
+    let ta = (lo - origin) / delta, tb = (hi - origin) / delta;
+    if (ta > tb) [ta, tb] = [tb, ta];
+    near = Math.max(near, ta);
+    far = Math.min(far, tb);
+    return near <= far;
+  };
+  return slab(ax, bx - ax, r.minX, r.maxX) && slab(az, bz - az, r.minZ, r.maxZ) && slab(ay, by - ay, 0, top);
+}
+
+/** World radius of the see-through hole cut around the player when a building is in the way. */
+const CUT_RADIUS = 3.6;
+
 /** The An Hòa neighbourhood, drawn from the layout in city.ts. All artwork is generated locally. */
 export function buildWorld(scene: THREE.Scene) {
   const root = new THREE.Group();
@@ -123,13 +159,16 @@ export function buildWorld(scene: THREE.Scene) {
   /** A colour nudged in hue/lightness by `t` (0..1) for natural variation without new materials. */
   const vary = (hex: string, t: number, amount = 1) => new THREE.Color(hex).offsetHSL((t - 0.5) * 0.04 * amount, (t - 0.5) * 0.08 * amount, (((t * 7.31) % 1) - 0.5) * 0.09 * amount);
 
+  // Street furniture drawn while `lift` is set stands on the raised sidewalk.
+  let lift = 0;
+  const onPavement = (x: number, z: number) => (onSidewalk(x, z) ? CURB_HEIGHT : 0);
   function shape(kind: Kind, color: ColorLike, x: number, y: number, z: number, sx: number, sy: number, sz: number, yaw = 0, tilt = 0, shadow = true, role: Role = 'solid') {
     const key = `${kind}|${role}|${shadow ? 1 : 0}`;
     let batch = batches.get(key);
     if (!batch) { batch = { kind, role, shadow, m: [], c: [], big: [] }; batches.set(key, batch); }
     rotation.set(0, yaw, tilt);
     quaternion.setFromEuler(rotation);
-    matrix.compose(position.set(x, y, z), quaternion, scale.set(sx, sy, sz));
+    matrix.compose(position.set(x, y + lift, z), quaternion, scale.set(sx, sy, sz));
     for (let i = 0; i < 16; i++) batch.m.push(matrix.elements[i]);
     const col = toColor(color);
     batch.c.push(col.r, col.g, col.b);
@@ -800,12 +839,10 @@ export function buildWorld(scene: THREE.Scene) {
   box('#b4b99a', 0, -0.22, 96.7, 660, 0.42, 466.6, 0, false);
   box('#b4b99a', 0, -0.22, -272.5, 660, 0.42, 135, 0, false);
   box('#d7d1bb', 0, -0.01, 39.25, 440, 0.12, 351.5, 0, false, 'ground');
-  const roads = [-108, -54, 0, 54, 108];
+  const roads = ROADS;
   for (const road of roads) {
-    box('#a7aaa1', 0, 0.006, road, 440, 0.15, 20, 0, false, 'ground');
-    box('#727f7b', 0, 0.026, road, 442, 0.08, 14, 0, false, 'ground');
-    box('#a7aaa1', road, 0.005, 56, 20, 0.15, 328, 0, false, 'ground');
-    box('#727f7b', road, 0.025, 56, 14, 0.08, 328, 0, false, 'ground');
+    box('#5f6a68', 0, 0.04, road, 442, 0.08, ASPHALT_HALF * 2, 0, false, 'ground');
+    box('#5f6a68', road, 0.039, 56, ASPHALT_HALF * 2, 0.08, 328, 0, false, 'ground');
     for (let i = -211; i < 216; i += 9) {
       if (roads.every((r) => Math.abs(r - i) > 10)) {
         box('#e3d4a7', i, 0.076, road, 3.2, 0.015, 0.17, 0, false, 'ground');
@@ -813,11 +850,47 @@ export function buildWorld(scene: THREE.Scene) {
       }
     }
     for (const crossing of roads) {
-      for (const side of [-1, 1]) for (let stripe = -5; stripe <= 5; stripe += 1.5) {
-        if (!(crossing === -108 && side < 0)) box('#d9dac7', road + stripe, 0.078, crossing + side * 10, 0.8, 0.015, 2.5, 0, false, 'ground');
-        box('#d9dac7', road + side * 10, 0.079, crossing + stripe, 2.5, 0.015, 0.8, 0, false, 'ground');
+      // Zebra crossings sit on the walking lines, just outside the junction.
+      for (const side of [-1, 1]) for (let stripe = -5.5; stripe <= 5.5; stripe += 1.375) {
+        if (!(crossing === ROAD_FIRST && side < 0)) box('#e4e3d4', road + stripe, 0.078, crossing + side * 8.6, 0.7, 0.015, 2.6, 0, false, 'ground');
+        box('#e4e3d4', road + side * 8.6, 0.079, crossing + stripe, 2.6, 0.015, 0.7, 0, false, 'ground');
       }
     }
+  }
+  // Raised sidewalks: paving slabs from the curb to the house fronts, with a pale stone curb along the
+  // carriageway. East-west sidewalks run through the corners; north-south ones stop at them.
+  const slabTop = 0.08 + CURB_HEIGHT;
+  const slabRandom = seeded(7331);
+  const spansBetween = (cuts: readonly number[], half: number, from: number, to: number) => {
+    const spans: [number, number][] = [];
+    let start = from;
+    for (const c of [...cuts].sort((a, b) => a - b)) {
+      if (c + half <= start || c - half >= to) continue;
+      if (c - half > start) spans.push([start, c - half]);
+      start = Math.max(start, c + half);
+    }
+    if (start < to) spans.push([start, to]);
+    return spans;
+  };
+  function pavement(alongX: boolean, line: number, side: number, from: number, to: number, cuts: readonly number[], slabCut: number) {
+    const inner = line + side * ASPHALT_HALF, outer = line + side * SIDEWALK_EDGE;
+    const mid = (inner + outer) / 2, depth = SIDEWALK_EDGE - ASPHALT_HALF;
+    const curbAt = inner + side * 0.18;
+    const place = (a: number, along: number, c: number, across: number, h: number, color: ColorLike) =>
+      alongX ? box(color, a, h / 2, c, along, h, across, 0, false, 'ground') : box(color, c, h / 2, a, across, h, along, 0, false, 'ground');
+    for (const [a, b] of spansBetween(cuts, slabCut, from, to)) {
+      // Slabs about 3 m long in slightly different shades read as paving without a texture.
+      const count = Math.max(1, Math.round((b - a) / 3));
+      const step = (b - a) / count;
+      for (let i = 0; i < count; i++) place(a + step * (i + 0.5), step, mid, depth, slabTop, vary('#bea58d', slabRandom(), 0.7));
+    }
+    for (const [a, b] of spansBetween(cuts, ASPHALT_HALF, from, to)) place((a + b) / 2, b - a, curbAt, 0.36, slabTop + 0.015, '#d9d5ca');
+  }
+  for (const road of roads) for (const side of [-1, 1]) {
+    // East-west roads: cut where north-south carriageways cross (none south of the riverside road).
+    pavement(true, road, side, -220, 220, road === ROAD_FIRST && side < 0 ? [] : roads, ASPHALT_HALF);
+    // North-south roads: from the riverside road to the north edge, leaving the corners to the east-west pavements.
+    pavement(false, road, side, ROAD_FIRST, 215, roads, SIDEWALK_EDGE);
   }
 
   // ---- The original park block and tiled square. ----
@@ -837,11 +910,16 @@ export function buildWorld(scene: THREE.Scene) {
   for (let i = 0; i < 4; i++) box('#c3bca6', 29, 0.28, 30 + i * 5.2, 28.8, 0.015, 0.055, 0, false, 'ground');
   // Café furniture, kept away from the mission pickup at (-32, 7).
   for (const t of SCENERY.tables) {
+    lift = onPavement(t.x, t.z);
     table(t.x, t.z);
     stool(t.x - 1.25, t.z);
     stool(t.x + 1.25, t.z, '#698b81');
   }
-  for (const b of SCENERY.benches) bench(b.x, b.z, b.yaw);
+  for (const b of SCENERY.benches) {
+    lift = onPavement(b.x, b.z);
+    bench(b.x, b.z, b.yaw);
+  }
+  lift = 0;
 
   // Soft decoration only goes where nobody walks and nothing solid stands.
   function softFree(x: number, z: number, r: number) {
@@ -900,10 +978,15 @@ export function buildWorld(scene: THREE.Scene) {
 
   // ---- Street trees, park trees and bamboo. ----
   const nearRoad = (t: Tree) => roads.some((r) => Math.abs(Math.abs(t.x - r) - 9.3) < 0.6 || Math.abs(Math.abs(t.z - r) - 9.3) < 0.6);
-  for (const t of SCENERY.trees) tree(t, nearRoad(t));
+  for (const t of SCENERY.trees) {
+    lift = onPavement(t.x, t.z);
+    tree(t, nearRoad(t));
+  }
+  lift = 0;
 
   // ---- Street lamps and their night-time light pools. ----
   for (const l of SCENERY.lamps) {
+    lift = onPavement(l.x, l.z);
     if (l.kind === 'street') {
       shape('cylinder', '#586c65', l.x, 3.2, l.z, 0.075, 6.4, 0.075);
       const yaw = Math.atan2(l.hx - l.x, l.hz - l.z);
@@ -917,6 +1000,7 @@ export function buildWorld(scene: THREE.Scene) {
       shape('cone', '#3f5a52', l.x, 4.38, l.z, 0.36, 0.25, 0.36);
     }
   }
+  lift = 0;
   const poolCanvas = document.createElement('canvas');
   poolCanvas.width = poolCanvas.height = 64;
   {
@@ -1051,7 +1135,11 @@ export function buildWorld(scene: THREE.Scene) {
       }
     }
   }
-  SCENERY.props.forEach(prop);
+  SCENERY.props.forEach((pr) => {
+    lift = onPavement(pr.x, pr.z);
+    prop(pr);
+  });
+  lift = 0;
 
   // Potted plants by doors, and lanterns strung across the alleys between houses.
   BUILDINGS.forEach((b, i) => {
@@ -1267,6 +1355,30 @@ export function buildWorld(scene: THREE.Scene) {
       root.add(mesh);
     }
   }
+  // Cutaway: when a building stands between the camera and the player, everything in front of the player
+  // inside a soft circle around them on screen is discarded (dithered at the rim), so they stay visible.
+  const cut = { center: { value: new THREE.Vector2() }, depth: { value: 0 }, radius: { value: 0 }, aspect: { value: 1 } };
+  const uncut = new Set<THREE.Material>([roles.ground, poolMaterial, puddleMaterial, waveMaterial]);
+  for (const material of materials) {
+    if (uncut.has(material)) continue;
+    material.onBeforeCompile = (shader) => {
+      Object.assign(shader.uniforms, { cutCenter: cut.center, cutDepth: cut.depth, cutRadius: cut.radius, cutAspect: cut.aspect });
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nvarying vec4 vCutClip;\nvarying float vCutDepth;')
+        .replace('#include <project_vertex>', '#include <project_vertex>\nvCutClip = gl_Position;\nvCutDepth = -mvPosition.z;');
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nvarying vec4 vCutClip;\nvarying float vCutDepth;\nuniform vec2 cutCenter;\nuniform float cutDepth;\nuniform float cutRadius;\nuniform float cutAspect;')
+        .replace('#include <clipping_planes_fragment>', `#include <clipping_planes_fragment>
+          if (cutRadius > 0.0 && vCutDepth < cutDepth) {
+            float cutEdge = length((vCutClip.xy / vCutClip.w - cutCenter) * vec2(cutAspect, 1.0)) / cutRadius;
+            float cutNoise = fract(sin(dot(floor(gl_FragCoord.xy), vec2(12.9898, 78.233))) * 43758.5453);
+            if (cutEdge < 1.0 && cutNoise > smoothstep(0.6, 1.0, cutEdge)) discard;
+          }`);
+    };
+  }
+  let cutStrength = 0;
+  const focusPoint = new THREE.Vector3();
+
   // Nothing in the neighbourhood moves, so skip per-frame matrix recomputation for the whole tree.
   root.traverse((object) => { object.updateMatrix(); object.matrixAutoUpdate = false; });
   root.updateMatrixWorld(true);
@@ -1282,6 +1394,23 @@ export function buildWorld(scene: THREE.Scene) {
         waveMesh.setMatrixAt(i, matrix);
       });
       waveMesh.instanceMatrix.needsUpdate = true;
+    },
+    /**
+     * Opens the cutaway around (x, y, z) while a building blocks the camera's view of it; call after the
+     * camera has moved this frame. `enabled` false closes it.
+     */
+    focus(camera: THREE.PerspectiveCamera, x: number, y: number, z: number, dt: number, enabled = true) {
+      const { x: cx, y: cy, z: cz } = camera.position;
+      let hidden = false;
+      if (enabled) for (const p of PLOTS) if (segmentHitsBlock(cx, cy, cz, x, y, z, p.full, p.h + 2.5)) { hidden = true; break; }
+      cutStrength += ((hidden ? 1 : 0) - cutStrength) * (1 - Math.exp(-dt * 8));
+      if (cutStrength < 0.01) { cut.radius.value = 0; return; }
+      const depth = -focusPoint.set(x, y, z).applyMatrix4(camera.matrixWorldInverse).z;
+      focusPoint.set(x, y, z).project(camera);
+      cut.center.value.set(focusPoint.x, focusPoint.y);
+      cut.depth.value = depth - 1.2;
+      cut.aspect.value = camera.aspect;
+      cut.radius.value = (CUT_RADIUS * cutStrength) / Math.max(1, depth * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
     },
     /** `night` 0..1 lights windows, lamps, signs and light pools; `wet` 0..1 darkens and glosses the paving. */
     setAtmosphere(a: { night: number; wet: number }) {

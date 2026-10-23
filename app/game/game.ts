@@ -34,6 +34,7 @@ export type Hud = {
   clock: string; ammo: { mag: number; reserve: number; reloading: boolean } | null; side: SideMissionView; offers: { x: number; z: number }[];
   gangs: { name: string; anger: number; x: number; z: number }[]; hospital: { x: number; z: number }; policeStation: { x: number; z: number };
   healCost: number; respawnIn: number; arsenal: { id: WeaponId; mag: number; reserve: number }[]; stunned: boolean; flatTires: boolean;
+  surrendered: boolean; gassed: boolean;
 };
 export type GameEvent = { type: 'store' } | { type: 'bikeshop' } | { type: 'hospital' } | { type: 'bag'; open: boolean };
 
@@ -421,7 +422,7 @@ type Peer = {
   group: THREE.Group;
   foot: ReturnType<typeof makePerson>;
   bike: ReturnType<typeof makeBike>;
-  car: THREE.Mesh | null;
+  car: THREE.Object3D | null;
   carKind: VehicleKind;
   guns: Map<WeaponId, THREE.Group>;
   label: THREE.Sprite;
@@ -573,6 +574,32 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     riderGuns.set(id, riderGun);
   }
   walker.group.traverse((o) => { o.castShadow = false; });
+  const seatHolder = new THREE.Group();
+  seatHolder.scale.setScalar(BIKE_SCALE);
+  const seated = makePerson('#e77641', true);
+  seatHolder.add(seated.group);
+  seatHolder.visible = false;
+  seatHolder.traverse((o) => { o.castShadow = false; });
+  scene.add(seatHolder);
+  const seatedGuns = new Map<WeaponId, THREE.Group>();
+  for (const id of ['pistol', 'shotgun', 'smg', 'grenade', 'rpg'] as const) {
+    const gun = makeGun(id).group;
+    gun.rotation.x = Math.PI / 2;
+    gun.position.set(0, -0.74, 0.06);
+    gun.visible = false;
+    seated.armRight.add(gun);
+    seatedGuns.set(id, gun);
+  }
+  // Handcuffs on the wrists during an arrest.
+  const cuffMaterial = new THREE.MeshStandardMaterial({ color: '#c9ced3', metalness: 0.8, roughness: 0.3 });
+  const cuffs = [walker.armLeft, walker.armRight].map((arm) => {
+    const cuff = new THREE.Mesh(new THREE.TorusGeometry(0.17, 0.05, 6, 12), cuffMaterial);
+    cuff.position.set(0, -0.62, 0);
+    cuff.rotation.x = Math.PI / 2;
+    cuff.visible = false;
+    arm.add(cuff);
+    return cuff;
+  });
 
   // Shopkeeper hands over the coffee; a receiver waits at each delivery address.
   const shopkeeper = makePerson('#c96f6f', false, '#2a2220');
@@ -647,6 +674,11 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   let receiverSpot: { x: number; z: number } | null = null;
   let velocity = 0;
   let steer = 0;
+  // Vehicle physics: world-space velocity (so cars can slide), yaw rate, and whether we were driving last frame.
+  let carVX = 0;
+  let carVZ = 0;
+  let yawRate = 0;
+  let wasDriving = false;
   let lean = 0;
   let frame = 0;
   let previousTime = performance.now();
@@ -689,6 +721,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   let jumpY = 0;
   let jumpV = 0;
   let flatTires = false;
+  // Giving up to the police, being pinned after a tackle, choking in tear gas, and the arrest clock.
+  let surrendered = false;
+  let pinnedUntil = 0;
+  let gassedUntil = 0;
+  let bustedAt = 0;
+  let coughAt = 0;
+  const gasClouds: { x: number; z: number; born: number; until: number; next: number }[] = [];
   const flatCars = new Set<Car>();
   let thief: Npc | null = null;
   let passengerAboard = false;
@@ -853,6 +892,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     reloadWeapon = null;
     for (const [gunId, gun] of guns) gun.group.visible = gunId === id;
     for (const [gunId, gun] of riderGuns) gun.visible = gunId === id;
+    for (const [gunId, gun] of seatedGuns) gun.visible = gunId === id;
     return true;
   }
   function giveWeapon(id: WeaponId) {
@@ -961,11 +1001,21 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   function busted(now: number) {
-    if (down) return;
+    if (down === 'wasted' || down === 'busted') return;
     interruptRace('Bạn đã bị bắt. Nhấn M để thử lại vòng đua.');
     leaveVehicleNow();
+    // A player pinned on the ground is hauled up where they lie.
+    if (playerBody) {
+      ragdolls.center(playerBody, scratch);
+      ragdolls.remove(playerBody);
+      playerBody = null;
+      if (clearAt(scratch.x, scratch.z, 0.4)) { state.x = scratch.x; state.z = scratch.z; }
+    }
     down = 'busted';
     downUntil = now + RESPAWN_MS;
+    bustedAt = now;
+    surrendered = false;
+    police.restrain(state.x, state.z, state.angle);
     showBanner('BỊ BẮT', now);
     notify('Cảnh sát còng tay bạn…', RESPAWN_MS);
     sideMissions.cancel();
@@ -999,6 +1049,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const body = ragdolls.spawn({ x: car.x - rx * side, y: groundHeight(car.x, car.z) + 0.3, z: car.z - rz * side, yaw: car.yaw, scale: 0.7, look: car.driver, velocity: { x: -rx * 4.5, y: 2.5, z: -rz * 4.5 } });
       looseBodies.push({ body, until: time + 10 });
       npcs.alarm(car.x, car.z, 20, time);
+      npcs.notice(car.x, car.z, 'fight', time);
       police.crime(2, time);
       notify(car.kind === 'moto' ? 'Cướp xe máy! Cảnh sát đang được gọi tới.' : 'Cướp xe! Cảnh sát đang được gọi tới.', 3000);
       playThud();
@@ -1110,22 +1161,28 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     equip(list[(index + 1) % list.length].id);
   }
 
-  function setInput(key: string, down: boolean) {
+  function setInput(key: string, pressed: boolean) {
     const normalized = key.toLowerCase();
-    if (down && !keys.has(normalized)) {
+    if (pressed && !keys.has(normalized)) {
       if (normalized === 'e' || normalized === 'key e') action();
       if (normalized === 'f') { triggerQueued = true; triggerSource = 'key'; unlockAudio(); }
       if (normalized === 'q') cycleWeapon();
       if (normalized === 'r') startReload(performance.now());
       if (normalized === 'v') Object.assign(view, CAMERA_DEFAULT);
       if (normalized === 'tab') setBag(true);
+      // H puts the hands up for the police (or lowers them again).
+      if (normalized === 'h') {
+        if (surrendered) { surrendered = false; notify('Bạn hạ tay xuống.', 1500); }
+        else if (police.wanted > 0 && !state.riding && !down) { surrendered = true; notify('Bạn giơ tay đầu hàng. Cảnh sát sẽ tới còng tay.', 3000); }
+        else if (!police.wanted) notify('Không có ai đang truy bắt bạn.', 1500);
+      }
       // Space jumps on foot; on a vehicle it stays the brake.
       if ((normalized === ' ' || normalized === 'space') && !state.riding && !down && jumpY === 0 && performance.now() > stunUntil) jumpV = 5.6;
       const slot = Number(normalized);
       if (slot >= 1 && slot <= WEAPONS.length && !equip(WEAPONS[slot - 1].id)) notify(`Chưa có ${WEAPONS[slot - 1].name}. Mua ở Tiệm súng.`);
     }
-    if (!down && normalized === 'tab') setBag(false);
-    if (down) keys.add(normalized);
+    if (!pressed && normalized === 'tab') setBag(false);
+    if (pressed) keys.add(normalized);
     else keys.delete(normalized);
   }
   function setBag(open: boolean) {
@@ -1329,6 +1386,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const result = npcs.damage(npc, amount, vx, vy, vz, time, force);
     if (!result) return;
     if (npc.role !== 'thief') police.crime(npc.gang >= 0 ? 0.5 : 1, time);
+    npcs.notice(x, z, result.body ? 'body' : 'fight', time);
     if (result.body) {
       if (result.killed) {
         dropMoney(x, z, npc.gang >= 0, now);
@@ -1398,7 +1456,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     if (!hit) animals.near(cx, cz, 0.9, (index) => { if (!hit) { hit = true; animals.hit(index, fx * 6, 3, fz * 6); } });
     if (!hit) hit = ragdolls.push(cx, cz, 0.9, fx * 7, 3, fz * 7) > 0;
-    if (hit) { playThud(); shake = Math.max(shake, 0.15); }
+    if (hit) { playThud(); shake = Math.max(shake, 0.15); npcs.notice(cx, cz, 'fight', time); }
   }
 
   function applyBlast(b: Explosion, now: number, byPlayer: boolean) {
@@ -1408,6 +1466,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const dPlayer = Math.hypot(state.x - b.x, state.z - b.z);
     shake = Math.max(shake, Math.max(0.15, 1.2 - dPlayer / 40));
     npcs.alarm(b.x, b.z, 70, time);
+    npcs.notice(b.x, b.z, 'fire', time);
     animals.alarm(b.x, b.z, 50);
     if (byPlayer) police.crime(3, time);
     ragdolls.blast(b.x, b.y, b.z, b.radius * 1.4, 26);
@@ -1553,6 +1612,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     shake = Math.max(shake, def.id === 'shotgun' ? 0.35 : def.id === 'smg' ? 0.1 : 0.15);
     npcs.alarm(state.x, state.z, 42, time);
+    npcs.notice(state.x, state.z, 'shots', time);
     animals.alarm(state.x, state.z, 30);
     // Shooting near the police is a crime even if nobody gets hurt.
     let policeNear = false;
@@ -1677,7 +1737,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const rounds = ammo.get(weapon);
     const hint = now < notificationUntil ? notification
       : down === 'wasted' ? 'Đang được đưa đi cấp cứu…'
-      : down === 'busted' ? 'Đang bị áp giải về đồn…'
+      : down === 'busted' ? 'Đang bị còng tay, áp giải về đồn…'
+      : surrendered ? 'Đang đầu hàng · Nhấn H để hạ tay xuống'
       : playerBody ? 'Đang đứng dậy…'
       : nearMission && missionInfo.requiresOnFoot && state.riding ? 'Giảm tốc rồi nhấn E xuống xe để dọn rác'
       : nearMission && missionInfo.requiresBike && !isMotorbike() ? 'Hãy dùng xe máy để tham gia vòng đua'
@@ -1687,10 +1748,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       : nearBikeShop ? 'Nhấn E để vào Cửa hàng xe máy'
       : nearHospital ? 'Nhấn E để khám và hồi máu'
       : missionInfo.status !== 'active' ? 'Nhấn M để chọn nhiệm vụ mới hoặc chơi lại'
-      : state.riding ? (weapon !== 'fists' ? 'W/S tiến lùi · A/D rẽ · Click bắn · E xuống xe' : 'W/S tiến lùi · A/D rẽ · Space phanh · E xuống xe')
+      : state.riding ? (weapon !== 'fists' ? 'W ga · S phanh/lùi · A/D lái · Space phanh tay · Click bắn' : 'W ga · S phanh/lùi · A/D lái · Space phanh tay · E xuống xe')
       : car && !nearBike ? (car.mode === 'lane' ? (car.kind === 'moto' ? 'Nhấn E để cướp xe máy (bị truy nã)' : 'Nhấn E để cướp xe (bị truy nã)') : car.health <= 0 ? 'Xe này đã hỏng' : 'Nhấn E để lên xe')
       : nearBike ? (bikeHealth > 0 ? (bikeId === 'horse' ? 'Nhấn E để cưỡi ngựa' : 'Nhấn E để lên xe máy') : bikeId === 'horse' ? 'Ngựa đã kiệt sức · Chữa ở Cửa hàng xe máy' : 'Xe máy đã hỏng · Mua xe mới ở Cửa hàng xe máy')
-      : police.wanted ? 'Đang bị truy nã · Trốn khỏi tầm mắt cảnh sát để thoát'
+      : police.wanted ? 'Đang bị truy nã · Trốn khỏi tầm mắt cảnh sát, hoặc nhấn H để đầu hàng'
       : rounds && rounds.mag === 0 && rounds.reserve === 0 ? 'Hết đạn · Mua thêm ở Tiệm súng'
       : weapon !== 'fists' ? 'Chĩa súng vào người để cướp · Click/F bắn · R nạp đạn · Giữ Tab túi súng'
       : 'WASD di chuyển · Shift chạy · Space nhảy · E tương tác · Giữ Tab mở túi súng';
@@ -1713,6 +1774,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       gangs: npcs.gangs.map((g) => ({ name: g.name, anger: Math.ceil(g.anger), x: Math.round(g.x), z: Math.round(g.z) })),
       hospital: { x: Math.round(LANDMARKS.hospital.x), z: Math.round(LANDMARKS.hospital.z) }, policeStation: { x: Math.round(LANDMARKS.police.x), z: Math.round(LANDMARKS.police.z) },
       arsenal: [...ammo.entries()].map(([id, a]) => ({ id, mag: a.mag, reserve: a.reserve })), stunned: now < stunUntil, flatTires,
+      surrendered, gassed: now < gassedUntil,
       healCost: Math.ceil((MAX_HEALTH - health) * 1.2), respawnIn: down === 'wasted' || down === 'busted' ? Math.max(0, Math.ceil((downUntil - now) / 1000)) : 0,
     };
     // React re-renders only when something visible changed.
@@ -1732,34 +1794,70 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     const broken = playerCar ? playerCar.health <= 0 : bikeHealth <= 0;
     const input = broken ? 0 : throttle;
-    if (braking) velocity = THREE.MathUtils.damp(velocity, 0, 7, dt);
-    else if (input > 0) velocity = velocity < -0.3 ? THREE.MathUtils.damp(velocity, 0, 6, dt) : THREE.MathUtils.damp(velocity, stats.top, stats.accel, dt);
-    else if (input < 0) velocity = velocity > 0.3 ? THREE.MathUtils.damp(velocity, 0, 5, dt) : THREE.MathUtils.damp(velocity, -stats.reverse, 1.8, dt);
-    else velocity = THREE.MathUtils.damp(velocity, 0, broken ? 3 : 0.8, dt);
-    if (Math.abs(velocity) < 0.02) velocity = 0;
-    // The bars turn gradually, steering needs some speed, and the turn rate eases off at top speed.
-    steer = THREE.MathUtils.damp(steer, steerInput, 6, dt);
-    const speedFactor = Math.min(1, Math.abs(velocity) / 3.5) * (1 - 0.4 * Math.min(1, Math.abs(velocity) / stats.top));
-    // Rain makes the road slippery.
-    state.angle -= steer * stats.turn * speedFactor * Math.sign(velocity) * (1 - atmosphere.rain * 0.15) * dt;
-    const fx = Math.sin(state.angle), fz = Math.cos(state.angle);
-    const dx = fx * velocity * dt, dz = fz * velocity * dt;
+    const twoWheels = !inCar();
+    // Arcade physics in the spirit of GTA: the vehicle keeps a world-space velocity, the engine and
+    // brakes act along the nose, tyres pull the sideways part back to zero (less in the rain, much
+    // less on the handbrake for cars), and steering follows a bicycle model whose steering angle
+    // shrinks with speed, so it is nimble when slow and stable when fast.
+    if (!wasDriving) {
+      carVX = Math.sin(state.angle) * velocity;
+      carVZ = Math.cos(state.angle) * velocity;
+      yawRate = 0;
+      wasDriving = true;
+    }
+    let fx = Math.sin(state.angle), fz = Math.cos(state.angle);
+    let forward = carVX * fx + carVZ * fz;
+    let lateral = carVX * Math.cos(state.angle) - carVZ * Math.sin(state.angle);
+    const engine = stats.accel * (twoWheels ? 4.6 : 4.2);
+    let accel = 0;
+    if (input > 0) accel = forward < -0.5 ? 14 : engine * Math.max(0, 1 - (forward / stats.top) ** 2);
+    else if (input < 0) accel = forward > 0.5 ? -13 : -engine * 0.6 * Math.max(0, 1 - (forward / -stats.reverse) ** 2);
+    // The engine curve caps top speed; off the throttle, rolling resistance and air drag slow it gently.
+    if (!input) accel -= forward * 0.08 + Math.sign(forward) * forward * forward * 0.002;
+    if (broken) accel -= Math.sign(forward) * 3;
+    if (braking) accel -= Math.sign(forward) * (twoWheels ? 9 : 5);
+    const nextForward = forward + accel * dt;
+    // Speed never flips direction in one step: braking stops the vehicle, and reverse starts from rest.
+    forward = forward !== 0 && Math.sign(nextForward) !== Math.sign(forward) ? 0 : nextForward;
+    if (input === 0 && Math.abs(forward) < 0.25) forward = 0;
+    const grip = (twoWheels ? 11 : braking && Math.abs(forward) > 6 ? 1.4 : 9) * (1 - atmosphere.rain * 0.3) * (flatTires ? 0.55 : 1);
+    lateral *= Math.exp(-grip * dt);
+    // Steering: the bars/wheel turn with some inertia; the usable angle shrinks with speed so the
+    // cornering force stays within what the tyres hold (tight turns when slow, wide sweeps when fast).
+    steer = THREE.MathUtils.damp(steer, steerInput, twoWheels ? 5.5 : 6.5, dt);
+    const wheelbase = twoWheels ? 1.35 : 2.7;
+    const cornering = (twoWheels ? 16 : 14) * (1 - atmosphere.rain * 0.25) * (flatTires ? 0.6 : 1);
+    const wheelAngle = steer * Math.min(0.6, Math.atan((cornering * wheelbase) / Math.max(1, forward * forward)));
+    let targetYaw = forward / wheelbase * Math.tan(wheelAngle);
+    // A pulled handbrake swings the tail of a car round.
+    if (braking && !twoWheels && Math.abs(forward) > 6) targetYaw *= 1.7;
+    targetYaw = THREE.MathUtils.clamp(targetYaw, -stats.turn * 1.15, stats.turn * 1.15);
+    yawRate = THREE.MathUtils.damp(yawRate, targetYaw, twoWheels ? 7 : 5, dt);
+    // Velocity is rebuilt from the old heading, then the body turns: the difference shows up as slide.
+    carVX = fx * forward + Math.cos(state.angle) * lateral;
+    carVZ = fz * forward - Math.sin(state.angle) * lateral;
+    state.angle -= yawRate * dt;
+    fx = Math.sin(state.angle);
+    fz = Math.cos(state.angle);
+    velocity = carVX * fx + carVZ * fz;
+    const dx = carVX * dt, dz = carVZ * dt;
     let impact = 0;
     if (vehicleClear(state.x + dx, state.z + dz, state.angle)) { state.x += dx; state.z += dz; }
     else {
       // Slide along walls when glancing off them; the blocked component is the impact speed.
       if (vehicleClear(state.x + dx, state.z, state.angle)) state.x += dx;
-      else impact = Math.max(impact, Math.abs(fx * velocity));
+      else { impact = Math.max(impact, Math.abs(carVX)); carVX *= -0.2; }
       if (vehicleClear(state.x, state.z + dz, state.angle)) state.z += dz;
-      else impact = Math.max(impact, Math.abs(fz * velocity));
-      if (!impact) impact = Math.abs(velocity) * 0.5;
-      velocity *= Math.exp(-dt * 8);
+      else { impact = Math.max(impact, Math.abs(carVZ)); carVZ *= -0.2; }
+      if (!impact) { impact = Math.hypot(carVX, carVZ) * 0.5; carVX *= 0.5; carVZ *= 0.5; }
+      yawRate *= 0.5;
+      velocity = carVX * fx + carVZ * fz;
     }
     if (impact > 6) {
       damageVehicle((impact - 6) * (inCar() ? 2.2 : 3.5), now);
+      if (impact > 10) npcs.notice(state.x, state.z, 'crash', now / 1000);
       shake = Math.max(shake, Math.min(0.6, impact * 0.03));
       if (inCar() && impact > 14) damagePlayer((impact - 14) * 1.5, now);
-      if (inCar()) velocity *= -0.25;
     }
     if (!inCar() && impact > CRASH_SPEED) { crash(now); return; }
     if (playerCar) {
@@ -1787,7 +1885,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const moving = horizontal !== 0 || vertical !== 0;
     const aiming = now < aimUntil;
     if (moving && !aiming) state.angle = angleLerp(state.angle, Math.atan2(dirX, dirZ), 1 - Math.exp(-dt * 12));
-    const topSpeed = keys.has('shift') ? 6.8 : aiming ? 3.4 : 4.2;
+    // Tear gas makes it hard to run.
+    const topSpeed = (keys.has('shift') ? 6.8 : aiming ? 3.4 : 4.2) * (performance.now() < gassedUntil ? 0.55 : 1);
     velocity = THREE.MathUtils.damp(velocity, moving ? topSpeed : 0, 9, dt);
     if (velocity < 0.025) velocity = 0;
     // While aiming the player strafes in the input direction instead of turning.
@@ -1878,7 +1977,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
 
     const stunned = now < stunUntil;
-    if (active && !down && !stunned) {
+    if (!state.riding) wasDriving = false;
+    if (police.wanted === 0) surrendered = false;
+    if (active && !down && !stunned && !surrendered) {
       let horizontal = 0;
       let vertical = 0;
       if (!focusedInput()) {
@@ -1908,7 +2009,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
 
     // The world moves on: weather and clock, traffic, police, gangs and residents.
-    if (atmosphere.update(dt, time, cameraTarget) && shadowsAllowed) renderer.shadowMap.needsUpdate = true;
+    // Rain fills whatever the camera can see, so it scales with the zoom.
+    if (atmosphere.update(dt, time, cameraTarget, THREE.MathUtils.clamp(smoothView.dist * 2.4, 50, 220)) && shadowsAllowed) renderer.shadowMap.needsUpdate = true;
     applyShadows();
     world.setAtmosphere?.({ night: atmosphere.night, wet: atmosphere.rain });
     setRain(active ? atmosphere.rain : 0);
@@ -1916,7 +2018,46 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     npcs.forEachCrossing((x, z) => crossing.push({ x, z }));
     vehicles.update(dt, time, { x: state.x, z: state.z, car: playerCar }, crossing);
     vehicleImpacts(now);
-    const policeResult = police.update(dt, time, { x: state.x, z: state.z, car: playerCar, riding: state.riding, heading: state.angle, speed: Math.abs(velocity), down: down !== null, stunned: now < stunUntil });
+    const policeResult = police.update(dt, time, {
+      x: state.x, z: state.z, car: playerCar, riding: state.riding, heading: state.angle, speed: Math.abs(velocity), down: down !== null, stunned: now < stunUntil,
+      armed: weapon !== 'fists' && !inCar(), surrendered, pinned: down === 'crash' && now < pinnedUntil, night: atmosphere.night,
+    });
+    if (policeResult.tackled && !down) {
+      knockPlayer(Math.sin(state.angle) * 3, 2, Math.cos(state.angle) * 3, now);
+      pinnedUntil = now + 3200;
+      damagePlayer(5, now, undefined, 'Cảnh sát');
+      notify('Bị cảnh sát quật ngã!', 2500);
+    }
+    if (policeResult.pulledOut && state.riding && !down) {
+      const side = inCar() ? 2.2 : 1.2;
+      const ox = Math.cos(state.angle) * -side, oz = -Math.sin(state.angle) * -side;
+      leaveVehicleNow();
+      if (clearAt(state.x + ox, state.z + oz, 0.4)) { state.x += ox; state.z += oz; }
+      knockPlayer(ox * 1.5, 1.5, oz * 1.5, now);
+      pinnedUntil = now + 3200;
+      notify('Bị lôi ra khỏi xe!', 2500);
+    }
+    for (const throwGas of policeResult.gas) {
+      gasClouds.push({ x: throwGas.x, z: throwGas.z, born: now + 700, until: now + 9500, next: 0 });
+      effects.tracer(hitPoint.set(throwGas.fromX, 1.5, throwGas.fromZ), scratch.set(throwGas.x, 0.3, throwGas.z), now);
+      npcs.alarm(throwGas.x, throwGas.z, 8, time);
+    }
+    // Tear gas clouds: grey-green smoke; standing in one chokes and slows the player.
+    for (let i = gasClouds.length - 1; i >= 0; i--) {
+      const cloud = gasClouds[i];
+      if (now > cloud.until) { gasClouds.splice(i, 1); continue; }
+      if (now < cloud.born) continue;
+      if (now > cloud.next) {
+        cloud.next = now + 110;
+        const a = Math.random() * Math.PI * 2, r = Math.random() * 3.6;
+        effects.smoke(cloud.x + Math.cos(a) * r, groundHeight(cloud.x, cloud.z) + 0.4, cloud.z + Math.sin(a) * r, now, false, '#cdd5ae');
+      }
+      if (!inCar() && down !== 'wasted' && Math.hypot(state.x - cloud.x, state.z - cloud.z) < 4.2) {
+        gassedUntil = now + 1500;
+        damagePlayer(2.5 * dt, now);
+        if (now > coughAt) { coughAt = now + 2500; bubbles.say('player', 'Khụ khụ… cay mắt quá!', now, () => ({ x: state.x, y: groundHeight(state.x, state.z) + 2, z: state.z }), 1800, 'shout'); }
+      }
+    }
     if (policeResult.spiked) notify('Cảnh sát rải bẫy đinh phía trước!', 2500);
     if (policeResult.blocked) notify('Phía trước có chốt chặn của cảnh sát!', 2500);
     // Driving over a spike strip: cars get flat tyres, bikes go down.
@@ -1927,6 +2068,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       else crash(now);
     }
     flatTires = !!playerCar && flatCars.has(playerCar);
+    if (policeResult.shots.some((shot) => shot.kind !== 'taser')) npcs.notice(state.x, state.z, 'shots', time);
     for (const shot of policeResult.shots) {
       playerPoint.set(state.x, 1.1, state.z);
       if (!shot.hit) playerPoint.add(scratch.set((Math.random() - 0.5) * 2.5, Math.random() * 0.8, (Math.random() - 0.5) * 2.5));
@@ -1946,7 +2088,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       playThud();
       notify('Cảnh sát vụt dùi cui!', 1200);
     }
-    if (policeResult.arrested && !down) busted(now);
+    if (policeResult.arrested && (!down || (down === 'crash' && now < pinnedUntil))) busted(now);
 
     if (jumpV !== 0 || jumpY > 0) {
       jumpV -= 18 * dt;
@@ -1971,6 +2113,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       notify(robbery.shop ? `Cướp tiệm! Nhặt ${formatThousands(robbery.amount)} rơi trước mặt` : `Cướp được ${formatThousands(robbery.amount)}, nhặt tiền đi!`, 2500);
     }
     for (let i = 0; i < npcEvents.strikes; i++) { damagePlayer(6, now, undefined, 'Băng đảng'); playThud(); }
+    if (npcEvents.shots.length) npcs.notice(state.x, state.z, 'shots', time);
     for (const shot of npcEvents.shots) {
       playerPoint.set(state.x, 1.1, state.z);
       if (!shot.hit) playerPoint.add(scratch.set((Math.random() - 0.5) * 3, Math.random() * 0.8, (Math.random() - 0.5) * 3));
@@ -2025,13 +2168,38 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     walker.limbLeft.rotation.x = jumpY > 0 ? -0.7 : stride;
     walker.limbRight.rotation.x = jumpY > 0 ? -0.25 : -stride;
     const twoHanded = weapon === 'shotgun' || weapon === 'smg' || weapon === 'rpg' || weapon === 'grenade';
-    const handsUp = down === 'busted';
+    const arrestTime = down === 'busted' ? now - bustedAt : -1;
+    const kneeling = arrestTime > 900;
+    const handsUp = surrendered || (arrestTime >= 0 && !kneeling);
     walker.armLeft.rotation.set(handsUp ? -2.9 : twoHanded ? -1.25 : -stride * 0.7, 0, twoHanded && !handsUp ? 0.45 : 0);
-    walker.armRight.rotation.x = handsUp ? -2.9 : now < punchUntil ? -1.65 : armed ? -Math.PI / 2 : stride * 0.7;
+    walker.armRight.rotation.set(handsUp ? -2.9 : now < punchUntil ? -1.65 : armed ? -Math.PI / 2 : stride * 0.7, 0, 0);
+    if (kneeling) {
+      // Forced to kneel with the hands cuffed behind the back.
+      walker.group.position.y -= 0.36 * PERSON_SCALE / 0.68;
+      walker.limbLeft.rotation.x = 1.25;
+      walker.limbRight.rotation.x = 1.25;
+      walker.armLeft.rotation.set(0.6, 0, 0.5);
+      walker.armRight.rotation.set(0.6, 0, -0.5);
+    }
+    for (const cuff of cuffs) cuff.visible = kneeling;
+    for (const [id, gun] of guns) gun.group.visible = id === weapon && !kneeling && !handsUp;
     if (now < stunUntil) { walker.armLeft.rotation.z = Math.sin(time * 40) * 0.3; walker.armRight.rotation.z = Math.cos(time * 37) * 0.3; walker.limbLeft.rotation.x = Math.sin(time * 33) * 0.15; }
     else walker.armRight.rotation.z = 0;
     const onBike = state.riding && !playerCar;
     rider.group.visible = onBike;
+    seatHolder.visible = !!playerCar && state.riding;
+    if (playerCar && state.riding) {
+      const moto = playerCar.kind === 'moto';
+      // Seat offsets in metres: a scooter saddle, or the left-hand driver's seat of a car.
+      const lx = moto ? 0 : -0.45, ly = moto ? -0.05 : -0.46, lz = moto ? -0.19 : 0.04;
+      const c = Math.cos(playerCar.yaw), s = Math.sin(playerCar.yaw);
+      seatHolder.position.set(playerCar.x + lx * c + lz * s, groundHeight(playerCar.x, playerCar.z) + ly, playerCar.z - lx * s + lz * c);
+      seatHolder.rotation.set(0, playerCar.yaw, moto ? -steer * Math.min(1, Math.abs(velocity) / 8) * 0.3 : 0, 'YXZ');
+      const drawing = armed && now < aimUntil;
+      seated.armRight.rotation.x = drawing ? -Math.PI / 2 : moto ? -1 : -1.15;
+      seated.armLeft.rotation.x = moto ? -1 : -1.15;
+      seated.group.rotation.y = drawing ? angleLerp(0, aimYaw - playerCar.yaw, 0.6) : 0;
+    }
     rider.armRight.rotation.x = armed && now < aimUntil ? -Math.PI / 2 : -1;
     rider.group.rotation.y = armed && now < aimUntil ? angleLerp(0, aimYaw - state.angle, 0.6) : 0;
     passenger.group.visible = passengerAboard && onBike && bikeId !== 'horse';
@@ -2117,6 +2285,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     desiredTarget.set(active ? (follow ? follow.x : state.x) : -3, 1, active ? (follow ? follow.z : state.z) : -5);
     cameraTarget.lerp(desiredTarget, cameraBlend);
     const viewBlend = 1 - Math.exp(-dt * 14);
+    // The camera closes in on an arrest.
+    if (down === 'busted') view.dist = Math.min(view.dist, 14);
     smoothView.yaw += (view.yaw - smoothView.yaw) * viewBlend;
     smoothView.pitch += (view.pitch - smoothView.pitch) * viewBlend;
     smoothView.dist += (view.dist - smoothView.dist) * viewBlend;
@@ -2131,12 +2301,16 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       camera.position.lerp(camDesired, cameraBlend);
     }
     camera.lookAt(cameraTarget);
+    const fov = 42 + (state.riding ? Math.min(1, Math.abs(velocity) / 26) * 10 : 0);
+    if (Math.abs(camera.fov - fov) > 0.05) { camera.fov += (fov - camera.fov) * (1 - Math.exp(-dt * 3)); camera.updateProjectionMatrix(); }
     if (shake > 0.001) {
       camera.position.x += (Math.random() - 0.5) * shake;
       camera.position.y += (Math.random() - 0.5) * shake;
       shake *= Math.exp(-dt * 12);
     }
     camera.updateMatrixWorld();
+    // Buildings between the camera and the player open up around them.
+    world.focus(camera, desiredTarget.x, groundHeight(desiredTarget.x, desiredTarget.z) + 1.1, desiredTarget.z, dt, active);
 
     // Floating health bars over anyone hurt recently, and speech bubbles.
     effects.beginBars(camera);
@@ -2300,6 +2474,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       playerBody = null;
       down = null;
       pendingHits.length = 0;
+      surrendered = false;
+      gasClouds.length = 0;
       Object.assign(view, CAMERA_DEFAULT);
       missionLabelKey = '';
       setMissionLabel();

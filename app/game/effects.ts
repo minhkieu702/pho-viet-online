@@ -141,7 +141,7 @@ export function createEffects(scene: THREE.Scene, ground: (x: number, z: number)
   materials.push(barMaterial);
 
   const smokeTexture = radialTexture('rgba(90,92,92,0.75)', 'rgba(90,92,92,0)');
-  const smokes = Array.from({ length: 18 }, () => {
+  const smokes = Array.from({ length: 48 }, () => {
     const material = new THREE.SpriteMaterial({ map: smokeTexture, depthWrite: false, transparent: true });
     materials.push(material);
     const sprite = new THREE.Sprite(material);
@@ -181,10 +181,10 @@ export function createEffects(scene: THREE.Scene, ground: (x: number, z: number)
       }
     },
     /** Rising smoke from a damaged vehicle. */
-    smoke(x: number, y: number, z: number, now: number, dark: boolean) {
+    smoke(x: number, y: number, z: number, now: number, dark: boolean, tint?: string) {
       const puff = smokes[smokeIndex++ % smokes.length];
       puff.sprite.position.set(x + (Math.random() - 0.5) * 0.4, y, z + (Math.random() - 0.5) * 0.4);
-      puff.material.color.set(dark ? '#3a3a3a' : '#9a9a96');
+      puff.material.color.set(tint ?? (dark ? '#3a3a3a' : '#9a9a96'));
       puff.born = now;
       puff.sprite.visible = true;
     },

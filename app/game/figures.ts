@@ -21,6 +21,8 @@ export const PART = {
   STRAIGHT: 1 << 12, BENT: 1 << 13,
   BATON: 1 << 14, PISTOL: 1 << 15, TASER: 1 << 16, RIFLE: 1 << 17,
   THIN: 1 << 18,
+  /** Motorbike riders: long sleeves (sun jacket) and a cloth face mask, light or dark. */
+  SLEEVE: 1 << 19, MASK: 1 << 20, MASK_DARK: 1 << 21,
 } as const;
 
 /** Skeleton of the crowd model (feet at y = 0, facing +z). */
@@ -162,9 +164,13 @@ const lathe = (profile: number[], seg = 10) => {
 /** Front half of a flat disc (cap visors and helmet peaks). */
 const halfDisc = (r: number, h: number) => new THREE.CylinderGeometry(r, r, h, 10, 1, false, -Math.PI / 2, Math.PI);
 
-/** Head of radius 1 centred on the origin: face, then every hair style and hat the `set` allows. */
-export function addHead(parts: FigureParts, set: 'civil' | 'police' | 'all') {
+/**
+ * Head of radius 1 centred on the origin: face, then every hair style and hat the `set` allows.
+ * 'rider' is a motorbike rider: the face, a half helmet and optional face masks, no loose hair.
+ */
+export function addHead(parts: FigureParts, set: 'civil' | 'police' | 'all' | 'rider') {
   const { SKIN, HAIR, ACCENT, SHIRT } = SLOT;
+  const rider = set === 'rider';
   parts.add(sphere(1, 12, 8), { scale: [1, 1.07, 0.97], slot: SKIN, smooth: true });
   for (const side of [-1, 1]) {
     parts.add(sphere(0.2, 5, 3), { at: [side * 0.97, -0.04, 0.02], scale: [0.6, 1, 0.75], slot: SKIN, shade: 0.93 });
@@ -174,12 +180,14 @@ export function addHead(parts: FigureParts, set: 'civil' | 'police' | 'all') {
   parts.add(sphere(0.13, 5, 3), { at: [0, -0.14, 0.95], scale: [1, 0.85, 0.85], slot: SKIN, shade: 0.97 });
   parts.add(box(0.24, 0.05, 0.06), { at: [0, -0.43, 0.875], rot: [0.35, 0, 0], slot: SKIN, shade: 0.55 });
 
-  // Hair: a chunky dome tilted back so the forehead stays clear, with sideburns, plus a style-specific extra.
-  parts.add(sphere(1.07, 12, 6, Math.PI * 0.56), { scale: [1, 1.07, 0.99], rot: [-0.5, 0, 0], slot: HAIR, part: PART.DOME });
-  for (const side of [-1, 1]) parts.add(box(0.14, 0.4, 0.3), { at: [side * 0.93, -0.06, 0.22], rot: [0, side * 0.35, 0], slot: HAIR, part: PART.DOME });
-  // Thinning hair for older people: only the back and sides.
-  parts.add(sphere(1.07, 12, 5, Math.PI * 0.5), { scale: [1, 1.07, 0.99], rot: [-1.0, 0, 0], at: [0, -0.04, 0], slot: HAIR, part: PART.THIN });
-  if (set !== 'police') {
+  if (!rider) {
+    // Hair: a chunky dome tilted back so the forehead stays clear, with sideburns, plus a style-specific extra.
+    parts.add(sphere(1.07, 12, 6, Math.PI * 0.56), { scale: [1, 1.07, 0.99], rot: [-0.5, 0, 0], slot: HAIR, part: PART.DOME });
+    for (const side of [-1, 1]) parts.add(box(0.14, 0.4, 0.3), { at: [side * 0.93, -0.06, 0.22], rot: [0, side * 0.35, 0], slot: HAIR, part: PART.DOME });
+    // Thinning hair for older people: only the back and sides.
+    parts.add(sphere(1.07, 12, 5, Math.PI * 0.5), { scale: [1, 1.07, 0.99], rot: [-1.0, 0, 0], at: [0, -0.04, 0], slot: HAIR, part: PART.THIN });
+  }
+  if (set === 'civil' || set === 'all') {
     parts.add(sphere(0.5, 6, 4), { at: [0.22, 0.6, 0.66], scale: [1.4, 0.5, 0.75], rot: [-0.55, 0, -0.3], slot: HAIR, part: PART.FRINGE });
     parts.add(sphere(1, 8, 6), { at: [0, -0.5, -0.36], scale: [1.08, 1.0, 0.74], slot: HAIR, part: PART.LONG });
     for (const side of [-1, 1]) parts.add(sphere(0.5, 5, 4), { at: [side * 0.84, -0.42, 0.14], scale: [0.62, 1.4, 0.95], slot: HAIR, part: PART.LONG });
@@ -191,7 +199,7 @@ export function addHead(parts: FigureParts, set: 'civil' | 'police' | 'all') {
     parts.add(new THREE.CylinderGeometry(1.12, 1.15, 0.32, 12), { at: [0, 0.3, 0], rot: [-0.12, 0, 0], slot: ACCENT, part: PART.BANDANA });
     for (const side of [-1, 1]) parts.add(box(0.16, 0.5, 0.08), { at: [side * 0.14, 0.02, -1.12], rot: [0.35, 0, side * 0.35], slot: ACCENT, part: PART.BANDANA });
   }
-  if (set !== 'civil') {
+  if (set === 'police' || set === 'all') {
     // Peaked police cap: flared crown, red band, dark visor and a gold badge.
     parts.add(cyl(1.24, 1.08, 0.5, 14), { at: [0, 0.68, -0.02], rot: [-0.08, 0, 0], slot: ACCENT, part: PART.CAP });
     parts.add(cyl(1.1, 1.1, 0.16, 14), { at: [0, 0.48, -0.01], rot: [-0.08, 0, 0], shade: '#9c3a32', part: PART.CAP });
@@ -202,11 +210,19 @@ export function addHead(parts: FigureParts, set: 'civil' | 'police' | 'all') {
     parts.add(halfDisc(1.0, 0.08), { at: [0, 0.4, 0.68], scale: [1, 1, 0.55], rot: [0.15, 0, 0], slot: ACCENT, shade: 0.8, part: PART.SWAT });
     for (const side of [-1, 1]) parts.add(box(0.2, 0.62, 0.62), { at: [side * 1.08, -0.08, -0.02], slot: ACCENT, shade: 0.85, part: PART.SWAT });
   }
-  if (set === 'all') {
+  if (set === 'all' || rider) {
     // Motorbike half helmet with a peak and a stripe in the shirt colour.
     parts.add(sphere(1.15, 12, 6, Math.PI * 0.52), { at: [0, 0.06, -0.02], scale: [1, 1.0, 1.02], rot: [-0.3, 0, 0], slot: ACCENT, part: PART.HELMET });
     parts.add(sphere(1.17, 12, 6, Math.PI * 0.5), { at: [0, 0.06, -0.02], scale: [0.2, 1.0, 1.03], rot: [-0.3, 0, 0], slot: SHIRT, part: PART.HELMET });
     parts.add(halfDisc(0.85, 0.07), { at: [0, 0.36, 0.86], scale: [1, 1, 0.6], rot: [0.15, 0, 0], slot: ACCENT, shade: 0.9, part: PART.HELMET });
+  }
+  if (rider) {
+    // A cloth face mask (khẩu trang) over nose and mouth: light surgical blue or dark cloth.
+    for (const [part, shade] of [[PART.MASK, '#b4cfdc'], [PART.MASK_DARK, '#2c3036']] as const) {
+      parts.add(new THREE.SphereGeometry(1.04, 12, 4, Math.PI * 0.12, Math.PI * 0.76, Math.PI * 0.53, Math.PI * 0.28), { scale: [1, 1.07, 0.97], shade, part });
+      parts.add(sphere(0.2, 6, 4), { at: [0, -0.17, 0.93], scale: [1, 0.9, 0.75], shade, part });
+      for (const side of [-1, 1]) parts.add(box(0.05, 0.05, 0.5), { at: [side * 0.97, -0.12, 0.2], rot: [0.3, side * 0.2, 0], shade, part });
+    }
   }
   return parts;
 }
@@ -275,6 +291,115 @@ export function armGeometry(weapons: boolean) {
     parts.add(box(0.054, 0.08, 0.092), { at: [0, -0.84, 0.03], shade: '#24272b', part: PART.TASER });
     parts.add(box(0.065, 0.66, 0.1), { at: [0, -0.88, 0.035], shade: '#24282c', part: PART.RIFLE });
     parts.add(box(0.05, 0.16, 0.12), { at: [0, -0.84, 0.1], shade: '#2f3337', part: PART.RIFLE });
+  }
+  return parts.build();
+}
+
+/** Umbrella in crowd model units: handle at the origin, shaft up +y, canopy on top (`length` is handle to tip). */
+export const UMBRELLA = { length: 1.64, radius: 0.84, drop: 0.36 } as const;
+
+/** An open umbrella: J handle, shaft, eight faceted canopy panels alternating palette slots 0 and 1, a darker underside. */
+export function umbrellaGeometry(panels = 8) {
+  const parts = new FigureParts();
+  const top = UMBRELLA.length, r = UMBRELLA.radius, rim = top - UMBRELLA.drop;
+  parts.add(cyl(0.034, 0.034, 0.22, 6), { at: [0, -0.01, 0], shade: '#4a3324' });
+  parts.add(new THREE.TorusGeometry(0.06, 0.026, 4, 8, Math.PI), { at: [-0.06, -0.12, 0], rot: [0, 0, Math.PI], shade: '#4a3324' });
+  parts.add(cyl(0.017, 0.017, top + 0.1, 5), { at: [0, (top + 0.1) / 2, 0], shade: '#2c2c2e' });
+  // Profile from the rim up to the tip (outer surface), and the same points reversed for the underside.
+  const outside = [new THREE.Vector2(r, rim), new THREE.Vector2(r * 0.7, rim + 0.21), new THREE.Vector2(r * 0.36, top - 0.05), new THREE.Vector2(0.001, top)];
+  const inside = [...outside].reverse().map((p) => new THREE.Vector2(p.x, p.y - 0.015));
+  const step = (Math.PI * 2) / panels;
+  for (let k = 0; k < panels; k++) {
+    parts.add(new THREE.LatheGeometry(outside, 1, k * step, step), { slot: k % 2 });
+    parts.add(new THREE.LatheGeometry(inside, 1, k * step, step), { slot: k % 2, shade: 0.6 });
+    parts.add(sphere(0.028, 4, 3), { at: [Math.sin(k * step) * r, rim - 0.01, Math.cos(k * step) * r], shade: '#2c2c2e' });
+  }
+  parts.add(cyl(0.024, 0.012, 0.14, 5), { at: [0, top + 0.06, 0], shade: '#2c2c2e' });
+  return parts.build();
+}
+
+/**
+ * Where a traffic rider sits on the scooter model, in moto-local metres (the model is real-world size:
+ * seat top 0.82 m, floorboard 0.65 m, handlebar 1.12 m high at z 0.52, grips about 0.36 m out).
+ */
+export const RIDER = {
+  scale: 0.82, hipY: 0.9, hipZ: -0.22, lean: 0.34,
+  grip: [0.36, 1.13, 0.5] as number[],
+  foot: [0.2, 0.655, 0.2] as number[],
+  /** Which way knees and elbows bend (x is mirrored per side). */
+  knee: [0.9, 0.55, 0.25] as number[],
+  elbow: [0.9, -0.45, -0.2] as number[],
+};
+
+/** Two-bone joint (elbow or knee) between `a` and `b` for segment lengths l1, l2, bent toward `hint`. */
+function joint(a: THREE.Vector3, b: THREE.Vector3, l1: number, l2: number, hint: THREE.Vector3) {
+  const d = new THREE.Vector3().subVectors(b, a);
+  const dist = d.length();
+  d.divideScalar(dist);
+  if (dist >= l1 + l2) return a.clone().addScaledVector(d, dist * l1 / (l1 + l2));
+  const p = (l1 * l1 - l2 * l2 + dist * dist) / (2 * dist);
+  const h = Math.sqrt(Math.max(0, l1 * l1 - p * p));
+  const n = hint.clone().addScaledVector(d, -hint.dot(d)).normalize();
+  return a.clone().addScaledVector(d, p).addScaledVector(n, h);
+}
+
+/** Points `parts.base` along a limb segment: model y = `from` lands on `a` and y = `from - length` on `b` (limbs hang along -y). */
+function alongSegment(parts: FigureParts, a: THREE.Vector3, b: THREE.Vector3, scale: number, from: number, length: number) {
+  const dir = new THREE.Vector3().subVectors(b, a);
+  const len = dir.length();
+  const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, -1, 0), dir.divideScalar(len));
+  parts.base.compose(a, q, new THREE.Vector3(scale, len / length, scale)).multiply(new THREE.Matrix4().makeTranslation(0, -from, 0));
+}
+
+/**
+ * A seated motorbike rider in one piece, posed on the traffic scooter: torso leaning toward the bars,
+ * head up looking down the road under a half helmet, elbows bent to the grips, knees up and feet on the
+ * floorboard. Built in moto-local metres so the scooter's own instance matrix (with its lean) places it.
+ * Palette: shirt, pants, skin, hair (brows), helmet; parts SLEEVE, MASK, MASK_DARK and HELMET.
+ */
+export function riderGeometry() {
+  const parts = new FigureParts();
+  const { SHIRT, PANTS, SKIN } = SLOT;
+  const S = RIDER.scale;
+  const xAxis = new THREE.Vector3(1, 0, 0);
+  const body = new THREE.Matrix4()
+    .compose(new THREE.Vector3(0, RIDER.hipY, RIDER.hipZ), new THREE.Quaternion().setFromAxisAngle(xAxis, RIDER.lean), new THREE.Vector3(S, S, S))
+    .multiply(new THREE.Matrix4().makeTranslation(0, -FIGURE.hipY, 0));
+  parts.base.copy(body);
+  addTorso(parts, false);
+  // The head tips back up so the rider looks down the road rather than at the handlebar.
+  parts.base.copy(body).multiply(new THREE.Matrix4().compose(
+    new THREE.Vector3(0, FIGURE.headY, 0.015), new THREE.Quaternion().setFromAxisAngle(xAxis, -RIDER.lean * 0.85), new THREE.Vector3(FIGURE.headR, FIGURE.headR, FIGURE.headR)));
+  addHead(parts, 'rider');
+  for (const side of [-1, 1]) {
+    // Arm: shoulder to grip, elbow bent outward and down.
+    const shoulder = new THREE.Vector3(side * FIGURE.shoulderX, FIGURE.shoulderY, 0).applyMatrix4(body);
+    const grip = new THREE.Vector3(side * RIDER.grip[0], RIDER.grip[1], RIDER.grip[2]);
+    const elbow = joint(shoulder, grip, 0.29 * S * 1.08, 0.31 * S * 1.08, new THREE.Vector3(side * RIDER.elbow[0], RIDER.elbow[1], RIDER.elbow[2]));
+    alongSegment(parts, shoulder, elbow, S, 0, 0.29);
+    parts.add(sphere(0.092, 7, 5), { at: [0, -0.02, 0], slot: SHIRT });
+    parts.add(tube(0.092, 0.08, 0.3, 7), { at: [0, -0.15, 0], slot: SHIRT });
+    parts.add(cyl(0.09, 0.09, 0.05, 7), { at: [0, -0.28, 0], slot: SHIRT, shade: 0.88 });
+    alongSegment(parts, elbow, grip, S, -0.29, 0.31);
+    parts.add(sphere(0.07, 6, 4), { at: [0, -0.29, 0], slot: SKIN });
+    parts.add(sphere(0.083, 6, 4), { at: [0, -0.29, 0], slot: SHIRT, part: PART.SLEEVE });
+    parts.add(tube(0.072, 0.061, 0.29, 7), { at: [0, -0.435, 0], slot: SKIN });
+    parts.add(tube(0.082, 0.07, 0.27, 7), { at: [0, -0.425, 0], slot: SHIRT, part: PART.SLEEVE });
+    parts.add(sphere(0.078, 6, 4), { at: [0, -0.6, 0.005], scale: [0.85, 1.12, 0.95], slot: SKIN });
+    // Leg: hip to ankle with the knee up and out, the foot flat on the floorboard.
+    const hip = new THREE.Vector3(side * FIGURE.hipX, FIGURE.hipY, 0).applyMatrix4(body);
+    const ankle = new THREE.Vector3(side * RIDER.foot[0], RIDER.foot[1] + 0.098 * S, RIDER.foot[2] - 0.05 * S);
+    const knee = joint(hip, ankle, 0.345 * S, 0.315 * S, new THREE.Vector3(side * RIDER.knee[0], RIDER.knee[1], RIDER.knee[2]));
+    alongSegment(parts, hip, knee, S, 0, 0.345);
+    parts.add(sphere(0.118, 7, 5), { at: [0, -0.02, 0], slot: PANTS });
+    parts.add(tube(0.116, 0.104, 0.36, 8), { at: [0, -0.18, 0], slot: PANTS });
+    alongSegment(parts, knee, ankle, S, -0.345, 0.315);
+    parts.add(sphere(0.106, 6, 4), { at: [0, -0.345, 0], slot: PANTS });
+    parts.add(tube(0.098, 0.082, 0.33, 8), { at: [0, -0.495, 0], slot: PANTS });
+    parts.base.compose(ankle, new THREE.Quaternion(), new THREE.Vector3(S, S, S));
+    parts.add(box(0.15, 0.1, 0.25), { at: [0, -0.048, 0.05], shade: '#2b2622' });
+    parts.add(sphere(0.075, 6, 3), { at: [0, -0.053, 0.175], scale: [1, 0.7, 1.1], shade: '#2b2622' });
+    parts.add(box(0.16, 0.03, 0.29), { at: [0, -0.086, 0.07], shade: '#1b1816' });
   }
   return parts.build();
 }

@@ -7,17 +7,17 @@ Bản thử nghiệm game thế giới mở 3D trên trình duyệt, lấy bối
 - Nhập tên, chọn **Tạo phòng cùng bạn bè** hoặc **Dạo phố một mình**.
 - Gửi link mời hoặc mã phòng 6 ký tự cho người có quyền truy cập trang. Một phòng có tối đa 8 người đang kết nối.
 - **Đi bộ:** WASD / phím mũi tên theo hướng camera, **Shift** chạy.
-- **Lái xe (xe máy, ô tô, ngựa):** **W / S** tiến, lùi · **A / D** rẽ · **Space** phanh. Camera tự xoay ra sau xe. Vẫn bắn được khi đang lái (click chuột hoặc F).
+- **Lái xe (xe máy, ô tô, ngựa):** **W** ga · **S** phanh rồi lùi · **A / D** lái · **Space** phanh tay (ô tô trượt đuôi khi ôm cua). Xe có quán tính và độ bám đường kiểu GTA: chạy nhanh thì tay lái đầm hơn, trời mưa đường trơn, xịt lốp thì khó giữ lái. Camera tự xoay ra sau xe, góc nhìn rộng ra khi chạy nhanh. Vẫn bắn được khi đang lái (click chuột hoặc F). Cướp xe thì nhân vật của bạn ngồi trên xe; người lái cũ bị lôi xuống.
 - **E:** lên/xuống xe, cướp ô tô hoặc xe máy đang chạy, tương tác nhiệm vụ ở điểm màu cam, nhận việc phụ, vào cửa hàng và bệnh viện. **M:** bảng nhiệm vụ; **Esc:** đóng.
 - **Chuột phải kéo / Z, C:** xoay camera. **Lăn chuột:** zoom. **V:** đặt lại góc nhìn. Điện thoại: kéo một ngón để xoay, chụm hai ngón để zoom.
 - **Click chuột / F:** bắn theo con trỏ (hoặc đấm). **1–6 / Q** đổi vũ khí. **R** nạp đạn. **Giữ Tab:** túi súng, thời gian chậm lại.
-- **Thành phố:** bản đồ 270 m × 270 m với bệnh viện, đồn công an, trường học, chùa, trạm xe buýt. Có ngày đêm (một ngày bằng 24 phút), nắng, mây, mưa. Ô tô và xe máy chạy theo làn, dừng cho người qua vạch kẻ đường. Có chó, mèo, sóc, chim bồ câu.
+- **Thành phố:** bản đồ 270 m × 270 m với bệnh viện, đồn công an, trường học, chùa, trạm xe buýt. Có ngày đêm (một ngày bằng 24 phút), nắng, mây, mưa (mưa phủ kín khung nhìn dù zoom xa). Đường nhựa có vỉa hè lát gạch, bó vỉa cao hơn lòng đường; người đi bộ đi trên vỉa hè và chỉ băng qua ở vạch kẻ đường. Ô tô và xe máy chạy theo làn, có người lái thật ngồi trên xe, dừng cho người qua đường. Có chó, mèo, sóc, chim bồ câu.
 - **Người dân có lịch sinh hoạt:** mỗi người có nhà riêng, sáng bước ra cửa đi làm, đi học, đi chợ; trưa ăn; chiều ra công viên; tối về nhà. Bong bóng thoại hiện điều họ đang nói.
 - **6 nhiệm vụ chính** chọn và chơi lại bằng phím M (xem bảng bên dưới). Thêm **20 việc phụ** nhận ở chấm vàng trên bản đồ: chở khách, đua xe, tìm mèo, bắt cướp giật, dọn rác công viên, thách đấu băng đảng…
 - **Tiệm súng:** súng lục, súng săn, tiểu liên, súng phóng lựu, bazooka, có đạn và hộp đạn. **Cửa hàng xe máy:** Cub, tay ga, Vespa, xe côn tay, ngựa; xe hỏng dần, bốc cháy rồi nổ.
 - **Cướp:** chĩa súng vào người dân thì họ giơ tay, giữ ngắm thì họ đưa tiền (chủ quán đưa cả két). Hạ ai thì rơi tiền ngẫu nhiên, đi qua để nhặt.
 - **Băng đảng Rắn Đen và Hổ Vàng:** giữ địa bàn; đánh, chĩa súng hay cầm súng lảng vảng ở đó thì cả băng xông vào đánh, giận hơn thì rút súng.
-- **Truy nã 1–5 sao:** cảnh sát ngày càng gắt: dùi cui và súng điện, rồi súng lục, súng săn, SWAT với tiểu liên; rải bẫy đinh làm xịt lốp, lập chốt chặn ở ngã tư, vây bọc và đón đầu. Bị bắt thì ra đồn, bị hạ gục thì tỉnh lại ở bệnh viện sau 5 giây; trả tiền ở bệnh viện để hồi máu.
+- **Truy nã 1–5 sao:** cảnh sát ngày càng gắt: dùi cui và súng điện, rồi súng lục, súng săn, SWAT với tiểu liên; rải bẫy đinh làm xịt lốp, lập chốt chặn ở ngã tư, vây bọc và đón đầu, ép xe (PIT), lao vào quật ngã khi bạn bỏ chạy, lôi bạn ra khỏi xe đang đứng, ném lựu đạn cay từ 3 sao, nấp sau xe khi bạn cầm súng, trực thăng soi đèn từ 4 sao. Nhấn **H** để giơ tay đầu hàng: cảnh sát thôi bắn và tới còng tay. Khi bị bắt, nhân vật giơ tay, quỳ xuống, bị còng tay và áp giải. Bị bắt thì ra đồn, bị hạ gục thì tỉnh lại ở bệnh viện sau 5 giây; trả tiền ở bệnh viện để hồi máu.
 - **Ragdoll:** người có khuỷu tay, đầu gối; nổ hay súng săn sát người có thể làm đứt tay chân. Động vật cũng ngã kiểu ragdoll.
 - **Phòng chung:** người chơi đấm, bắn, tông được nhau (và bị truy nã); máu, vũ khí, phương tiện và trạng thái gục được đồng bộ qua máy chủ.
 - Nút **FPS** trên thanh trên cùng mở cài đặt đồ họa (Tự động / Cao / Cân bằng / Hiệu năng) và cho biết trình duyệt đang vẽ bằng GPU nào.

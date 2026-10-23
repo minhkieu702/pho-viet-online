@@ -28,11 +28,13 @@ export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight
   const fog = scene.fog as THREE.Fog;
   const background = scene.background as THREE.Color;
 
-  const DROPS = 2600, BOX = 46, HEIGHT = 26;
+  // Drops live in a unit cube that the shader stretches to a box around the camera's focus; the box
+  // grows with the zoom so rain always fills the view, and fades out toward its edges.
+  const DROPS = 7000;
   const positions = new Float32Array(DROPS * 6);
   const ends = new Float32Array(DROPS * 2);
   for (let i = 0; i < DROPS; i++) {
-    const x = Math.random() * BOX, y = Math.random() * HEIGHT, z = Math.random() * BOX;
+    const x = Math.random(), y = Math.random(), z = Math.random();
     positions.set([x, y, z, x, y, z], i * 6);
     ends[i * 2 + 1] = 1;
   }
@@ -42,25 +44,27 @@ export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight
   const material = new THREE.ShaderMaterial({
     transparent: true,
     depthWrite: false,
-    uniforms: { time: { value: 0 }, focus: { value: new THREE.Vector3() }, amount: { value: 0 }, wind: { value: new THREE.Vector2(1.2, 0.6) } },
+    uniforms: { time: { value: 0 }, focus: { value: new THREE.Vector3() }, amount: { value: 0 }, wind: { value: new THREE.Vector2(1.2, 0.6) }, box: { value: 60 }, height: { value: 30 } },
     vertexShader: `
       attribute float end;
-      uniform float time; uniform vec3 focus; uniform vec2 wind;
-      varying float vEnd;
+      uniform float time; uniform vec3 focus; uniform vec2 wind; uniform float box; uniform float height;
+      varying float vEnd; varying float vFade;
       void main() {
-        vec3 p = position;
-        float fall = time * 22.0;
-        p.y = mod(p.y - fall, ${HEIGHT.toFixed(1)});
-        p.xz = mod(p.xz + wind * (${HEIGHT.toFixed(1)} - p.y) * 0.05 - focus.xz + ${(BOX / 2).toFixed(1)}, ${BOX.toFixed(1)}) + focus.xz - ${(BOX / 2).toFixed(1)};
-        p.y += focus.y - 4.0;
-        // The second vertex of each drop trails upward along the fall direction.
-        p += vec3(-wind.x * 0.05, 0.75, -wind.y * 0.05) * end;
+        vec3 p = position * vec3(box, height, box);
+        p.y = mod(p.y - time * 22.0, height);
+        p.xz = mod(p.xz + wind * (height - p.y) * 0.05 - focus.xz + box * 0.5, box) + focus.xz - box * 0.5;
+        vec2 offset = abs(p.xz - focus.xz) / (box * 0.5);
+        vFade = 1.0 - smoothstep(0.7, 1.0, max(offset.x, offset.y));
+        p.y += focus.y - height * 0.25;
+        // The second vertex of each drop trails upward; longer streaks when seen from further away.
+        float streak = 0.75 * clamp(box / 60.0, 1.0, 2.5);
+        p += vec3(-wind.x * 0.05, streak, -wind.y * 0.05) * end;
         vEnd = end;
         gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
       }`,
     fragmentShader: `
-      uniform float amount; varying float vEnd;
-      void main() { gl_FragColor = vec4(0.78, 0.84, 0.9, amount * (0.55 - vEnd * 0.4)); }`,
+      uniform float amount; varying float vEnd; varying float vFade;
+      void main() { gl_FragColor = vec4(0.78, 0.84, 0.9, amount * vFade * (0.55 - vEnd * 0.4)); }`,
   });
   const drops = new THREE.LineSegments(geometry, material);
   drops.frustumCulled = false;
@@ -85,7 +89,7 @@ export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight
     },
     setWeather(next: Weather) { weather = next; weatherTimer = (2 + Math.random() * 4) * SECONDS_PER_HOUR; },
     /** Advances the clock; returns true when the sun moved enough that the static shadow map should be redrawn. */
-    update(dt: number, time: number, focus: THREE.Vector3) {
+    update(dt: number, time: number, focus: THREE.Vector3, spread = 60) {
       hours = (hours + dt / SECONDS_PER_HOUR) % 24;
       weatherTimer -= dt;
       if (weatherTimer <= 0) {
@@ -119,6 +123,8 @@ export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight
       material.uniforms.time.value = time;
       material.uniforms.amount.value = rain;
       material.uniforms.focus.value.copy(focus);
+      material.uniforms.box.value = spread;
+      material.uniforms.height.value = Math.max(30, spread * 0.45);
       drops.visible = rain > 0.03;
       const moved = sunDirection.angleTo(lastShadowDir) > 0.035;
       if (moved) lastShadowDir = sunDirection.clone();

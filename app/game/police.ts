@@ -10,6 +10,10 @@ export type CopWeapon = 'baton' | 'taser' | 'pistol' | 'shotgun' | 'smg';
 type Officer = {
   index: number;
   state: 'off' | 'seated' | 'chase' | 'return' | 'down';
+  // Tactics: when a tackle started, progress pulling the player out of a vehicle, holding a cuffed player.
+  lunge: number;
+  pull: number;
+  escort: boolean;
   car: Car | null;
   x: number;
   z: number;
@@ -29,7 +33,11 @@ type Officer = {
   swat: boolean;
 };
 export type PoliceShot = { from: THREE.Vector3; hit: boolean; damage: number; kind: CopWeapon };
-export type PlayerView = { x: number; z: number; car: Car | null; riding: boolean; heading: number; speed: number; down: boolean; stunned: boolean };
+export type PlayerView = {
+  x: number; z: number; car: Car | null; riding: boolean; heading: number; speed: number; down: boolean; stunned: boolean;
+  armed: boolean; surrendered: boolean; pinned: boolean; night: number;
+};
+export type GasThrow = { fromX: number; fromZ: number; x: number; z: number };
 type Spike = { x: number; z: number; alongX: boolean; until: number };
 
 const OFFICERS = 16;
@@ -38,6 +46,11 @@ const LINES = {
   chase: ['Đứng lại!', 'Cảnh sát đây!', 'Giơ tay lên!', 'Không chạy được đâu!'],
   arrest: ['Anh bị bắt!', 'Đưa tay ra sau!'],
   surround: ['Bao vây nó!', 'Chặn bên kia!', 'Vòng ra sau!'],
+  drop: ['Bỏ súng xuống!', 'Thả vũ khí ra!', 'Buông súng!'],
+  surrendered: ['Đứng yên!', 'Quỳ xuống, tay sau đầu!'],
+  gas: ['Ném hơi cay!', 'Hun nó ra!'],
+  tackle: ['Bắt được rồi!', 'Nằm xuống!'],
+  pull: ['Ra khỏi xe!', 'Xuống xe ngay!'],
   spikes: ['Rải đinh!', 'Chặn đường nó lại!'],
 };
 const pick = <T,>(list: T[]) => list[Math.floor(Math.random() * list.length)];
@@ -77,7 +90,7 @@ export function createPolice(
   const spikes: Spike[] = [];
   const officers: Officer[] = Array.from({ length: OFFICERS }, (_, index) => ({
     index, state: 'off', car: null, x: 0, z: 0, yaw: 0, stride: 0, health: 80, maxHealth: 80, hitAt: -99, nextShot: 0, burst: 0, arrest: 0,
-    body: null, timer: 0, pace: 0, chatterAt: 0, weapon: 'baton', swat: false,
+    body: null, timer: 0, pace: 0, chatterAt: 0, weapon: 'baton', swat: false, lunge: -99, pull: 0, escort: false,
   }));
 
   // Officers are three figure meshes (body, legs, arms) shared by the whole force, plus the spike strips.
@@ -126,9 +139,19 @@ export function createPolice(
     const style = styleOf(o.swat ? SWAT_LOOK : LOOK);
     base.compose(pos.set(o.x, world.ground(o.x, o.z), o.z), quat.setFromAxisAngle(yAxis, o.yaw), size.set(SCALE * style.width, SCALE * style.height, SCALE * style.width));
     const swing = Math.sin(o.stride) * Math.min(0.75, o.pace * 0.12);
-    const aiming = o.state === 'chase' && o.weapon !== 'baton';
+    const holding = o.escort;
+    const diving = o.state === 'chase' && lastTime - o.lunge < 0.45;
+    const aiming = o.state === 'chase' && o.weapon !== 'baton' && !holding && !diving;
     const longGun = aiming && o.weapon !== 'taser' && o.weapon !== 'pistol';
     const p = looks[o.index];
+    if (holding || diving) {
+      bodies.push(base, p.body);
+      limb(legs, -FIGURE.hipX, FIGURE.hipY, diving ? 0.5 : 0, p.legs);
+      limb(legs, FIGURE.hipX, FIGURE.hipY, diving ? -0.3 : 0, p.legs);
+      limb(arms, -FIGURE.shoulderX, FIGURE.shoulderY, diving ? -2.4 : -1.0, p.armL, holding ? 0.35 : 0);
+      limb(arms, FIGURE.shoulderX, FIGURE.shoulderY, diving ? -2.4 : -1.0, p.armR, holding ? -0.35 : 0);
+      return;
+    }
     bodies.push(base, p.body);
     limb(legs, -FIGURE.hipX, FIGURE.hipY, swing, p.legs);
     limb(legs, FIGURE.hipX, FIGURE.hipY, -swing, p.legs);
@@ -156,13 +179,68 @@ export function createPolice(
     heat = 0;
     for (const o of officers) if (o.state === 'chase') o.state = 'return';
   }
+  let lastTime = 0;
+  let gasAt = 0;
+
+  // A police helicopter joins from four stars: it circles the player, keeps them in sight and at
+  // night lights them with a spotlight; at five stars a marksman fires from it.
+  const heli = new THREE.Group();
+  const heliPaint = new THREE.MeshStandardMaterial({ color: '#f2f2ee', roughness: 0.5, metalness: 0.2 });
+  const heliDark = new THREE.MeshStandardMaterial({ color: '#1f3f78', roughness: 0.5 });
+  const heliGlass = new THREE.MeshStandardMaterial({ color: '#203038', roughness: 0.1, metalness: 0.5 });
+  const heliParts: THREE.Mesh[] = [];
+  const part = (geometry: THREE.BufferGeometry, mat: THREE.Material, x: number, y: number, z: number) => {
+    const mesh = new THREE.Mesh(geometry, mat);
+    mesh.position.set(x, y, z);
+    heli.add(mesh);
+    heliParts.push(mesh);
+    return mesh;
+  };
+  part(new THREE.SphereGeometry(1.3, 12, 8), heliPaint, 0, 0, 0.2).scale.set(1, 0.85, 1.5);
+  part(new THREE.SphereGeometry(0.9, 10, 6), heliGlass, 0, 0.2, 1.3).scale.set(1, 0.8, 0.9);
+  part(new THREE.BoxGeometry(2.62, 0.35, 2.4), heliDark, 0, -0.45, 0.2);
+  part(new THREE.BoxGeometry(0.35, 0.35, 4.2), heliPaint, 0, 0.3, -3.2);
+  part(new THREE.BoxGeometry(0.1, 1.0, 0.6), heliDark, 0, 0.75, -5.2);
+  for (const x of [-0.9, 0.9]) part(new THREE.BoxGeometry(0.1, 0.1, 3.0), heliDark, x, -1.35, 0.2);
+  const rotor = part(new THREE.BoxGeometry(9, 0.06, 0.35), heliDark, 0, 1.25, 0.2);
+  const rotorCross = part(new THREE.BoxGeometry(0.35, 0.06, 9), heliDark, 0, 1.25, 0.2);
+  const tailRotor = part(new THREE.BoxGeometry(0.06, 1.6, 0.2), heliDark, 0.22, 0.8, -5.2);
+  const spotMaterial = new THREE.MeshBasicMaterial({ color: '#fff6d8', transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
+  const spotGeometry = new THREE.ConeGeometry(4.5, 1, 20, 1, true).translate(0, -0.5, 0);
+  const spot = new THREE.Mesh(spotGeometry, spotMaterial);
+  spot.frustumCulled = false;
+  scene.add(spot);
+  heli.visible = false;
+  spot.visible = false;
+  scene.add(heli);
+  let heliAngle = 0;
+  let heliShotAt = 0;
+  const heliPos = new THREE.Vector3(0, 40, 0);
+  const heliTarget = new THREE.Vector3();
+  const spotDir = new THREE.Vector3();
+  const downAxis = new THREE.Vector3(0, -1, 0);
+
+  /** An officer takes hold of the player from behind for the arrest. */
+  function restrain(x: number, z: number, yaw: number) {
+    let best: Officer | null = null, bestD = 8;
+    for (const o of officers) {
+      if (o.state !== 'chase') continue;
+      const d = Math.hypot(o.x - x, o.z - z);
+      if (d < bestD) { bestD = d; best = o; }
+    }
+    if (!best) best = officers.find((o) => o.state === 'off') ?? null;
+    if (!best) return;
+    Object.assign(best, { state: 'chase', escort: true, x: x - Math.sin(yaw) * 0.7, z: z - Math.cos(yaw) * 0.7, yaw, pace: 0 });
+    if (!best.car) best.maxHealth = best.health = 80;
+    say(`cop${best.index}`, pick(LINES.arrest), () => (best.state === 'chase' ? { x: best.x, y: 2.1, z: best.z } : null));
+  }
 
   /** Everything vanishes at once, used after an arrest or when the player is downed and respawns. */
   function reset() {
     standDown();
     for (const o of officers) {
       if (o.body) ragdolls.remove(o.body);
-      Object.assign(o, { state: 'off', car: null, body: null, arrest: 0 });
+      Object.assign(o, { state: 'off', car: null, body: null, arrest: 0, escort: false, pull: 0 });
     }
     for (const car of vehicles.cars) if (car.kind === 'police' && car.mode !== 'player') car.mode = 'off';
     spikes.length = 0;
@@ -176,7 +254,7 @@ export function createPolice(
       : wanted === 3 ? (Math.random() < 0.5 ? 'shotgun' : 'pistol')
       : swat ? 'smg' : 'shotgun';
     const maxHealth = swat ? 140 : 80;
-    Object.assign(o, { state: 'seated', car, health: maxHealth, maxHealth, arrest: 0, body: null, hitAt: -99, weapon, swat, burst: 0 });
+    Object.assign(o, { state: 'seated', car, health: maxHealth, maxHealth, arrest: 0, body: null, hitAt: -99, weapon, swat, burst: 0, lunge: -99, pull: 0, escort: false });
     paint(o);
   }
 
@@ -247,6 +325,7 @@ export function createPolice(
     get wanted() { return wanted; },
     crime,
     reset,
+    restrain,
     /** True when (x, z) is on a spike strip; the strip is used up. */
     onSpikes(x: number, z: number) {
       for (let i = 0; i < spikes.length; i++) {
@@ -293,6 +372,10 @@ export function createPolice(
       for (const o of officers) if ((o.state === 'chase' || o.state === 'return') && time - o.hitAt < 4) callback(o.x, HEIGHT + 0.35, o.z, Math.max(0, o.health) / o.maxHealth);
     },
     update(dt: number, time: number, player: PlayerView) {
+      lastTime = time;
+      let tackled = false;
+      let pulledOut = false;
+      const gas: GasThrow[] = [];
       const shots: PoliceShot[] = [];
       let strikes = 0;
       let arrested = false;
@@ -327,7 +410,7 @@ export function createPolice(
         blocked = roadblock(player);
       }
       for (let i = spikes.length - 1; i >= 0; i--) if (time > spikes[i].until) spikes.splice(i, 1);
-      vehicles.updatePolice(dt, time, player.x, player.z, player.car, wanted);
+      vehicles.updatePolice(dt, time, player.x, player.z, player.car, wanted, player.heading);
       let seen = false;
       for (const car of vehicles.cars) {
         if (car.kind !== 'police') continue;
@@ -368,6 +451,9 @@ export function createPolice(
             if (o.body) ragdolls.remove(o.body);
             Object.assign(o, { state: 'off', body: null, car: null });
           }
+        } else if (o.state === 'chase' && o.escort) {
+          // Holding a cuffed player: stay put behind them.
+          o.pace = 0;
         } else if (o.state === 'chase') {
           const d = Math.hypot(player.x - o.x, player.z - o.z);
           if (d < 40 + wanted * 5) seen = true;
@@ -378,27 +464,54 @@ export function createPolice(
             // Ranged officers spread around the player at a firing distance; melee and tasers close in.
             // Anyone may move in to cuff once the player is stunned, stopped or down to their last legs.
             const gun = o.weapon === 'baton' ? null : GUNS[o.weapon];
-            const helpless = player.stunned || (!inVehicle && player.speed < 0.6 && wanted <= 2);
+            const helpless = player.stunned || player.surrendered || player.pinned || (!inVehicle && player.speed < 0.6 && wanted <= 2);
             const keep = !gun || helpless ? 0 : o.weapon === 'taser' ? 5 : o.weapon === 'shotgun' ? 7 : 11;
             const slot = chasers.indexOf(o) / Math.max(1, chasers.length) * Math.PI * 2 + player.heading;
-            const tx = keep ? leadX + Math.sin(slot) * keep : player.x, tz = keep ? leadZ + Math.cos(slot) * keep : player.z;
-            step(o, tx, tz, 5 + wanted * 0.35 + (o.swat ? 0.3 : 0), dt, { x: player.x, z: player.z });
+            let tx = keep ? leadX + Math.sin(slot) * keep : player.x, tz = keep ? leadZ + Math.cos(slot) * keep : player.z;
+            // Facing an armed player, gunmen take cover behind their own cruiser (cars stop bullets).
+            const cover = o.car && gun && player.armed && !helpless && Math.hypot(o.car.x - player.x, o.car.z - player.z) < 30 ? o.car : null;
+            if (cover) {
+              const cx = cover.x - player.x, cz = cover.z - player.z, cd = Math.hypot(cx, cz) || 1;
+              tx = cover.x + cx / cd * 2.4 + Math.cos(slot) * 0.8;
+              tz = cover.z + cz / cd * 2.4 - Math.sin(slot) * 0.8;
+            }
+            // A runner on foot gets tackled by whoever is close and not holding a long gun.
+            const lunging = time - o.lunge < 0.45;
+            if (!inVehicle && !player.down && !player.surrendered && player.speed > 3.5 && d > 1 && d < 3.4 && time - o.lunge > 4 && (o.weapon === 'baton' || o.weapon === 'taser' || o.weapon === 'pistol')) {
+              o.lunge = time;
+            }
+            if (lunging) {
+              step(o, player.x, player.z, 9.5, dt);
+              if (d < 0.95 && !player.down) { tackled = true; o.lunge = time - 0.45; say(`cop${o.index}`, pick(LINES.tackle), () => (o.state === 'chase' ? { x: o.x, y: 2.1, z: o.z } : null)); }
+            } else step(o, tx, tz, 5 + wanted * 0.35 + (o.swat ? 0.3 : 0), dt, { x: player.x, z: player.z });
+            // A stopped vehicle: someone opens the door and drags the driver out.
+            if (inVehicle && !player.down && player.speed < 1.5 && d < 2.6) {
+              o.pull += dt;
+              if (o.pull > 0.9) { pulledOut = true; o.pull = 0; say(`cop${o.index}`, pick(LINES.pull), () => (o.state === 'chase' ? { x: o.x, y: 2.1, z: o.z } : null)); }
+            } else o.pull = Math.max(0, o.pull - dt);
+            // From three stars a gunman lobs tear gas at a player standing their ground.
+            if (wanted >= 3 && gun && !player.down && !player.surrendered && d > 6 && d < 22 && time > gasAt && world.sight(o.x, o.z, player.x, player.z) && (!inVehicle || player.speed < 3)) {
+              gasAt = time + 11 - wanted;
+              gas.push({ fromX: o.x, fromZ: o.z, x: player.x + (Math.random() - 0.5) * 2, z: player.z + (Math.random() - 0.5) * 2 });
+              say(`cop${o.index}`, pick(LINES.gas), () => (o.state === 'chase' ? { x: o.x, y: 2.1, z: o.z } : null));
+            }
             o.chatterAt -= dt;
             if (o.chatterAt <= 0 && d < 25) {
               o.chatterAt = 5 + Math.random() * 6;
-              const lines = d < 3 ? LINES.arrest : chasers.length > 2 && Math.random() < 0.4 ? LINES.surround : LINES.chase;
+              const lines = player.surrendered ? LINES.surrendered : d < 3 ? LINES.arrest : player.armed && d < 18 ? LINES.drop : chasers.length > 2 && Math.random() < 0.4 ? LINES.surround : LINES.chase;
               say(`cop${o.index}`, pick(lines), () => (o.state === 'chase' ? { x: o.x, y: 2.1, z: o.z } : null));
             }
             const reach = inVehicle ? 2.0 : 1.05;
-            const canCuff = !player.down && d < reach && (!inVehicle || player.speed < 1.5);
-            o.arrest = canCuff ? o.arrest + dt * (player.stunned ? 2 : 1) : Math.max(0, o.arrest - dt);
+            // Officers have to be right next to the player; a pinned, stunned or surrendering player is cuffed quickly.
+            const canCuff = (!player.down || player.pinned) && d < reach && (!inVehicle || player.speed < 1.5);
+            o.arrest = canCuff ? o.arrest + dt * (player.stunned || player.pinned || player.surrendered ? 2.5 : 1) : Math.max(0, o.arrest - dt);
             if (o.arrest > 1.3) arrested = true;
             // Up close they swing a baton, which also stops the player from simply walking off.
-            if (!player.down && !inVehicle && d < 1.3 && time > o.nextShot && (o.weapon === 'baton' || Math.random() < 0.4)) {
+            if (!player.down && !player.surrendered && !inVehicle && d < 1.3 && time > o.nextShot && (o.weapon === 'baton' || Math.random() < 0.4)) {
               o.nextShot = time + 1.1 + Math.random() * 0.5;
               strikes++;
             }
-            if (gun && !player.down && d < gun.range && d > 1.6 && time > o.nextShot && world.sight(o.x, o.z, player.x, player.z)) {
+            if (gun && !player.down && !player.surrendered && d < gun.range && d > 1.6 && time > o.nextShot && world.sight(o.x, o.z, player.x, player.z)) {
               // SMGs fire short bursts; everything else single shots.
               if (o.weapon === 'smg' && o.burst < 2) { o.burst++; o.nextShot = time + 0.11; }
               else { o.burst = 0; o.nextShot = time + gun.cooldown * (1 - wanted * 0.06) + Math.random() * 0.6; }
@@ -426,13 +539,51 @@ export function createPolice(
       }
       for (const batch of [bodies, legs, arms]) batch.end();
       spikeMesh.instanceMatrix.needsUpdate = true;
+      // Helicopter.
+      const flying = wanted >= 4 && !player.down;
+      if (flying && !heli.visible) { heli.visible = true; heliPos.set(player.x + 60, 40, player.z + 60); }
+      if (heli.visible) {
+        heliAngle += dt * 0.3;
+        if (flying) heliTarget.set(player.x + Math.cos(heliAngle) * 16, 26, player.z + Math.sin(heliAngle) * 16);
+        else heliTarget.set(heliPos.x + 40, 60, heliPos.z + 40);
+        // Limited speed: a fast bike can outrun it.
+        const step = heliTarget.clone().sub(heliPos);
+        const length = step.length();
+        if (length > 0.01) heliPos.addScaledVector(step, Math.min(1, 15 * dt / length));
+        heli.position.copy(heliPos);
+        heli.rotation.y = Math.atan2(player.x - heliPos.x, player.z - heliPos.z);
+        heli.rotation.z = Math.sin(time * 0.7) * 0.05;
+        rotor.rotation.y += dt * 30;
+        rotorCross.rotation.y = rotor.rotation.y;
+        tailRotor.rotation.x += dt * 40;
+        const horizontal = Math.hypot(heliPos.x - player.x, heliPos.z - player.z);
+        if (flying && horizontal < 45) seen = true;
+        // Spotlight cone from the helicopter to the player at night.
+        spot.visible = flying && player.night > 0.2;
+        if (spot.visible) {
+          spotDir.set(player.x - heliPos.x, -heliPos.y, player.z - heliPos.z);
+          const reach = spotDir.length();
+          spot.position.copy(heliPos);
+          spot.quaternion.setFromUnitVectors(downAxis, spotDir.normalize());
+          spot.scale.set(1, reach, 1);
+          spotMaterial.opacity = 0.16 * player.night;
+        }
+        if (wanted >= 5 && flying && horizontal < 40 && time > heliShotAt) {
+          heliShotAt = time + 2.2 + Math.random();
+          shots.push({ from: heliPos.clone().setY(heliPos.y - 1.2), hit: Math.random() < 0.18, damage: 9, kind: 'smg' });
+        }
+        if (!flying && heliPos.y > 55) { heli.visible = false; spot.visible = false; }
+      }
       if (spiked) say('spikes', pick(LINES.spikes), () => null);
       // Lose the police by staying out of sight long enough.
       if (seen) lastSeen = time;
       if (wanted > 0 && time - lastSeen > 6 + 3 * wanted) standDown();
-      return { shots, strikes, arrested, evading: wanted > 0 && !seen, spiked, blocked };
+      return { shots, strikes, arrested, evading: wanted > 0 && !seen, spiked, blocked, tackled, pulledOut, gas };
     },
     dispose() {
+      scene.remove(heli, spot);
+      for (const mesh of heliParts) mesh.geometry.dispose();
+      heliPaint.dispose(); heliDark.dispose(); heliGlass.dispose(); spotMaterial.dispose(); spotGeometry.dispose();
       for (const batch of [bodies, legs, arms]) { scene.remove(batch.mesh); batch.dispose(); }
       scene.remove(spikeMesh);
       spikeMesh.dispose();
