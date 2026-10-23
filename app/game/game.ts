@@ -589,6 +589,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   let gunfireCrimeAt = 0;
   let gangKnocks = 0;
   let stunUntil = 0;
+  // Height above the ground and vertical speed of a jump on foot.
+  let jumpY = 0;
+  let jumpV = 0;
   let flatTires = false;
   const flatCars = new Set<Car>();
   let thief: Npc | null = null;
@@ -1020,6 +1023,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (normalized === 'r') startReload(performance.now());
       if (normalized === 'v') Object.assign(view, CAMERA_DEFAULT);
       if (normalized === 'tab') setBag(true);
+      // Space jumps on foot; on a vehicle it stays the brake.
+      if ((normalized === ' ' || normalized === 'space') && !state.riding && !down && jumpY === 0 && performance.now() > stunUntil) jumpV = 5.6;
       const slot = Number(normalized);
       if (slot >= 1 && slot <= WEAPONS.length && !equip(WEAPONS[slot - 1].id)) notify(`Chưa có ${WEAPONS[slot - 1].name}. Mua ở Tiệm súng.`);
     }
@@ -1592,7 +1597,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       : police.wanted ? 'Đang bị truy nã · Trốn khỏi tầm mắt cảnh sát để thoát'
       : rounds && rounds.mag === 0 && rounds.reserve === 0 ? 'Hết đạn · Mua thêm ở Tiệm súng'
       : weapon !== 'fists' ? 'Chĩa súng vào người để cướp · Click/F bắn · R nạp đạn · Giữ Tab túi súng'
-      : 'WASD di chuyển · Shift chạy · E tương tác · Giữ Tab mở túi súng';
+      : 'WASD di chuyển · Shift chạy · Space nhảy · E tương tác · Giữ Tab mở túi súng';
     const policePoints: { x: number; z: number }[] = [];
     police.forEachUnit((x, z) => { if (policePoints.length < 10) policePoints.push({ x: Math.round(x), z: Math.round(z) }); });
     const vehicle = vehicleKind();
@@ -1847,6 +1852,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     if (policeResult.arrested && !down) busted(now);
 
+    if (jumpV !== 0 || jumpY > 0) {
+      jumpV -= 18 * dt;
+      jumpY = Math.max(0, jumpY + jumpV * dt);
+      if (jumpY === 0) { jumpV = 0; if (!state.riding) shake = Math.max(shake, 0.05); }
+    }
+    if (state.riding || down) { jumpY = 0; jumpV = 0; }
+
     const armed = weapon !== 'fists';
     const aiming = armed && !down && (now < aimUntil || (!state.riding && (mouseHeld || keys.has('f') || pointerInside)));
     if (pointerInside && armed && !state.riding) {
@@ -1909,12 +1921,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
     // Player, bike and props.
     walker.group.visible = !state.riding && !playerBody;
-    walker.group.position.set(state.x, groundHeight(state.x, state.z) - 0.02, state.z);
+    walker.group.position.set(state.x, groundHeight(state.x, state.z) - 0.02 + jumpY, state.z);
     walker.group.rotation.y = state.angle;
     walkClock += Math.abs(velocity) * dt * 1.9;
     const stride = moving && active && !state.riding ? Math.sin(walkClock * 2) * 0.62 : 0;
-    walker.limbLeft.rotation.x = stride;
-    walker.limbRight.rotation.x = -stride;
+    // In the air the legs tuck up; otherwise they stride.
+    walker.limbLeft.rotation.x = jumpY > 0 ? -0.7 : stride;
+    walker.limbRight.rotation.x = jumpY > 0 ? -0.25 : -stride;
     const twoHanded = weapon === 'shotgun' || weapon === 'smg' || weapon === 'rpg' || weapon === 'grenade';
     const handsUp = down === 'busted';
     walker.armLeft.rotation.set(handsUp ? -2.9 : twoHanded ? -1.25 : -stride * 0.7, 0, twoHanded && !handsUp ? 0.45 : 0);
@@ -1967,7 +1980,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
 
     effects.beginBlobs();
-    if (walker.group.visible) effects.blob(state.x, groundHeight(state.x, state.z) + 0.02, state.z, 0.9);
+    if (walker.group.visible) effects.blob(state.x, groundHeight(state.x, state.z) + 0.02, state.z, 0.9 * Math.max(0.5, 1 - jumpY * 0.35));
     if (!playerCar || bikeX !== state.x) effects.blob(bikeX, groundHeight(bikeX, bikeZ) + 0.02, bikeZ, bikeId === 'horse' ? 1.2 : 0.9, bikeId === 'horse' ? 2.6 : 2.1, bikeAngle);
     for (const person of [shopkeeper.group, receiver.group]) if (person.visible) effects.blob(person.position.x, person.position.y + 0.04, person.position.z, 0.9);
     for (const car of vehicles.cars) {
