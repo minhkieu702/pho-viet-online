@@ -4,19 +4,18 @@ import { createRagdolls, type RagdollBody, type RagdollLook } from './ragdoll';
 import { createNpcs } from './npcs';
 import { createEffects, makeGun } from './effects';
 import { playShot, playThud, unlockAudio } from './audio';
-import { DELIVERY_PAY, WEAPONS, weaponById, type WeaponId } from './weapons';
+import { WEAPONS, weaponById, type WeaponId } from './weapons';
+import { createMissions, type MissionEvent, type MissionId, type MissionView } from './missions';
 import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuName, isSoftwareGpu, type QualityMode } from './quality';
 
 export type PlayerState = { x: number; z: number; angle: number; riding: boolean; speed: number; score: number };
 export type PeerState = PlayerState & { id: string; name: string; color: string };
 export type Hud = {
-  speed: number; riding: boolean; score: number; mission: string; missionStep: number; hint: string; x: number; z: number;
+  speed: number; riding: boolean; score: number; mission: string; missionStep: number; missionInfo: MissionView; hint: string; x: number; z: number;
   cash: number; deliveries: number; weapon: WeaponId; owned: WeaponId[]; down: boolean; fps: number; quality: string; qualityMode: QualityMode; gpu: string; softwareGpu: boolean;
 };
 export type GameEvent = { type: 'store' };
 
-const PICKUP = { x: -32, z: 7 };
-const DELIVERY = { x: 54, z: -35 };
 export const STORE = { x: -18, z: 49.6 };
 const UP = new THREE.Vector3(0, 1, 0);
 const CAMERA_DEFAULT = { yaw: Math.atan2(31, 39), pitch: Math.atan2(36, Math.hypot(31, 39)), dist: Math.hypot(31, 36, 39) };
@@ -271,10 +270,21 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const pin = new THREE.Group();
   const cone = cylinder(pin, 0.66, 0, 1.2, [0, 0, 0], missionRing.mat, 4);
   cone.rotation.y = Math.PI / 4;
-  const cup = cylinder(pin, 0.39, 0.3, 0.7, [0, 0.93, 0], material('#fff2d0'), 10);
-  cylinder(pin, 0.42, 0.42, 0.1, [0, 1.32, 0], material('#537764'), 10);
-  box(pin, [0.06, 0.4, 0.06], [0.12, 1.52, 0], material('#344f40'));
+  const coffeeIcon = new THREE.Group();
+  const cup = cylinder(coffeeIcon, 0.39, 0.3, 0.7, [0, 0.93, 0], material('#fff2d0'), 10);
+  cylinder(coffeeIcon, 0.42, 0.42, 0.1, [0, 1.32, 0], material('#537764'), 10);
+  box(coffeeIcon, [0.06, 0.4, 0.06], [0.12, 1.52, 0], material('#344f40'));
   cup.rotation.z = 0.12;
+  const parcelIcon = new THREE.Group();
+  box(parcelIcon, [1, 0.85, 0.85], [0, 1.05, 0], material('#d6a466'));
+  box(parcelIcon, [0.18, 0.87, 0.87], [0, 1.05, 0], material('#fff0ce'));
+  const flagIcon = new THREE.Group();
+  cylinder(flagIcon, 0.045, 0.045, 1.5, [-0.3, 1.05, 0], material('#fff0ce'), 6);
+  box(flagIcon, [0.9, 0.55, 0.06], [0.15, 1.5, 0], material('#e77641'));
+  const cleanupIcon = new THREE.Group();
+  sphere(cleanupIcon, 0.47, [0, 1, 0], material('#416c54'));
+  cylinder(cleanupIcon, 0.12, 0.25, 0.3, [0, 1.44, 0], material('#7ba27b'), 6);
+  pin.add(coffeeIcon, parcelIcon, flagIcon, cleanupIcon);
   pin.position.y = 4;
   marker.add(pin);
   let missionLabel = makeLabel('NHẬN CÀ PHÊ', '#f6cf71', '#493d23');
@@ -295,7 +305,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   let bikeAngle = -2.5;
   let active = false;
   let disposed = false;
-  let missionStep = 0;
+  const missions = createMissions();
+  let missionLabelKey = '';
   let velocity = 0;
   let frame = 0;
   let previousTime = performance.now();
@@ -428,11 +439,37 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   function setMissionLabel() {
+    const info = missions.view();
+    marker.visible = info.target !== null;
+    if (info.target) marker.position.set(info.target.x, groundHeight(info.target.x, info.target.z), info.target.z);
+    const key = `${info.id}:${info.step}:${info.status}`;
+    if (key === missionLabelKey) return;
+    missionLabelKey = key;
+    coffeeIcon.visible = info.id === 'coffee';
+    parcelIcon.visible = info.id === 'market' || info.id === 'post';
+    flagIcon.visible = info.id === 'tour' || info.id === 'circuit';
+    cleanupIcon.visible = info.id === 'cleanup';
     marker.remove(missionLabel);
     disposeTree(missionLabel);
-    missionLabel = makeLabel(missionStep === 0 ? 'NHẬN CÀ PHÊ' : 'ĐIỂM GIAO HÀNG', '#f6cf71', '#493d23');
+    missionLabel = makeLabel(info.label.toLocaleUpperCase('vi'), '#f6cf71', '#493d23');
     missionLabel.position.y = 7.3;
     marker.add(missionLabel);
+  }
+
+  function handleMissionEvent(event: MissionEvent | null) {
+    if (!event) return;
+    let message = event.message;
+    if (event.reward) {
+      cash += event.reward.cash;
+      state.score += event.reward.score;
+      if (event.reward.delivery) {
+        deliveries++;
+        if (deliveries === 1) message += ' Tiệm súng đã mở cửa cho bạn!';
+      }
+    }
+    notify(message, 5500);
+    setMissionLabel();
+    emitHud(performance.now());
   }
 
   function equip(id: WeaponId) {
@@ -444,20 +481,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   function action() {
     if (!active || playerBody) return;
-    const target = missionStep === 0 ? PICKUP : DELIVERY;
-    if (distance(target) < 6.5) {
-      if (missionStep === 0) {
-        missionStep = 1;
-        notify('Đã nhận cà phê! Giao đến Bưu điện.', 4500);
-      } else {
-        state.score += 50;
-        cash += DELIVERY_PAY;
-        deliveries++;
-        missionStep = 0;
-        notify(deliveries === 1 ? '+100.000đ · Tiệm súng đã mở cửa cho bạn!' : '+50 điểm · +100.000đ · Giao hàng thành công!', 4500);
-      }
-      setMissionLabel();
-      return;
+    const info = missions.view();
+    const needsVehicleChange = (info.requiresOnFoot && state.riding) || (info.requiresBike && !state.riding);
+    const missionEvent = missions.interact({ ...state, down: false });
+    if (missionEvent) {
+      handleMissionEvent(missionEvent);
+      // E must still allow mounting or dismounting at a restricted objective.
+      if (!needsVehicleChange) return;
     }
     if (!state.riding && distance(STORE) < 4.5) {
       onEvent({ type: 'store' });
@@ -518,7 +548,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
   function onKeyUp(event: KeyboardEvent) { setInput(event.key, false); }
   function clearKeys() { keys.clear(); mouseHeld = false; triggerQueued = false; }
-  function onVisibility() { if (document.hidden) clearKeys(); }
+  function onVisibility() { previousTime = performance.now(); if (document.hidden) clearKeys(); }
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
   window.addEventListener('blur', clearKeys);
@@ -746,21 +776,24 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   function emitHud(now: number) {
-    const target = missionStep === 0 ? PICKUP : DELIVERY;
-    const nearMission = distance(target) < 6.5;
+    const missionInfo = missions.view();
+    const nearMission = missionInfo.target !== null && distance(missionInfo.target) <= 6.5;
     const nearBike = !state.riding && Math.hypot(state.x - bikeX, state.z - bikeZ) < 5;
     const nearStore = !state.riding && distance(STORE) < 4.5;
     const hint = now < notificationUntil ? notification
       : playerBody ? 'Đang đứng dậy…'
-      : nearMission ? (missionStep === 0 ? 'Nhấn E để nhận cà phê' : 'Nhấn E để giao cà phê · +100.000đ')
-      : nearStore ? (deliveries ? 'Nhấn E để vào Tiệm súng' : 'Tiệm súng: giao 1 đơn cà phê để mở khóa')
+      : nearMission && missionInfo.requiresOnFoot && state.riding ? 'Giảm tốc rồi nhấn E xuống xe để dọn rác'
+      : nearMission && missionInfo.requiresBike && !state.riding ? 'Đến gần xe máy và nhấn E để lên xe'
+      : nearMission ? missionInfo.objective
+      : nearStore ? (deliveries ? 'Nhấn E để vào Tiệm súng' : 'Tiệm súng: hoàn thành 1 nhiệm vụ giao hàng để mở khóa')
+      : missionInfo.status !== 'active' ? 'Nhấn M để chọn nhiệm vụ mới hoặc chơi lại'
       : state.riding ? 'WASD lái xe · Space phanh · E xuống xe'
       : nearBike ? 'Nhấn E để lên xe máy'
       : weapon !== 'fists' ? 'Click / F bắn · Q đổi vũ khí · Chuột phải xoay camera'
       : 'WASD di chuyển · Shift chạy · E tương tác';
     const hud: Hud = {
       speed: Math.round(velocity * 10) / 10, riding: state.riding, score: state.score,
-      mission: missionStep === 0 ? 'Nhận cà phê ở quán Cô Ba' : 'Giao cà phê đến Bưu điện', missionStep, hint,
+      mission: missionInfo.objective, missionStep: missionInfo.step, missionInfo, hint,
       x: Math.round(state.x * 2) / 2, z: Math.round(state.z * 2) / 2,
       cash, deliveries, weapon, owned: WEAPONS.filter((w) => owned.has(w.id)).map((w) => w.id), down: playerBody !== null,
       fps: monitor.fps, quality: QUALITY_LEVELS[level].label, qualityMode, gpu, softwareGpu,
@@ -850,6 +883,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       triggerQueued = false;
     }
 
+    if (active && !document.hidden) handleMissionEvent(missions.update(Math.max(0, interval / 1000), { ...state, down: playerBody !== null }));
+
     const armed = weapon !== 'fists';
     walker.group.visible = !state.riding && !playerBody;
     walker.group.position.set(state.x, 0.15, state.z);
@@ -869,8 +904,6 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     else scratch.set(state.x, 0, state.z);
     youLabel.position.set(scratch.x, state.riding ? 4.9 : 4.3, scratch.z);
     youLabel.visible = active;
-    const point = missionStep === 0 ? PICKUP : DELIVERY;
-    marker.position.set(point.x, 0, point.z);
     pin.position.y = 4.2 + Math.sin(time * 2.5) * 0.3;
     pin.rotation.y = time * 0.35;
     missionRing.ring.scale.setScalar(1 + Math.sin(time * 2.5) * 0.045);
@@ -933,22 +966,29 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     frame = requestAnimationFrame(update);
   }
+  setMissionLabel();
   emitHud(performance.now());
   frame = requestAnimationFrame(update);
 
   return {
-    setActive(value: boolean) { active = value; clearKeys(); rotating = null; touches.clear(); if (!value) velocity = 0; },
+    setActive(value: boolean) { active = value; previousTime = performance.now(); clearKeys(); rotating = null; touches.clear(); if (!value) velocity = 0; },
     getState(): PlayerState { return { ...state }; },
     setPeers,
     action,
     setInput,
+    selectMission(id: MissionId) {
+      missions.select(id);
+      setMissionLabel();
+      notify(missions.view().objective, 4500);
+      emitHud(performance.now());
+    },
     equip(id: WeaponId) { equip(id); emitHud(performance.now()); },
     cycleWeapon() { cycleWeapon(); emitHud(performance.now()); },
     buyWeapon(id: WeaponId): string | null {
       const def = weaponById(id);
       if (owned.has(id)) { equip(id); emitHud(performance.now()); return null; }
-      if (!deliveries) return 'Hoàn thành ít nhất 1 chuyến giao cà phê để mở khóa Tiệm súng.';
-      if (cash < def.price) return 'Chưa đủ tiền. Giao thêm cà phê để kiếm tiền nhé.';
+      if (!deliveries) return 'Hoàn thành ít nhất 1 nhiệm vụ giao hàng để mở khóa Tiệm súng.';
+      if (cash < def.price) return 'Chưa đủ tiền. Làm thêm nhiệm vụ để kiếm tiền nhé.';
       cash -= def.price;
       owned.add(id);
       equip(id);
@@ -968,7 +1008,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       bikeZ = 10;
       bikeAngle = -2.5;
       velocity = 0;
-      missionStep = 0;
+      missions.reset();
       notificationUntil = 0;
       cash = 0;
       deliveries = 0;
