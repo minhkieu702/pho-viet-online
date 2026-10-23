@@ -7,21 +7,24 @@ Bản thử nghiệm game thế giới mở 3D trên trình duyệt, lấy bối
 - Nhập tên, chọn **Tạo phòng cùng bạn bè** hoặc **Dạo phố một mình**.
 - Gửi link mời hoặc mã phòng 6 ký tự cho người có quyền truy cập trang. Một phòng có tối đa 8 người đang kết nối.
 - **Đi bộ:** WASD / phím mũi tên theo hướng camera, **Shift** chạy.
-- **Lái xe:** **W / S** tiến, lùi · **A / D** rẽ · **Space** phanh. Camera tự xoay ra sau xe khi đang chạy.
-- **E:** lên/xuống xe, cướp ô tô đang chạy, nhận/giao cà phê, vào cửa hàng.
+- **Lái xe (xe máy, ô tô, ngựa):** **W / S** tiến, lùi · **A / D** rẽ · **Space** phanh. Camera tự xoay ra sau xe. Vẫn bắn được khi đang lái (click chuột hoặc F).
+- **E:** lên/xuống xe, cướp ô tô hoặc xe máy đang chạy, nhận/giao cà phê, nhận việc phụ, vào cửa hàng và bệnh viện.
 - **Chuột phải kéo / Z, C:** xoay camera. **Lăn chuột:** zoom. **V:** đặt lại góc nhìn. Điện thoại: kéo một ngón để xoay, chụm hai ngón để zoom.
-- **Click chuột / F:** bắn theo con trỏ (hoặc đấm). **1–4 / Q** đổi vũ khí. **Giữ Tab:** mở túi súng, thời gian chậm lại.
-- Nhận cà phê ở quán Cô Ba, giao cho người nhận đang vẫy tay (6 địa chỉ ngẫu nhiên), mỗi đơn 100.000đ.
-- **Tiệm súng** (ô xanh dương, mở sau đơn đầu tiên): súng lục, súng săn, tiểu liên.
-- **Cửa hàng xe máy** (ô xanh lá): xe số Cub, tay ga, Vespa, xe côn tay và ngựa. Xe hỏng dần khi va chạm hoặc bị bắn, bốc khói rồi chết máy; sửa hoặc mua xe mới tại đây.
-- Ô tô chạy theo làn trên mọi tuyến đường. Người đi đường có máu, thanh máu hiện khi bị đánh; hết máu thì ngã kiểu ragdoll và chảy máu.
-- **Truy nã 1–5 sao:** đánh, bắn, tông người hoặc cướp xe sẽ bị xe cảnh sát truy đuổi. Cảnh sát xuống xe còng tay, vụt dùi cui, từ 2 sao thì nổ súng. Trốn khỏi tầm mắt một lúc để thoát. Bị bắt mất 30% tiền, bị hạ gục mất 20%.
-- **Phòng chung:** người chơi đấm, bắn, tông được nhau; máu, vũ khí, phương tiện và trạng thái gục được đồng bộ qua máy chủ.
+- **Click chuột / F:** bắn theo con trỏ (hoặc đấm). **1–6 / Q** đổi vũ khí. **R** nạp đạn. **Giữ Tab:** túi súng, thời gian chậm lại.
+- **Thành phố:** bản đồ 270 m × 270 m với bệnh viện, đồn công an, trường học, chùa, trạm xe buýt. Có ngày đêm (một ngày bằng 24 phút), nắng, mây, mưa. Ô tô và xe máy chạy theo làn, dừng cho người qua vạch kẻ đường. Có chó, mèo, sóc, chim bồ câu.
+- **Người dân có lịch sinh hoạt:** mỗi người có nhà riêng, sáng bước ra cửa đi làm, đi học, đi chợ; trưa ăn; chiều ra công viên; tối về nhà. Bong bóng thoại hiện điều họ đang nói.
+- **Giao cà phê:** nhận ở quán Cô Ba, giao cho người nhận đang vẫy tay, mỗi đơn 100.000đ. Thêm **20 việc phụ** (chấm vàng trên bản đồ): chở khách, đua xe, tìm mèo, bắt cướp giật, dọn rác công viên, thách đấu băng đảng…
+- **Tiệm súng:** súng lục, súng săn, tiểu liên, súng phóng lựu, bazooka, có đạn và hộp đạn. **Cửa hàng xe máy:** Cub, tay ga, Vespa, xe côn tay, ngựa; xe hỏng dần, bốc cháy rồi nổ.
+- **Cướp:** chĩa súng vào người dân thì họ giơ tay, giữ ngắm thì họ đưa tiền (chủ quán đưa cả két). Hạ ai thì rơi tiền ngẫu nhiên, đi qua để nhặt.
+- **Băng đảng Rắn Đen và Hổ Vàng:** giữ địa bàn; đánh, chĩa súng hay cầm súng lảng vảng ở đó thì cả băng xông vào đánh, giận hơn thì rút súng.
+- **Truy nã 1–5 sao:** cảnh sát ngày càng gắt: dùi cui và súng điện, rồi súng lục, súng săn, SWAT với tiểu liên; rải bẫy đinh làm xịt lốp, lập chốt chặn ở ngã tư, vây bọc và đón đầu. Bị bắt thì ra đồn, bị hạ gục thì tỉnh lại ở bệnh viện sau 5 giây; trả tiền ở bệnh viện để hồi máu.
+- **Ragdoll:** người có khuỷu tay, đầu gối; nổ hay súng săn sát người có thể làm đứt tay chân. Động vật cũng ngã kiểu ragdoll.
+- **Phòng chung:** người chơi đấm, bắn, tông được nhau (và bị truy nã); máu, vũ khí, phương tiện và trạng thái gục được đồng bộ qua máy chủ.
 - Điện thoại có các nút cảm ứng. Trên máy tính nên dùng trình duyệt hỗ trợ WebGL và bật tăng tốc phần cứng.
 
 ## Phạm vi bản thử nghiệm
 
-Có khu phố 3D, va chạm công trình, xe máy cá nhân, nhiệm vụ giao cà phê lặp lại và người chơi khác được đồng bộ qua máy chủ. Phòng dùng HTTP polling khoảng 350 ms cộng thời gian mạng, nội suy hiển thị ở phía trình duyệt; chưa phải máy chủ mô phỏng vật lý có thẩm quyền. Điểm và di chuyển do máy khách gửi, không phù hợp thi đấu có thưởng. Người chơi vắng mặt bị ẩn sau 15 giây, phiên hết hạn sau 30 phút không hoạt động. Tiền, xe, người đi đường, giao thông, cảnh sát và ragdoll chạy riêng trong máy từng người; giữa người chơi chỉ đồng bộ vị trí, máu, vũ khí, phương tiện, sao truy nã và các đòn đánh trúng nhau (máy khách tự báo, không chống gian lận). Chưa có chat hoặc lưu tiến trình dài hạn.
+Có khu phố 3D, va chạm công trình, xe máy cá nhân, nhiệm vụ giao cà phê lặp lại và người chơi khác được đồng bộ qua máy chủ. Phòng dùng HTTP polling khoảng 350 ms cộng thời gian mạng, nội suy hiển thị ở phía trình duyệt; chưa phải máy chủ mô phỏng vật lý có thẩm quyền. Điểm và di chuyển do máy khách gửi, không phù hợp thi đấu có thưởng. Người chơi vắng mặt bị ẩn sau 15 giây, phiên hết hạn sau 30 phút không hoạt động. Tiền, xe, người dân, động vật, giao thông, thời tiết, cảnh sát và ragdoll chạy riêng trong máy từng người; giữa người chơi chỉ đồng bộ vị trí, máu, vũ khí, phương tiện, sao truy nã và các đòn đánh trúng nhau (máy khách tự báo, không chống gian lận). Chưa có chat hoặc lưu tiến trình dài hạn.
 
 ## Deploy lên Cloudflare
 
@@ -30,7 +33,7 @@ Có khu phố 3D, va chạm công trình, xe máy cá nhân, nhiệm vụ giao c
 ## Hiệu năng
 
 - Bóng đổ của khu phố được vẽ một lần (bản đồ tĩnh); nhân vật và xe dùng bóng mờ instanced nên mỗi khung hình không phải vẽ lại shadow map.
-- Gần 50 người đi đường, toàn bộ ô tô, cảnh sát, giọt máu, thanh máu và mây đều là instanced mesh: mỗi nhóm chỉ tốn vài lần vẽ dù phố đông.
+- Người dân, động vật, ô tô, xe máy, cảnh sát, ragdoll, giọt máu, thanh máu, mảnh vỡ và mây đều là instanced mesh: mỗi nhóm chỉ tốn vài lần vẽ dù phố đông. Mưa là một shader, không tốn CPU cho từng giọt.
 - Chế độ **Tự động** đo nhịp khung hình mỗi giây, so với tần số quét màn hình và hạ dần (bóng đổ → độ phân giải → tắt bóng) khi rớt khung, rồi nâng lại khi ổn định.
 - Lần đầu chạy, cấp đồ họa được chọn theo tên GPU (GPU tích hợp, điện thoại hoặc render bằng CPU bắt đầu ở mức nhẹ). Khi trình duyệt tắt tăng tốc phần cứng, game cảnh báo vì WebGL đang chạy trên CPU.
 - FPS bị giới hạn bởi tần số quét màn hình: 120 FPS cần màn hình 120 Hz trở lên.

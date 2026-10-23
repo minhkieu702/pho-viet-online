@@ -1,0 +1,718 @@
+/**
+ * Layout data for the An Hòa neighbourhood: roads, buildings with their doors, places people visit, street
+ * lamps and every collider. Pure and deterministic (seeded), so gameplay, pedestrian routines and the
+ * renderer in world.ts all agree on the same city. No three.js in here.
+ */
+
+export const ROADS = [-108, -54, 0, 54, 108]; // road centre lines on both axes (roads are 20 m wide, asphalt 14 m)
+export const BOUND = 135; // playable half-size
+export const SIDEWALK = 8.4; // pedestrians walk on lines at road centre ± 8.4
+
+export type BuildingKind = 'home' | 'shop' | 'cafe' | 'food' | 'office' | 'school' | 'hospital' | 'police' | 'post' | 'gunstore' | 'bikeshop' | 'pagoda';
+export type Point = { x: number; z: number };
+export type Building = {
+  id: number; x: number; z: number; w: number; d: number; h: number; facing: number;
+  name: string; subtitle: string; kind: BuildingKind; color: string;
+  door: Point; curb: Point; residents: number; jobs: number;
+};
+export type PoiKind = 'park' | 'square' | 'market' | 'cafe-seat' | 'bench' | 'bus-stop' | 'pagoda-yard' | 'school-yard';
+export type Poi = { id: number; kind: PoiKind; x: number; z: number; yaw: number; curb: Point; seat: boolean };
+
+/** Axis-aligned footprint; the same shape as world.ts' Collider. */
+export type Rect = { minX: number; maxX: number; minZ: number; maxZ: number };
+/** Render-only details of a building, parallel to BUILDINGS (same id). */
+export type PlotStyle = 'legacy' | 'home' | 'shop' | 'kiosk' | 'hospital' | 'police' | 'school' | 'pagoda' | 'office';
+export type Plot = {
+  id: number; style: PlotStyle;
+  full: Rect; // upper floors
+  ground: Rect; // ground floor = collider; smaller than `full` where an arcade keeps a walking line clear
+  h: number; facing: number; // visual front (the legacy post office keeps its old +z front, its door is on the west side)
+  legacy: number; // index in the original neighbourhood (canopy colours, balconies), -1 for new buildings
+  sign: boolean; signColor: string; number: number; row: number; seed: number;
+};
+export type TreeSpecies = 'round' | 'layered' | 'tall' | 'flame' | 'palm' | 'bamboo';
+export type Tree = { species: TreeSpecies; x: number; z: number; size: number; spin: number; tint: number };
+export type Lamp = { x: number; z: number; hx: number; hz: number; kind: 'street' | 'post' };
+export type PropKind = 'fountain' | 'stall' | 'fence' | 'wall' | 'pillar' | 'urn' | 'stupa' | 'flagpole' | 'shelter' | 'planter' | 'scooter' | 'cart';
+/** A solid prop: (x, z) centre, sx/sz world-axis collider size, yaw for the model. */
+export type Prop = { kind: PropKind; x: number; z: number; sx: number; sz: number; yaw: number; tint: number };
+export type Seat = { x: number; z: number; yaw: number };
+
+const PI = Math.PI;
+const HALF_PI = PI / 2;
+const ROAD_HALF = 10;
+const PED = 0.45;
+/**
+ * Vertical roads (x = r) end in a T at the riverside road; horizontal roads run the full width. Walking lines
+ * run the full playable width on both axes (across the riverside promenade too).
+ */
+const V_ROAD_START = -108;
+const LINE_VALUES = ROADS.flatMap((r) => [r - SIDEWALK, r + SIDEWALK]);
+
+let seed = 240917;
+function rand() {
+  seed = (seed * 16807) % 2147483647;
+  return (seed - 1) / 2147483646;
+}
+const between = (a: number, b: number) => a + rand() * (b - a);
+const pick = <T>(list: readonly T[]) => list[Math.floor(rand() * list.length)];
+const r2 = (v: number) => Math.round(v * 100) / 100;
+const rectAt = (x: number, z: number, sx: number, sz: number): Rect => ({ minX: x - sx / 2, maxX: x + sx / 2, minZ: z - sz / 2, maxZ: z + sz / 2 });
+/** Unit vector a yaw faces (0 => +z, PI/2 => +x), snapped so axis-aligned yaws are exact. */
+function forward(yaw: number) {
+  return { x: Math.round(Math.sin(yaw) * 1e6) / 1e6, z: Math.round(Math.cos(yaw) * 1e6) / 1e6 };
+}
+function rectDistance(r: Rect, x: number, z: number) {
+  const dx = Math.max(r.minX - x, 0, x - r.maxX);
+  const dz = Math.max(r.minZ - z, 0, z - r.maxZ);
+  return Math.hypot(dx, dz);
+}
+function segmentDistance(x: number, z: number, ax: number, az: number, bx: number, bz: number) {
+  const vx = bx - ax, vz = bz - az;
+  const len2 = vx * vx + vz * vz;
+  const t = len2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * vx + (z - az) * vz) / len2)) : 0;
+  return Math.hypot(x - (ax + vx * t), z - (az + vz * t));
+}
+
+export const COLLIDERS: Rect[] = [];
+
+/** True when a circle of `radius` at (x, z) touches no collider. */
+export function pointClear(x: number, z: number, radius = PED) {
+  for (const c of COLLIDERS) {
+    const nx = Math.max(c.minX, Math.min(c.maxX, x));
+    const nz = Math.max(c.minZ, Math.min(c.maxZ, z));
+    if ((x - nx) ** 2 + (z - nz) ** 2 < radius * radius) return false;
+  }
+  return true;
+}
+
+/** True when a circle of `radius` can slide along the straight segment without touching a collider (sampled every 0.25 m). */
+export function segmentClear(ax: number, az: number, bx: number, bz: number, radius = PED) {
+  const steps = Math.max(1, Math.ceil(Math.hypot(bx - ax, bz - az) / 0.25));
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    if (!pointClear(ax + (bx - ax) * t, az + (bz - az) * t, radius)) return false;
+  }
+  return true;
+}
+
+/** Whether a point on a walking line sits on a crossing (inside another road's band) rather than a sidewalk. */
+function onCrossing(lineAxis: 'h' | 'v', lineCoord: number, along: number) {
+  if (lineAxis === 'h') return lineCoord >= V_ROAD_START && ROADS.some((r) => Math.abs(along - r) < ROAD_HALF);
+  return ROADS.some((r) => Math.abs(along - r) < ROAD_HALF);
+}
+function curbValid(p: Point, lineAxis: 'h' | 'v') {
+  if (Math.abs(p.x) > BOUND || Math.abs(p.z) > BOUND) return false;
+  return lineAxis === 'h' ? !onCrossing('h', p.z, p.x) : !onCrossing('v', p.x, p.z);
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Buildings
+// ---------------------------------------------------------------------------------------------------------
+
+type Axis = 'h' | 'v';
+type Draft = {
+  full: Rect; h: number; facing: number; entrance: number;
+  kind: BuildingKind; name: string; subtitle: string; color: string;
+  style: PlotStyle; legacy: number; sign: boolean; signColor: string; row: number;
+  street: { axis: Axis; road: number; side: number } | null;
+  residents: number; jobs: number; seed: number; cart: boolean;
+};
+const drafts: Draft[] = [];
+let rowCount = 0;
+
+function draft(d: Partial<Draft> & Pick<Draft, 'full' | 'h' | 'facing' | 'kind' | 'name' | 'subtitle' | 'color' | 'style'>) {
+  const item: Draft = {
+    entrance: d.facing, legacy: -1, sign: false, signColor: '#245b4f', row: -1, street: null,
+    residents: 0, jobs: 0, seed: Math.floor(rand() * 1e6), cart: false, ...d,
+  };
+  drafts.push(item);
+  return item;
+}
+
+// The original hand-made neighbourhood, kept at exactly the same coordinates.
+const LEGACY_SHOPS: [string, string, BuildingKind][] = [
+  ['CÀ PHÊ CÔ BA', 'CÀ PHÊ PHIN • TỪ 1998', 'cafe'], ['BÁNH MÌ', 'NÓNG GIÒN MỖI NGÀY', 'food'],
+  ['TẠP HÓA', 'CHUYỆN NHỎ MỖI NGÀY', 'shop'], ['TIỆM HOA', 'MỘT CHÚT TƯƠI VUI', 'shop'],
+  ['PHỞ CÔ BA', 'PHỞ BÒ • PHỞ GÀ', 'food'], ['XE MÁY', 'SỬA XE • THAY NHỚT', 'shop'],
+  ['NHÀ SÁCH', 'SÁCH VÀ NHỮNG GIẤC MƠ', 'shop'], ['BÚN CHẢ', 'BẾP NHÀ • VỊ QUEN', 'food'],
+];
+const LEGACY_COLORS = ['#ddbd84', '#a1beb1', '#d68f76', '#e4d9ba', '#9eb7bd', '#c9b2bb'];
+const LEGACY_X = [-76, -65, -42, -30, -18, 20, 32, 43, 66, 77];
+const LEGACY_ROWS: { z: number; xs: number[]; w: number; height: (i: number) => number; facing: number; cafe?: number }[] = [
+  { z: -18, xs: [-76, -65, -42, -31, -20, 20, 31, 42, 66, 77], w: 9.7, height: (i) => 7.4 + (i % 3) * 3.15, facing: 0, cafe: -31 },
+  { z: 21, xs: LEGACY_X, w: 10, height: (i) => 7.1 + (i % 3) * 2.8, facing: PI, cafe: -30 },
+  { z: -72, xs: LEGACY_X, w: 10, height: (i) => 7.3 + (i % 3) * 2.65, facing: 0 },
+  { z: 74, xs: LEGACY_X, w: 10, height: (i) => 6.6 + (i % 3) * 2.7, facing: PI },
+  { z: -40, xs: [-76, -65, -42, -30, -18, 66, 77], w: 10, height: (i) => 6.8 + (i % 2) * 3, facing: PI },
+  { z: 42, xs: [-76, -65, -42, -30, -18, 66, 77], w: 10, height: (i) => 7.2 + (i % 2) * 3, facing: 0 },
+];
+{
+  let index = 0;
+  for (const row of LEGACY_ROWS) {
+    const rowId = rowCount++;
+    for (const x of row.xs) {
+      const i = index++;
+      const h = row.height(i);
+      const full = rectAt(x, row.z, row.w, 11);
+      const isPost = x === 66 && row.z === -40;
+      const isGun = x === -18 && row.z === 42;
+      const shop = LEGACY_SHOPS[x === row.cafe ? 0 : i % LEGACY_SHOPS.length];
+      let kind = shop[2];
+      if (x === 20 && row.z === -18) kind = 'bikeshop';
+      const base = { full, h, legacy: i, row: rowId, style: 'legacy' as const, sign: true, signColor: i % 3 === 0 ? '#b14635' : '#245b4f' };
+      if (isPost) {
+        // The post office's sign faces +z as before; its door opens west onto the post-office road.
+        draft({ ...base, facing: 0, entrance: -HALF_PI, kind: 'post', name: 'BƯU ĐIỆN', subtitle: 'GỬI MỘT CHÚT THƯƠNG', color: '#dfb16f' });
+      } else if (isGun) {
+        draft({ ...base, facing: row.facing, kind: 'gunstore', name: 'TIỆM SÚNG', subtitle: 'VŨ KHÍ • TRANG BỊ • MỞ CỬA 24/7', color: '#7d8a84', signColor: '#2f4a6b' });
+      } else {
+        draft({ ...base, facing: row.facing, kind, name: shop[0], subtitle: shop[1], color: LEGACY_COLORS[i % LEGACY_COLORS.length] });
+      }
+    }
+  }
+}
+
+// Landmarks in the outer ring.
+const hospital = draft({
+  full: { minX: 120.5, maxX: 135.5, minZ: -42, maxZ: -12 }, h: 13.6, facing: -HALF_PI, kind: 'hospital', style: 'hospital',
+  name: 'BỆNH VIỆN AN HÒA', subtitle: 'CẤP CỨU 24/7 • KHÁM BỆNH • TIÊM CHỦNG', color: '#eef0e8', sign: true, signColor: '#1f6b5c', jobs: 7,
+});
+const police = draft({
+  full: { minX: -133, maxX: -120.5, minZ: -38, maxZ: -16 }, h: 10.4, facing: HALF_PI, kind: 'police', style: 'police',
+  name: 'CÔNG AN PHƯỜNG', subtitle: 'PHƯỜNG AN HÒA • TRỰC BAN 24/7', color: '#e9c46a', sign: true, signColor: '#a8322a', jobs: 5,
+});
+draft({
+  full: { minX: 12, maxX: 42, minZ: 127, maxZ: 137 }, h: 10.6, facing: PI, kind: 'school', style: 'school',
+  name: 'TRƯỜNG TIỂU HỌC', subtitle: 'TRƯỜNG TIỂU HỌC AN HÒA', color: '#f2d58a', sign: true, signColor: '#2c5d8f', jobs: 5,
+});
+draft({
+  full: { minX: -35, maxX: -19, minZ: 127, maxZ: 136 }, h: 9.6, facing: PI, entrance: PI, kind: 'pagoda', style: 'pagoda',
+  name: 'CHÙA AN HÒA', subtitle: 'NAM MÔ A DI ĐÀ PHẬT', color: '#e7b75f', sign: true, signColor: '#8e2b20',
+});
+draft({
+  full: { minX: 120.5, maxX: 134.5, minZ: -94, maxZ: -68 }, h: 26, facing: -HALF_PI, kind: 'office', style: 'office',
+  name: 'VĂN PHÒNG', subtitle: 'TÒA NHÀ AN HÒA • 8 TẦNG', color: '#c9d4d6', sign: true, signColor: '#27455e', jobs: 7,
+});
+draft({
+  full: { minX: -2, maxX: 2, minZ: -124, maxZ: -121 }, h: 3.4, facing: 0, kind: 'food', style: 'kiosk',
+  name: 'NƯỚC MÍA', subtitle: 'MÍA ÉP • DỪA TƯƠI', color: '#e9c873', sign: true, signColor: '#3e7a3a', jobs: 1,
+});
+
+// New rows of tube houses facing the roads, in attached groups with alleys between them.
+const STREETS_H = new Map([[-108, 'ĐƯỜNG BỜ SÔNG'], [-54, 'ĐƯỜNG HOA SỮA'], [0, 'ĐƯỜNG AN HÒA'], [54, 'ĐƯỜNG PHƯỢNG VĨ'], [108, 'ĐƯỜNG CHỢ CŨ']]);
+const STREETS_V = new Map([[-108, 'ĐƯỜNG TRE XANH'], [-54, 'ĐƯỜNG BÀNG LĂNG'], [0, 'ĐƯỜNG TRUNG TÂM'], [54, 'ĐƯỜNG BƯU ĐIỆN'], [108, 'ĐƯỜNG BỆNH VIỆN']]);
+const HOME_COLORS = ['#e9cf8f', '#f0dcae', '#cfe0c8', '#e3b9a3', '#c9d7e3', '#efe6d2', '#d9a6a0', '#bcd0b5', '#f2c47a', '#d7c4dd', '#a9c9c2', '#e6c3a0'];
+const NEW_SHOPS: [string, string, BuildingKind][] = [
+  ['TIỆM MAY', 'MAY ĐO • SỬA ĐỒ', 'shop'], ['QUÁN CƠM', 'CƠM TẤM • CƠM NHÀ', 'food'],
+  ['TIỆM TÓC', 'CẮT • GỘI • SẤY', 'shop'], ['NHÀ THUỐC', 'NHÀ THUỐC TÂY • TƯ VẤN', 'shop'],
+];
+const STALL_NAMES = ['BÚN RIÊU CÔ HAI', 'BÁNH XÈO', 'XÔI SÁNG', 'CHÈ BÀ TƯ', 'HỦ TIẾU GÕ', 'BÁNH CUỐN', 'BÁNH CANH', 'CHÁO LÒNG'];
+let shopIndex = 0;
+let stallIndex = 0;
+
+type RowSpec = { axis: Axis; road: number; side: 1 | -1; from: number; to: number; maxDepth: number; front?: number; shop?: boolean };
+function addRow(spec: RowSpec) {
+  const { axis, road, side, from, to } = spec;
+  const rowId = rowCount++;
+  const frontDist = spec.front ?? 12.5;
+  const len = to - from;
+  const n = Math.max(1, Math.round(len / 9.2));
+  const gaps: number[] = [];
+  for (let k = 0; k < n - 1; k++) gaps.push(rand() < 0.55 ? between(1.8, 2.8) : 0);
+  if (n >= 3 && Math.max(...gaps) === 0) gaps[Math.floor(n / 2) - 1] = 2.2;
+  const free = len - gaps.reduce((a, b) => a + b, 0);
+  const weights = Array.from({ length: n }, () => between(0.8, 1.25));
+  const weightSum = weights.reduce((a, b) => a + b, 0);
+  const widths = weights.map((w) => Math.min(11.5, Math.max(5.5, (free * w) / weightSum)));
+  const used = widths.reduce((a, b) => a + b, 0) + gaps.reduce((a, b) => a + b, 0);
+  let a = from + Math.max(0, len - used) / 2;
+  const facing = axis === 'h' ? (side > 0 ? PI : 0) : (side > 0 ? -HALF_PI : HALF_PI);
+  const street = (axis === 'h' ? STREETS_H : STREETS_V).get(road) ?? 'ĐƯỜNG AN HÒA';
+  const shopAt = spec.shop ? Math.floor(n / 2) : -1;
+  for (let k = 0; k < n; k++) {
+    const w = r2(widths[k]);
+    const d = r2(Math.min(spec.maxDepth, between(9.5, 12)));
+    const front = road + side * frontDist;
+    const back = front + side * d;
+    const lo = r2(a), hi = r2(a + w);
+    const full = axis === 'h'
+      ? { minX: lo, maxX: hi, minZ: Math.min(front, back), maxZ: Math.max(front, back) }
+      : { minX: Math.min(front, back), maxX: Math.max(front, back), minZ: lo, maxZ: hi };
+    const floors = pick([2, 2, 3, 3, 3, 4]);
+    const h = r2(floors * 3.2 + between(0.5, 1.1));
+    const color = pick(HOME_COLORS);
+    const roll = rand();
+    if (k === shopAt) {
+      const [name, subtitle, kind] = NEW_SHOPS[shopIndex++ % NEW_SHOPS.length];
+      draft({ full, h, facing, kind, name, subtitle, color, style: 'shop', sign: true, signColor: pick(['#b14635', '#245b4f', '#7a4b8c', '#2f5d8a']), row: rowId, street: { axis, road, side } });
+    } else if (roll < 0.16) {
+      draft({ full, h, facing, kind: 'food', name: STALL_NAMES[stallIndex++ % STALL_NAMES.length], subtitle: street, color, style: 'home', row: rowId, street: { axis, road, side }, cart: true });
+    } else {
+      draft({ full, h, facing, kind: 'home', name: 'NHÀ', subtitle: street, color, style: 'home', row: rowId, street: { axis, road, side } });
+    }
+    a += w + (gaps[k] ?? 0);
+  }
+}
+const BLOCKS = [[-97, -65], [-43, -11], [11, 43], [65, 97]];
+// Inner blocks: houses facing the riverside road and road 108.
+BLOCKS.forEach(([from, to], i) => addRow({ axis: 'h', road: -108, side: 1, from, to, maxDepth: 11, shop: i === 1 }));
+BLOCKS.forEach(([from, to], i) => addRow({ axis: 'h', road: 108, side: -1, from, to, maxDepth: 11, shop: i === 2 }));
+// The original rows continue to the new outer roads.
+for (const [from, to] of [[-97, -82.8], [83.6, 97]]) {
+  addRow({ axis: 'h', road: 0, side: -1, from, to, maxDepth: 11 });
+  addRow({ axis: 'h', road: 0, side: 1, from, to, maxDepth: 11, front: 15.5 });
+  addRow({ axis: 'h', road: -54, side: -1, from, to, maxDepth: 11 });
+  addRow({ axis: 'h', road: -54, side: 1, from, to, maxDepth: 11 });
+  addRow({ axis: 'h', road: 54, side: -1, from, to, maxDepth: 11 });
+  addRow({ axis: 'h', road: 54, side: 1, from, to, maxDepth: 11, front: 14.5 });
+}
+// Outer strips.
+addRow({ axis: 'v', road: 108, side: 1, from: 11, to: 43, maxDepth: 12.5, shop: true });
+addRow({ axis: 'v', road: 108, side: 1, from: 65, to: 97, maxDepth: 12.5 });
+addRow({ axis: 'v', road: -108, side: -1, from: -97, to: -65, maxDepth: 12.5 });
+addRow({ axis: 'v', road: -108, side: -1, from: 11, to: 43, maxDepth: 12.5, shop: true });
+addRow({ axis: 'v', road: -108, side: -1, from: 65, to: 97, maxDepth: 12.5 });
+addRow({ axis: 'h', road: 108, side: 1, from: -97, to: -65, maxDepth: 12.5 });
+addRow({ axis: 'h', road: 108, side: 1, from: 65, to: 97, maxDepth: 12.5 });
+
+/**
+ * Ground-floor footprint. Where an original house reaches over a walking line, its ground floor is recessed
+ * into an arcade (upper floors overhang) so the sidewalk stays walkable; the door side keeps room for a door.
+ */
+function groundOf(full: Rect, entrance: number): Rect {
+  const g = { ...full };
+  const e = forward(entrance);
+  for (const L of LINE_VALUES) {
+    if (full.minX < L + 0.5 && full.maxX > L - 0.5) {
+      if ((full.minX + full.maxX) / 2 < L) g.maxX = Math.min(g.maxX, L - (e.x > 0.5 ? 1.6 : 0.6), full.maxX - 1.2);
+      else g.minX = Math.max(g.minX, L + (e.x < -0.5 ? 1.6 : 0.6), full.minX + 1.2);
+    }
+    if (full.minZ < L + 0.5 && full.maxZ > L - 0.5) {
+      if ((full.minZ + full.maxZ) / 2 < L) g.maxZ = Math.min(g.maxZ, L - (e.z > 0.5 ? 1.6 : 0.6), full.maxZ - 1.2);
+      else g.minZ = Math.max(g.minZ, L + (e.z < -0.5 ? 1.6 : 0.6), full.minZ + 1.2);
+    }
+  }
+  return g;
+}
+const grounds = drafts.map((d) => groundOf(d.full, d.entrance));
+grounds.forEach((g) => COLLIDERS.push(g));
+
+// ---------------------------------------------------------------------------------------------------------
+// Fixed scenery: the original park, square, market and street trees, plus the new landmarks' grounds.
+// ---------------------------------------------------------------------------------------------------------
+
+const trees: Tree[] = [];
+const props: Prop[] = [];
+const lamps: Lamp[] = [];
+const benches: Seat[] = [];
+const busStops: Seat[] = [];
+
+function addProp(kind: PropKind, x: number, z: number, sx: number, sz: number, yaw = 0, tint = rand()) {
+  props.push({ kind, x, z, sx, sz, yaw, tint });
+  COLLIDERS.push(rectAt(x, z, sx, sz));
+}
+function trunkSize(t: Tree) {
+  return t.species === 'bamboo' ? 1.1 : t.species === 'palm' ? 0.5 : 0.65;
+}
+function addTree(species: TreeSpecies, x: number, z: number, size: number, tint = rand()) {
+  const t = { species, x: r2(x), z: r2(z), size: r2(size), spin: r2(rand() * PI * 2), tint: r2(tint) };
+  trees.push(t);
+  // Beyond the playable edge nothing can bump into a trunk, so skip the collider.
+  if (Math.abs(t.x) > BOUND + 2 || Math.abs(t.z) > BOUND + 2) return;
+  const s = trunkSize(t);
+  COLLIDERS.push(rectAt(t.x, t.z, s, s));
+}
+function addLamp(x: number, z: number, hx: number, hz: number, kind: Lamp['kind'] = 'street') {
+  lamps.push({ x: r2(x), z: r2(z), hx: r2(hx), hz: r2(hz), kind });
+  const s = kind === 'post' ? 0.3 : 0.24;
+  COLLIDERS.push(rectAt(x, z, s, s));
+}
+const insideAnyFull = (x: number, z: number, margin = 0) => drafts.some((d) => rectDistance(d.full, x, z) <= margin);
+
+// Park block: lawn, fountain and trees (legacy positions); two of the old trees are now flame trees.
+const PARK: Rect = { minX: 13, maxX: 43, minZ: -44, maxZ: -22 };
+const SQUARE: Rect = { minX: 14.5, maxX: 43.5, minZ: 29.5, maxZ: 46.5 };
+addProp('fountain', 28, -33, 7, 7);
+([[17, -40, 'round'], [39, -40, 'flame'], [17, -26, 'flame'], [39, -26, 'round']] as const).forEach(([x, z, s]) => addTree(s, x, z, 1.15));
+for (const [x, z] of [[17, 33], [42, 33], [17, 44], [42, 44]]) addTree('palm', x, z, 1);
+benches.push({ x: 22, z: -38, yaw: 0 }, { x: 34, z: -28, yaw: PI }, { x: 35, z: -37, yaw: HALF_PI });
+benches.push({ x: 23, z: 43, yaw: 0 }, { x: 35, z: 43, yaw: 0 }, { x: 42, z: 38, yaw: HALF_PI });
+const CAFE_TABLES: Point[] = [{ x: -39, z: -9.5 }, { x: -26, z: -9.5 }, { x: -38, z: 11 }, { x: -24, z: 11 }];
+for (let i = 0; i < 3; i++) addProp('stall', -42 + i * 11, 32, 4.7, 2.4, 0);
+
+// Original street trees (road + 9.2) and lamps (road - 9.2). The few that stood inside a house are dropped,
+// and the lamp that grew through a café table moves 3 m east.
+for (const road of [-54, 0, 54]) {
+  for (const along of [-81, -61, -42, -16, 18, 43, 68, 84]) {
+    if (ROADS.some((r) => Math.abs(r - along) < 10)) continue;
+    if (!(road === 0 && (along === -42 || along === -16)) && !insideAnyFull(along, road + 9.2)) addTree('round', along, road + 9.2, 0.72);
+    const lx = road === 0 && along === -42 ? along + 6.4 : along + 3.4;
+    if (!insideAnyFull(lx, road - 9.2)) addLamp(lx, road - 9.2, lx + 1.1, road - 9.2);
+  }
+}
+
+// School: yard behind a fence with a wide gate, a flag pole and a flame tree.
+addProp('fence', 16.15, 120, 10.3, 0.3);
+addProp('fence', 37.85, 120, 10.3, 0.3);
+addProp('fence', 11, 123.5, 0.3, 7);
+addProp('fence', 43, 123.5, 0.3, 7);
+addProp('pillar', 21.65, 120, 0.7, 0.7);
+addProp('pillar', 32.35, 120, 0.7, 0.7);
+addProp('flagpole', 38.5, 123.5, 0.3, 0.3);
+addTree('flame', 15.5, 123.6, 1.15);
+// Pagoda: walled yard, three-way gate, bronze urn, stupa and a bodhi tree.
+addProp('wall', -36.5, 120, 9, 0.5);
+addProp('wall', -17.5, 120, 9, 0.5);
+addProp('wall', -41, 128.5, 0.5, 17);
+addProp('wall', -13, 128.5, 0.5, 17);
+addProp('pillar', -31.5, 120, 1, 1);
+addProp('pillar', -22.5, 120, 1, 1);
+addProp('urn', -27, 123.6, 1, 1);
+addProp('stupa', -37.2, 124.6, 2.4, 2.4);
+addTree('round', -17.4, 124.6, 1.35, 0.15);
+// Riverside market stalls on the promenade.
+for (const x of [66, 76, 86]) addProp('stall', x, -124.5, 4.7, 2.4, 0);
+// Bus stops: shelter back panel on the building side of the walking line, bench facing the road.
+function busStop(axis: Axis, road: number, side: 1 | -1, along: number) {
+  const yaw = axis === 'h' ? (side > 0 ? PI : 0) : (side > 0 ? -HALF_PI : HALF_PI);
+  const seat = road + side * 9.95;
+  const back = road + side * 11.1;
+  if (axis === 'h') {
+    busStops.push({ x: along, z: seat, yaw });
+    addProp('shelter', along, back, 4.4, 0.25, yaw);
+  } else {
+    busStops.push({ x: seat, z: along, yaw });
+    addProp('shelter', back, along, 0.25, 4.4, yaw);
+  }
+}
+busStop('h', -108, -1, -76);
+busStop('h', 108, 1, 38);
+busStop('v', 108, 1, -36);
+busStop('v', -108, -1, -19.5);
+// Corner gardens and the promenade.
+const GARDENS: Rect[] = [{ minX: 118.6, maxX: 137, minZ: 118.6, maxZ: 137 }, { minX: -137, maxX: -118.6, minZ: 118.6, maxZ: 137 }];
+addTree('flame', 130, 130, 1.25);
+addTree('flame', -130, 130, 1.25);
+benches.push({ x: 121.6, z: 127.5, yaw: -HALF_PI }, { x: 127.5, z: 121.6, yaw: PI });
+benches.push({ x: -121.6, z: 127.5, yaw: HALF_PI }, { x: -127.5, z: 121.6, yaw: PI });
+const PROMENADE_BENCHES = [-122, -86, -42, -14, 14, 42, 92, 122];
+for (const x of PROMENADE_BENCHES) benches.push({ x, z: -133, yaw: PI });
+for (const x of [-104, -64, -28, 28, 104]) addTree('palm', x, -131, 1);
+// Pagoda and school yards are paved; the promenade runs the whole northern edge.
+const YARDS: Rect[] = [{ minX: -41, maxX: -13, minZ: 120, maxZ: 137 }, { minX: 11, maxX: 43, minZ: 120, maxZ: 137 }];
+
+// ---------------------------------------------------------------------------------------------------------
+// Doors and curbs.
+// ---------------------------------------------------------------------------------------------------------
+
+function findDoor(g: Rect, entrance: number) {
+  const e = forward(entrance);
+  const alongX = Math.abs(e.z) > 0.5;
+  const wall = e.x > 0.5 ? g.maxX : e.x < -0.5 ? g.minX : e.z > 0.5 ? g.maxZ : g.minZ;
+  const lo = alongX ? g.minX : g.minZ, hi = alongX ? g.maxX : g.maxZ;
+  const mid = (lo + hi) / 2, half = (hi - lo) / 2 - 0.9;
+  const dir = alongX ? e.z : e.x;
+  for (const off of [0, 0.8, -0.8, 1.6, -1.6, 2.4, -2.4, 3.2, -3.2, 4, -4, 5, -5, 6, -6]) {
+    if (Math.abs(off) > half) continue;
+    const along = r2(mid + off);
+    const coord = r2(wall + dir * 0.8);
+    const L = LINE_VALUES.filter((v) => (v - coord) * dir > 0.01).sort((a, b) => (a - b) * dir)[0];
+    if (L === undefined) continue;
+    const door = alongX ? { x: along, z: coord } : { x: coord, z: along };
+    const curb = alongX ? { x: along, z: r2(L) } : { x: r2(L), z: along };
+    if (!curbValid(curb, alongX ? 'h' : 'v')) continue;
+    if (pointClear(door.x, door.z) && pointClear(curb.x, curb.z) && segmentClear(door.x, door.z, curb.x, curb.z)) return { door, curb };
+  }
+  return null;
+}
+const doors = drafts.map((d, i) => findDoor(grounds[i], d.entrance));
+
+// ---------------------------------------------------------------------------------------------------------
+// Places to visit.
+// ---------------------------------------------------------------------------------------------------------
+
+type PoiSpec = { kind: PoiKind; x: number; z: number; yaw: number; seat: boolean };
+const poiSpecs: PoiSpec[] = [];
+function seatsOf(b: Seat, kind: PoiKind, spread = 0.65) {
+  const c = Math.cos(b.yaw), s = Math.sin(b.yaw);
+  for (const lx of [-spread, spread]) {
+    poiSpecs.push({ kind, x: r2(b.x + lx * c + 0.12 * s), z: r2(b.z - lx * s + 0.12 * c), yaw: b.yaw, seat: true });
+  }
+}
+benches.forEach((b) => seatsOf(b, 'bench'));
+busStops.forEach((b) => seatsOf(b, 'bus-stop', 0.7));
+for (const t of CAFE_TABLES) {
+  poiSpecs.push({ kind: 'cafe-seat', x: t.x - 1.25, z: t.z, yaw: HALF_PI, seat: true });
+  poiSpecs.push({ kind: 'cafe-seat', x: t.x + 1.25, z: t.z, yaw: -HALF_PI, seat: true });
+}
+for (const x of [-42, -31, -20]) {
+  poiSpecs.push({ kind: 'market', x, z: 29.55, yaw: 0, seat: false });
+  poiSpecs.push({ kind: 'market', x, z: 34.45, yaw: PI, seat: false });
+}
+for (const x of [66, 76, 86]) {
+  poiSpecs.push({ kind: 'market', x, z: -122, yaw: PI, seat: false });
+  poiSpecs.push({ kind: 'market', x: x + 2.95, z: -124.5, yaw: -HALF_PI, seat: false });
+}
+poiSpecs.push(
+  { kind: 'park', x: 28, z: -38.4, yaw: 0, seat: false },
+  { kind: 'park', x: 22.4, z: -31.5, yaw: HALF_PI, seat: false },
+  { kind: 'park', x: 33.6, z: -34.5, yaw: -HALF_PI, seat: false },
+  { kind: 'square', x: 25.5, z: 36.5, yaw: 0.5, seat: false },
+  { kind: 'square', x: 32.5, z: 36.5, yaw: -0.5, seat: false },
+  { kind: 'square', x: 29, z: 41.5, yaw: PI, seat: false },
+  { kind: 'park', x: 124.5, z: 124.5, yaw: PI / 4, seat: false },
+  { kind: 'park', x: -124.5, z: 124.5, yaw: -PI / 4, seat: false },
+  { kind: 'pagoda-yard', x: -27, z: 122.4, yaw: 0, seat: false },
+  { kind: 'pagoda-yard', x: -24.6, z: 125.3, yaw: 0, seat: false },
+  { kind: 'pagoda-yard', x: -30, z: 123.2, yaw: 0.2, seat: false },
+  { kind: 'pagoda-yard', x: -25, z: 121.4, yaw: -0.7, seat: false },
+  { kind: 'school-yard', x: 24.2, z: 122.6, yaw: 1.2, seat: false },
+  { kind: 'school-yard', x: 29.8, z: 122.6, yaw: -1.2, seat: false },
+  { kind: 'school-yard', x: 25.6, z: 124.9, yaw: 2.6, seat: false },
+  { kind: 'school-yard', x: 28.4, z: 124.9, yaw: -2.6, seat: false },
+);
+// People leaning on the river railing.
+for (const x of [-56, -24, 24, 112]) poiSpecs.push({ kind: 'park', x, z: -134.5, yaw: PI, seat: false });
+
+/** Shortest straight, collider-free way from a spot to a walking line. */
+function findCurb(x: number, z: number): Point | null {
+  let best: Point | null = null;
+  let bestLen = Infinity;
+  for (const L of LINE_VALUES) {
+    const options: [Point, 'h' | 'v'][] = [[{ x, z: r2(L) }, 'h'], [{ x: r2(L), z }, 'v']];
+    for (const [curb, axis] of options) {
+      const len = Math.hypot(curb.x - x, curb.z - z);
+      if (len >= bestLen || !curbValid(curb, axis)) continue;
+      if (pointClear(curb.x, curb.z) && segmentClear(curb.x, curb.z, x, z)) {
+        best = curb;
+        bestLen = len;
+      }
+    }
+  }
+  return best;
+}
+const poiCurbs = poiSpecs.map((p) => (pointClear(p.x, p.z) ? findCurb(p.x, p.z) : null));
+
+// Paths people use: door->curb and curb->spot. New scenery keeps clear of them and of the walking lines.
+const segments: [number, number, number, number][] = [];
+doors.forEach((d) => { if (d) segments.push([d.door.x, d.door.z, d.curb.x, d.curb.z]); });
+poiSpecs.forEach((p, i) => { const c = poiCurbs[i]; if (c) segments.push([c.x, c.z, p.x, p.z]); });
+// Hard-coded gameplay spots (spawn, mission pickup, shop rings, delivery receivers) stay uncluttered.
+const KEEP_CLEAR: Point[] = [
+  { x: 12.6, z: 12.4 }, { x: 12.4, z: 14.2 }, { x: -32, z: 7 }, { x: -30, z: 13 }, { x: -18, z: 49.6 }, { x: 20, z: -10.9 },
+  { x: 22.5, z: -10.3 }, { x: 54, z: -35 }, { x: 28, z: -24 }, { x: -36.5, z: 35 }, { x: 36, z: 33 }, { x: -20, z: -83.5 }, { x: 32, z: 13.5 },
+];
+
+/**
+ * Distance from (x, z) to the nearest thing people walk on: a walking line, a door/spot path or a POI.
+ * world.ts uses it to keep soft decoration (shrubs, flowers, puddles) off the paths.
+ */
+export function pathClearance(x: number, z: number) {
+  let best = Infinity;
+  for (const L of LINE_VALUES) {
+    if (Math.abs(x) <= BOUND + 1) best = Math.min(best, Math.abs(z - L));
+    if (Math.abs(z) <= BOUND + 1) best = Math.min(best, Math.abs(x - L));
+  }
+  for (const [ax, az, bx, bz] of segments) best = Math.min(best, segmentDistance(x, z, ax, az, bx, bz));
+  for (const p of poiSpecs) best = Math.min(best, Math.hypot(x - p.x, z - p.z));
+  return best;
+}
+
+/** Whether a solid square of half-size `half` can stand at (x, z) without blocking anything. */
+function spotFree(x: number, z: number, half: number, clearOfFull = 0) {
+  if (pathClearance(x, z) < half + PED + 0.1) return false;
+  for (const c of COLLIDERS) {
+    if (x + half + 0.1 > c.minX && x - half - 0.1 < c.maxX && z + half + 0.1 > c.minZ && z - half - 0.1 < c.maxZ) return false;
+  }
+  if (clearOfFull > 0 && insideAnyFull(x, z, clearOfFull)) return false;
+  if (KEEP_CLEAR.some((p) => Math.hypot(p.x - x, p.z - z) < 2.6)) return false;
+  for (const b of benches) if (Math.hypot(b.x - x, b.z - z) < 2.4) return false;
+  for (const b of busStops) if (Math.hypot(b.x - x, b.z - z) < 3.8) return false;
+  for (const t of CAFE_TABLES) if (Math.hypot(t.x - x, t.z - z) < 3) return false;
+  return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// New street trees and lamps along every road, then shop-front planters, parked scooters and bamboo.
+// ---------------------------------------------------------------------------------------------------------
+
+// Landmark entrances and shop signs stay visible from the street: no street trees right in front of them.
+const SHOWCASE = drafts.flatMap((d, i) => {
+  const door = doors[i];
+  if (!door) return [];
+  const r = ['hospital', 'police', 'office', 'school', 'pagoda', 'kiosk'].includes(d.style) ? 7 : d.style === 'shop' ? 3.2 : 0;
+  return r ? [{ x: door.curb.x, z: door.curb.z, r }] : [];
+});
+function speciesFor(axis: Axis, road: number, side: number): TreeSpecies {
+  if (axis === 'h' && road === -108) return side < 0 ? 'palm' : 'tall';
+  if (Math.abs(road) === 108) return axis === 'h' ? 'layered' : 'tall';
+  if (axis === 'v') return Math.abs(road) === 54 ? 'layered' : 'round';
+  return 'round';
+}
+for (const axis of ['h', 'v'] as Axis[]) {
+  for (const road of ROADS) {
+    for (const side of [-1, 1]) {
+      const legacyRoad = axis === 'h' && Math.abs(road) <= 54;
+      const promenade = axis === 'h' && road === -108 && side < 0;
+      const species = speciesFor(axis, road, side);
+      const start = axis === 'v' ? V_ROAD_START + ROAD_HALF + 2 : -196;
+      let lastTree = -Infinity;
+      // Lamps are staggered between the two sides of a road.
+      let lastLamp = side > 0 ? -Infinity : start - 14;
+      for (let along = start; along <= 196; along += 1) {
+        if (legacyRoad && Math.abs(along) <= 88) continue;
+        // No crossing roads on the river side of the riverside road; everywhere else keep junctions open.
+        if (!promenade && ROADS.some((r) => Math.abs(along - r) < 12)) continue;
+        const beyond = Math.abs(along) > BOUND + 3;
+        const offset = promenade ? 9.6 : 9.4;
+        const tx = axis === 'h' ? along : road + side * offset;
+        const tz = axis === 'h' ? road + side * offset : along;
+        const half = species === 'palm' ? 0.25 : 0.33;
+        const showcase = SHOWCASE.some((p) => Math.hypot(p.x - tx, p.z - tz) < p.r);
+        if (along - lastTree >= (promenade ? 15 : 13.5) && !showcase && (beyond ? !insideAnyFull(tx, tz, 1.4) : spotFree(tx, tz, half, 1.4))) {
+          addTree(species, tx, tz, between(0.68, 0.86));
+          lastTree = along;
+          continue;
+        }
+        const lampOffset = 9.3;
+        const lx = axis === 'h' ? along : road + side * lampOffset;
+        const lz = axis === 'h' ? road + side * lampOffset : along;
+        if (!beyond && along - lastLamp >= 28 && along - lastTree >= 5 && spotFree(lx, lz, 0.12, 0.5)) {
+          const hx = axis === 'h' ? lx : lx - side * 1.1;
+          const hz = axis === 'h' ? lz - side * 1.1 : lz;
+          addLamp(lx, lz, hx, hz);
+          lastLamp = along;
+        }
+      }
+    }
+  }
+}
+// Decorative lamp posts on the promenade, in the park, the square, the yards and gardens.
+for (let x = -130; x <= 130; x += 13) if (spotFree(x, -127.5, 0.2)) addLamp(x, -127.5, x, -127.5, 'post');
+for (const [x, z] of [[14.2, -43], [41.8, -43], [14.2, -23.5], [15.6, 30.6], [42.4, 30.6], [12.2, 126.2], [41.8, 126.2], [-39.8, 126.2], [-14.2, 126.2], [133, 121], [-133, 121]]) {
+  if (spotFree(x, z, 0.2)) addLamp(x, z, x, z, 'post');
+}
+
+// Flower planters, parked scooters and street-food carts in front of houses.
+drafts.forEach((d, i) => {
+  const door = doors[i];
+  if (!door || d.style === 'hospital' || d.style === 'school' || d.style === 'pagoda' || d.style === 'office' || d.style === 'kiosk') return;
+  const g = grounds[i];
+  const e = forward(d.entrance);
+  const alongX = Math.abs(e.z) > 0.5;
+  const wall = e.x > 0.5 ? g.maxX : e.x < -0.5 ? g.minX : e.z > 0.5 ? g.maxZ : g.minZ;
+  const lo = alongX ? g.minX : g.minZ, hi = alongX ? g.maxX : g.maxZ;
+  const doorAlong = alongX ? door.door.x : door.door.z;
+  const place = (kind: PropKind, along: number, out: number, sAlong: number, sOut: number) => {
+    const coord = wall + (alongX ? e.z : e.x) * out;
+    const x = alongX ? along : coord, z = alongX ? coord : along;
+    const sx = alongX ? sAlong : sOut, sz = alongX ? sOut : sAlong;
+    if (Math.abs(along - doorAlong) < sAlong / 2 + 1.7) return false;
+    if (!spotFree(x, z, Math.max(sx, sz) / 2)) return false;
+    addProp(kind, r2(x), r2(z), sx, sz, d.entrance);
+    return true;
+  };
+  if (d.cart) {
+    const first = rand() < 0.5 ? -1 : 1;
+    if (!place('cart', doorAlong + first * 2.9, 1.3, 1.9, 1.0)) place('cart', doorAlong - first * 2.9, 1.3, 1.9, 1.0);
+  }
+  const roll = rand();
+  if (d.legacy < 0 && roll < 0.7) place('planter', lo + 0.75, 0.35, 1.1, 0.5);
+  if (d.legacy < 0 && roll > 0.35) place('planter', hi - 0.75, 0.35, 1.1, 0.5);
+  const bikes = d.legacy >= 0 ? (rand() < 0.45 ? 2 : 0) : rand() < 0.55 ? 1 + Math.floor(rand() * 3) : 0;
+  for (let k = 0; k < bikes; k++) place('scooter', between(lo + 0.6, hi - 0.6), 1.45, 0.62, 1.75);
+});
+
+// Bamboo clumps in the back alleys between rows of houses.
+for (const z of [-81.2, -29, 31.5, 82.2]) {
+  for (let x = -128; x <= 128; x += 9) {
+    const bx = x + between(-2.5, 2.5);
+    if (rand() < 0.32 && ROADS.every((r) => Math.abs(bx - r) > 11) && rectDistance(PARK, bx, z) > 1.5 && rectDistance(SQUARE, bx, z) > 1.5 && spotFree(bx, z, 0.6, -1) && !insideAnyFull(bx, z, 0.4)) {
+      addTree('bamboo', bx, z, between(0.85, 1.15));
+    }
+  }
+}
+for (let z = -95; z <= 95; z += 10) {
+  for (const x of [-137.5, 137.5]) if (rand() < 0.35 && spotFree(x, z, 0.6, -1) && !insideAnyFull(x, z, 0.4)) addTree('bamboo', x, z, between(0.9, 1.2));
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// Final data.
+// ---------------------------------------------------------------------------------------------------------
+
+/** House numbers along each street: odd on one side, even on the other. */
+const numbers = new Map<number, number>();
+{
+  const byStreet = new Map<string, number[]>();
+  drafts.forEach((d, i) => {
+    if (!d.street) return;
+    const key = `${d.street.axis}:${d.street.road}:${d.street.side}`;
+    if (!byStreet.has(key)) byStreet.set(key, []);
+    byStreet.get(key)!.push(i);
+  });
+  for (const [key, list] of byStreet) {
+    const axis = key[0];
+    list.sort((a, b) => (axis === 'h' ? drafts[a].full.minX - drafts[b].full.minX : drafts[a].full.minZ - drafts[b].full.minZ));
+    const odd = key.endsWith(':-1');
+    list.forEach((i, k) => numbers.set(i, k * 2 + (odd ? 1 : 2) + (Math.abs(drafts[i].street!.road) === 108 ? 40 : 0)));
+  }
+}
+
+// Residents (~70) and jobs (~50) across the city.
+{
+  const homes = drafts.filter((d) => d.kind === 'home');
+  homes.forEach((d) => { d.residents = 1; });
+  const shops = drafts.filter((d) => ['shop', 'cafe', 'food', 'bikeshop'].includes(d.kind) && d.style !== 'kiosk');
+  let extra = 70 - homes.length;
+  const families = homes.filter((_, k) => k % 5 === 2);
+  for (const d of families) if (extra > 8) { d.residents = 2; extra--; }
+  for (let k = 0; k < shops.length && extra > 0; k += 2) { shops[k].residents = 1; extra--; }
+  for (let k = 1; k < shops.length && extra > 0; k += 2) { shops[k].residents = 1; extra--; }
+  const fixed: [BuildingKind, number][] = [['post', 2], ['gunstore', 1], ['bikeshop', 1]];
+  for (const [kind, jobs] of fixed) drafts.filter((d) => d.kind === kind).forEach((d) => { d.jobs = jobs; });
+  // The two Cô Ba cafés that the delivery mission uses are the busiest.
+  drafts.filter((d) => d.kind === 'cafe' && d.legacy >= 0 && (d.legacy === 3 || d.legacy === 13)).forEach((d) => { d.jobs = 2; });
+  let jobs = drafts.reduce((sum, d) => sum + d.jobs, 0);
+  const employers = drafts.filter((d) => ['shop', 'cafe', 'food'].includes(d.kind) && d.jobs === 0);
+  for (let k = 0; k < employers.length && jobs < 50; k += 2) { employers[k].jobs = 1; jobs++; }
+  for (let k = 1; k < employers.length && jobs < 50; k += 2) { employers[k].jobs = 1; jobs++; }
+}
+
+export const BUILDINGS: Building[] = [];
+export const PLOTS: Plot[] = [];
+drafts.forEach((d, i) => {
+  const door = doors[i];
+  if (!door) throw new Error(`city: no door for building ${i} (${d.name})`);
+  const f = d.full;
+  const sideways = Math.abs(forward(d.entrance).x) > 0.5;
+  const sx = f.maxX - f.minX, sz = f.maxZ - f.minZ;
+  const number = numbers.get(i) ?? 0;
+  const id = BUILDINGS.length;
+  BUILDINGS.push({
+    id, x: r2((f.minX + f.maxX) / 2), z: r2((f.minZ + f.maxZ) / 2), w: r2(sideways ? sz : sx), d: r2(sideways ? sx : sz), h: d.h,
+    facing: d.entrance, name: d.kind === 'home' ? `NHÀ SỐ ${number}` : d.name, subtitle: d.kind === 'home' || d.cart ? `${number} ${d.subtitle}` : d.subtitle,
+    kind: d.kind, color: d.color, door: door.door, curb: door.curb, residents: d.residents, jobs: d.jobs,
+  });
+  PLOTS.push({ id, style: d.style, full: f, ground: grounds[i], h: d.h, facing: d.facing, legacy: d.legacy, sign: d.sign, signColor: d.signColor, number, row: d.row, seed: d.seed });
+});
+
+export const POIS: Poi[] = [];
+poiSpecs.forEach((p, i) => {
+  const curb = poiCurbs[i];
+  if (!curb) throw new Error(`city: no curb for ${p.kind} at ${p.x}, ${p.z}`);
+  POIS.push({ id: POIS.length, kind: p.kind, x: p.x, z: p.z, yaw: p.yaw, curb, seat: p.seat });
+});
+
+export const LAMPS: Point[] = lamps.map((l) => ({ x: l.hx, z: l.hz }));
+export const LANDMARKS: { hospital: Point; police: Point } = {
+  hospital: { ...BUILDINGS[drafts.indexOf(hospital)].door },
+  police: { ...BUILDINGS[drafts.indexOf(police)].door },
+};
+
+/** Everything world.ts draws that is not a building; solid items here are already in COLLIDERS. */
+export const SCENERY = {
+  trees, lamps, props, benches, busStops, tables: CAFE_TABLES,
+  park: PARK, square: SQUARE, gardens: GARDENS, yards: YARDS,
+  promenade: { minX: -200, maxX: 200, minZ: -136.5, maxZ: -118 } as Rect,
+};

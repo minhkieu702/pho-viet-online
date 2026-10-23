@@ -14,15 +14,17 @@ export type BikeDef = {
 };
 
 export const BIKES: BikeDef[] = [
-  { id: 'cub', name: 'Xe số Cub', price: 60, top: 17, reverse: 4, accel: 1.7, turn: 2.9, health: 80, color: '#4f86c6', description: 'Rẻ, bốc, luồn lách giỏi nhưng mau hỏng.' },
-  { id: 'scooter', name: 'Xe tay ga', price: 90, top: 19, reverse: 4, accel: 1.4, turn: 2.6, health: 100, color: '#ed763e', description: 'Chiếc xe quen thuộc của cả khu phố.' },
-  { id: 'vespa', name: 'Vespa cổ', price: 220, top: 21, reverse: 4, accel: 1.5, turn: 2.5, health: 140, color: '#86b8a0', description: 'Vỏ thép dày, chịu va chạm tốt.' },
-  { id: 'horse', name: 'Ngựa', price: 300, top: 15, reverse: 2.5, accel: 1.9, turn: 3.4, health: 130, color: '#7a4e2e', description: 'Không cần xăng, rẽ cực gắt, phi nước đại khắp phố.' },
-  { id: 'sport', name: 'Xe côn tay', price: 450, top: 27, reverse: 4, accel: 2.1, turn: 2.4, health: 110, color: '#c9493b', description: 'Nhanh nhất phố, tăng tốc cực mạnh.' },
+  { id: 'cub', name: 'Xe số Cub', price: 60, top: 17, reverse: 4, accel: 1.7, turn: 2.2, health: 80, color: '#4f86c6', description: 'Rẻ, bốc, luồn lách giỏi nhưng mau hỏng.' },
+  { id: 'scooter', name: 'Xe tay ga', price: 90, top: 19, reverse: 4, accel: 1.4, turn: 2.0, health: 100, color: '#ed763e', description: 'Chiếc xe quen thuộc của cả khu phố.' },
+  { id: 'vespa', name: 'Vespa cổ', price: 220, top: 21, reverse: 4, accel: 1.5, turn: 1.9, health: 140, color: '#86b8a0', description: 'Vỏ thép dày, chịu va chạm tốt.' },
+  { id: 'horse', name: 'Ngựa', price: 300, top: 15, reverse: 2.5, accel: 1.9, turn: 2.5, health: 130, color: '#7a4e2e', description: 'Không cần xăng, rẽ cực gắt, phi nước đại khắp phố.' },
+  { id: 'sport', name: 'Xe côn tay', price: 450, top: 27, reverse: 4, accel: 2.1, turn: 1.8, health: 110, color: '#c9493b', description: 'Nhanh nhất phố, tăng tốc cực mạnh.' },
 ];
 
-export const CAR_STATS = { top: 26, reverse: 7, accel: 1.1, turn: 1.7 };
-export const POLICE_CAR_STATS = { top: 30, reverse: 8, accel: 1.3, turn: 1.8 };
+// Cars steer as readily as a bike at town speeds; they just accelerate a little slower.
+export const CAR_STATS = { top: 26, reverse: 7, accel: 1.4, turn: 1.9 };
+export const POLICE_CAR_STATS = { top: 30, reverse: 8, accel: 1.6, turn: 2.0 };
+export const MOTO_STATS = { top: 18, reverse: 4, accel: 1.5, turn: 2.0 };
 
 export function bikeById(id: BikeId) {
   return BIKES.find((bike) => bike.id === id) ?? BIKES[1];

@@ -52,8 +52,35 @@ export function playShot(id: WeaponId) {
   if (id === 'pistol') burst(0.2, 2600, 0.45, 150);
   else if (id === 'shotgun') burst(0.45, 1500, 0.7, 90);
   else if (id === 'smg') burst(0.12, 3200, 0.28, 170);
+  else if (id === 'grenade') burst(0.3, 700, 0.5, 95);
+  else if (id === 'rpg') burst(0.7, 1800, 0.55, 60);
 }
 
 export function playThud() {
   burst(0.16, 500, 0.5, 70);
+}
+
+export function playBoom() {
+  burst(1.1, 900, 0.95, 55);
+}
+
+let rainSource: AudioBufferSourceNode | null = null;
+let rainGain: GainNode | null = null;
+/** A looping filtered-noise hiss whose volume follows the rain (0..1). */
+export function setRain(level: number) {
+  if (!context || !noise || context.state !== 'running') return;
+  if (!rainSource && level > 0.02) {
+    rainSource = context.createBufferSource();
+    rainSource.buffer = noise;
+    rainSource.loop = true;
+    const filter = context.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 2400;
+    filter.Q.value = 0.4;
+    rainGain = context.createGain();
+    rainGain.gain.value = 0;
+    rainSource.connect(filter).connect(rainGain).connect(context.destination);
+    rainSource.start();
+  }
+  if (rainGain) rainGain.gain.setTargetAtTime(level * 0.12, context.currentTime, 0.5);
 }

@@ -40,8 +40,6 @@ export function createSky(scene: THREE.Scene) {
   const sunMaterial = new THREE.SpriteMaterial({ map: sunTexture, fog: false, depthWrite: false, transparent: true });
   const sun = new THREE.Sprite(sunMaterial);
   sun.scale.setScalar(70);
-  // Matches the direction of the scene's directional light.
-  const sunDirection = new THREE.Vector3(-42, 75, 20).normalize();
   root.add(sun);
 
   const cloudCanvas = document.createElement('canvas');
@@ -74,9 +72,18 @@ export function createSky(scene: THREE.Scene) {
   const size = new THREE.Vector3();
 
   return {
-    update(camera: THREE.Camera, time: number) {
+    /**
+     * `sunDirection` is the normalised direction toward the sun (matches the directional light),
+     * `tint` multiplies the dome colours (dusk, night, rain) and `cover` 0..1 thickens and greys the clouds.
+     */
+    update(camera: THREE.Camera, time: number, sunDirection: THREE.Vector3, tint: THREE.Color, cover: number, sunGlow: number) {
       root.position.set(camera.position.x, 0, camera.position.z);
       sun.position.copy(sunDirection).multiplyScalar(240);
+      sun.visible = sunDirection.y > -0.08 && sunGlow > 0.02;
+      sunMaterial.opacity = sunGlow;
+      domeMaterial.color.copy(tint);
+      cloudMaterial.color.copy(tint).lerp(new THREE.Color('#6d7378'), cover * 0.6);
+      cloudMaterial.opacity = 0.55 + cover * 0.4;
       cloudData.forEach((cloud, i) => {
         // Clouds drift slowly and wrap around the dome.
         const x = ((cloud.x + time * 1.6 + 250) % 500 + 500) % 500 - 250;
