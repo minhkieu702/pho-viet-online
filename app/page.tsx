@@ -1,13 +1,14 @@
 "use client";
 import {useEffect,useRef,useState} from 'react';
 import {ArrowUpRight,Bike,Check,ChevronRight,ClipboardList,Clock3,Coffee,Copy,Crosshair,Cpu,DoorOpen,Expand,Flag,Gauge,Heart,HelpCircle,Lock,MapPin,Navigation,Plus,Radio,RotateCcw,Siren,Store,Users,Wallet,Wrench,X} from 'lucide-react';
-import type {Hud,IncomingHit,PeerState} from './game/game';
+import type {Hud,PeerState} from './game/game';
+import {connectRoom} from './game/room-connection';
+import type {Session} from '../lib/multiplayer-protocol';
 import {BIKES,bikeById,repairCost,type BikeId} from './game/bikes';
 import type {QualityMode} from './game/quality';
 import {WEAPONS,formatCash,type WeaponId} from './game/weapons';
 import {MISSION_DEFS,createMissions,type MissionId,type MissionView} from './game/missions';
 type Engine=ReturnType<typeof import('./game/game')['createGame']>;
-type Session={room:string;id:string;token:string};
 const QUALITY_OPTIONS:[QualityMode,string,string][]=[['auto','Tự động','Tự hạ/tăng để giữ khung hình mượt'],['high','Cao','Bóng đổ nét, độ phân giải đầy đủ'],['medium','Cân bằng','Bóng đổ nhẹ hơn, phân giải vừa'],['low','Hiệu năng','Tắt bóng đổ, ưu tiên 120 FPS máy yếu']];
 function savedQuality():QualityMode{try{const v=localStorage.getItem('pvo-quality');return QUALITY_OPTIONS.some(([k])=>k===v)?v as QualityMode:'auto';}catch{return 'auto';}}
 const MISSION_KINDS:Record<MissionId,string>={coffee:'Giao hàng',market:'Giao hàng',post:'Giao nhiều điểm',tour:'Khám phá',cleanup:'Dọn phố',circuit:'Thử thách xe máy'};
@@ -37,8 +38,25 @@ useEffect(()=>{game.current?.setActive(active&&!help&&!storeOpen&&!bikeShopOpen&
 useEffect(()=>{weaponRef.current=hud.weapon;},[hud.weapon]);
 useEffect(()=>{const shortcuts=(event:KeyboardEvent)=>{const target=event.target;if(target instanceof HTMLElement&&target.closest('input,textarea,select,[contenteditable="true"]'))return;if(event.key==='Escape'){setMissionsOpen(false);setStoreOpen(false);setBikeShopOpen(false);setHelp(false);setSettingsOpen(false);}else if(active&&!help&&!storeOpen&&!bikeShopOpen&&!bagOpen&&!event.repeat&&!event.ctrlKey&&!event.metaKey&&!event.altKey&&(event.code==='KeyM'||event.key.toLowerCase()==='m')){event.preventDefault();setSettingsOpen(false);setMissionsOpen(value=>!value);}};window.addEventListener('keydown',shortcuts);return()=>window.removeEventListener('keydown',shortcuts);},[active,help,storeOpen,bikeShopOpen,bagOpen]);
 useEffect(()=>{sessionRef.current=session;},[session]);
-useEffect(()=>{const leave=()=>{const s=sessionRef.current;if(s)navigator.sendBeacon('/api/room',new Blob([JSON.stringify({action:'leave',...s})],{type:'application/json'}));};window.addEventListener('pagehide',leave);return()=>window.removeEventListener('pagehide',leave);},[]);
-useEffect(()=>{if(!session){game.current?.setPeers([]);setPeers([]);return;}let cancelled=false,timer:ReturnType<typeof setTimeout>,request:AbortController|null=null,failures=0;const sync=async()=>{const start=performance.now();request=new AbortController();const timeout=setTimeout(()=>request?.abort(),6000);try{const response=await fetch('/api/room',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'sync',...session,state:game.current?.getState(),hits:game.current?.takeHits()??[]}),signal:request.signal});const data=await response.json() as {error?:string;room:string;id:string;token:string;peers:PeerState[];hits?:IncomingHit[]};if(cancelled)return;if(!response.ok){if([401,403,404,409,410].includes(response.status)){setError(data.error||'Phiên đã hết hạn. Hãy vào lại phòng.');setSession(null);return;}throw new Error(data.error);}failures=0;setConnection('Đã kết nối');setLatency(Math.round(performance.now()-start));setPeers(data.peers);game.current?.setPeers(data.peers);if(data.hits?.length)game.current?.receiveHits(data.hits);}catch{if(cancelled)return;failures++;setConnection('Đang kết nối lại…');if(failures>=3){setPeers([]);game.current?.setPeers([]);}}finally{clearTimeout(timeout);if(!cancelled)timer=setTimeout(sync,failures?1500:350);}};sync();return()=>{cancelled=true;clearTimeout(timer);request?.abort();};},[session]);
+useEffect(()=>{const leave=(event:PageTransitionEvent)=>{const s=sessionRef.current;if(s&&!event.persisted)navigator.sendBeacon('/api/room',new Blob([JSON.stringify({action:'leave',...s})],{type:'application/json'}));};window.addEventListener('pagehide',leave);return()=>window.removeEventListener('pagehide',leave);},[]);
+useEffect(()=>{
+  if(!session){game.current?.setPeers([]);setPeers([]);return;}
+  let lastHudUpdate=-Infinity;
+  const room=connectRoom(session,location.href,{
+    getState:()=>game.current?.getState(),
+    takeHits:()=>game.current?.takeHits()??[],
+    onPeers:(next,serverTime)=>{
+      game.current?.setPeers(next,serverTime);
+      const now=performance.now();
+      if(!next.length||now-lastHudUpdate>=200){setPeers(next);lastHudUpdate=now;}
+    },
+    onHits:hits=>game.current?.receiveHits(hits),
+    onStatus:status=>{setConnection(status==='connected'?'Đã kết nối':'Đang kết nối lại…');if(status!=='connected')setLatency(0);},
+    onLatency:setLatency,
+    onFatal:message=>{setError(message);setSession(null);},
+  });
+  return()=>{room.dispose();game.current?.setPeers([]);};
+},[session]);
 async function enter(action:'create'|'join'){setPending(true);setError('');try{const response=await fetch('/api/room',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,name:name.trim()||'Khách qua phố',...(action==='join'?{code}:{} )}),signal:AbortSignal.timeout(12000)});const data=await response.json() as {error?:string;room:string;id:string;token:string;peers:PeerState[]};if(!response.ok)throw new Error(data.error||'Chưa thể vào phòng. Hãy thử lại.');game.current?.reset();game.current?.setActive(true);setSession({room:data.room,id:data.id,token:data.token});setActive(true);setPeers(data.peers||[]);}catch(e){setError(e instanceof Error?e.message:'Không thể kết nối máy chủ.');}finally{setPending(false);}}
 function setQuality(mode:QualityMode){game.current?.setQuality(mode);try{localStorage.setItem('pvo-quality',mode);}catch{}}
 function buyBike(id:BikeId){setBikeMessage(game.current?.buyBike(id)??'');}

@@ -11,15 +11,11 @@ import { createVehicles, makeCarMesh, CAR_HEALTH, POLICE_CAR_HEALTH, type Car } 
 import { createPolice } from './police';
 import { createSky, HORIZON } from './sky';
 import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuName, isSoftwareGpu, type QualityMode } from './quality';
+import { createPeerInterpolator, createSnapshotClock } from './peer-interpolation';
+import type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
 
 export type VehicleKind = 'foot' | 'scooter' | 'car' | 'police';
-export type PlayerState = {
-  x: number; z: number; angle: number; riding: boolean; speed: number; score: number;
-  health?: number; weapon?: WeaponId; vehicle?: VehicleKind; down?: boolean; firing?: boolean; wanted?: number;
-};
-export type PeerState = PlayerState & { id: string; name: string; color: string };
-export type OutgoingHit = { target: string; damage: number; dx: number; dz: number };
-export type IncomingHit = { attacker: string; name: string; damage: number; dx: number; dz: number };
+export type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
 export type Hud = {
   speed: number; riding: boolean; score: number; mission: string; missionStep: number; missionInfo: MissionView; hint: string; x: number; z: number;
   cash: number; deliveries: number; weapon: WeaponId; owned: WeaponId[]; down: boolean; fps: number; quality: string; qualityMode: QualityMode;
@@ -321,6 +317,7 @@ type Peer = {
   guns: Map<WeaponId, THREE.Group>;
   label: THREE.Sprite;
   target: PeerState;
+  motion: ReturnType<typeof createPeerInterpolator>;
   name: string;
   color: string;
   body: RagdollBody | null;
@@ -489,6 +486,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   for (const object of [marker, storeRing.group, bikeShopRing.group]) object.traverse((o) => { o.castShadow = false; });
 
   const peers = new Map<string, Peer>();
+  const peerClock = createSnapshotClock();
   const state: PlayerState = { x: START.x, z: START.z, angle: Math.PI / 2, riding: false, speed: 0, score: 0 };
   let bikeX = BIKE_START.x;
   let bikeZ = BIKE_START.z;
@@ -992,7 +990,16 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     peers.delete(id);
   }
 
-  function setPeers(nextPeers: PeerState[]) {
+  function setPeers(nextPeers: PeerState[], serverTime?: number) {
+    if (!nextPeers.length) {
+      for (const [id, peer] of peers) removePeer(id, peer);
+      peerClock.reset();
+      return;
+    }
+    const receivedAt = performance.now();
+    // Untimestamped callers still work, using the same local monotonic domain.
+    const snapshotTime = serverTime ?? receivedAt;
+    if (!peerClock.observe(snapshotTime, receivedAt)) return;
     const incomingIds = new Set(nextPeers.map((p) => p.id));
     for (const [id, peer] of peers) if (!incomingIds.has(id)) removePeer(id, peer);
     for (const peer of nextPeers) {
@@ -1025,9 +1032,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         peerBike.group.rotation.y = peer.angle;
         group.traverse((o) => { o.castShadow = false; });
         scene.add(group);
-        existing = { group, foot, bike: peerBike, car: null, carKind: 'foot', guns: peerGuns, label, target: { ...peer }, name: peer.name, color: peer.color, body: null, flashAt: 0, hurtAt: -99, predicted: 0 };
+        existing = { group, foot, bike: peerBike, car: null, carKind: 'foot', guns: peerGuns, label, target: { ...peer }, motion: createPeerInterpolator(), name: peer.name, color: peer.color, body: null, flashAt: 0, hurtAt: -99, predicted: 0 };
         peers.set(peer.id, existing);
       }
+      if (!existing.motion.push(peer, snapshotTime)) continue;
       // A fresh health report replaces our local damage prediction.
       if (existing.target.health !== peer.health) existing.predicted = 0;
       existing.target = { ...peer };
@@ -1370,15 +1378,17 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     return moving;
   }
 
-  function updatePeers(dt: number, now: number, time: number) {
+  function updatePeers(now: number, time: number) {
+    const renderTime = peerClock.renderTime(now);
     for (const [, peer] of peers) {
       const { target } = peer;
-      const blend = 1 - Math.exp(-dt * 12);
-      peer.group.position.x = THREE.MathUtils.lerp(peer.group.position.x, target.x, blend);
-      peer.group.position.z = THREE.MathUtils.lerp(peer.group.position.z, target.z, blend);
+      const pose = peer.motion.sample(renderTime);
+      if (!pose) continue;
+      peer.group.position.x = pose.x;
+      peer.group.position.z = pose.z;
       const { x, z } = peer.group.position;
       peer.group.position.y = groundHeight(x, z) - 0.02;
-      peer.foot.group.rotation.y = angleLerp(peer.foot.group.rotation.y, target.angle, blend);
+      peer.foot.group.rotation.y = pose.angle;
       peer.bike.group.rotation.y = peer.foot.group.rotation.y;
       const kind = peerVehicle(peer);
       if ((kind === 'car' || kind === 'police') && peer.carKind !== kind) {
@@ -1405,7 +1415,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       peer.label.position.y = kind === 'car' || kind === 'police' ? 3.1 : 2.6;
       const armed = target.weapon && target.weapon !== 'fists';
       for (const [id, gun] of peer.guns) gun.visible = id === target.weapon;
-      const peerStride = target.speed > 1 ? Math.sin(time * 10) * 0.55 : 0;
+      const peerStride = Math.abs(pose.speed) > 1 ? Math.sin(time * 10) * 0.55 : 0;
       peer.foot.limbLeft.rotation.x = peerStride;
       peer.foot.limbRight.rotation.x = -peerStride;
       peer.foot.armRight.rotation.x = armed ? -Math.PI / 2 : -peerStride * 0.7;
@@ -1554,7 +1564,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         if (Math.abs(car.speed) > 2) ragdolls.push(car.x + Math.sin(car.yaw) * 2.2, car.z + Math.cos(car.yaw) * 2.2, 1.4, Math.sin(car.yaw) * car.speed, 1.5, Math.cos(car.yaw) * car.speed);
       }
     }
-    updatePeers(dt, now, time);
+    updatePeers(now, time);
     npcs.update(dt, time, groundHeight);
     npcs.forEachStanding((x, z) => effects.blob(x, groundHeight(x, z) + 0.02, z, 0.85));
     police.forEachUnit((x, z, onFoot) => { if (onFoot) effects.blob(x, groundHeight(x, z) + 0.02, z, 0.85); });

@@ -20,6 +20,8 @@ const managedLinux = readExecutionProfile() === "managed-linux";
 const localBindingConfig = {
   main: "./worker/index.ts",
   compatibility_flags: ["nodejs_compat"],
+  durable_objects: { bindings: [{ name: "ROOMS", class_name: "RealtimeRoom" }] },
+  migrations: [{ tag: "v1-realtime-rooms", new_sqlite_classes: ["RealtimeRoom"] }],
   d1_databases: d1
     ? [
         {

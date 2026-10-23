@@ -37,11 +37,27 @@ Mỗi lượt hoàn thành chỉ nhận thưởng một lần; chọn chơi lạ
 
 ## Phạm vi bản thử nghiệm
 
-Có khu phố 3D, va chạm công trình, xe máy cá nhân, sáu nhiệm vụ có thể chơi lại và người chơi khác được đồng bộ qua máy chủ. Phòng dùng HTTP polling khoảng 350 ms cộng thời gian mạng, nội suy hiển thị ở phía trình duyệt; chưa phải máy chủ mô phỏng vật lý có thẩm quyền. Điểm và di chuyển do máy khách gửi, không phù hợp thi đấu có thưởng. Người chơi vắng mặt bị ẩn sau 15 giây, phiên hết hạn sau 30 phút không hoạt động. Nhiệm vụ, tiền, xe, người đi đường, giao thông, cảnh sát và ragdoll chạy riêng trong máy từng người; giữa người chơi đồng bộ vị trí, máu, vũ khí, phương tiện, sao truy nã và các đòn đánh trúng nhau (máy khách tự báo, không chống gian lận). Chưa có chat hoặc lưu tiến trình dài hạn.
+Có khu phố 3D, va chạm công trình, xe máy cá nhân, sáu nhiệm vụ có thể chơi lại và người chơi khác được đồng bộ qua WebSocket. Một Cloudflare Durable Object quản lý từng phòng, nhận và phát trạng thái khoảng 20 lần/giây khi có thay đổi. Trình duyệt nội suy với bộ đệm 120 ms và chỉ dự đoán thêm tối đa 120 ms khi thiếu bản tin. Đây là thông số thiết kế, không phải cam kết độ trễ trên mọi mạng.
+
+Điểm và di chuyển vẫn do máy khách gửi; chưa phải máy chủ mô phỏng vật lý có thẩm quyền, không phù hợp thi đấu có thưởng. Nhiệm vụ, tiền, xe, người đi đường, giao thông, cảnh sát và ragdoll chạy riêng trong máy từng người; giữa người chơi đồng bộ vị trí, máu, vũ khí, phương tiện, sao truy nã và các đòn đánh trúng nhau. Chưa có chat hoặc lưu tiến trình dài hạn.
+
+### Cách đồng bộ
+
+- HTTP `/api/room` chỉ tạo, tham gia hoặc rời phòng. Vị trí đi qua `/api/room/socket?room=CODE`; mã bí mật được gửi trong bản tin xác thực đầu tiên, không nằm trong URL hay danh sách người chơi.
+- Trạng thái chuyển động ở bộ nhớ Durable Object; không truy vấn D1 theo từng bước di chuyển. Object lưu tên phòng và mã phiên đã băm khi thay đổi thành viên, định kỳ khoảng 60 giây và khi ngắt kết nối cuối. Vị trí được gửi lại từ trình duyệt sau khi object khởi động lại.
+- Tự nối lại với thời gian chờ tăng dần; bỏ qua trạng thái chuyển động cũ khi đường truyền đầy. Đòn đánh có ID, xác nhận và gửi lại trong tối đa 10 giây; chống trùng được giữ qua lần nối lại của cùng trang. Hàng đợi có giới hạn; đây không phải nhật ký chiến đấu bền vững qua khởi động lại máy chủ hoặc tải lại trang.
+- Mỗi phòng tối đa 8 chỗ đang hoạt động. Mất kết nối 15 giây sẽ nhường chỗ; mã phiên có thể nối lại trong 30 phút nếu phòng còn chỗ. Sau nhiều lượt ra/vào, object chỉ giữ tối đa 64 phiên gần đây. Kết nối mới của cùng phiên thay thế kết nối cũ.
+- Nội suy người chơi khác dùng đồng hồ riêng, không bị chậm theo thao tác mở túi súng. Độ trễ hiển thị trong game là thời gian ping khứ hồi, không gồm bộ đệm nội suy.
 
 ## Deploy lên Cloudflare
 
-Đặt `D1_DATABASE_ID` là ID database D1 thật khi build (bỏ trống thì dùng ID giả của Sites), áp các migration mới bằng `wrangler d1 execute DB --remote --config dist/server/wrangler.json --file drizzle/<tệp>.sql`, rồi `wrangler deploy --config dist/server/wrangler.json`.
+Chỉ triển khai khi muốn cập nhật bản đang chơi. Push GitHub không tự chạy lệnh deploy trong repository này.
+
+`vite.config.ts` khai báo binding `ROOMS`, lớp export `RealtimeRoom` và migration SQLite `v1-realtime-rooms`. Bản build phải giữ cả ba trong `dist/server/wrangler.json`; Wrangler áp migration Durable Object khi deploy. Tài khoản/hosting đích phải hỗ trợ Durable Objects và cho phép WebSocket upgrade.
+
+Binding D1 cũ vẫn được giữ để bảo toàn dữ liệu và cấu hình hiện có, nhưng multiplayer mới không dùng các bảng đó. Đặt `D1_DATABASE_ID` là ID database D1 thật khi build cho tài khoản Cloudflare riêng (bỏ trống thì dùng ID giả của Sites). Sau khi kiểm tra cấu hình, dùng `wrangler deploy --config dist/server/wrangler.json`. Không chạy lại migration D1 cũ để bật WebSocket.
+
+Phòng D1 của phiên bản polling không được chuyển sang Durable Object; sau khi triển khai phiên bản này, tải lại trang và tạo phòng mới. Giữ `.openai/hosting.json` để bảo toàn định danh Sites; cần xác nhận hosting hỗ trợ binding/migration mới trước khi xuất bản lên đó.
 
 ## Hiệu năng
 
@@ -53,26 +69,25 @@ Có khu phố 3D, va chạm công trình, xe máy cá nhân, sáu nhiệm vụ c
 
 ## Phát triển
 
-Node.js 22.13 trở lên. Frontend React/Vinext + Three.js, backend Cloudflare Worker + D1. Trang dùng Sites hosting, giữ cấu hình trong `.openai/hosting.json`.
+Node.js 22.13 trở lên. Frontend React/Vinext + Three.js, backend Cloudflare Worker + Durable Objects. Local dùng runtime của Cloudflare, không cần đăng nhập tài khoản hoặc database remote.
 
 ```sh
 npm ci
 npm run build
-node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0000_unknown_skullbuster.sql
-node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js d1 execute DB --local --config dist/server/wrangler.json --persist-to .wrangler/state --file drizzle/0001_pvp_hits.sql
-npm run dev
+npm start
 ```
 
-Chỉ chạy migration trên cơ sở dữ liệu local mới; không chạy lại tệp SQL đã áp dụng. Bản hosted tự áp dụng migration qua quy trình Sites. Lỗi trình khởi chạy `npm.cmd` trên một số môi trường Windows có thể được tránh bằng cách gọi `node` với đường dẫn tuyệt đối tới `npm-cli.js` của bản Node đã cài.
+Mở địa chỉ local mà Wrangler in ra (thường là `http://127.0.0.1:8787`). `npm run dev` dùng cho chỉnh sửa giao diện; kiểm tra WebSocket trên bản build với `npm start` để chạy đúng entrypoint của Worker. Không cần migration D1 cho phòng mới. Lỗi trình khởi chạy `npm.cmd` trên một số môi trường Windows có thể được tránh bằng cách gọi `node` với đường dẫn tuyệt đối tới `npm-cli.js` của bản Node đã cài.
 
 ## Kiểm tra
 
 ```sh
 npx tsc --noEmit
-node --experimental-transform-types --test scripts/missions.test.mjs
-node --experimental-transform-types --experimental-sqlite --test scripts/room.test.mjs
+npm test
+# Khi npm start đang chạy trong terminal khác:
+npm run test:realtime
 ```
 
-Bộ kiểm tra dùng SQLite thật và migration đã sinh để kiểm tra đồng bộ hai người, mã phiên, giới hạn 8 người, dữ liệu lỗi, hết hạn và thu hồi chỗ trống. Giới hạn 8 người là giới hạn logic đã kiểm tra, không phải kết quả benchmark mạng.
+Bộ kiểm tra bao phủ vòng đời phòng, xác thực, giới hạn 8 người, hết hạn, nội suy và tự nối lại. Kiểm tra tích hợp dùng HTTP/WebSocket thật qua Worker và Durable Object local: hai chiều chuyển động, phòng riêng biệt, bản tin cũ/lỗi, thay thế kết nối, xác nhận đòn đánh và nhường chỗ sau mất mạng. Có thể đặt `TEST_BASE_URL` để đổi cổng local; bộ kiểm tra từ chối host remote. Giới hạn 8 người là giới hạn logic đã kiểm tra, không phải kết quả benchmark mạng Internet.
 
 Kiểm thử nhiệm vụ bao phủ thứ tự mục tiêu, khoảng cách tương tác, yêu cầu lên/xuống xe, hết giờ/ngã xe, thưởng một lần, đổi nhiệm vụ và chơi lại.
