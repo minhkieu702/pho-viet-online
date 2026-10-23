@@ -1,286 +1,265 @@
-// Run after `db:generate` with:
-// node --experimental-transform-types --experimental-sqlite --test scripts/room.test.mjs
-import { test } from "node:test";
-import assert from "node:assert/strict";
-import { DatabaseSync } from "node:sqlite";
-import { readdirSync, readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { handleRoom } from "../lib/room-service.ts";
+// node --experimental-transform-types --test scripts/room.test.mjs
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { handleRoom, handleRoomSocket } from '../lib/room-service.ts';
+import { RealtimeRoom } from '../lib/realtime-room.ts';
+import { playerState, playerHit, hashToken, ACTIVE_MS, SESSION_MS } from '../lib/room-validation.ts';
 
-const migrationFolder = fileURLToPath(new URL("../drizzle/", import.meta.url));
-const migrations = readdirSync(migrationFolder).filter((file) => file.endsWith(".sql")).sort();
-assert.ok(migrations.length, "Generate the actual Drizzle migration before testing.");
-
-function database() {
-  const sqlite = new DatabaseSync(":memory:");
-  sqlite.exec("PRAGMA foreign_keys = ON");
-  for (const migration of migrations) sqlite.exec(readFileSync(`${migrationFolder}/${migration}`, "utf8"));
-  const db = {
-    prepare(sql) {
-      const statement = sqlite.prepare(sql);
-      let values = [];
-      const bound = {
-        bind(...args) { values = args; return bound; },
-        _execute() {
-          if (/^\s*SELECT\b/i.test(sql)) {
-            return { results: statement.all(...values), success: true, meta: { changes: 0 } };
-          }
-          const result = statement.run(...values);
-          return { results: [], success: true, meta: { changes: Number(result.changes) } };
-        },
-        async run() { return bound._execute(); },
-        async first() { return statement.get(...values) ?? null; },
-      };
-      return bound;
-    },
-    async batch(statements) {
-      sqlite.exec("BEGIN");
-      try {
-        const result = statements.map((statement) => statement._execute());
-        sqlite.exec("COMMIT");
-        return result;
-      } catch (error) { sqlite.exec("ROLLBACK"); throw error; }
+function memory() {
+  const values = new Map();
+  return {
+    writes: 0, alarm: null,
+    async get(key) { return structuredClone(values.get(key)); },
+    async put(key, value) { this.writes++; values.set(key, structuredClone(value)); },
+    async setAlarm(value) { this.alarm = value; },
+    async deleteAll() { values.clear(); },
+  };
+}
+function actor(storage = memory()) {
+  const room = new RealtimeRoom({ storage, blockConcurrencyWhile: work => work() });
+  return { room, storage };
+}
+function namespace(t) {
+  const actors = new Map();
+  const rooms = {
+    idFromName: code => code,
+    get(code) {
+      if (!actors.has(code)) actors.set(code, actor());
+      return { fetch: request => actors.get(code).room.fetch(request) };
     },
   };
-  return { db, sqlite };
+  t.after(() => { for (const entry of actors.values()) entry.room.reset(); });
+  return { rooms, actors };
 }
-
 function request(body, headers = {}) {
-  return new Request("https://example.test/api/room", {
-    method: "POST",
-    headers: { "content-type": "application/json", ...headers },
-    body: typeof body === "string" ? body : JSON.stringify(body),
+  return new Request('https://example.test/api/room', {
+    method: 'POST', headers: { 'content-type': 'application/json', ...headers },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
   });
 }
-
-async function call(db, body) {
-  const response = await handleRoom(request(body), db);
-  return { status: response.status, headers: response.headers, body: await response.json() };
+async function call(rooms, body, headers) {
+  const response = await handleRoom(request(body, headers), rooms);
+  return { status: response.status, body: await response.json() };
 }
-
-const state = { x: 3, z: 5, angle: 0.2, riding: true, speed: 12, score: 75 };
-const combatDefaults = { health: 100, weapon: "fists", vehicle: "foot", down: false, firing: false, wanted: 0 };
 const credentials = ({ room, id, token }) => ({ room, id, token });
-const sync = (db, session, extra = {}) => call(db, { action: "sync", ...credentials(session), state, ...extra });
-const hit = (target, damage = 10, dx = 0, dz = 0) => ({ target, damage, dx, dz });
-const hitCount = (sqlite) => sqlite.prepare("SELECT COUNT(*) AS n FROM hits").get().n;
-
-test("create, join and synchronize real persisted peers without exposing private tokens", async (t) => {
-  const { db, sqlite } = database();
-  t.after(() => sqlite.close());
-  const first = await call(db, { action: "create", name: "  Hùng  " });
-  assert.equal(first.status, 201);
-  assert.match(first.body.room, /^[A-Z0-9]{6}$/);
-  assert.match(first.body.token, /^[0-9a-f]{64}$/);
-  assert.deepEqual(first.body.peers, []);
-  assert.match(first.headers.get("cache-control"), /no-store/);
-  const row = sqlite.prepare("SELECT * FROM players WHERE id = ?").get(first.body.id);
-  assert.equal(row.name, "Hùng");
-  assert.notEqual(row.token_hash, first.body.token);
-  assert.equal(row.token_hash.length, 64);
-
-  const second = await call(db, { action: "join", name: "Lan", code: first.body.room.toLowerCase() });
-  assert.equal(second.status, 200);
-  assert.equal(second.body.peers.length, 1);
-  assert.equal(second.body.peers[0].id, first.body.id);
-  assert.equal(second.body.peers[0].token, undefined);
-  assert.equal(second.body.peers[0].token_hash, undefined);
-
-  assert.equal((await call(db, { action: "sync", ...credentials(second.body), state })).status, 200);
-  const seen = await call(db, { action: "sync", ...credentials(first.body), state });
-  assert.equal(seen.status, 200);
-  const remote = seen.body.peers[0];
-  assert.ok(Math.abs(remote.angle - state.angle) < 1e-10);
-  assert.deepEqual({ ...remote, angle: state.angle },
-    { id: second.body.id, name: "Lan", color: second.body.color, ...state, ...combatDefaults, vehicle: "scooter" });
-});
-
-test("server rejects impersonation, malformed input, and oversize bodies; bounds submitted state", async (t) => {
-  const { db, sqlite } = database();
-  t.after(() => sqlite.close());
-  const session = (await call(db, { action: "create", name: "Minh" })).body;
-  const fake = { ...credentials(session), token: "0".repeat(64) };
-  assert.equal((await call(db, { action: "sync", ...fake, state })).status, 401);
-  await call(db, { action: "leave", ...fake });
-  assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM players").get().n, 1);
-
-  const bounded = { ...state, x: 10000, z: -10000, speed: 999, score: 9999999 };
-  assert.equal((await call(db, { action: "sync", ...credentials(session), state: bounded })).status, 200);
-  const stored = sqlite.prepare("SELECT x, z, speed, score FROM players").get();
-  assert.deepEqual({ ...stored }, { x: 85, z: -85, speed: 36, score: 1000000 });
-  assert.equal((await call(db, { action: "sync", ...credentials(session), state: { ...state, x: "bad" } })).status, 400);
-  assert.equal((await call(db, { action: "sync", ...credentials(session), state: { ...state, riding: 1 } })).status, 400);
-  assert.equal((await call(db, { action: "create", name: "x".repeat(19) })).status, 400);
-  assert.equal((await call(db, { action: "join", name: "Minh", code: "BAD" })).status, 400);
-  assert.equal((await call(db, { action: "join", name: "Minh", code: "ZZZZZZ" })).status, 404);
-  assert.equal((await handleRoom(request("{broken"), db)).status, 400);
-  assert.equal((await handleRoom(request("[]"), db)).status, 400);
-  assert.equal((await handleRoom(request(" ".repeat(4097)), db)).status, 413);
-  assert.equal((await handleRoom(request({}, { "content-type": "text/plain" }), db)).status, 415);
-  assert.equal((await call(undefined, { action: "create", name: "Minh" })).status, 503);
-
-  assert.equal((await call(db, { action: "leave", ...credentials(session) })).status, 200);
-  assert.equal(sqlite.prepare("SELECT COUNT(*) AS n FROM players").get().n, 0);
-});
-
-test("eight-player cap remains valid when an inactive player tries to reclaim a replaced slot", async (t) => {
-  const { db, sqlite } = database();
-  t.after(() => sqlite.close());
-  const host = (await call(db, { action: "create", name: "Chủ phòng" })).body;
-  for (let i = 0; i < 7; i++) {
-    assert.equal((await call(db, { action: "join", name: `Bạn ${i}`, code: host.room })).status, 200);
-  }
-  assert.equal((await call(db, { action: "join", name: "Người thứ chín", code: host.room })).status, 409);
-  sqlite.prepare("UPDATE players SET last_seen = ? WHERE id = ?").run(Date.now() - 16000, host.id);
-  const replacement = await call(db, { action: "join", name: "Người mới", code: host.room });
-  assert.equal(replacement.status, 200);
-  assert.equal(replacement.body.peers.length, 7);
-  assert.equal(replacement.body.peers.some((peer) => peer.id === host.id), false);
-  assert.equal((await call(db, { action: "sync", ...credentials(host), state })).status, 409);
-  await call(db, { action: "leave", ...credentials(replacement.body) });
-  assert.equal((await call(db, { action: "sync", ...credentials(host), state })).status, 200);
-});
-
-test("expired sessions cannot resume; creating a room cleans abandoned data", async (t) => {
-  const { db, sqlite } = database();
-  t.after(() => sqlite.close());
-  const host = (await call(db, { action: "create", name: "Phiên cũ" })).body;
-  const expired = Date.now() - 31 * 60000;
-  sqlite.prepare("UPDATE players SET last_seen = ?").run(expired);
-  sqlite.prepare("UPDATE rooms SET last_activity = ?").run(expired);
-  assert.equal((await call(db, { action: "sync", ...credentials(host), state })).status, 401);
-  assert.equal((await call(db, { action: "join", name: "Lan", code: host.room })).status, 404);
-  assert.equal((await call(db, { action: "create", name: "Phòng mới" })).status, 201);
-  assert.equal(sqlite.prepare("SELECT code FROM rooms WHERE code = ?").get(host.room), undefined);
-  assert.equal(sqlite.prepare("SELECT id FROM players WHERE id = ?").get(host.id), undefined);
-});
-
-async function duel(db) {
-  const attacker = (await call(db, { action: "create", name: "An" })).body;
-  const target = (await call(db, { action: "join", name: "Bình", code: attacker.room })).body;
-  return { attacker, target };
+const state = { x: 3, z: 5, angle: 0.2, riding: false, speed: 0, score: 75 };
+function connection(room) {
+  const messages = [], closes = [];
+  const value = {
+    socket: { send: message => messages.push(JSON.parse(message)), close: (...args) => closes.push(args) },
+    seq: 0, closed: false, rateStart: Date.now(), messages: 0, queued: 0,
+    timer: setTimeout(() => {}, 5_000),
+  };
+  room.connections.add(value);
+  return { value, messages, closes };
+}
+async function connect(room, session) {
+  const result = connection(room);
+  await room.message(result.value, { type: 'auth', id: session.id, token: session.token });
+  return result;
 }
 
-test("combat state round-trips, with defaults for old clients and bounds for bad values", async (t) => {
-  const { db, sqlite } = database();
-  t.after(() => sqlite.close());
-  const { attacker, target } = await duel(db);
-  assert.deepEqual({ ...target.peers[0], ...combatDefaults }, target.peers[0]);
-
-  // Old clients omit every combat field; riding decides the default vehicle.
-  await sync(db, target, { state: { ...state, riding: false } });
-  let seen = (await sync(db, attacker)).body.peers[0];
-  assert.deepEqual({ ...seen, ...combatDefaults }, seen);
-
-  const combat = { health: 42.6, weapon: "smg", vehicle: "police", down: true, firing: true, wanted: 3 };
-  assert.equal((await sync(db, target, { state: { ...state, ...combat } })).status, 200);
-  seen = (await sync(db, attacker)).body.peers[0];
-  assert.deepEqual({ health: seen.health, weapon: seen.weapon, vehicle: seen.vehicle, down: seen.down,
-    firing: seen.firing, wanted: seen.wanted }, { ...combat, health: 43 });
-
-  const invalid = { health: 500, weapon: "rocket", vehicle: "tank", down: "yes", firing: 1, wanted: 9 };
-  assert.equal((await sync(db, target, { state: { ...state, ...invalid } })).status, 200);
-  seen = (await sync(db, attacker)).body.peers[0];
-  assert.deepEqual({ health: seen.health, weapon: seen.weapon, vehicle: seen.vehicle, down: seen.down,
-    firing: seen.firing, wanted: seen.wanted }, { ...combatDefaults, health: 100, vehicle: "scooter", wanted: 5 });
-
-  await sync(db, target, { state: { ...state, riding: false, health: -4, wanted: "3", vehicle: null } });
-  const row = sqlite.prepare("SELECT health, weapon, vehicle, down, firing, wanted FROM players WHERE id = ?").get(target.id);
-  assert.deepEqual({ ...row }, { health: 0, weapon: "fists", vehicle: "foot", down: 0, firing: 0, wanted: 0 });
+test('lifecycle stores hashes, rejects HTTP sync, and never exposes pending players', async t => {
+  const { rooms, actors } = namespace(t);
+  const created = await call(rooms, { action: 'create', name: '  Hùng  ' });
+  assert.equal(created.status, 201);
+  const session = created.body;
+  assert.match(session.room, /^[A-Z0-9]{6}$/);
+  assert.match(session.token, /^[0-9a-f]{64}$/);
+  const saved = await actors.get(session.room).storage.get('room');
+  assert.equal(saved.players[0].name, 'Hùng');
+  assert.equal(saved.players[0].tokenHash, await hashToken(session.token));
+  assert.equal(JSON.stringify(saved).includes(session.token), false);
+  assert.deepEqual((await call(rooms, { action: 'join', name: 'Lan', code: session.room.toLowerCase() })).body.peers, []);
+  assert.equal((await call(rooms, { action: 'sync', ...credentials(session), state })).status, 400);
 });
 
-test("a hit is delivered once to its target, oldest first, with the attacker's name", async (t) => {
-  const { db, sqlite } = database();
-  t.after(() => sqlite.close());
-  const { attacker, target } = await duel(db);
-  const sent = await sync(db, attacker, { hits: [hit(target.id, 25, 0.5, -2), hit(target.id, 7.4, -0.25, 0.75)] });
-  assert.equal(sent.status, 200);
-  assert.deepEqual(sent.body.hits, []);
-  assert.equal(hitCount(sqlite), 2);
-
-  const received = await sync(db, target);
-  assert.deepEqual(received.body.hits.map((row) => ({ ...row })), [
-    { attacker: attacker.id, name: "An", damage: 25, dx: 0.5, dz: -1 },
-    { attacker: attacker.id, name: "An", damage: 7, dx: -0.25, dz: 0.75 },
-  ]);
-  assert.deepEqual((await sync(db, target)).body.hits, []);
-  assert.equal(hitCount(sqlite), 0);
-
-  // A departed attacker becomes a stranger; a departed target takes its pending hits with it.
-  await sync(db, attacker, { hits: [hit(target.id, 5)] });
-  await call(db, { action: "leave", ...credentials(attacker) });
-  assert.deepEqual((await sync(db, target)).body.hits.map((row) => ({ ...row })),
-    [{ attacker: attacker.id, name: "Người lạ", damage: 5, dx: 0, dz: 0 }]);
-  const third = (await call(db, { action: "join", name: "Cường", code: target.room })).body;
-  await sync(db, third, { hits: [hit(target.id, 5)] });
-  assert.equal(hitCount(sqlite), 1);
-  await call(db, { action: "leave", ...credentials(target) });
-  assert.equal(hitCount(sqlite), 0);
+test('concurrent room admission reserves exactly eight slots and rejects ninth', async t => {
+  const { rooms } = namespace(t);
+  const host = (await call(rooms, { action: 'create', name: 'Host' })).body;
+  const joins = await Promise.all(Array.from({ length: 16 }, (_, index) => call(rooms, { action: 'join', name: `Player ${index}`, code: host.room })));
+  assert.equal(joins.filter(result => result.status === 200).length, 7);
+  assert.equal(joins.filter(result => result.status === 409).length, 9);
 });
 
-test("hits on self, other rooms, inactive or unknown players and malformed hits are ignored", async (t) => {
-  const { db, sqlite } = database();
-  t.after(() => sqlite.close());
-  const { attacker, target } = await duel(db);
-  const outsider = (await call(db, { action: "create", name: "Dũng" })).body;
-  const idle = (await call(db, { action: "join", name: "Hoa", code: attacker.room })).body;
-  sqlite.prepare("UPDATE players SET last_seen = ? WHERE id = ?").run(Date.now() - 16000, idle.id);
+test('HTTP proxy returns mutable headers for framework response handling', async () => {
+  const upstream = Response.json({ room: 'ABCDEF' }, { status: 201, headers: { 'cache-control': 'no-store' } });
+  // An immutable network response is only exposed by workerd, but assert this
+  // boundary owns a new response rather than forwarding the upstream object.
+  const rooms = { idFromName: code => code, get: () => ({ fetch: async () => upstream }) };
+  const response = await handleRoom(request({ action: 'create', name: 'Host' }), rooms);
+  assert.notEqual(response, upstream);
+  assert.equal(response.status, 201);
+  response.headers.set('x-framework', 'vinext');
+  assert.equal(response.headers.get('x-framework'), 'vinext');
+  assert.equal(upstream.headers.has('x-framework'), false);
+  assert.deepEqual(await response.json(), { room: 'ABCDEF' });
+});
 
-  const ignored = [hit(attacker.id), hit(outsider.id), hit(idle.id), hit(crypto.randomUUID())];
-  assert.equal((await sync(db, attacker, { hits: ignored })).status, 200);
-  for (const hits of ["nope", { target: target.id }, 42, null,
-    [null, 5, "x", [target.id], { target: target.id }, { ...hit(target.id), damage: "10" },
-      { ...hit(target.id), dx: null }, { ...hit(target.id), target: target.id.toUpperCase() }, hit(123)]]) {
-    assert.equal((await sync(db, attacker, { hits })).status, 200);
+test('expired reservation is reclaimable, old session cannot overfill room, retained sessions bounded', async t => {
+  let now = 2_000_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const { rooms, actors } = namespace(t);
+  const host = (await call(rooms, { action: 'create', name: 'Host' })).body;
+  now += ACTIVE_MS + 1;
+  await Promise.all(Array.from({ length: 8 }, (_, index) => call(rooms, { action: 'join', name: `Player ${index}`, code: host.room })));
+  const entry = actors.get(host.room);
+  const old = await connect(entry.room, host);
+  assert.equal(old.closes[0][0], 4409);
+  for (let index = 0; index < 72; index++) {
+    now += ACTIVE_MS + 1;
+    assert.equal((await call(rooms, { action: 'join', name: `Guest ${index}`, code: host.room })).status, 200);
   }
-  assert.equal(hitCount(sqlite), 0);
-  assert.deepEqual((await sync(db, outsider)).body.hits, []);
-  assert.deepEqual((await sync(db, target)).body.hits, []);
+  assert.equal(entry.room.players.size, 64);
+  assert.equal((await entry.storage.get('room')).players.length, 64);
 });
 
-test("hit damage is clamped, capped at 200 per sync, limited to 8 entries and 20 deliveries", async (t) => {
-  const { db, sqlite } = database();
-  t.after(() => sqlite.close());
-  const { attacker, target } = await duel(db);
-  const damages = async () => (await sync(db, target)).body.hits.map((row) => row.damage);
-
-  await sync(db, attacker, { hits: [hit(target.id, -5, 9, -9), hit(target.id, 0.2), hit(target.id, 250)] });
-  const clamped = (await sync(db, target)).body.hits;
-  assert.deepEqual(clamped.map((row) => [row.damage, row.dx, row.dz]), [[1, 1, -1], [1, 0, 0], [100, 0, 0]]);
-
-  await sync(db, attacker, { hits: [hit(target.id, 150), hit(target.id, 70), hit(target.id, 60), hit(target.id, 9)] });
-  assert.deepEqual(await damages(), [100, 70, 30]);
-
-  await sync(db, attacker, { hits: Array.from({ length: 12 }, () => hit(target.id, 3)) });
-  assert.deepEqual(await damages(), Array(8).fill(3));
-
-  for (let i = 0; i < 3; i++) await sync(db, attacker, { hits: Array.from({ length: 8 }, () => hit(target.id, 1)) });
-  assert.equal((await damages()).length, 20);
-  assert.equal((await damages()).length, 4);
-  assert.equal(hitCount(sqlite), 0);
-
-  // A full eight-hit sync from a newer client stays well inside the body limit.
-  const longest = { ...state, x: -84.12345678901234, z: 84.12345678901234, angle: -3.141592653589793,
-    speed: -35.98765432109876, score: 999999, health: 99, weapon: "shotgun", vehicle: "police",
-    down: false, firing: true, wanted: 5 };
-  const full = Array.from({ length: 8 }, () => hit(target.id, 25, -0.7071067811865476, 0.7071067811865476));
-  const body = { action: "sync", ...credentials(attacker), state: longest, hits: full };
-  assert.ok(JSON.stringify(body).length < 2048, `sync body is ${JSON.stringify(body).length} bytes`);
-  assert.equal((await call(db, body)).status, 200);
-  assert.deepEqual(await damages(), Array(8).fill(25));
+test('authentication, replacement, state bounds/sequence and movement do not write storage', async t => {
+  const { rooms, actors } = namespace(t);
+  const host = (await call(rooms, { action: 'create', name: 'Host' })).body;
+  const guest = (await call(rooms, { action: 'join', name: 'Guest', code: host.room })).body;
+  const entry = actors.get(host.room);
+  const invalid = await connect(entry.room, { ...host, token: '0'.repeat(64) });
+  assert.equal(invalid.closes[0][0], 4401);
+  const first = await connect(entry.room, host);
+  const second = await connect(entry.room, guest);
+  const writes = entry.storage.writes;
+  await entry.room.message(first.value, { type: 'state', seq: 1, state: { ...state, x: 900, z: -900, speed: 999 } });
+  await entry.room.message(first.value, { type: 'state', seq: 1, state: { ...state, x: 1 } });
+  await entry.room.message(second.value, { type: 'state', seq: 1, state });
+  entry.room.broadcast(Date.now());
+  const peers = second.messages.filter(message => message.type === 'snapshot').at(-1).peers;
+  assert.equal(peers.length, 1);
+  assert.equal(peers[0].id, host.id);
+  assert.equal(peers[0].x, 85);
+  assert.equal(peers[0].z, -85);
+  assert.equal(peers[0].speed, 36);
+  assert.equal(peers[0].tokenHash, undefined);
+  assert.equal(entry.storage.writes, writes);
+  const replacement = await connect(entry.room, host);
+  assert.equal(first.closes.at(-1)[0], 4001);
+  assert.equal(replacement.messages[0].type, 'ready');
+  await entry.room.message(replacement.value, { type: 'state', seq: 1, state });
+  assert.equal(entry.room.players.get(host.id).state.x, 3);
 });
 
-test("stale hits expire after ten seconds and are cleaned up opportunistically", async (t) => {
-  const { db, sqlite } = database();
-  t.after(() => sqlite.close());
-  const { attacker, target } = await duel(db);
-  await sync(db, attacker, { hits: [hit(target.id, 11), hit(target.id, 12)] });
-  sqlite.prepare("UPDATE hits SET created_at = ? WHERE damage = 11").run(Date.now() - 11000);
-  assert.deepEqual((await sync(db, target)).body.hits.map((row) => row.damage), [12]);
-  assert.equal(hitCount(sqlite), 0);
+test('PvP retry has stable id, acks remove delivery, dedupe survives reconnect', async t => {
+  const { rooms, actors } = namespace(t);
+  const attacker = (await call(rooms, { action: 'create', name: 'Attacker' })).body;
+  const target = (await call(rooms, { action: 'join', name: 'Target', code: attacker.room })).body;
+  const { room } = actors.get(attacker.room);
+  let source = await connect(room, attacker);
+  const recipient = await connect(room, target);
+  await room.message(recipient.value, { type: 'state', seq: 1, state });
+  const id = crypto.randomUUID();
+  const message = { type: 'hit', id, hit: { target: target.id, damage: 20, dx: 1, dz: 0 } };
+  await room.message(source.value, message);
+  assert.ok(source.messages.some(message => message.type === 'hitAck' && message.id === id));
+  const first = recipient.messages.find(message => message.type === 'hit');
+  assert.equal(first.id, `${attacker.id}:${id}`);
+  room.deliverHits(Date.now() + 1000);
+  assert.equal(recipient.messages.filter(message => message.type === 'hit').length, 2);
+  await room.message(recipient.value, { type: 'hitAck', id: first.id });
+  source = await connect(room, attacker);
+  await room.message(source.value, message);
+  assert.equal(room.hits.size, 0);
+  assert.equal(recipient.messages.filter(message => message.type === 'hit').length, 2);
+});
 
-  await sync(db, target, { hits: [hit(attacker.id, 13)] });
-  sqlite.prepare("UPDATE hits SET created_at = ?").run(Date.now() - 11000);
-  await sync(db, target);
-  assert.equal(hitCount(sqlite), 0);
+test('saved sessions recover after actor restart; leave is authenticated and durable', async t => {
+  const { rooms, actors } = namespace(t);
+  const host = (await call(rooms, { action: 'create', name: 'Host' })).body;
+  const storage = actors.get(host.room).storage;
+  const restored = actor(storage);
+  actors.set(host.room, restored);
+  await restored.room.ready;
+  const socket = await connect(restored.room, host);
+  assert.equal(socket.messages[0].type, 'ready');
+  assert.equal(restored.room.players.get(host.id).state, undefined);
+  assert.equal((await call(rooms, { action: 'leave', ...credentials(host), token: '0'.repeat(64) })).status, 401);
+  assert.equal(restored.room.players.size, 1);
+  assert.equal((await call(rooms, { action: 'leave', ...credentials(host) })).status, 200);
+  assert.equal(restored.room.players.size, 0);
+  assert.deepEqual((await storage.get('room')).players, []);
+  const expired = await connect(restored.room, host);
+  assert.equal(expired.closes[0][0], 4401);
+});
+
+test('new hits do not eagerly resend the entire unacknowledged queue', async t => {
+  const { rooms, actors } = namespace(t);
+  const attacker = (await call(rooms, { action: 'create', name: 'Attacker' })).body;
+  const target = (await call(rooms, { action: 'join', name: 'Target', code: attacker.room })).body;
+  const { room } = actors.get(attacker.room);
+  const source = await connect(room, attacker);
+  const recipient = await connect(room, target);
+  await room.message(recipient.value, { type: 'state', seq: 1, state });
+  for (let index = 0; index < 2; index++) {
+    await room.message(source.value, { type: 'hit', id: crypto.randomUUID(), hit: { target: target.id, damage: 20, dx: 1, dz: 0 } });
+  }
+  const delivered = recipient.messages.filter(message => message.type === 'hit');
+  assert.equal(delivered.length, 2);
+  assert.equal(new Set(delivered.map(message => message.id)).size, 2);
+  assert.equal(room.hits.size, 2);
+});
+
+test('alarm removes expired room and its credentials', async t => {
+  let now = 2_000_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const { rooms, actors } = namespace(t);
+  const host = (await call(rooms, { action: 'create', name: 'Host' })).body;
+  const entry = actors.get(host.room);
+  assert.equal(entry.storage.alarm, now + SESSION_MS);
+  now += SESSION_MS + 1;
+  await entry.room.alarm();
+  assert.equal(await entry.storage.get('room'), undefined);
+  assert.equal((await call(rooms, { action: 'join', code: host.room, name: 'Guest' })).status, 404);
+  const expired = await connect(entry.room, host);
+  assert.equal(expired.closes[0][0], 4404);
+});
+
+test('server derives bounded velocity, timestamps samples, and resets it on teleport', async t => {
+  let now = 2_000_000_000_000;
+  t.mock.method(Date, 'now', () => now);
+  const { rooms, actors } = namespace(t);
+  const host = (await call(rooms, { action: 'create', name: 'Host' })).body;
+  const { room } = actors.get(host.room);
+  const socket = await connect(room, host);
+  await room.message(socket.value, { type: 'state', seq: 1, state });
+  now += 50;
+  await room.message(socket.value, { type: 'state', seq: 2, state: { ...state, x: 4 } });
+  const player = room.players.get(host.id);
+  assert.equal(player.updatedAt, now);
+  assert.equal(player.vx, 20);
+  assert.equal(player.vz, 0);
+  now += 50;
+  await room.message(socket.value, { type: 'state', seq: 3, state: { ...state, x: 80 } });
+  assert.equal(player.vx, 0);
+  await assert.rejects(room.message(socket.value, { type: 'state', seq: 0, state }));
+  assert.equal(player.state.x, 80);
+});
+
+test('HTTP rejects invalid input/origin/binding without reaching a room', async t => {
+  const { rooms } = namespace(t);
+  assert.equal((await call(rooms, { action: 'create', name: 'x'.repeat(19) })).status, 400);
+  assert.equal((await call(rooms, { action: 'create', name: 'Minh' }, { origin: 'https://evil.test' })).status, 403);
+  assert.equal((await call(rooms, '{broken')).status, 400);
+  assert.equal((await call(rooms, '[]')).status, 400);
+  assert.equal((await call(rooms, ' '.repeat(4097))).status, 413);
+  assert.equal((await call(rooms, {}, { 'content-type': 'text/plain' })).status, 415);
+  assert.equal((await call(undefined, { action: 'create', name: 'Minh' })).status, 503);
+  assert.equal((await handleRoomSocket(new Request('https://example.test/api/room/socket?room=ABCDEF'), rooms)).status, 426);
+  assert.equal((await handleRoomSocket(new Request('https://example.test/api/room/socket?room=ABCDEF', { headers: { upgrade: 'websocket', origin: 'https://evil.test' } }), rooms)).status, 403);
+});
+
+test('state and hit validation keep numerical bounds and reject NaN/impersonation', () => {
+  assert.throws(() => playerState({ ...state, x: NaN }));
+  assert.throws(() => playerState({ ...state, riding: 1 }));
+  assert.throws(() => playerHit({ target: 'invalid', damage: 1, dx: 0, dz: 0 }, crypto.randomUUID()));
+  const id = crypto.randomUUID();
+  assert.throws(() => playerHit({ target: id, damage: 1, dx: 0, dz: 0 }, id));
+  const bounded = playerState({ ...state, health: 1000, wanted: 10, weapon: 'bad', vehicle: 'bad' });
+  assert.equal(bounded.health, 100);
+  assert.equal(bounded.wanted, 5);
+  assert.equal(bounded.weapon, 'fists');
+  assert.equal(bounded.vehicle, 'foot');
 });

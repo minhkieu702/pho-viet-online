@@ -12,7 +12,10 @@ import { createAtmosphere } from './atmosphere';
 import { createAnimals } from './animals';
 import { createSideMissions, type SideMissionView } from './side-missions';
 import { playBoom, playShot, playThud, setRain, unlockAudio } from './audio';
-import { DELIVERY_PAY, WEAPONS, weaponById, type WeaponId } from './weapons';
+import { WEAPONS, weaponById, type WeaponId } from './weapons';
+import { createMissions, type MissionEvent, type MissionId, type MissionView } from './missions';
+import { createPeerInterpolator, createSnapshotClock } from './peer-interpolation';
+import type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
 import { BIKES, CAR_STATS, MOTO_STATS, POLICE_CAR_STATS, bikeById, repairCost, type BikeId } from './bikes';
 import { createVehicles, makeCarMesh, CAR_HEALTH, MOTO_HEALTH, POLICE_CAR_HEALTH, type Car } from './vehicles';
 import { createPolice } from './police';
@@ -20,15 +23,9 @@ import { createSky, HORIZON } from './sky';
 import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuName, isSoftwareGpu, type QualityMode } from './quality';
 
 export type VehicleKind = 'foot' | 'scooter' | 'car' | 'police';
-export type PlayerState = {
-  x: number; z: number; angle: number; riding: boolean; speed: number; score: number;
-  health?: number; weapon?: WeaponId; vehicle?: VehicleKind; down?: boolean; firing?: boolean; wanted?: number;
-};
-export type PeerState = PlayerState & { id: string; name: string; color: string };
-export type OutgoingHit = { target: string; damage: number; dx: number; dz: number };
-export type IncomingHit = { attacker: string; name: string; damage: number; dx: number; dz: number };
+export type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
 export type Hud = {
-  speed: number; riding: boolean; score: number; mission: string; missionStep: number; hint: string; x: number; z: number;
+  speed: number; riding: boolean; score: number; mission: string; missionStep: number; missionInfo: MissionView; hint: string; x: number; z: number;
   cash: number; deliveries: number; weapon: WeaponId; owned: WeaponId[]; down: boolean; fps: number; quality: string; qualityMode: QualityMode;
   gpu: string; softwareGpu: boolean;
   health: number; wanted: number; banner: string; vehicle: VehicleKind; vehicleHealth: number;
@@ -46,7 +43,7 @@ const BIKE_START = { x: 12.4, z: 14.2 };
 const PICKUP = { x: -32, z: 7 };
 const SHOPKEEPER = { x: -30, z: 13, yaw: Math.PI };
 const RECEIVERS = [
-  { name: 'Bưu điện', x: 54, z: -35 }, { name: 'Công viên', x: 28, z: -24 }, { name: 'Chợ An Hòa', x: -36.5, z: 35 },
+  { name: 'Bưu điện', x: 54, z: -35 }, { name: 'Công viên', x: 28, z: -26 }, { name: 'Chợ An Hòa', x: -36.5, z: 35 },
   { name: 'Quảng trường', x: 36, z: 33 }, { name: 'Bờ sông', x: -20, z: -126 }, { name: 'Tiệm hoa', x: 32, z: 13.5 },
 ];
 export const STORE = { x: -18, z: 49.6 };
@@ -333,6 +330,7 @@ type Peer = {
   guns: Map<WeaponId, THREE.Group>;
   label: THREE.Sprite;
   target: PeerState;
+  motion: ReturnType<typeof createPeerInterpolator>;
   name: string;
   color: string;
   body: RagdollBody | null;
@@ -449,7 +447,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   rider.group.visible = false;
   bike.group.add(rider.group);
   scene.add(bike.group);
-  // A passenger rides pillion for taxi sideMissions.
+  // A passenger rides pillion for taxi missions.
   const passenger = makePerson('#6f86a8', true, '#2a2220');
   passenger.group.position.set(0, 0.5, -0.95);
   passenger.armLeft.rotation.x = -0.3;
@@ -498,9 +496,23 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const pin = new THREE.Group();
   const cone = cylinder(pin, 0.5, 0, 0.9, [0, 0, 0], missionRing.mat, 4);
   cone.rotation.y = Math.PI / 4;
-  const cup = cylinder(pin, 0.3, 0.23, 0.55, [0, 0.72, 0], material('#fff2d0'), 10);
-  cylinder(pin, 0.32, 0.32, 0.08, [0, 1.02, 0], material('#537764'), 10);
+  const coffeeIcon = new THREE.Group();
+  const cup = cylinder(coffeeIcon, 0.39, 0.3, 0.7, [0, 0.93, 0], material('#fff2d0'), 10);
+  cylinder(coffeeIcon, 0.42, 0.42, 0.1, [0, 1.32, 0], material('#537764'), 10);
+  box(coffeeIcon, [0.06, 0.4, 0.06], [0.12, 1.52, 0], material('#344f40'));
   cup.rotation.z = 0.12;
+  const parcelIcon = new THREE.Group();
+  box(parcelIcon, [1, 0.85, 0.85], [0, 1.05, 0], material('#d6a466'));
+  box(parcelIcon, [0.18, 0.87, 0.87], [0, 1.05, 0], material('#fff0ce'));
+  const flagIcon = new THREE.Group();
+  cylinder(flagIcon, 0.045, 0.045, 1.5, [-0.3, 1.05, 0], material('#fff0ce'), 6);
+  box(flagIcon, [0.9, 0.55, 0.06], [0.15, 1.5, 0], material('#e77641'));
+  const cleanupIcon = new THREE.Group();
+  sphere(cleanupIcon, 0.47, [0, 1, 0], material('#416c54'));
+  cylinder(cleanupIcon, 0.12, 0.25, 0.3, [0, 1.44, 0], material('#7ba27b'), 6);
+  pin.add(coffeeIcon, parcelIcon, flagIcon, cleanupIcon);
+  pin.position.y = 2.7;
+  for (const icon of [coffeeIcon, parcelIcon, flagIcon, cleanupIcon]) icon.scale.setScalar(0.75);
   marker.add(pin);
   let missionLabel = makeLabel('NHẬN CÀ PHÊ', '#f6cf71', '#493d23');
   missionLabel.position.y = 4.6;
@@ -522,6 +534,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   marker.traverse((o) => { o.castShadow = false; });
 
   const peers = new Map<string, Peer>();
+  const peerClock = createSnapshotClock();
   const state: PlayerState = { x: START.x, z: START.z, angle: Math.PI / 2, riding: false, speed: 0, score: 0 };
   let bikeX = BIKE_START.x;
   let bikeZ = BIKE_START.z;
@@ -532,9 +545,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   let lastDamage = -99;
   let active = false;
   let disposed = false;
-  let missionStep = 0;
-  let receiverIndex = 0;
+  const missions = createMissions();
+  let missionLabelKey = '';
   let receiverHappyUntil = 0;
+  let receiverSpot: { x: number; z: number } | null = null;
   let velocity = 0;
   let steer = 0;
   let lean = 0;
@@ -686,16 +700,51 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     bannerUntil = now + duration;
   }
 
-  function currentTarget() {
-    return missionStep === 0 ? { ...PICKUP, name: 'Quán Cô Ba' } : receivers[receiverIndex];
+  function isMotorbike() {
+    return state.riding && (playerCar === null || playerCar.kind === 'moto') && !(playerCar === null && bikeId === 'horse');
+  }
+
+  function missionPlayer() {
+    return { x: state.x, z: state.z, riding: missions.view().requiresBike ? isMotorbike() : state.riding, down: down !== null };
+  }
+
+  function interruptRace(message: string) {
+    const event = missions.update(0, { ...missionPlayer(), down: true });
+    if (event) handleMissionEvent({ ...event, message });
   }
 
   function setMissionLabel() {
+    const info = missions.view();
+    marker.visible = info.target !== null;
+    if (info.target) marker.position.set(info.target.x, groundHeight(info.target.x, info.target.z), info.target.z);
+    const key = `${info.id}:${info.step}:${info.status}`;
+    if (key === missionLabelKey) return;
+    missionLabelKey = key;
+    coffeeIcon.visible = info.id === 'coffee';
+    parcelIcon.visible = info.id === 'market' || info.id === 'post';
+    flagIcon.visible = info.id === 'tour' || info.id === 'circuit';
+    cleanupIcon.visible = info.id === 'cleanup';
     marker.remove(missionLabel);
     disposeTree(missionLabel);
-    missionLabel = makeLabel(missionStep === 0 ? 'NHẬN CÀ PHÊ' : `GIAO: ${receivers[receiverIndex].name.toUpperCase()}`, '#f6cf71', '#493d23');
+    missionLabel = makeLabel(info.label.toLocaleUpperCase('vi'), '#f6cf71', '#493d23');
     missionLabel.position.y = 4.6;
     marker.add(missionLabel);
+  }
+
+  function handleMissionEvent(event: MissionEvent | null) {
+    if (!event) return;
+    let message = event.message;
+    if (event.reward) {
+      cash += event.reward.cash;
+      state.score += event.reward.score;
+      if (event.reward.delivery) {
+        deliveries++;
+        if (deliveries === 1) message += ' Tiệm súng đã mở cửa cho bạn!';
+      }
+    }
+    notify(message, 5500);
+    setMissionLabel();
+    emitHud(performance.now());
   }
 
   function equip(id: WeaponId) {
@@ -785,6 +834,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   function wasted(now: number, by?: string) {
     if (down === 'wasted') return;
+    interruptRace('Bạn đã bị hạ gục. Nhấn M để thử lại vòng đua.');
     knockPlayer((Math.random() - 0.5) * 3, 2, (Math.random() - 0.5) * 3, now, 'wasted');
     health = 0;
     showBanner('BỊ HẠ GỤC', now);
@@ -813,6 +863,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   function busted(now: number) {
     if (down) return;
+    interruptRace('Bạn đã bị bắt. Nhấn M để thử lại vòng đua.');
     leaveVehicleNow();
     down = 'busted';
     downUntil = now + RESPAWN_MS;
@@ -915,24 +966,17 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (!active || down) return;
     const now = performance.now();
     const time = now / 1000;
-    const target = currentTarget();
-    if (distance(target) < 4.5) {
-      if (missionStep === 0) {
-        missionStep = 1;
-        let next = Math.floor(Math.random() * receivers.length);
-        if (next === receiverIndex) next = (next + 1) % receivers.length;
-        receiverIndex = next;
-        notify(`Đã nhận cà phê! Giao đến ${receivers[receiverIndex].name}.`, 4500);
-      } else {
-        state.score += 50;
-        cash += DELIVERY_PAY;
-        deliveries++;
-        missionStep = 0;
+    const info = missions.view();
+    const needsVehicleChange = (info.requiresOnFoot && state.riding) || (info.requiresBike && !isMotorbike());
+    const missionEvent = missions.interact(missionPlayer());
+    if (missionEvent) {
+      if (!needsVehicleChange && info.step > 0 && ['coffee', 'market', 'post'].includes(info.id)) {
+        receiverSpot = info.target;
         receiverHappyUntil = now + 6000;
-        notify(deliveries === 1 ? '+100.000đ · Tiệm súng đã mở cửa cho bạn!' : '+50 điểm · +100.000đ · Cảm ơn bạn!', 4500);
       }
-      setMissionLabel();
-      return;
+      handleMissionEvent(missionEvent);
+      // E must still allow mounting or dismounting at a restricted objective.
+      if (!needsVehicleChange) return;
     }
     const offer = sideMissions.nearOffer(state.x, state.z);
     if (offer) {
@@ -996,7 +1040,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
   function onKeyUp(event: KeyboardEvent) { setInput(event.key, false); }
   function clearKeys() { keys.clear(); mouseHeld = false; triggerQueued = false; setBag(false); }
-  function onVisibility() { if (document.hidden) clearKeys(); }
+  function onVisibility() { previousTime = performance.now(); if (document.hidden) clearKeys(); }
   window.addEventListener('keydown', onKeyDown);
   window.addEventListener('keyup', onKeyUp);
   window.addEventListener('blur', clearKeys);
@@ -1093,7 +1137,16 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     peers.delete(id);
   }
 
-  function setPeers(nextPeers: PeerState[]) {
+  function setPeers(nextPeers: PeerState[], serverTime?: number) {
+    if (!nextPeers.length) {
+      for (const [id, peer] of peers) removePeer(id, peer);
+      peerClock.reset();
+      return;
+    }
+    const receivedAt = performance.now();
+    // Untimestamped callers still work, using the same local monotonic domain.
+    const snapshotTime = serverTime ?? receivedAt;
+    if (!peerClock.observe(snapshotTime, receivedAt)) return;
     const incomingIds = new Set(nextPeers.map((p) => p.id));
     for (const [id, peer] of peers) if (!incomingIds.has(id)) removePeer(id, peer);
     for (const peer of nextPeers) {
@@ -1126,9 +1179,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         peerBike.group.rotation.y = peer.angle;
         group.traverse((o) => { o.castShadow = false; });
         scene.add(group);
-        existing = { group, foot, bike: peerBike, car: null, carKind: 'foot', guns: peerGuns, label, target: { ...peer }, name: peer.name, color: peer.color, body: null, flashAt: 0, hurtAt: -99, predicted: 0 };
+        existing = { group, foot, bike: peerBike, car: null, carKind: 'foot', guns: peerGuns, label, target: { ...peer }, motion: createPeerInterpolator(), name: peer.name, color: peer.color, body: null, flashAt: 0, hurtAt: -99, predicted: 0 };
         peers.set(peer.id, existing);
       }
+      if (!existing.motion.push(peer, snapshotTime)) continue;
       // A fresh health report replaces our local damage prediction.
       if (existing.target.health !== peer.health) existing.predicted = 0;
       existing.target = { ...peer };
@@ -1418,6 +1472,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   function crash(now: number) {
+    interruptRace('Bạn đã ngã xe. Nhấn M để thử lại vòng đua.');
     const fx = Math.sin(state.angle), fz = Math.cos(state.angle);
     const speed = velocity;
     if (playerCar) { playerCar.mode = 'parked'; playerCar.speed = 0; playerCar = null; }
@@ -1509,8 +1564,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   function emitHud(now: number) {
-    const target = currentTarget();
-    const nearMission = distance(target) < 4.5;
+    const missionInfo = missions.view();
+    const target = missionInfo.target;
+    const nearMission = target !== null && distance(target) <= 6.5;
     const nearBike = !state.riding && Math.hypot(state.x - bikeX, state.z - bikeZ) < 2.6;
     const nearStore = !state.riding && distance(STORE) < 3.5;
     const nearBikeShop = !state.riding && distance(BIKE_SHOP) < 3.5;
@@ -1522,11 +1578,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       : down === 'wasted' ? 'Đang được đưa đi cấp cứu…'
       : down === 'busted' ? 'Đang bị áp giải về đồn…'
       : playerBody ? 'Đang đứng dậy…'
-      : nearMission ? (missionStep === 0 ? 'Nhấn E để nhận cà phê' : `Nhấn E để giao cà phê cho ${target.name} · +100.000đ`)
+      : nearMission && missionInfo.requiresOnFoot && state.riding ? 'Giảm tốc rồi nhấn E xuống xe để dọn rác'
+      : nearMission && missionInfo.requiresBike && !isMotorbike() ? 'Hãy dùng xe máy để tham gia vòng đua'
+      : nearMission ? missionInfo.objective
       : offer ? `Nhấn E để nhận việc: ${offer.def.title} (+${formatThousands(offer.def.reward)})`
-      : nearStore ? (deliveries ? 'Nhấn E để vào Tiệm súng' : 'Tiệm súng: giao 1 đơn cà phê để mở khóa')
+      : nearStore ? (deliveries ? 'Nhấn E để vào Tiệm súng' : 'Tiệm súng: hoàn thành 1 nhiệm vụ giao hàng để mở khóa')
       : nearBikeShop ? 'Nhấn E để vào Cửa hàng xe máy'
       : nearHospital ? 'Nhấn E để khám và hồi máu'
+      : missionInfo.status !== 'active' ? 'Nhấn M để chọn nhiệm vụ mới hoặc chơi lại'
       : state.riding ? (weapon !== 'fists' ? 'W/S tiến lùi · A/D rẽ · Click bắn · E xuống xe' : 'W/S tiến lùi · A/D rẽ · Space phanh · E xuống xe')
       : car && !nearBike ? (car.mode === 'lane' ? (car.kind === 'moto' ? 'Nhấn E để cướp xe máy (bị truy nã)' : 'Nhấn E để cướp xe (bị truy nã)') : car.health <= 0 ? 'Xe này đã hỏng' : 'Nhấn E để lên xe')
       : nearBike ? (bikeHealth > 0 ? (bikeId === 'horse' ? 'Nhấn E để cưỡi ngựa' : 'Nhấn E để lên xe máy') : bikeId === 'horse' ? 'Ngựa đã kiệt sức · Chữa ở Cửa hàng xe máy' : 'Xe máy đã hỏng · Mua xe mới ở Cửa hàng xe máy')
@@ -1540,13 +1599,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const vehicleHealth = playerCar ? playerCar.health / carMax(playerCar) : state.riding ? bikeHealth / bikeById(bikeId).health : -1;
     const hud: Hud = {
       speed: Math.round(velocity * 10) / 10, riding: state.riding, score: state.score,
-      mission: missionStep === 0 ? 'Nhận cà phê ở quán Cô Ba' : `Giao cà phê đến ${target.name}`, missionStep, hint,
+      mission: missionInfo.objective, missionStep: missionInfo.step, missionInfo, hint,
       x: Math.round(state.x * 2) / 2, z: Math.round(state.z * 2) / 2,
       cash, deliveries, weapon, owned: WEAPONS.filter((w) => owned.has(w.id)).map((w) => w.id), down: down !== null,
       fps: monitor.fps, quality: QUALITY_LEVELS[level].label, qualityMode, gpu, softwareGpu,
       health: Math.ceil(health), wanted: police.wanted, banner: now < bannerUntil ? banner : '', vehicle, vehicleHealth: Math.round(vehicleHealth * 100) / 100,
       bike: bikeId, bikeHealth: Math.round(bikeHealth / bikeById(bikeId).health * 100) / 100, bikeBroken: bikeHealth <= 0,
-      bikeX: Math.round(bikeX), bikeZ: Math.round(bikeZ), targetX: Math.round(target.x), targetZ: Math.round(target.z), targetName: target.name, police: policePoints,
+      bikeX: Math.round(bikeX), bikeZ: Math.round(bikeZ), targetX: Math.round(target?.x ?? state.x), targetZ: Math.round(target?.z ?? state.z), targetName: missionInfo.label, police: policePoints,
       clock: atmosphere.label(), ammo: rounds ? { mag: rounds.mag, reserve: rounds.reserve, reloading: reloadWeapon === weapon } : null,
       side: sideView ? { ...sideView, timeLeft: sideView.timeLeft === null ? null : Math.ceil(sideView.timeLeft) } : null,
       offers: sideMissions.active ? [] : sideMissions.offers.map((o) => ({ x: Math.round(o.x), z: Math.round(o.z) })),
@@ -1641,15 +1700,17 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     return moving;
   }
 
-  function updatePeers(dt: number, now: number, time: number) {
+  function updatePeers(now: number, time: number) {
+    const renderTime = peerClock.renderTime(now);
     for (const [, peer] of peers) {
       const { target } = peer;
-      const blend = 1 - Math.exp(-dt * 12);
-      peer.group.position.x = THREE.MathUtils.lerp(peer.group.position.x, target.x, blend);
-      peer.group.position.z = THREE.MathUtils.lerp(peer.group.position.z, target.z, blend);
+      const pose = peer.motion.sample(renderTime);
+      if (!pose) continue;
+      peer.group.position.x = pose.x;
+      peer.group.position.z = pose.z;
       const { x, z } = peer.group.position;
       peer.group.position.y = groundHeight(x, z) - 0.02;
-      peer.foot.group.rotation.y = angleLerp(peer.foot.group.rotation.y, target.angle, blend);
+      peer.foot.group.rotation.y = pose.angle;
       peer.bike.group.rotation.y = peer.foot.group.rotation.y;
       const kind = peerVehicle(peer);
       if ((kind === 'car' || kind === 'police') && peer.carKind !== kind) {
@@ -1676,7 +1737,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       peer.label.position.y = kind === 'car' || kind === 'police' ? 3.1 : 2.6;
       const armed = target.weapon && target.weapon !== 'fists';
       for (const [id, gun] of peer.guns) gun.visible = id === target.weapon;
-      const peerStride = target.speed > 1 ? Math.sin(time * 10) * 0.55 : 0;
+      const peerStride = Math.abs(pose.speed) > 1 ? Math.sin(time * 10) * 0.55 : 0;
       peer.foot.limbLeft.rotation.x = peerStride;
       peer.foot.limbRight.rotation.x = -peerStride;
       peer.foot.armRight.rotation.x = armed ? -Math.PI / 2 : -peerStride * 0.7;
@@ -1832,7 +1893,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       }
     }
 
-    // Side sideMissions.
+    if (active && !document.hidden && !down) handleMissionEvent(missions.update(Math.max(0, interval / 1000), missionPlayer()));
+
+    // Side missions.
     const missionResult = sideMissions.update(dt, missionContext(time));
     sideView = missionResult.view;
     passengerAboard = missionResult.passenger;
@@ -1880,24 +1943,24 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     youLabel.position.set(scratch.x, inCar() ? 3.1 : state.riding ? 2.6 : 2.3, scratch.z);
     youLabel.visible = active;
 
-    // Coffee mission marker, shopkeeper and receiver.
-    const target = currentTarget();
-    marker.position.set(target.x, groundHeight(target.x, target.z) - 0.1, target.z);
+    // Mission marker, shopkeeper and receiver.
     pin.position.y = 2.7 + Math.sin(time * 2.5) * 0.2;
     pin.rotation.y = time * 0.35;
     missionRing.ring.scale.setScalar(1 + Math.sin(time * 2.5) * 0.045);
     for (const [ring, phase] of [[storeRing, 1.5], [bikeShopRing, 3], [hospitalRing, 4.5]] as const) ring.ring.scale.setScalar(1 + Math.sin(time * 2.5 + phase) * 0.045);
-    shopkeeperCup.visible = missionStep === 0;
-    shopkeeper.armRight.rotation.x = missionStep === 0 && distance(PICKUP) < 14 ? -1.4 + Math.sin(time * 3) * 0.08 : 0;
-    const showReceiver = missionStep === 1 || now < receiverHappyUntil;
-    receiver.group.visible = showReceiver;
-    if (showReceiver) {
-      const spot = receivers[receiverIndex];
+    const mission = missions.view();
+    const coffeePickup = mission.id === 'coffee' && mission.status === 'active' && mission.step === 0;
+    shopkeeperCup.visible = coffeePickup;
+    shopkeeper.armRight.rotation.x = coffeePickup && distance(PICKUP) < 14 ? -1.4 + Math.sin(time * 3) * 0.08 : 0;
+    const deliveryTarget = ['coffee', 'market', 'post'].includes(mission.id) && mission.step > 0 ? mission.target : null;
+    const spot = now < receiverHappyUntil ? receiverSpot : deliveryTarget;
+    receiver.group.visible = spot !== null;
+    if (spot) {
       const rx = spot.x + 1.2, rz = spot.z + 1.2;
       receiver.group.position.set(rx, groundHeight(rx, rz) - 0.02, rz);
       receiver.group.rotation.y = Math.atan2(state.x - rx, state.z - rz);
       const happy = now < receiverHappyUntil;
-      receiverCup.visible = happy;
+      receiverCup.visible = happy && mission.id === 'coffee';
       const near = distance(spot) < 18;
       receiver.armRight.rotation.set(happy ? -1.3 : near ? -2.8 : 0, 0, happy ? 0 : near ? Math.sin(time * 9) * 0.35 : 0);
       receiver.group.position.y += happy ? Math.abs(Math.sin(time * 7)) * 0.08 : 0;
@@ -1917,7 +1980,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         ragdolls.push(car.x + Math.sin(car.yaw) * (moto ? 1 : 2.2), car.z + Math.cos(car.yaw) * (moto ? 1 : 2.2), moto ? 0.8 : 1.4, Math.sin(car.yaw) * car.speed, 1.5, Math.cos(car.yaw) * car.speed);
       }
     }
-    updatePeers(dt, now, time);
+    updatePeers(now, time);
     npcs.forEachStanding((x, z, npc) => effects.blob(x, npc.y + 0.02, z, 0.85));
     police.forEachUnit((x, z, onFoot) => { if (onFoot) effects.blob(x, groundHeight(x, z) + 0.02, z, 0.85); });
     animals.forEachShadow((x, z, size) => effects.blob(x, groundHeight(x, z) + 0.02, z, size, size * 1.6));
@@ -1987,6 +2050,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     frame = requestAnimationFrame(update);
   }
+  setMissionLabel();
   emitHud(performance.now());
   frame = requestAnimationFrame(update);
 
@@ -2004,7 +2068,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   return {
-    setActive(value: boolean) { active = value; clearKeys(); rotating = null; touches.clear(); if (!value && !state.riding) velocity = 0; },
+    setActive(value: boolean) { active = value; previousTime = performance.now(); clearKeys(); rotating = null; touches.clear(); if (!value && !state.riding) velocity = 0; },
     getState(): PlayerState {
       return {
         ...state, health: Math.ceil(health), weapon, vehicle: vehicleKind(), down: down === 'wasted',
@@ -2024,12 +2088,20 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     setPeers,
     action,
     setInput,
+    selectMission(id: MissionId) {
+      missions.select(id, id === 'coffee' ? receivers[Math.floor(Math.random() * receivers.length)] : undefined);
+      receiverHappyUntil = 0;
+      receiverSpot = null;
+      setMissionLabel();
+      notify(missions.view().objective, 4500);
+      emitHud(performance.now());
+    },
     equip(id: WeaponId) { equip(id); emitHud(performance.now()); },
     cycleWeapon() { cycleWeapon(); emitHud(performance.now()); },
     buyWeapon(id: WeaponId): string | null {
       const def = weaponById(id);
       if (owned.has(id)) { equip(id); emitHud(performance.now()); return null; }
-      if (!deliveries) return 'Hoàn thành ít nhất 1 chuyến giao cà phê để mở khóa Tiệm súng.';
+      if (!deliveries) return 'Hoàn thành ít nhất 1 nhiệm vụ giao hàng để mở khóa Tiệm súng.';
       if (cash < def.price) return 'Chưa đủ tiền. Giao thêm cà phê hoặc làm nhiệm vụ để kiếm tiền nhé.';
       cash -= def.price;
       giveWeapon(id);
@@ -2100,7 +2172,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       bikeAngle = Math.PI / 2;
       bikeHealth = bikeById(bikeId).health;
       velocity = 0;
-      missionStep = 0;
+      missions.reset();
+      receiverHappyUntil = 0;
+      receiverSpot = null;
       notificationUntil = 0;
       bannerUntil = 0;
       cash = 0;
@@ -2118,6 +2192,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       down = null;
       pendingHits.length = 0;
       Object.assign(view, CAMERA_DEFAULT);
+      missionLabelKey = '';
       setMissionLabel();
       clearKeys();
       emitHud(performance.now());
