@@ -1,14 +1,28 @@
 /** D1-backed room presence. Every stored player is authenticated by a private token. */
 const ACTIVE_MS = 15_000;
 const SESSION_MS = 30 * 60_000;
+const HIT_TTL_MS = 10_000;
 const MAX_PLAYERS = 8;
 const MAX_BODY_BYTES = 4096;
+const MAX_HITS_SENT = 8;
+const MAX_HITS_DELIVERED = 20;
+const MAX_DAMAGE_PER_SYNC = 200;
+const UNKNOWN_ATTACKER = "Người lạ";
+const WEAPONS = ["fists", "pistol", "shotgun", "smg"] as const;
+const VEHICLES = ["foot", "scooter", "car", "police"] as const;
+const PLAYER_ID = /^[0-9a-f-]{36}$/;
 const COLORS = ["#ffd15c", "#62dfc6", "#ff8d83", "#b6a0ff", "#72c8ff", "#ffad70", "#d4ec7e", "#f9a9de"];
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 type Payload = Record<string, unknown>;
-type State = { x: number; z: number; angle: number; riding: boolean; speed: number; score: number };
-type PlayerRow = Omit<State, "riding"> & { id: string; name: string; color: string; riding: number };
+type State = {
+  x: number; z: number; angle: number; riding: boolean; speed: number; score: number;
+  health: number; weapon: (typeof WEAPONS)[number]; vehicle: (typeof VEHICLES)[number];
+  down: boolean; firing: boolean; wanted: number;
+};
+type Flag = "riding" | "down" | "firing";
+type PlayerRow = Omit<State, Flag> & Record<Flag, number> & { id: string; name: string; color: string };
+type Hit = { target: string; damage: number; dx: number; dz: number };
 
 class ClientError extends Error {
   constructor(message: string, readonly status = 400) { super(message); }
@@ -71,11 +85,26 @@ function roomCode(value: unknown): string {
   return code;
 }
 
-function numberIn(value: unknown, min: number, max: number): number {
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new ClientError("Trạng thái nhân vật không hợp lệ.");
-  }
+function isNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
+}
+
+function numberIn(value: unknown, min: number, max: number): number {
+  if (!isNumber(value)) throw new ClientError("Trạng thái nhân vật không hợp lệ.");
+  return clamp(value, min, max);
+}
+
+// Combat fields are optional so older clients keep syncing; bad values fall back instead of failing.
+function optionalInteger(value: unknown, min: number, max: number, fallback: number) {
+  return isNumber(value) ? Math.round(clamp(value, min, max)) : fallback;
+}
+
+function oneOf<T extends string>(value: unknown, options: readonly T[], fallback: T): T {
+  return options.includes(value as T) ? value as T : fallback;
 }
 
 function playerState(value: unknown): State {
@@ -92,7 +121,31 @@ function playerState(value: unknown): State {
     riding: state.riding,
     speed: numberIn(state.speed, -36, 36),
     score: Math.floor(numberIn(state.score, 0, 1_000_000)),
+    health: optionalInteger(state.health, 0, 100, 100),
+    weapon: oneOf(state.weapon, WEAPONS, "fists"),
+    vehicle: oneOf(state.vehicle, VEHICLES, state.riding ? "scooter" : "foot"),
+    down: state.down === true,
+    firing: state.firing === true,
+    wanted: optionalInteger(state.wanted, 0, 5, 0),
   };
+}
+
+function playerHits(value: unknown, attacker: string): Hit[] {
+  // Hits are a best-effort relay: malformed entries are dropped so one bad hit never fails a sync.
+  if (!Array.isArray(value)) return [];
+  const hits: Hit[] = [];
+  let budget = MAX_DAMAGE_PER_SYNC;
+  for (const entry of value.slice(0, MAX_HITS_SENT)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const { target, damage, dx, dz } = entry as Payload;
+    if (typeof target !== "string" || !PLAYER_ID.test(target) || target === attacker ||
+        !isNumber(damage) || !isNumber(dx) || !isNumber(dz)) continue;
+    const dealt = Math.min(budget, Math.round(clamp(damage, 1, 100)));
+    hits.push({ target, damage: dealt, dx: clamp(dx, -1, 1), dz: clamp(dz, -1, 1) });
+    budget -= dealt;
+    if (!budget) break;
+  }
+  return hits;
 }
 
 function randomHex(bytes = 32) {
@@ -111,7 +164,7 @@ async function hashToken(token: string) {
 
 async function credentials(body: Payload) {
   const room = roomCode(body.room);
-  if (typeof body.id !== "string" || !/^[0-9a-f-]{36}$/.test(body.id) ||
+  if (typeof body.id !== "string" || !PLAYER_ID.test(body.id) ||
       typeof body.token !== "string" || !/^[0-9a-f]{64}$/.test(body.token)) {
     throw new ClientError("Phiên chơi không hợp lệ. Hãy vào lại phòng.", 401);
   }
@@ -119,13 +172,39 @@ async function credentials(body: Payload) {
 }
 
 function peerQuery(db: D1Database, room: string, id: string, now: number) {
-  return db.prepare(`SELECT id, name, color, x, z, angle, riding, speed, score
+  return db.prepare(`SELECT id, name, color, x, z, angle, riding, speed, score,
+    health, weapon, vehicle, down, firing, wanted
     FROM players WHERE room = ? AND id <> ? AND last_seen >= ?
     ORDER BY joined_at, id LIMIT 8`).bind(room, id, now - ACTIVE_MS);
 }
 
 function peers(rows: unknown[]) {
-  return (rows as PlayerRow[]).map((player) => ({ ...player, riding: Boolean(player.riding) }));
+  return (rows as PlayerRow[]).map((player) => ({
+    ...player, riding: Boolean(player.riding), down: Boolean(player.down), firing: Boolean(player.firing),
+  }));
+}
+
+function hitInsert(db: D1Database, room: string, attacker: string, hit: Hit, now: number) {
+  // The target check lives in the INSERT, so a hit only lands on another active player in this room.
+  return db.prepare(`INSERT INTO hits (room, target, attacker, damage, dx, dz, created_at)
+    SELECT room, id, ?, ?, ?, ?, ? FROM players
+    WHERE id = ? AND room = ? AND id <> ? AND last_seen >= ?`)
+    .bind(attacker, hit.damage, hit.dx, hit.dz, now, hit.target, room, attacker, now - ACTIVE_MS);
+}
+
+function hitStatements(db: D1Database, target: string, now: number) {
+  // The SELECT and DELETE share one batch transaction and one ordering, so each hit is delivered once.
+  return [
+    db.prepare(`SELECT hits.attacker, COALESCE(players.name, ?) AS name, hits.damage, hits.dx, hits.dz
+      FROM hits LEFT JOIN players ON players.id = hits.attacker
+      WHERE hits.target = ? AND hits.created_at >= ?
+      ORDER BY hits.id LIMIT ?`).bind(UNKNOWN_ATTACKER, target, now - HIT_TTL_MS, MAX_HITS_DELIVERED),
+    db.prepare(`DELETE FROM hits WHERE id IN
+      (SELECT id FROM hits WHERE target = ? AND created_at >= ? ORDER BY id LIMIT ?)`)
+      .bind(target, now - HIT_TTL_MS, MAX_HITS_DELIVERED),
+    db.prepare(`DELETE FROM hits WHERE id IN
+      (SELECT id FROM hits WHERE created_at < ? ORDER BY created_at LIMIT 128)`).bind(now - HIT_TTL_MS),
+  ];
 }
 
 async function cleanExpired(db: D1Database, now: number) {
@@ -186,12 +265,15 @@ async function enterRoom(db: D1Database, body: Payload, now: number) {
 async function syncRoom(db: D1Database, body: Payload, now: number) {
   const { room, id, tokenHash } = await credentials(body);
   const state = playerState(body.state);
+  const hits = playerHits(body.hits, id);
   // An inactive player may reclaim a slot only if room capacity is still available.
-  const updated = await db.prepare(`UPDATE players SET x = ?, z = ?, angle = ?, riding = ?, speed = ?, score = ?, last_seen = ?
+  const updated = await db.prepare(`UPDATE players SET x = ?, z = ?, angle = ?, riding = ?, speed = ?, score = ?,
+    health = ?, weapon = ?, vehicle = ?, down = ?, firing = ?, wanted = ?, last_seen = ?
     WHERE id = ? AND room = ? AND token_hash = ? AND last_seen >= ?
     AND (last_seen >= ? OR
       (SELECT COUNT(*) FROM players AS active WHERE active.room = ? AND active.id <> ? AND active.last_seen >= ?) < ?)`)
-    .bind(state.x, state.z, state.angle, Number(state.riding), state.speed, state.score, now,
+    .bind(state.x, state.z, state.angle, Number(state.riding), state.speed, state.score,
+      state.health, state.weapon, state.vehicle, Number(state.down), Number(state.firing), state.wanted, now,
       id, room, tokenHash, now - SESSION_MS, now - ACTIVE_MS, room, id, now - ACTIVE_MS, MAX_PLAYERS).run();
   if (!updated.meta.changes) {
     const valid = await db.prepare("SELECT id FROM players WHERE id = ? AND room = ? AND token_hash = ? AND last_seen >= ?")
@@ -202,8 +284,10 @@ async function syncRoom(db: D1Database, body: Payload, now: number) {
   const results = await db.batch([
     db.prepare("UPDATE rooms SET last_activity = ? WHERE code = ?").bind(now, room),
     peerQuery(db, room, id, now),
+    ...hitStatements(db, id, now),
+    ...hits.map((hit) => hitInsert(db, room, id, hit, now)),
   ]);
-  return reply({ peers: peers(results[1].results), serverTime: now });
+  return reply({ peers: peers(results[1].results), hits: results[2].results, serverTime: now });
 }
 
 export async function handleRoom(request: Request, db?: D1Database): Promise<Response> {

@@ -8,6 +8,13 @@
       "when": 1792723729320,
       "tag": "0000_unknown_skullbuster",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1792745398929,
+      "tag": "0001_pvp_hits",
+      "breakpoints": true
     }
   ]
 }

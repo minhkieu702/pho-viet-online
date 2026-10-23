@@ -36,7 +36,7 @@ const STEP = 1 / 120;
 const GRAVITY = -24;
 const DRAG = 0.996;
 const RADIUS = 0.12;
-const MAX_BODIES = 14;
+const MAX_BODIES = 18;
 const BOUND = 88;
 
 export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground: (x: number, z: number) => number) {

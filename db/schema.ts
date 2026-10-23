@@ -20,7 +20,29 @@ export const players = sqliteTable("players", {
   score: integer("score").notNull().default(0),
   joinedAt: integer("joined_at").notNull(),
   lastSeen: integer("last_seen").notNull(),
+  // Combat state is client-reported; SQL defaults keep the migration additive for existing rows.
+  health: integer("health").notNull().default(100),
+  weapon: text("weapon", { enum: ["fists", "pistol", "shotgun", "smg"] }).notNull().default("fists"),
+  vehicle: text("vehicle", { enum: ["foot", "scooter", "car", "police"] }).notNull().default("foot"),
+  down: integer("down", { mode: "boolean" }).notNull().default(false),
+  firing: integer("firing", { mode: "boolean" }).notNull().default(false),
+  wanted: integer("wanted").notNull().default(0),
 }, (table) => [
   index("players_room_seen_idx").on(table.room, table.lastSeen),
   index("players_seen_idx").on(table.lastSeen),
+]);
+
+// Short-lived relay of damage one player dealt to another; consumed on the target's next sync.
+export const hits = sqliteTable("hits", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  room: text("room").notNull(),
+  target: text("target").notNull().references(() => players.id, { onDelete: "cascade" }),
+  attacker: text("attacker").notNull(),
+  damage: integer("damage").notNull(),
+  dx: real("dx").notNull(),
+  dz: real("dz").notNull(),
+  createdAt: integer("created_at").notNull(),
+}, (table) => [
+  index("hits_target_idx").on(table.target),
+  index("hits_created_idx").on(table.createdAt),
 ]);
