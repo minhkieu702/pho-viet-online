@@ -2,6 +2,13 @@ import * as THREE from 'three';
 
 export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number };
 
+/** Walkable surface height: the park lawn and tiled square sit slightly above the street. */
+export function groundHeight(x: number, z: number) {
+  if (x > 13 && x < 43 && z > -44 && z < -22) return 0.24;
+  if (x > 14.5 && x < 43.5 && z > 29.5 && z < 46.5) return 0.27;
+  return 0.1;
+}
+
 /** An original, deliberately compact Vietnamese neighbourhood. All artwork is generated locally. */
 export function buildWorld(scene: THREE.Scene) {
   const root = new THREE.Group();
@@ -24,8 +31,7 @@ export function buildWorld(scene: THREE.Scene) {
   const rotation = new THREE.Euler();
   const position = new THREE.Vector3();
   const scale = new THREE.Vector3();
-  const people: { object: THREE.Group; centerX: number; centerZ: number; phase: number; axis: 'x' | 'z' }[] = [];
-  const waterWaves: THREE.Mesh[] = [];
+  const waves: { x: number; z: number; width: number }[] = [];
 
   function shape(kind: string, color: string, x: number, y: number, z: number, sx: number, sy: number, sz: number, yaw = 0, tilt = 0, shadow = true) {
     const key = `${kind}:${color}:${shadow}`;
@@ -107,7 +113,7 @@ export function buildWorld(scene: THREE.Scene) {
     box('#586c65', x + .6, 6.35, z, 1.25, .13, .13);
     box('#e9d8a7', x + 1.1, 6.25, z, .65, .12, .35);
   }
-  function house(x: number, z: number, w: number, h: number, d: number, color: string, name: string, subtitle: string, facing = 0, index = 0) {
+  function house(x: number, z: number, w: number, h: number, d: number, color: string, name: string, subtitle: string, facing = 0, index = 0, signColor?: string) {
     const front = d / 2;
     const c = Math.cos(facing), s = Math.sin(facing);
     const part = (lx: number, ly: number, lz: number, pw: number, ph: number, pd: number, pc: string) => box(pc, x + lx * c + lz * s, ly, z - lx * s + lz * c, pw, ph, pd, facing);
@@ -140,7 +146,7 @@ export function buildWorld(scene: THREE.Scene) {
     }
     const sy = Math.min(h - .65, 3.8);
     part(0, sy, front + .23, w - .45, 1.25, .22, '#e7d9bd');
-    sign(name, subtitle, index % 3 === 0 ? '#b14635' : '#245b4f', x + (front + .36) * s, sy, z + (front + .36) * c, w - .65, 1.1, facing);
+    sign(name, subtitle, signColor ?? (index % 3 === 0 ? '#b14635' : '#245b4f'), x + (front + .36) * s, sy, z + (front + .36) * c, w - .65, 1.1, facing);
     // Segmented striped shop canopy.
     for (let aw = 0; aw < 8; aw++) {
       part(-w / 2 + .35 + (aw + .5) * (w - .7) / 8, 2.98, front + 1.2, (w - .7) / 8, .16, 2, aw % 2 ? '#f3e6ca' : index % 2 ? '#5e927c' : '#cf795d');
@@ -186,6 +192,11 @@ export function buildWorld(scene: THREE.Scene) {
   const addHouse = (x: number, z: number, w: number, h: number, facing: number, preferred?: number) => {
     const id = preferred ?? houseIndex % shops.length;
     const isPostOffice = x === 66 && z === -40;
+    const isGunStore = x === -18 && z === 42;
+    if (isGunStore) {
+      house(x, z, w, h, 11, '#7d8a84', 'TIỆM SÚNG', 'VŨ KHÍ • TRANG BỊ • MỞ CỬA 24/7', facing, houseIndex++, '#2f4a6b');
+      return;
+    }
     house(x, z, w, h, 11, isPostOffice ? '#dfb16f' : colors[houseIndex % colors.length], isPostOffice ? 'BƯU ĐIỆN' : shops[id][0], isPostOffice ? 'GỬI MỘT CHÚT THƯƠNG' : shops[id][1], isPostOffice ? 0 : facing, houseIndex++);
   };
   for (const x of [-76, -65, -42, -31, -20, 20, 31, 42, 66, 77]) addHouse(x, -18, 9.7, 7.4 + (houseIndex % 3) * 3.15, 0, x === -31 ? 0 : undefined);
@@ -243,15 +254,15 @@ export function buildWorld(scene: THREE.Scene) {
   box('#e2cfaa', 0, .45, -91.3, 184, .28, .45);
   for (let x = -89; x <= 90; x += 5) box('#d6c4a1', x, .7, -91.3, .3, 1.2, .35);
   for (let x = -79; x <= 80; x += 22) { palm(x, -86); bench(x + 4, -86, Math.PI); }
-  for (let i = 0; i < 22; i++) {
-    const geometry = new THREE.PlaneGeometry(2 + (i % 4) * 1.4, .14);
-    const material = new THREE.MeshBasicMaterial({ color: '#b5d2b7', transparent: true, opacity: .32 });
-    geometries.push(geometry); materials.push(material);
-    const wave = new THREE.Mesh(geometry, material);
-    wave.rotation.x = -Math.PI / 2;
-    wave.position.set(-90 + ((i * 31) % 180), -.145, -97 - ((i * 7) % 28));
-    root.add(wave); waterWaves.push(wave);
-  }
+  // All river ripples share one instanced draw call.
+  for (let i = 0; i < 22; i++) waves.push({ x: -90 + ((i * 31) % 180), z: -97 - ((i * 7) % 28), width: 2 + (i % 4) * 1.4 });
+  const waveGeometry = new THREE.PlaneGeometry(1, .14).rotateX(-Math.PI / 2);
+  const waveMaterial = new THREE.MeshBasicMaterial({ color: '#b5d2b7', transparent: true, opacity: .32 });
+  geometries.push(waveGeometry); materials.push(waveMaterial);
+  const waveMesh = new THREE.InstancedMesh(waveGeometry, waveMaterial, waves.length);
+  waveMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  waveMesh.frustumCulled = false;
+  root.add(waveMesh);
   // A distant skyline frames the map without obstructing the playable streets.
   for (let i = 0; i < 18; i++) {
     const x = -130 + i * 16;
@@ -259,27 +270,6 @@ export function buildWorld(scene: THREE.Scene) {
     box(i % 2 ? '#b9c4b6' : '#c6c6b5', x, h / 2, -151 - (i % 3) * 8, 10 + i % 4, h, 12);
     for (let floor = 3; floor < h - 1; floor += 4) box('#a4b7af', x, floor, -144.9 - (i % 3) * 8, 7, .9, .04, 0, false);
   }
-
-  function pedestrian(x: number, z: number, color: string, phase: number, axis: 'x' | 'z') {
-    const group = new THREE.Group();
-    const material = new THREE.MeshStandardMaterial({ color, roughness: .9 });
-    const skin = new THREE.MeshStandardMaterial({ color: '#d3a179', roughness: .9 });
-    const pants = new THREE.MeshStandardMaterial({ color: '#536c69', roughness: .9 });
-    materials.push(material, skin, pants);
-    const body = new THREE.Mesh(primitiveGeometries.box, material); body.scale.set(.58, .78, .38); body.position.y = 1.13;
-    const head = new THREE.Mesh(primitiveGeometries.ball, skin); head.scale.set(.28, .3, .28); head.position.y = 1.85;
-    group.add(body, head);
-    for (const dx of [-.16, .16]) { const leg = new THREE.Mesh(primitiveGeometries.box, pants); leg.scale.set(.2, .68, .23); leg.position.set(dx, .4, 0); group.add(leg); }
-    if (phase % 2 < 1) {
-      const hatMat = new THREE.MeshStandardMaterial({ color: '#e5cf92', roughness: 1 }); materials.push(hatMat);
-      const hat = new THREE.Mesh(primitiveGeometries.cone, hatMat); hat.scale.set(.52, .3, .52); hat.position.y = 2.14; group.add(hat);
-    }
-    group.position.set(x, .12, z); group.traverse(o => { if (o instanceof THREE.Mesh) o.castShadow = true; });
-    root.add(group); people.push({ object: group, centerX: x, centerZ: z, phase, axis });
-  }
-  pedestrian(-22, -8.7, '#db9876', 0, 'x'); pedestrian(28, 8.8, '#86a799', 2.6, 'x');
-  pedestrian(8.7, -30, '#d4b164', 5, 'z'); pedestrian(-45, -62.7, '#bca5b7', 7.3, 'x');
-  pedestrian(62.7, 29, '#8caaa9', 9.3, 'z'); pedestrian(-26, 62.7, '#d18469', 11.2, 'x');
 
   // Instancing keeps the detailed neighbourhood practical on ordinary laptops.
   for (const batch of batches.values()) {
@@ -290,16 +280,18 @@ export function buildWorld(scene: THREE.Scene) {
     mesh.computeBoundingSphere();
     root.add(mesh);
   }
+  // Nothing in the neighbourhood moves, so skip per-frame matrix recomputation for the whole tree.
+  root.traverse((object) => { object.updateMatrix(); object.matrixAutoUpdate = false; });
+  root.updateMatrixWorld(true);
+  const identity = new THREE.Quaternion();
   return {
     colliders,
     update(time: number) {
-      people.forEach(({ object, centerX, centerZ, phase, axis }) => {
-        const t = time * .2 + phase;
-        const offset = Math.sin(t) * 5.5;
-        object.position.set(centerX + (axis === 'x' ? offset : 0), .12 + Math.abs(Math.sin(time * 4 + phase)) * .035, centerZ + (axis === 'z' ? offset : 0));
-        object.rotation.y = (axis === 'x' ? Math.PI / 2 : 0) + (Math.cos(t) < 0 ? Math.PI : 0);
+      waves.forEach((wave, i) => {
+        matrix.compose(position.set(wave.x + Math.sin(time * .3 + i) * .6, -.145, wave.z), identity, scale.set(wave.width, 1, 1));
+        waveMesh.setMatrixAt(i, matrix);
       });
-      waterWaves.forEach((wave, i) => { wave.position.x += Math.sin(time * .3 + i) * .002; });
+      waveMesh.instanceMatrix.needsUpdate = true;
     },
     dispose() {
       scene.remove(root);
