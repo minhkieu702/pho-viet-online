@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { BUILDINGS, COLLIDERS, LAMPS, LAND, PLOTS, RIVER, RIVER_BED, ROADS_X, ROADS_Z, SCENERY, VENUES, inRect, pathClearance, pointClear, type Building, type Plot, type Prop, type Rect, type Tree } from './city';
 import { buildSkyline } from './skyline';
+import { APPROACHES, lightFor, type Light } from './signals';
 
 export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number };
 
@@ -1081,6 +1082,67 @@ export function buildWorld(scene: THREE.Scene) {
   pools.renderOrder = 2;
   root.add(pools);
 
+  // ---- Traffic lights: a pole at the near right-hand corner of each approach, an arm over the lane with a
+  // signal head, and a second head low on the pole. The lenses are one instanced mesh recoloured as they change.
+  const LENS_ON: Record<Light, THREE.Color> = { red: new THREE.Color('#ff2a1a'), yellow: new THREE.Color('#ffb21a'), green: new THREE.Color('#2bff74') };
+  const LENS_OFF = [new THREE.Color('#3a1412'), new THREE.Color('#3a2c12'), new THREE.Color('#123a1e')];
+  const lensSpots: { x: number; y: number; z: number; yaw: number }[] = [];
+  for (const a of APPROACHES) {
+    const { pole, dir } = a;
+    const alongX = a.axis === 'x';
+    // The heads face the oncoming traffic.
+    const yaw = alongX ? (dir > 0 ? -HALF_PI : HALF_PI) : dir > 0 ? PI : 0;
+    lift = onPavement(pole.x, pole.z);
+    shape('cylinder', '#4a5458', pole.x, 3.1, pole.z, 0.11, 6.2, 0.11);
+    shape('cylinder', '#3d4549', pole.x, 0.15, pole.z, 0.2, 0.3, 0.2);
+    const armEnd = alongX ? { x: pole.x, z: a.rz + dir * 2.4 } : { x: a.rx - dir * 2.4, z: pole.z };
+    box('#4a5458', (pole.x + armEnd.x) / 2, 6.0, (pole.z + armEnd.z) / 2, alongX ? 0.12 : Math.abs(pole.x - armEnd.x), 0.12, alongX ? Math.abs(pole.z - armEnd.z) : 0.12, 0, false);
+    const heads = [
+      alongX ? { x: pole.x, y: 5.25, z: a.rz + dir * 3.0 } : { x: a.rx - dir * 3.0, y: 5.25, z: pole.z },
+      { x: pole.x - Math.sin(yaw) * -0.25, y: 2.9, z: pole.z - Math.cos(yaw) * -0.25 },
+    ];
+    for (const h of heads) {
+      box('#1f2326', h.x, h.y, h.z, 0.44, 1.18, 0.3, yaw, false);
+      box('#e9c84a', h.x - Math.sin(yaw) * 0.03, h.y, h.z - Math.cos(yaw) * 0.03, 0.56, 1.3, 0.04, yaw, false);
+      for (let k = 0; k < 3; k++) {
+        const ly = h.y + 0.37 - k * 0.37;
+        const fx = Math.sin(yaw), fz = Math.cos(yaw);
+        box('#15181a', h.x + fx * 0.22, ly + 0.14, h.z + fz * 0.22, 0.34, 0.04, 0.16, yaw, false);
+        lensSpots.push({ x: h.x + fx * 0.16, y: ly + lift, z: h.z + fz * 0.16, yaw });
+      }
+    }
+    lift = 0;
+    colliders.push({ minX: pole.x - 0.17, maxX: pole.x + 0.17, minZ: pole.z - 0.17, maxZ: pole.z + 0.17 });
+  }
+  const lensGeometry = new THREE.CylinderGeometry(0.13, 0.13, 0.05, 12).rotateX(HALF_PI);
+  const lensMaterial = new THREE.MeshBasicMaterial({ color: '#ffffff', toneMapped: false });
+  geometries.push(lensGeometry);
+  materials.push(lensMaterial);
+  const lenses = new THREE.InstancedMesh(lensGeometry, lensMaterial, lensSpots.length);
+  lensSpots.forEach((l, i) => {
+    rotation.set(0, l.yaw, 0);
+    lenses.setMatrixAt(i, matrix.compose(position.set(l.x, l.y, l.z), quaternion.setFromEuler(rotation), scale.set(1, 1, 1)));
+    lenses.setColorAt(i, LENS_OFF[i % 3]);
+  });
+  lenses.computeBoundingSphere();
+  root.add(lenses);
+  const shown: (Light | 'off')[] = APPROACHES.map(() => 'off');
+  /** Lights each approach's lenses for the current phase (dark when the power is out). */
+  function updateSignals(time: number) {
+    let changed = false;
+    APPROACHES.forEach((a, n) => {
+      const light: Light | 'off' = apocalypse ? 'off' : lightFor(a.rx, a.rz, a.axis, time);
+      if (light === shown[n]) return;
+      shown[n] = light;
+      changed = true;
+      for (let k = 0; k < 6; k++) {
+        const slot = k % 3, on = (slot === 0 && light === 'red') || (slot === 1 && light === 'yellow') || (slot === 2 && light === 'green');
+        lenses.setColorAt(n * 6 + k, on ? LENS_ON[light as Light] : LENS_OFF[slot]);
+      }
+    });
+    if (changed && lenses.instanceColor) lenses.instanceColor.needsUpdate = true;
+  }
+
   // ---- The nightlife strip ("phố đèn đỏ"): banners across the road at both ends, strings of red lanterns,
   // neon frames on every venue's sign, canopy and door, "18+" badges, and coloured light pools at night. ----
   const neonPools: { x: number; z: number; color: string; size: number }[] = [];
@@ -1701,6 +1763,7 @@ export function buildWorld(scene: THREE.Scene) {
     colliders,
     update(time: number) {
       skyline.update(time);
+      updateSignals(time);
       waves.forEach((wave, i) => {
         matrix.compose(position.set(wave.x + Math.sin(time * 0.3 + i) * 0.6, -0.78, wave.z), identity, scale.set(wave.width, 1, 1));
         waveMesh.setMatrixAt(i, matrix);

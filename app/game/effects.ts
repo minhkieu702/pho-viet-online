@@ -160,6 +160,33 @@ export function createEffects(scene: THREE.Scene, ground: (x: number, z: number)
   const blobScale = new THREE.Vector3();
   const yAxis = new THREE.Vector3(0, 1, 0);
 
+  // Crashes: sparks that streak away and fall, and bits of bumper, glass and trim that bounce and settle.
+  const MAX_SPARKS = 160, MAX_DEBRIS = 220;
+  const sparkGeometry = new THREE.BoxGeometry(0.035, 0.035, 0.3);
+  const sparkMaterial = new THREE.MeshBasicMaterial({ color: '#ffd27a', toneMapped: false, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false });
+  const sparks = new THREE.InstancedMesh(sparkGeometry, sparkMaterial, MAX_SPARKS);
+  sparks.count = 0;
+  sparks.frustumCulled = false;
+  sparks.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  root.add(sparks);
+  // Per spark: x, y, z, vx, vy, vz, age, life.
+  const sparkState = new Float32Array(MAX_SPARKS * 8);
+  const debrisGeometry = new THREE.BoxGeometry(0.16, 0.05, 0.12);
+  const debrisMaterial = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.5, metalness: 0.2 });
+  const debris = new THREE.InstancedMesh(debrisGeometry, debrisMaterial, MAX_DEBRIS);
+  debris.count = 0;
+  debris.frustumCulled = false;
+  debris.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  debris.setColorAt(0, new THREE.Color('#ffffff'));
+  root.add(debris);
+  // Per piece: x, y, z, vx, vy, vz, spin, angle, size, age.
+  const debrisState = new Float32Array(MAX_DEBRIS * 10);
+  let debrisNext = 0;
+  const debrisColor = new THREE.Color();
+  const sparkDir = new THREE.Vector3(), zAxis = new THREE.Vector3(0, 0, 1), debrisEuler = new THREE.Euler();
+  geometries.push(sparkGeometry, debrisGeometry);
+  materials.push(sparkMaterial, debrisMaterial);
+
   function splat(x: number, z: number, size: number) {
     blobQuat.setFromAxisAngle(yAxis, Math.random() * Math.PI * 2);
     blobMatrix.compose(blobPos.set(x, ground(x, z) + 0.03, z), blobQuat, blobScale.set(size, 1, size));
@@ -181,6 +208,33 @@ export function createEffects(scene: THREE.Scene, ground: (x: number, z: number)
         dropState[s + 5] = dir.z * push + (Math.random() - 0.5) * 2.4;
         dropState[s + 6] = 0.04 + Math.random() * 0.07;
       }
+    },
+    /** Sparks flying off a metal-on-metal impact at `at`, thrown mostly along `dir` (and up). */
+    sparks(at: THREE.Vector3, dir: THREE.Vector3, count: number) {
+      for (let n = 0; n < count && sparks.count < MAX_SPARKS; n++) {
+        const s = sparks.count++ * 8;
+        const push = 3 + Math.random() * 7;
+        sparkState[s] = at.x; sparkState[s + 1] = at.y; sparkState[s + 2] = at.z;
+        sparkState[s + 3] = dir.x * push + (Math.random() - 0.5) * 6;
+        sparkState[s + 4] = 1 + Math.random() * 4;
+        sparkState[s + 5] = dir.z * push + (Math.random() - 0.5) * 6;
+        sparkState[s + 6] = 0;
+        sparkState[s + 7] = 0.25 + Math.random() * 0.4;
+      }
+    },
+    /** Pieces of a vehicle (paint-coloured panel bits, glass, black trim) scattered from an impact. */
+    debris(at: THREE.Vector3, dir: THREE.Vector3, count: number, paint: THREE.ColorRepresentation) {
+      for (let n = 0; n < count; n++) {
+        const i = debrisNext;
+        debrisNext = (debrisNext + 1) % MAX_DEBRIS;
+        debris.count = Math.max(debris.count, i + 1);
+        const s = i * 10, push = 1.5 + Math.random() * 4;
+        debrisState.set([at.x, at.y, at.z, dir.x * push + (Math.random() - 0.5) * 3, 1.5 + Math.random() * 3, dir.z * push + (Math.random() - 0.5) * 3,
+          (Math.random() - 0.5) * 18, Math.random() * Math.PI * 2, 0.5 + Math.random() * 0.9, 0], s);
+        const roll = Math.random();
+        debris.setColorAt(i, roll < 0.5 ? debrisColor.set(paint) : roll < 0.75 ? debrisColor.set('#bcd6e2') : debrisColor.set('#26292b'));
+      }
+      if (debris.instanceColor) debris.instanceColor.needsUpdate = true;
     },
     /** Rising smoke from a damaged vehicle. */
     smoke(x: number, y: number, z: number, now: number, dark: boolean, tint?: string) {
@@ -263,6 +317,52 @@ export function createEffects(scene: THREE.Scene, ground: (x: number, z: number)
         drops.setMatrixAt(i, blobMatrix);
       }
       drops.instanceMatrix.needsUpdate = true;
+      // Sparks: ballistic, streaked along their motion, gone in a fraction of a second.
+      for (let i = 0; i < sparks.count; i++) {
+        const s = i * 8;
+        sparkState[s + 6] += dt;
+        if (sparkState[s + 6] > sparkState[s + 7]) {
+          sparks.count--;
+          sparkState.copyWithin(s, sparks.count * 8, sparks.count * 8 + 8);
+          i--;
+          continue;
+        }
+        sparkState[s + 4] -= 14 * dt;
+        sparkState[s] += sparkState[s + 3] * dt;
+        sparkState[s + 1] = Math.max(ground(sparkState[s], sparkState[s + 2]) + 0.02, sparkState[s + 1] + sparkState[s + 4] * dt);
+        sparkState[s + 2] += sparkState[s + 5] * dt;
+        sparkDir.set(sparkState[s + 3], sparkState[s + 4], sparkState[s + 5]).normalize();
+        blobQuat.setFromUnitVectors(zAxis, sparkDir);
+        const fade = 1 - sparkState[s + 6] / sparkState[s + 7];
+        blobMatrix.compose(blobPos.set(sparkState[s], sparkState[s + 1], sparkState[s + 2]), blobQuat, blobScale.set(fade, fade, 0.4 + fade));
+        sparks.setMatrixAt(i, blobMatrix);
+      }
+      sparks.instanceMatrix.needsUpdate = true;
+      // Debris: tumbles, bounces off the road and lies there, shrinking away after half a minute.
+      for (let i = 0; i < debris.count; i++) {
+        const s = i * 10;
+        const age = (debrisState[s + 9] += dt);
+        const floor = ground(debrisState[s], debrisState[s + 2]) + 0.025;
+        if (debrisState[s + 1] > floor || debrisState[s + 4] > 0) {
+          debrisState[s + 4] -= 16 * dt;
+          debrisState[s] += debrisState[s + 3] * dt;
+          debrisState[s + 1] += debrisState[s + 4] * dt;
+          debrisState[s + 2] += debrisState[s + 5] * dt;
+          debrisState[s + 7] += debrisState[s + 6] * dt;
+          if (debrisState[s + 1] <= floor) {
+            debrisState[s + 1] = floor;
+            debrisState[s + 4] = Math.abs(debrisState[s + 4]) > 2 ? -debrisState[s + 4] * 0.3 : 0;
+            debrisState[s + 3] *= 0.5; debrisState[s + 5] *= 0.5; debrisState[s + 6] *= 0.5;
+          }
+        }
+        const shrink = age > 30 ? Math.max(0, 1 - (age - 30) / 3) : 1;
+        const size = debrisState[s + 8] * shrink;
+        const resting = debrisState[s + 1] <= floor + 0.001 && debrisState[s + 4] === 0;
+        debrisEuler.set(resting ? 0 : debrisState[s + 7], debrisState[s + 7] * 0.7, 0);
+        blobMatrix.compose(blobPos.set(debrisState[s], debrisState[s + 1], debrisState[s + 2]), blobQuat.setFromEuler(debrisEuler), blobScale.set(size, size, size));
+        debris.setMatrixAt(i, blobMatrix);
+      }
+      debris.instanceMatrix.needsUpdate = true;
       if (tracersLive) {
         tracersLive = false;
         for (let i = 0; i < TRACERS; i++) {

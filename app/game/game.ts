@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { buildWorld, dockAt, groundHeight } from './world';
-import { LAND, LANDMARKS, PLAY, PLOTS, RIVER, SCENERY, VENUES, WATER_LEVEL, inRect, type Dock } from './city';
+import { LAND, LANDMARKS, PLAY, PLOTS, RIVER, ROADS_X, ROADS_Z, SCENERY, VENUES, WATER_LEVEL, inRect, type Dock } from './city';
 import { createBoats, makeBoatMesh, type Boat } from './boats';
 import { createNav } from './nav';
 import { createRagdolls, type BodyPart, type RagdollBody, type RagdollLook } from './ragdoll';
@@ -12,13 +12,14 @@ import { createBubbles } from './bubbles';
 import { createAtmosphere } from './atmosphere';
 import { createAnimals } from './animals';
 import { createSideMissions, type SideMissionView } from './side-missions';
-import { playBoom, playShot, playThud, setRain, unlockAudio } from './audio';
+import { playBoom, playCrash, playHorn, playShot, playThud, setRain, unlockAudio } from './audio';
+import { STOP_LINE, lightFor, nearest } from './signals';
 import { WEAPONS, weaponById, type WeaponId } from './weapons';
 import { createMissions, type MissionEvent, type MissionId, type MissionView } from './missions';
 import { createPeerInterpolator, createSnapshotClock } from './peer-interpolation';
 import type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
 import { BIKES, CAR_STATS, MOTO_STATS, POLICE_CAR_STATS, bikeById, repairCost, type BikeId } from './bikes';
-import { createVehicles, makeCarMesh, seatOf, vehicleStyle, CAR_HEALTH, MOTO_HEALTH, POLICE_CAR_HEALTH, type Car } from './vehicles';
+import { createVehicles, makeCarMesh, seatOf, vehicleStyle, CAR_HEALTH, MASS, MOTO_HEALTH, POLICE_CAR_HEALTH, type Body, type Car, type Crash } from './vehicles';
 import { FLOORBOARD, MOTO_RIDER, motoParts, vehicleMaterial, type MotoStyle } from './vehicle-models';
 import { createPolice } from './police';
 import { createZombies, type Zombie } from './zombies';
@@ -927,11 +928,99 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     return worldClear(x, z, radius) && !vehicles.blocked(x, z, radius, playerCar);
   }
 
-  /** A vehicle footprint approximated by three circles along its length. */
+  /**
+   * A vehicle footprint approximated by three circles along its length, against walls and props. Other vehicles
+   * are not walls: driving into one is a collision (see crashInto).
+   */
   function vehicleClear(x: number, z: number, angle: number) {
     const fx = Math.sin(angle), fz = Math.cos(angle);
-    if (playerCar && playerCar.kind !== 'moto') return clearAt(x, z, 1.05) && clearAt(x + fx * 1.3, z + fz * 1.3, 1.0) && clearAt(x - fx * 1.3, z - fz * 1.3, 1.0);
-    return clearAt(x, z, 0.45) && clearAt(x + fx * 0.65, z + fz * 0.65, 0.35) && clearAt(x - fx * 0.65, z - fz * 0.65, 0.35);
+    if (playerCar && playerCar.kind !== 'moto') return worldClear(x, z, 1.05) && worldClear(x + fx * 1.3, z + fz * 1.3, 1.0) && worldClear(x - fx * 1.3, z - fz * 1.3, 1.0);
+    return worldClear(x, z, 0.45) && worldClear(x + fx * 0.65, z + fz * 0.65, 0.35) && worldClear(x - fx * 0.65, z - fz * 0.65, 0.35);
+  }
+
+  // ---- Vehicle crashes ----
+  const CRASH_LINES = ['Đi kiểu gì vậy hả?!', 'Trời ơi xe tôi!', 'Có biết lái xe không?!', 'Đứng lại đền tiền đi!', 'Mắt để đâu vậy?!', 'Bằng lái mua à?!'];
+  let crashSoundAt = 0, hornAt = 0;
+  /** Pushes the player's vehicle into whatever vehicles it touches; momentum, spin and position change on both. */
+  function crashInto(now: number, time: number) {
+    const kind = playerCar ? playerCar.kind : 'moto';
+    const [hw, hl] = vehicles.halfSize(kind);
+    const body: Body = { x: state.x, z: state.z, yaw: state.angle, vx: carVX, vz: carVZ, spin: -yawRate, mass: playerCar ? MASS[kind] : bikeId === 'horse' ? 520 : MASS.moto, hw, hl };
+    const crashes = vehicles.collideBody(body, playerCar, time);
+    if (!crashes.length) return;
+    carVX = body.vx;
+    carVZ = body.vz;
+    yawRate = -body.spin;
+    if (vehicleClear(body.x, body.z, state.angle)) { state.x = body.x; state.z = body.z; }
+    velocity = carVX * Math.sin(state.angle) + carVZ * Math.cos(state.angle);
+    for (const crash of crashes) handleCrash(crash, now, time, true);
+  }
+  /** Sparks, flying debris, the bang, damage, riders thrown off, angry drivers and a horn. */
+  function handleCrash(e: Crash, now: number, time: number, player: boolean) {
+    const strength = e.impact;
+    const distanceToPlayer = Math.hypot(e.x - state.x, e.z - state.z);
+    hitPoint.set(e.x, 0.75, e.z);
+    if (strength > 2.5) effects.sparks(hitPoint, rayDir.set(-e.nz, 0.2, e.nx), Math.min(28, Math.round(strength * 2.2)));
+    if (strength > 4) {
+      const pieces = Math.min(10, Math.round(strength * 0.8));
+      effects.debris(hitPoint, rayDir.set(e.nx, 0, e.nz), pieces, vehicles.paintOf(e.b));
+      effects.debris(hitPoint, rayDir.set(-e.nx, 0, -e.nz), pieces, e.a ? vehicles.paintOf(e.a) : playerCar ? vehicles.paintOf(playerCar) : bikeById(bikeId).color);
+    }
+    if (distanceToPlayer < 75 && now > crashSoundAt) {
+      crashSoundAt = now + 140;
+      playCrash(Math.min(1, strength / 14) * (1 - distanceToPlayer / 90));
+    }
+    if (player || distanceToPlayer < 18) shake = Math.max(shake, Math.min(0.6, strength * 0.035 * (player ? 1 : 0.4)));
+    const harm = Math.max(0, strength - 2.5);
+    for (const car of [e.a, e.b]) if (car && car !== playerCar && harm > 0) damageCar(car, harm * (car.kind === 'moto' ? 7 : 4), now);
+    if (player && harm > 0) damageVehicle(harm * (inCar() ? 3.5 : 6), now);
+    for (const car of [e.a, e.b]) {
+      if (!car || car === playerCar || !car.driver) continue;
+      if (car.kind === 'moto' && car.fallen) throwRider(car, e, strength, time);
+      else if (car.kind !== 'moto' && strength > 2 && Math.random() < 0.7) {
+        bubbles.say(`car${car.kind}${car.index}`, CRASH_LINES[Math.floor(Math.random() * CRASH_LINES.length)], now, () => ({ x: car.x, y: 2.4, z: car.z }), 2200, 'shout');
+        if (now > hornAt && distanceToPlayer < 50) { hornAt = now + 900; playHorn(strength > 6); }
+      }
+    }
+    if (strength > 8) npcs.notice(e.x, e.z, 'crash', time);
+    // On two wheels a hard hit throws the player off.
+    if (player && state.riding && !inCar() && strength > 7.5) crash(now);
+  }
+  /** A rider thrown off a motorbike that went down: a ragdoll flung along the hit, left lying for a while. */
+  function throwRider(car: Car, e: Crash, strength: number, time: number) {
+    const look = car.driver!;
+    car.driver = null;
+    const away = e.b === car ? 1 : -1;
+    const body = ragdolls.spawn({
+      x: car.x, y: groundHeight(car.x, car.z) + 0.9, z: car.z, yaw: car.yaw, scale: RAGDOLL_SCALE, look,
+      velocity: { x: car.vx + e.nx * away * strength * 0.5, y: 2.5 + strength * 0.25, z: car.vz + e.nz * away * strength * 0.5 },
+    });
+    looseBodies.push({ body, until: time + 16 });
+    if (strength > 9) effects.blood(hitPoint.set(car.x, 1, car.z), rayDir.set(e.nx * away, 0, e.nz * away), 6);
+  }
+
+  // ---- Red lights: a cruiser nearby will not let it go. ----
+  let lightGap = Infinity, lightJunction = '';
+  function checkRedLight(time: number) {
+    if (!state.riding || Math.abs(velocity) < 4) { lightGap = Infinity; return; }
+    const alongX = Math.abs(Math.sin(state.angle)) > Math.abs(Math.cos(state.angle));
+    const dir = Math.sign((alongX ? Math.sin(state.angle) : Math.cos(state.angle)) * velocity) || 1;
+    const along = alongX ? state.x : state.z, cross = alongX ? state.z : state.x;
+    const road = nearest(alongX ? ROADS_Z : ROADS_X, cross);
+    if (Math.abs(cross - road) > 7) { lightGap = Infinity; return; }
+    const junction = nearest(alongX ? ROADS_X : ROADS_Z, along + dir * 20);
+    const gap = (junction - along) * dir - STOP_LINE;
+    const key = `${junction}:${road}:${alongX}`;
+    if (key === lightJunction && lightGap > 0 && gap <= 0 && gap > -4) {
+      const light = alongX ? lightFor(junction, road, 'x', time) : lightFor(road, junction, 'z', time);
+      if (light === 'red') {
+        let seen = false;
+        police.forEachUnit((x, z) => { if (Math.hypot(x - state.x, z - state.z) < 55) seen = true; });
+        if (seen) { police.crime(1, time); notify('Vượt đèn đỏ ngay trước mặt cảnh sát!', 2500); }
+      }
+    }
+    lightJunction = key;
+    lightGap = gap;
   }
 
   /** Open water a swimmer can be in: inside the buoys and beside (not under) the piers; the steps lead out. */
@@ -1234,6 +1323,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     car.driver = null;
     car.mode = 'player';
     car.speed = 0;
+    // Picking up a fallen bike, or getting into a car that had skidded to a stop.
+    Object.assign(car, { vx: 0, vz: 0, spin: 0, fallen: false, recoverAt: 0 });
     playerCar = car;
     state.riding = true;
     state.x = car.x;
@@ -2359,12 +2450,6 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
           if (!down) knockPlayer(vx * 0.8, 3 + Math.abs(car.speed) * 0.2, vz * 0.8, now);
           return;
         }
-      } else if (car.kind === 'police' && car.mode === 'chase' && Math.abs(lx) < hw + 1 && Math.abs(lz) < hl + 1.4) {
-        damageVehicle(Math.abs(car.speed) * 1.2, now);
-        shake = Math.max(shake, 0.5);
-        playThud();
-        car.speed *= -0.3;
-        if (!inCar() && Math.abs(car.speed) > 3) { crash(now); return; }
       }
     }
   }
@@ -2543,15 +2628,15 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     // cornering force stays within what the tyres hold (tight turns when slow, wide sweeps when fast).
     // Turning in eases on progressively; letting go recentres a little quicker.
     const recentring = Math.abs(steerInput) < Math.abs(steer) || steerInput * steer < 0;
-    steer = THREE.MathUtils.damp(steer, steerInput, (twoWheels ? 6.5 : 7) * (recentring ? 1.35 : 1), dt);
+    steer = THREE.MathUtils.damp(steer, steerInput, (twoWheels ? 8.5 : 8) * (recentring ? 1.35 : 1), dt);
     const wheelbase = twoWheels ? 1.35 : 2.7;
-    const cornering = (twoWheels ? 21 : 18) * (1 - atmosphere.rain * 0.25) * (flatTires ? 0.6 : 1);
-    const wheelAngle = steer * Math.min(twoWheels ? 0.72 : 0.66, Math.atan((cornering * wheelbase) / Math.max(1, forward * forward)));
+    const cornering = (twoWheels ? 30 : 26) * (1 - atmosphere.rain * 0.25) * (flatTires ? 0.6 : 1);
+    const wheelAngle = steer * Math.min(twoWheels ? 0.82 : 0.75, Math.atan((cornering * wheelbase) / Math.max(1, forward * forward)));
     let targetYaw = forward / wheelbase * Math.tan(wheelAngle);
     // A pulled handbrake swings the tail of a car round.
     if (braking && !twoWheels && Math.abs(forward) > 6) targetYaw *= 1.7;
-    targetYaw = THREE.MathUtils.clamp(targetYaw, -stats.turn * 1.35, stats.turn * 1.35);
-    yawRate = THREE.MathUtils.damp(yawRate, targetYaw, twoWheels ? 6 : 5, dt);
+    targetYaw = THREE.MathUtils.clamp(targetYaw, -stats.turn * 1.7, stats.turn * 1.7);
+    yawRate = THREE.MathUtils.damp(yawRate, targetYaw, twoWheels ? 7.5 : 6.5, dt);
     // Velocity is rebuilt from the old heading, then the body turns: the difference shows up as slide.
     carVX = fx * forward + Math.cos(state.angle) * lateral;
     carVZ = fz * forward - Math.sin(state.angle) * lateral;
@@ -2579,6 +2664,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (inCar() && impact > 14) damagePlayer((impact - 14) * 1.5, now);
     }
     if (!inCar() && impact > CRASH_SPEED) { crash(now); return; }
+    crashInto(now, time);
+    if (!state.riding) return;
     if (playerCar) {
       playerCar.x = state.x;
       playerCar.z = state.z;
@@ -2890,7 +2977,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     setRain(active ? atmosphere.rain : 0);
     crossing.length = 0;
     npcs.forEachCrossing((x, z) => crossing.push({ x, z }));
-    vehicles.update(dt, time, { x: state.x, z: state.z, car: playerCar }, crossing);
+    for (const crash of vehicles.update(dt, time, { x: state.x, z: state.z, car: playerCar }, crossing)) handleCrash(crash, now, time, false);
+    checkRedLight(time);
     vehicleImpacts(now);
     const policeResult = police.update(dt, time, {
       x: state.x, z: state.z, car: playerCar, riding: state.riding, heading: state.angle, speed: Math.abs(velocity), down: down !== null, stunned: now < stunUntil,

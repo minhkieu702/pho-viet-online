@@ -1,17 +1,21 @@
 import * as THREE from 'three';
 import { LAND, ROADS_X, ROADS_Z } from './city';
+import { STOP_LINE, lightFor } from './signals';
 import { groundHeight } from './world';
 import type { RagdollLook } from './ragdoll';
 import { CAR_DRIVER, FigureBatch, PART, PEG_RIDER, RIDER, figureMaterial, palette, riderGeometry, setStyle, styleOf } from './figures';
 import { FLOORBOARD, MOTO_RIDER, carGeometry, carGlassGeometry, carSpec, glassMaterial, motoGeometry, vehicleMaterial, type CarStyle, type MotoStyle, type Vec3 } from './vehicle-models';
 
 /**
- * Traffic on the street grid: cars and motorbikes that keep to right-hand lanes, turn at junctions and
- * stop for anyone on a crosswalk, plus police cruisers that route along road centre lines to the player.
- * Every body style (vehicle-models.ts) is one instanced draw, with its glass, drivers and riders batched too.
+ * Traffic on the street grid: cars and motorbikes that keep to right-hand lanes, stop at red lights, turn at
+ * junctions and stop for anyone on a crosswalk, plus police cruisers that route along road centre lines to the
+ * player. Vehicles collide as capsules: an impact exchanges momentum (with spin from where it lands), knocks
+ * cars out of their lane into a skid, and topples motorbikes. Every body style (vehicle-models.ts) is one
+ * instanced draw, with its glass, drivers and riders batched too.
  */
 export type CarKind = 'traffic' | 'police' | 'moto';
-export type CarMode = 'lane' | 'parked' | 'player' | 'chase' | 'hold' | 'leave' | 'off';
+/** `knocked`: skidding after an impact, under physics until it comes to rest. */
+export type CarMode = 'lane' | 'parked' | 'player' | 'chase' | 'hold' | 'leave' | 'off' | 'knocked';
 type Axis = 'x' | 'z';
 type Point = { x: number; z: number };
 export type Car = {
@@ -34,7 +38,15 @@ export type Car = {
   timer: number;
   stuck: number;
   health: number;
+  /** Skid (or shove) velocity and spin after an impact. */
+  vx: number; vz: number; spin: number;
+  /** A motorbike lying on its side; when a skidding car may rejoin its lane. */
+  fallen: boolean; recoverAt: number;
 };
+/** A moving vehicle for collisions: centre, heading, velocity, spin, mass and capsule half-sizes. */
+export type Body = { x: number; z: number; yaw: number; vx: number; vz: number; spin: number; mass: number; hw: number; hl: number };
+/** One impact: where, along which normal (from `a` towards `b`), and the closing speed. */
+export type Crash = { a: Car | null; b: Car; x: number; z: number; nx: number; nz: number; impact: number };
 
 /** Roads a vehicle can drive along an axis (east-west roads for 'x'), and the junctions it meets on the way. */
 const roadsAlong = (axis: Axis) => (axis === 'x' ? ROADS_Z : ROADS_X);
@@ -49,6 +61,67 @@ export const CAR_HEALTH = 160;
 export const POLICE_CAR_HEALTH = 220;
 export const MOTO_HEALTH = 70;
 const HALF: Record<CarKind, [number, number]> = { traffic: [CAR_HALF_WIDTH, CAR_HALF_LENGTH], police: [CAR_HALF_WIDTH, CAR_HALF_LENGTH], moto: [0.4, 1.0] };
+/** Kilograms, rider included. */
+export const MASS: Record<CarKind, number> = { traffic: 1300, police: 1500, moto: 260 };
+
+/** Closest points between segments p1-q1 and p2-q2 on the ground plane. */
+function closestPoints(p1x: number, p1z: number, q1x: number, q1z: number, p2x: number, p2z: number, q2x: number, q2z: number) {
+  const d1x = q1x - p1x, d1z = q1z - p1z, d2x = q2x - p2x, d2z = q2z - p2z, rx = p1x - p2x, rz = p1z - p2z;
+  const a = d1x * d1x + d1z * d1z, e = d2x * d2x + d2z * d2z, f = d2x * rx + d2z * rz;
+  let s = 0, t = 0;
+  if (a < 1e-9 && e < 1e-9) { s = t = 0; }
+  else if (a < 1e-9) { t = THREE.MathUtils.clamp(f / e, 0, 1); }
+  else {
+    const c = d1x * rx + d1z * rz;
+    if (e < 1e-9) { s = THREE.MathUtils.clamp(-c / a, 0, 1); }
+    else {
+      const b = d1x * d2x + d1z * d2z, denom = a * e - b * b;
+      s = denom > 1e-9 ? THREE.MathUtils.clamp((b * f - c * e) / denom, 0, 1) : 0;
+      t = (b * s + f) / e;
+      if (t < 0) { t = 0; s = THREE.MathUtils.clamp(-c / a, 0, 1); }
+      else if (t > 1) { t = 1; s = THREE.MathUtils.clamp((b - c) / a, 0, 1); }
+    }
+  }
+  return { ax: p1x + d1x * s, az: p1z + d1z * s, bx: p2x + d2x * t, bz: p2z + d2z * t };
+}
+/** Where two capsule-shaped vehicles touch: normal from a to b, overlap depth and the contact point. */
+export function contact(a: Body, b: Body) {
+  const sa = Math.max(0, a.hl - a.hw), sb = Math.max(0, b.hl - b.hw);
+  const fax = Math.sin(a.yaw) * sa, faz = Math.cos(a.yaw) * sa, fbx = Math.sin(b.yaw) * sb, fbz = Math.cos(b.yaw) * sb;
+  const c = closestPoints(a.x - fax, a.z - faz, a.x + fax, a.z + faz, b.x - fbx, b.z - fbz, b.x + fbx, b.z + fbz);
+  let dx = c.bx - c.ax, dz = c.bz - c.az;
+  let d = Math.hypot(dx, dz);
+  if (d >= a.hw + b.hw) return null;
+  if (d < 1e-5) { dx = b.x - a.x; dz = b.z - a.z; d = Math.hypot(dx, dz) || 1; if (d === 1 && dx === 0 && dz === 0) dx = 1; }
+  const nx = dx / d, nz = dz / d, depth = a.hw + b.hw - Math.min(d, a.hw + b.hw);
+  return { nx, nz, depth, px: c.ax + nx * (a.hw - depth / 2), pz: c.az + nz * (a.hw - depth / 2) };
+}
+/**
+ * Resolves an impact between two bodies with an impulse at the contact point (a little bounce, some sliding
+ * friction), changing both velocities and spins. Returns the closing speed (0 if they were already parting).
+ */
+export function impulse(a: Body, b: Body, c: { nx: number; nz: number; px: number; pz: number }, restitution = 0.22) {
+  const rax = c.px - a.x, raz = c.pz - a.z, rbx = c.px - b.x, rbz = c.pz - b.z;
+  // The velocity of a point at r on a body spinning at w about +y is (w * rz, -w * rx).
+  const vax = a.vx + a.spin * raz, vaz = a.vz - a.spin * rax, vbx = b.vx + b.spin * rbz, vbz = b.vz - b.spin * rbx;
+  const rel = (vbx - vax) * c.nx + (vbz - vaz) * c.nz;
+  if (rel >= 0) return 0;
+  const ia = (a.mass * ((2 * a.hl) ** 2 + (2 * a.hw) ** 2)) / 12, ib = (b.mass * ((2 * b.hl) ** 2 + (2 * b.hw) ** 2)) / 12;
+  const apply = (jx: number, jz: number) => {
+    b.vx += jx / b.mass; b.vz += jz / b.mass; b.spin += (rbz * jx - rbx * jz) / ib;
+    a.vx -= jx / a.mass; a.vz -= jz / a.mass; a.spin -= (raz * jx - rax * jz) / ia;
+  };
+  const cna = raz * c.nx - rax * c.nz, cnb = rbz * c.nx - rbx * c.nz;
+  const j = (-(1 + restitution) * rel) / (1 / a.mass + 1 / b.mass + (cna * cna) / ia + (cnb * cnb) / ib);
+  apply(j * c.nx, j * c.nz);
+  // Friction along the contact: the bodies drag on each other as they scrape past.
+  const tx = -c.nz, tz = c.nx;
+  const slip = (vbx - vax) * tx + (vbz - vaz) * tz;
+  const cta = raz * tx - rax * tz, ctb = rbz * tx - rbx * tz;
+  const jt = THREE.MathUtils.clamp(-slip / (1 / a.mass + 1 / b.mass + (cta * cta) / ia + (ctb * ctb) / ib), -0.35 * j, 0.35 * j);
+  apply(jt * tx, jt * tz);
+  return -rel;
+}
 // Cars keep to the middle of the right-hand side, motorbikes hug the curb.
 const LANES: Record<CarKind, number> = { traffic: 3.0, police: 3.0, moto: 5.4 };
 const COUNTS: Record<CarKind, number> = { traffic: 12, police: 8, moto: 18 };
@@ -156,6 +229,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   const blank = (index: number, kind: CarKind): Car => ({
     index, kind, mode: 'off', x: 0, z: 0, yaw: 0, speed: 0, axis: 'x', road: 0, along: 0, dir: 1, plan: null,
     cruise: 10, driver: null, waypoints: [], routeAt: 0, timer: 0, stuck: 0, health: CAR_HEALTH,
+    vx: 0, vz: 0, spin: 0, fallen: false, recoverAt: 0,
   });
   for (const kind of ['traffic', 'police', 'moto'] as CarKind[]) for (let i = 0; i < COUNTS[kind]; i++) cars.push(blank(i, kind));
 
@@ -338,13 +412,15 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       const centre = axis === 'x' ? awayX : awayZ;
       const lo = Math.max(cross[0], centre - TRAFFIC_NEAR), hi = Math.min(cross[cross.length - 1], centre + TRAFFIC_NEAR);
       if (hi <= lo) continue;
-      let along = lo + random() * (hi - lo);
-      if (cross.some((r) => Math.abs(r - along) < 9)) along += 12;
+      const along = lo + random() * (hi - lo);
+      // Not inside a junction or between its stop line and the crossing, where a car would sit across a red light.
+      if (cross.some((r) => Math.abs(r - along) < STOP_LINE + 8)) continue;
       if (along < cross[0] + 2 || along > cross[cross.length - 1] - 2) continue;
       const dir = random() < 0.5 ? 1 : -1;
       const p = lanePoint(car.kind, axis, road, along, dir);
       if (Math.hypot(p.x - awayX, p.z - awayZ) < minDistance) continue;
       car.mode = 'lane';
+      Object.assign(car, { vx: 0, vz: 0, spin: 0, fallen: false, recoverAt: 0 });
       car.health = car.kind === 'moto' ? MOTO_HEALTH : CAR_HEALTH;
       car.cruise = car.kind === 'moto' ? 7 + random() * 4 : 8.5 + random() * 4;
       const shirt = Math.floor(random() * DRIVER_SHIRTS.length);
@@ -375,7 +451,8 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     car.plan = straight && random() < 0.45 ? straight : options[Math.floor(random() * options.length)];
   }
 
-  function obstacleAhead(car: Car, player: Point & { car: Car | null }) {
+  /** What blocks the lane ahead: 'queue' behind traffic going the same way (as at a red light), 'block' otherwise. */
+  function obstacleAhead(car: Car, player: Point & { car: Car | null }): 'queue' | 'block' | null {
     const fx = Math.sin(car.yaw), fz = Math.cos(car.yaw);
     const width = car.kind === 'moto' ? 1.1 : 2.3;
     const check = (x: number, z: number, reach: number, side = width) => {
@@ -383,23 +460,44 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       const ahead = dx * fx + dz * fz, lateral = Math.abs(dx * fz - dz * fx);
       return ahead > 0 && ahead < reach && lateral < side;
     };
-    if (player.car !== car && check(player.x, player.z, 8.5)) return true;
-    for (const p of crossing) if (check(p.x, p.z, 9, 2.6)) return true;
-    for (const other of cars) if (other !== car && other.mode !== 'off' && check(other.x, other.z, other.kind === 'moto' ? 5 : 7.5)) return true;
-    return false;
+    if (player.car !== car && check(player.x, player.z, 8.5)) return 'block';
+    for (const p of crossing) if (check(p.x, p.z, 9, 2.6)) return 'queue';
+    let found: 'queue' | 'block' | null = null;
+    for (const other of cars) {
+      if (other === car || other.mode === 'off' || !check(other.x, other.z, other.kind === 'moto' ? 5 : 7.5)) continue;
+      if (other.mode === 'lane' && other.axis === car.axis && other.dir === car.dir) found ??= 'queue';
+      else return 'block';
+    }
+    return found;
   }
 
-  function driveLane(car: Car, dt: number, player: Point & { car: Car | null }) {
-    const waiting = obstacleAhead(car, player);
+  function driveLane(car: Car, dt: number, time: number, player: Point & { car: Car | null }) {
+    const obstacle = obstacleAhead(car, player);
+    const waiting = obstacle !== null;
     // Blocked for too long (a parked car, a player standing in the lane): turn around instead of jamming.
-    car.stuck = waiting ? car.stuck + dt : 0;
+    // Queueing behind traffic (at a red light) or people on a crossing is just waiting.
+    car.stuck = obstacle === 'block' ? car.stuck + dt : 0;
     if (car.stuck > 4.5) {
       car.stuck = 0;
       car.dir = -car.dir;
       car.plan = null;
     }
-    const target = waiting ? 0 : car.cruise;
-    car.speed = THREE.MathUtils.damp(car.speed, target, target ? 1.4 : 6, dt);
+    let target = waiting ? 0 : car.cruise;
+    const hl = HALF[car.kind][1];
+    // The next junction ahead (within a block).
+    let junction: number | undefined;
+    for (const r of junctionsAlong(car.axis)) {
+      const ahead = (r - car.along) * car.dir;
+      if (ahead > 0 && ahead < 60 && (junction === undefined || ahead < (junction - car.along) * car.dir)) junction = r;
+    }
+    if (junction !== undefined) {
+      // Distance from the front bumper to the stop line before the junction.
+      const gap = (junction - car.along) * car.dir - STOP_LINE - hl;
+      const light = car.axis === 'x' ? lightFor(junction, car.road, 'x', time) : lightFor(car.road, junction, 'z', time);
+      const stop = light === 'red' || (light === 'yellow' && gap > (car.speed * car.speed) / 9 + 1);
+      if (stop && gap > -0.6) target = Math.min(target, Math.sqrt(Math.max(0, gap - 0.2) * 5));
+    }
+    car.speed = target < car.speed ? Math.max(target, car.speed - 7 * dt) : THREE.MathUtils.damp(car.speed, target, 1.4, dt);
     if (!car.plan) planJunction(car);
     const before = car.along;
     car.along += car.dir * car.speed * dt;
@@ -450,6 +548,115 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     return last ? remaining : remaining + 20;
   }
 
+  /** A vehicle as a collision body (lane traffic moves along its heading at its speed, plus any shove). */
+  function bodyOf(car: Car): Body {
+    const [hw, hl] = HALF[car.kind];
+    const moving = car.mode === 'knocked' ? 0 : car.speed;
+    return { x: car.x, z: car.z, yaw: car.yaw, vx: Math.sin(car.yaw) * moving + car.vx, vz: Math.cos(car.yaw) * moving + car.vz, spin: car.spin, mass: MASS[car.kind], hw, hl };
+  }
+  /** Writes a body's new motion back: traffic that took a real hit skids out of its lane; police only get shoved. */
+  function knock(car: Car, body: Body, before: Body, time: number) {
+    const dvx = body.vx - before.vx, dvz = body.vz - before.vz;
+    const kick = Math.hypot(dvx, dvz);
+    if (car.mode === 'knocked' || car.mode === 'parked' || car.mode === 'off') {
+      if (car.mode === 'parked' && kick > 0.4) { car.mode = 'knocked'; car.recoverAt = 0; }
+      car.vx = body.vx; car.vz = body.vz; car.spin = body.spin;
+    } else if (car.kind === 'police') {
+      // Cruisers keep their crews' plans; the hit shoves them and turns them for a moment.
+      car.vx += dvx; car.vz += dvz; car.spin += body.spin - before.spin;
+      car.speed *= 0.6;
+    } else if (kick > 1.0) {
+      car.mode = 'knocked';
+      car.vx = body.vx; car.vz = body.vz; car.spin = body.spin;
+      car.plan = null;
+      car.recoverAt = 0;
+    }
+    if (car.kind === 'moto' && kick > 3.2) car.fallen = true;
+  }
+  /** A skid: tyres scrub off sideways speed fast, rolling speed slowly; walls stop it; then it rests or drives on. */
+  function skid(car: Car, dt: number, time: number) {
+    const fx = Math.sin(car.yaw), fz = Math.cos(car.yaw);
+    let along = car.vx * fx + car.vz * fz, side = car.vx * fz - car.vz * fx;
+    if (car.fallen) {
+      // A bike on its side just grinds to a halt.
+      const sp = Math.hypot(car.vx, car.vz), slow = Math.max(0, sp - 7 * dt);
+      if (sp > 0) { car.vx *= slow / sp; car.vz *= slow / sp; }
+    } else {
+      along = Math.sign(along) * Math.max(0, Math.abs(along) - 2.2 * dt);
+      side = Math.sign(side) * Math.max(0, Math.abs(side) - 9 * dt);
+      car.vx = fx * along + fz * side;
+      car.vz = fz * along - fx * side;
+    }
+    car.spin *= Math.exp(-dt * 2.4);
+    const radius = HALF[car.kind][0];
+    const nx = car.x + car.vx * dt, nz = car.z + car.vz * dt;
+    if (worldClear(nx, nz, radius)) { car.x = nx; car.z = nz; }
+    else {
+      if (worldClear(nx, car.z, radius)) car.x = nx; else car.vx *= -0.3;
+      if (worldClear(car.x, nz, radius)) car.z = nz; else car.vz *= -0.3;
+      car.spin *= 0.6;
+    }
+    car.yaw += car.spin * dt;
+    car.speed = car.vx * Math.sin(car.yaw) + car.vz * Math.cos(car.yaw);
+    if (Math.hypot(car.vx, car.vz) < 0.25 && Math.abs(car.spin) < 0.15) {
+      car.vx = car.vz = car.spin = car.speed = 0;
+      // Shaken drivers set off again after a moment if they still can; wrecks and fallen bikes stay put.
+      if (car.fallen || !car.driver || car.health <= 0) { car.mode = 'parked'; return; }
+      if (!car.recoverAt) car.recoverAt = time + 2.5;
+      if (time > car.recoverAt) rejoin(car);
+    }
+  }
+  /** Back into the nearest lane heading the way the vehicle points, or left parked if it is off the road. */
+  function rejoin(car: Car) {
+    let best: { axis: Axis; road: number; d: number } | null = null;
+    for (const axis of ['x', 'z'] as Axis[]) {
+      const cross = axis === 'x' ? car.z : car.x;
+      for (const road of roadsAlong(axis)) {
+        const d = Math.abs(cross - road);
+        if (d < 8 && (!best || d < best.d)) best = { axis, road, d };
+      }
+    }
+    if (!best) { car.mode = 'parked'; return; }
+    const heading = best.axis === 'x' ? Math.sin(car.yaw) : Math.cos(car.yaw);
+    const dir = heading >= 0 ? 1 : -1;
+    Object.assign(car, { mode: 'lane', axis: best.axis, road: best.road, along: best.axis === 'x' ? car.x : car.z, dir, plan: null, speed: 0, recoverAt: 0 });
+  }
+  /** Resolves every pair of touching vehicles where at least one is skidding; returns the impacts. */
+  function collisions(time: number, crashes: Crash[]) {
+    for (let i = 0; i < cars.length; i++) {
+      const a = cars[i];
+      if (a.mode === 'off' || a.mode === 'player') continue;
+      for (let j = i + 1; j < cars.length; j++) {
+        const b = cars[j];
+        if (b.mode === 'off' || b.mode === 'player') continue;
+        if (a.mode !== 'knocked' && b.mode !== 'knocked' && !(a.kind === 'police' && a.mode === 'chase') && !(b.kind === 'police' && b.mode === 'chase')) continue;
+        if (Math.abs(a.x - b.x) > 5 || Math.abs(a.z - b.z) > 5) continue;
+        const ba = bodyOf(a), bb = bodyOf(b);
+        const c = contact(ba, bb);
+        if (!c) continue;
+        const a0 = { ...ba }, b0 = { ...bb };
+        const hit = impulse(ba, bb, c);
+        // Push apart (heavier bodies move less).
+        const wa = 1 / ba.mass, wb = 1 / bb.mass, share = c.depth / (wa + wb);
+        a.x -= c.nx * share * wa; a.z -= c.nz * share * wa;
+        b.x += c.nx * share * wb; b.z += c.nz * share * wb;
+        knock(a, ba, a0, time);
+        knock(b, bb, b0, time);
+        if (hit > 0.8) crashes.push({ a, b, x: c.px, z: c.pz, nx: c.nx, nz: c.nz, impact: hit });
+      }
+    }
+  }
+  /** Shove left over from a hit on a vehicle that keeps driving (police), fading out. */
+  function settleShove(car: Car, dt: number) {
+    if (!car.vx && !car.vz && !car.spin) return;
+    const nx = car.x + car.vx * dt, nz = car.z + car.vz * dt;
+    if (worldClear(nx, nz, HALF[car.kind][0])) { car.x = nx; car.z = nz; }
+    car.yaw += car.spin * dt;
+    const k = Math.exp(-dt * 4);
+    car.vx *= k; car.vz *= k; car.spin *= k;
+    if (Math.abs(car.vx) + Math.abs(car.vz) + Math.abs(car.spin) < 0.05) car.vx = car.vz = car.spin = 0;
+  }
+
   // Initial traffic spread over the grid.
   for (const car of cars) if (car.kind !== 'police') spawnTraffic(car, 12, 12, 14);
 
@@ -495,6 +702,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       const top = 18 + stars * 3;
       for (const car of cars) {
         if (car.kind !== 'police') continue;
+        if (car.mode !== 'knocked' && car.mode !== 'player') settleShove(car, dt);
         if (car.mode === 'chase') {
           if (time > car.routeAt) {
             car.waypoints = roadRoute(car.x, car.z, px, pz);
@@ -522,15 +730,41 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
         }
       }
     },
-    /** `pedestrians` are people on crosswalks this frame; traffic stops for them. */
+    /**
+     * Pushes the player's vehicle (as a body) against everything it touches, knocking traffic about; the body's
+     * velocity, spin and position are updated in place. Returns the impacts.
+     */
+    collideBody(body: Body, exclude: Car | null, time: number) {
+      const crashes: Crash[] = [];
+      for (const car of cars) {
+        if (car === exclude || car.mode === 'off') continue;
+        if (Math.abs(car.x - body.x) > 6 || Math.abs(car.z - body.z) > 6) continue;
+        const other = bodyOf(car);
+        const c = contact(body, other);
+        if (!c) continue;
+        const before = { ...other };
+        const hit = impulse(body, other, c);
+        const wa = 1 / body.mass, wb = 1 / other.mass, share = c.depth / (wa + wb);
+        body.x -= c.nx * share * wa; body.z -= c.nz * share * wa;
+        const ox = car.x + c.nx * share * wb, oz = car.z + c.nz * share * wb;
+        if (worldClear(ox, oz, HALF[car.kind][0] * 0.8)) { car.x = ox; car.z = oz; }
+        knock(car, other, before, time);
+        if (hit > 0.8) crashes.push({ a: null, b: car, x: c.px, z: c.pz, nx: c.nx, nz: c.nz, impact: hit });
+      }
+      return crashes;
+    },
+    /** `pedestrians` are people on crosswalks this frame; traffic stops for them. Returns impacts between vehicles. */
     update(dt: number, time: number, player: Point & { car: Car | null }, pedestrians: Point[]) {
       crossing.length = 0;
       crossing.push(...pedestrians);
+      const crashes: Crash[] = [];
       for (const car of cars) {
         if (car.kind === 'police') continue;
+        if (car.mode === 'lane' || car.mode === 'parked') settleShove(car, dt);
         // Traffic that has drifted far away from the player reappears on a street nearer them, out of sight.
         if (car.mode === 'lane' && traffic && Math.hypot(car.x - player.x, car.z - player.z) > TRAFFIC_FAR) spawnTraffic(car, player.x, player.z, 90);
-        if (car.mode === 'lane') driveLane(car, dt, player);
+        if (car.mode === 'lane') driveLane(car, dt, time, player);
+        else if (car.mode === 'knocked') skid(car, dt, time);
         else if (traffic && (car.mode === 'parked' || car.mode === 'off')) {
           // Abandoned vehicles far from the player are recycled into fresh traffic.
           const far = Math.hypot(car.x - player.x, car.z - player.z) > 70;
@@ -538,6 +772,9 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
           if (car.mode === 'off' || car.timer > 4) { car.timer = 0; spawnTraffic(car, player.x, player.z, 60); }
         }
       }
+      // Skidding police cars too, then every pair that touches.
+      for (const car of cars) if (car.kind === 'police' && car.mode === 'knocked') skid(car, dt, time);
+      collisions(time, crashes);
       flash += dt;
       const phase = Math.floor(flash * 6) % 2 === 0;
       riders.begin();
@@ -552,21 +789,21 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
           return;
         }
         quat.setFromAxisAngle(up, car.yaw);
-        const toppled = car.kind === 'moto' && car.mode === 'parked' && wrecks.has(car);
+        const toppled = car.kind === 'moto' && (car.fallen || (car.mode === 'parked' && wrecks.has(car)));
         // How fast the vehicle is turning (a rising yaw is a left turn).
         const yawRate = Math.atan2(Math.sin(car.yaw - lastYaw[n]), Math.cos(car.yaw - lastYaw[n])) / Math.max(dt, 1e-3);
         lastYaw[n] = car.yaw;
         if (car.kind === 'moto') {
           // Riders bank into the corner by the angle that balances it, towards the inside of the turn.
           const bank = -Math.atan(car.speed * yawRate / 9.81);
-          lean[n] = toppled ? 1.42 : THREE.MathUtils.damp(lean[n], THREE.MathUtils.clamp(bank, -0.45, 0.45), 8, dt);
+          lean[n] = toppled ? THREE.MathUtils.damp(lean[n], 1.42, 9, dt) : THREE.MathUtils.damp(lean[n], THREE.MathUtils.clamp(bank, -0.45, 0.45), 8, dt);
           quat.multiply(tilt.setFromAxisAngle(zAxis, lean[n]));
         }
         // Wheels on the road surface, or up on the sidewalk when a car mounts the curb.
         matrix.compose(pos.set(car.x, groundHeight(car.x, car.z) - 0.04 + (toppled ? 0.3 : 0), car.z), quat, one);
         model.body.setMatrixAt(slot, matrix);
         // Only a vehicle that still has its own driver shows one; a stolen or parked one does not.
-        const occupied = car.mode === 'lane' && !!car.driver;
+        const occupied = (car.mode === 'lane' || (car.mode === 'knocked' && !car.fallen)) && !!car.driver;
         if (car.kind === 'moto') {
           // The rider sits in the bike's own frame, so it leans into corners with it.
           if (occupied) (FLOORBOARD[vehicleStyle(car) as MotoStyle] ? riders : pegRiders).push(matrix, seatedPalette(n, car.driver!, true));
@@ -598,6 +835,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       for (const mesh of meshes) mesh.instanceMatrix.needsUpdate = true;
       lights.instanceMatrix.needsUpdate = true;
       if (lights.instanceColor) lights.instanceColor.needsUpdate = true;
+      return crashes;
     },
     /** Traffic on, or (zombie mode) every vehicle abandoned on the roads and the cruisers gone. */
     setTraffic(on: boolean, px: number, pz: number) {
@@ -610,6 +848,8 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
         else wreck(car);
       }
     },
+    /** The paint colour a vehicle is drawn in. */
+    paintOf,
     /** Whether a vehicle is an abandoned wreck (and how badly). */
     wreckOf(car: Car) { return wrecks.get(car) ?? null; },
     /** Head and tail lamps glow brighter as night falls (0..1). */

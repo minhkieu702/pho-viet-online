@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { BUILDINGS, POIS, type Building, type Poi } from './city';
 import { createNav, type Waypoint } from './nav';
+import { walkOk } from './signals';
 import type { createRagdolls, RagdollBody, RagdollLook } from './ragdoll';
 import { FIGURE, FigureBatch, PART, UMBRELLA, armGeometry, bodyGeometry, deriveStyle, figureMaterial, legGeometry, palette, setStyle, umbrellaGeometry } from './figures';
 import { BRAIN, INCIDENTS, createIncidents, createMind, createSense, decide, drift, engage, perceive, type Incident, type IncidentKind, type Intent, type Mind } from './brain';
@@ -47,6 +48,8 @@ export type Npc = {
   claim: Claim | null;
   /** What they are doing on the spot, since when and until when; pacing steps away by (offX, offZ). */
   act: Act; actFrom: number; actUntil: number; offX: number; offZ: number; gaze: number;
+  /** The path leg (a crosswalk) the lights have let them start across. */
+  crossOk: number;
 };
 export type GangShot = { from: THREE.Vector3; hit: boolean };
 /** People on the street this frame, and what the rain and the brain have them doing. */
@@ -174,7 +177,7 @@ export function createNpcs(
       health: gang >= 0 ? GANG_HEALTH : MAX_HEALTH, hitAt: -99, afraidFor: 0, lastAimed: -99, robbedDay: -1,
       chatterAt: random() * 20, checkAt: random() * 2, nextAttack: 0, body: null, timer: 0, pooled: false,
       mind: createMind(mindRandom, role), leave: [], claim: null,
-      act: 'none', actFrom: 0, actUntil: random() * 4, offX: 0, offZ: 0, gaze: 0,
+      act: 'none', actFrom: 0, actUntil: random() * 4, offX: 0, offZ: 0, gaze: 0, crossOk: -1,
     });
   }
 
@@ -571,6 +574,7 @@ export function createNpcs(
     if (target.via) npc.path.push({ x: target.via.x, z: target.via.z, crossing: false });
     npc.path.push({ x: target.x, z: target.z, crossing: false });
     npc.pathIndex = 0;
+    npc.crossOk = -1;
     npc.run = run;
     if (npc.inside) {
       npc.x = npc.inside.door.x;
@@ -1173,7 +1177,13 @@ export function createNpcs(
           npc.speed = THREE.MathUtils.damp(npc.speed, want, 4, dt);
           npc.pose = run ? 'run' : 'walk';
           if (!target) arrive(npc);
-          else {
+          else if (target.crossing && !run && npc.crossOk !== npc.pathIndex && Math.hypot(target.x - npc.x, target.z - npc.z) > 12 && !walkOk(npc.x, npc.z, target.x, target.z, time)) {
+            // On the curb at a crosswalk: wait until the lights hold the traffic.
+            npc.speed = 0;
+            npc.pose = 'idle';
+            npc.targetYaw = Math.atan2(target.x - npc.x, target.z - npc.z);
+          } else {
+            if (target.crossing) npc.crossOk = npc.pathIndex;
             const tx = target.x - npc.x, tz = target.z - npc.z;
             const left = Math.hypot(tx, tz);
             const stepLength = npc.speed * dt;

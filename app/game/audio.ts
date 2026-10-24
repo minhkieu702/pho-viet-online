@@ -60,6 +60,67 @@ export function playThud() {
   burst(0.16, 500, 0.5, 70);
 }
 
+/** A crash: a crunch of noise, metal ringing at a few clashing pitches and, when hard, glass tinkling after. */
+export function playCrash(strength: number) {
+  if (!context || !noise || context.state !== 'running') return;
+  const s = Math.max(0.15, Math.min(1, strength));
+  burst(0.25 + s * 0.35, 1800 + s * 2200, 0.35 + s * 0.45, 60 + s * 30);
+  const now = context.currentTime;
+  for (const f of [310, 517, 739]) {
+    const osc = context.createOscillator();
+    const gain = context.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(f * (0.9 + Math.random() * 0.2), now);
+    gain.gain.setValueAtTime(0.06 * s, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.35 + s * 0.3);
+    osc.connect(gain).connect(context.destination);
+    osc.start(now);
+    osc.stop(now + 0.7);
+  }
+  if (s > 0.55) {
+    // Glass: a few short bright clicks just after the hit.
+    for (let k = 0; k < 4; k++) {
+      const source = context.createBufferSource();
+      source.buffer = noise;
+      const filter = context.createBiquadFilter();
+      filter.type = 'highpass';
+      filter.frequency.value = 5000;
+      const gain = context.createGain();
+      const t = now + 0.08 + k * 0.05 + Math.random() * 0.04;
+      gain.gain.setValueAtTime(0.12 * s, t);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+      source.connect(filter).connect(gain).connect(context.destination);
+      source.start(t, Math.random() * 0.3);
+      source.stop(t + 0.06);
+    }
+  }
+}
+
+/** A car horn: two slightly detuned tones (a long one, or two short toots). */
+export function playHorn(long = false) {
+  if (!context || context.state !== 'running') return;
+  const now = context.currentTime;
+  const toots: [number, number][] = long ? [[0, 0.7]] : [[0, 0.16], [0.22, 0.2]];
+  for (const [start, length] of toots) {
+    for (const f of [415, 494]) {
+      const osc = context.createOscillator();
+      const filter = context.createBiquadFilter();
+      const gain = context.createGain();
+      osc.type = 'square';
+      osc.frequency.value = f;
+      filter.type = 'lowpass';
+      filter.frequency.value = 1400;
+      gain.gain.setValueAtTime(0.0001, now + start);
+      gain.gain.exponentialRampToValueAtTime(0.05, now + start + 0.02);
+      gain.gain.setValueAtTime(0.05, now + start + length - 0.03);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + start + length);
+      osc.connect(filter).connect(gain).connect(context.destination);
+      osc.start(now + start);
+      osc.stop(now + start + length + 0.02);
+    }
+  }
+}
+
 export function playBoom() {
   burst(1.1, 900, 0.95, 55);
 }
