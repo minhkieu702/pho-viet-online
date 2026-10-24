@@ -303,7 +303,9 @@ export function createNpcs(
     local.compose(pos.set(px, py, 0), twist ? quat.setFromEuler(euler.set(angle, 0, twist)) : quat.setFromAxisAngle(xAxis, angle), size.set(1, 1, 1));
     batch.push(outM.multiplyMatrices(base, local), look);
   }
-  function visible(npc: Npc) { return npc.state !== 'inside' && npc.state !== 'down' && npc.state !== 'away'; }
+  // Off in zombie mode: nobody is drawn, hit or found while the streets belong to the dead.
+  let enabled = true;
+  function visible(npc: Npc) { return enabled && npc.state !== 'inside' && npc.state !== 'down' && npc.state !== 'away'; }
   function draw(npc: Npc, i: number, time: number) {
     if (!visible(npc)) return;
     const d = dress[i];
@@ -839,6 +841,11 @@ export function createNpcs(
     npcs,
     gangs: gangState,
     setSay(fn: (npc: Npc, text: string, shout: boolean) => void) { saySink = fn; },
+    /** Empties (or refills) the streets; the caller stops calling `update` while disabled. */
+    setEnabled(on: boolean) {
+      enabled = on;
+      if (!on) for (const batch of batches) { batch.begin(); batch.end(); }
+    },
     knock,
     provoke,
     flee,

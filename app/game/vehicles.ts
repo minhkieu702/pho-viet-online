@@ -49,6 +49,7 @@ const COUNTS: Record<CarKind, number> = { traffic: 12, police: 8, moto: 18 };
 const BODY_COLORS = ['#c9493b', '#3f6f9f', '#e8d6a8', '#5e927c', '#f0f0ea', '#2f3a40', '#d98c3c', '#8c6fae', '#9fb4d6', '#b8b2a4'];
 const MOTO_COLORS = ['#ed763e', '#4f86c6', '#c9493b', '#e8e2d0', '#2b2f33', '#86b8a0', '#d4b164', '#a57fb0'];
 const TAXI_COLORS = ['#f3f1ea', '#3a9a68'];
+const DUST = new THREE.Color('#9b9384');
 const DRIVER_SHIRTS = ['#db9876', '#86a799', '#d4b164', '#8caaa9', '#c96f6f', '#6f86a8'];
 /** Body style of each traffic car (by index), and of each motorbike: mostly scooters and step-throughs. */
 const TRAFFIC_STYLES: CarStyle[] = ['sedan', 'hatch', 'suv', 'taxi', 'sedan', 'pickup', 'hatch', 'sedan', 'suv', 'taxi', 'hatch', 'sedan'];
@@ -219,6 +220,39 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   for (const model of models.values()) if (model.glass) model.glass.renderOrder = 2;
   const seatMatrix = new THREE.Matrix4();
   const policeRoof = carSpec('police');
+  // Zombie mode: no traffic, only abandoned cars (dusty or burnt out) and toppled motorbikes.
+  let traffic = true;
+  const wrecks = new Map<Car, 'dusty' | 'burnt'>();
+  const paintOf = (car: Car) => (car.kind === 'moto' ? MOTO_COLORS[car.index % MOTO_COLORS.length]
+    : car.kind === 'police' ? '#f4f4f0'
+    : vehicleStyle(car) === 'taxi' ? TAXI_COLORS[car.index % TAXI_COLORS.length] : BODY_COLORS[car.index % BODY_COLORS.length]);
+  function repaint(car: Car) {
+    const n = cars.indexOf(car);
+    const wreck = wrecks.get(car);
+    color.set(paintOf(car));
+    if (wreck === 'dusty') color.lerp(DUST, 0.45).multiplyScalar(0.8);
+    else if (wreck === 'burnt') color.set('#2b2724');
+    modelOf[n].body.setColorAt(slotOf[n], color);
+    modelOf[n].body.instanceColor!.needsUpdate = true;
+  }
+  /** Leaves a vehicle abandoned somewhere on the roads, often across a lane. */
+  function wreck(car: Car) {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const axis: Axis = random() < 0.5 ? 'x' : 'z';
+      const road = ROADS[Math.floor(random() * ROADS.length)];
+      const along = -EDGE + random() * EDGE * 2;
+      const across = (random() - 0.5) * 12;
+      const x = axis === 'x' ? along : road + across, z = axis === 'x' ? road + across : along;
+      if (Math.abs(x) > BOUND - 4 || Math.abs(z) > BOUND - 4 || blocked(x, z, 2.8, car) || !worldClear(x, z, 1.2)) continue;
+      Object.assign(car, { mode: 'parked', x, z, yaw: random() * Math.PI * 2, speed: 0, driver: null, waypoints: [], plan: null, stuck: 0, timer: 0 });
+      const burnt = car.kind !== 'moto' && random() < 0.35;
+      car.health = burnt ? 0 : (car.kind === 'moto' ? MOTO_HEALTH : CAR_HEALTH) * (0.4 + random() * 0.4);
+      wrecks.set(car, burnt ? 'burnt' : 'dusty');
+      repaint(car);
+      return;
+    }
+    car.mode = 'off';
+  }
 
   const matrix = new THREE.Matrix4();
   const lightMatrix = new THREE.Matrix4();
@@ -471,7 +505,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       for (const car of cars) {
         if (car.kind === 'police') continue;
         if (car.mode === 'lane') driveLane(car, dt, player);
-        else if (car.mode === 'parked' || car.mode === 'off') {
+        else if (traffic && (car.mode === 'parked' || car.mode === 'off')) {
           // Abandoned vehicles far from the player are recycled into fresh traffic.
           const far = Math.hypot(car.x - player.x, car.z - player.z) > 70;
           car.timer = far ? car.timer + dt : 0;
@@ -492,15 +526,16 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
           return;
         }
         quat.setFromAxisAngle(up, car.yaw);
+        const toppled = car.kind === 'moto' && car.mode === 'parked' && wrecks.has(car);
         if (car.kind === 'moto') {
           // Riders lean into corners a little.
           const goal = car.mode === 'lane' ? lanePoint(car.kind, car.axis, car.road, car.along, car.dir).yaw : car.yaw;
           const turn = Math.atan2(Math.sin(goal - car.yaw), Math.cos(goal - car.yaw));
-          lean[n] = THREE.MathUtils.damp(lean[n], THREE.MathUtils.clamp(-turn * 0.6, -0.35, 0.35), 6, dt);
+          lean[n] = toppled ? 1.42 : THREE.MathUtils.damp(lean[n], THREE.MathUtils.clamp(-turn * 0.6, -0.35, 0.35), 6, dt);
           quat.multiply(tilt.setFromAxisAngle(zAxis, lean[n]));
         }
         // Wheels on the road surface, or up on the sidewalk when a car mounts the curb.
-        matrix.compose(pos.set(car.x, groundHeight(car.x, car.z) - 0.04, car.z), quat, one);
+        matrix.compose(pos.set(car.x, groundHeight(car.x, car.z) - 0.04 + (toppled ? 0.3 : 0), car.z), quat, one);
         model.body.setMatrixAt(slot, matrix);
         // Only a vehicle that still has its own driver shows one; a stolen or parked one does not.
         const occupied = car.mode === 'lane' && !!car.driver;
@@ -508,7 +543,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
           // The rider sits in the bike's own frame, so it leans into corners with it.
           if (occupied) (FLOORBOARD[vehicleStyle(car) as MotoStyle] ? riders : pegRiders).push(matrix, seatedPalette(n, car.driver!, true));
         } else {
-          model.glass!.setMatrixAt(slot, matrix);
+          if (wrecks.get(car) !== 'burnt') model.glass!.setMatrixAt(slot, matrix);
           const crewed = occupied || (car.kind === 'police' && (car.mode === 'chase' || car.mode === 'leave'));
           if (crewed) {
             const seat = seatOf(car);
@@ -536,8 +571,21 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       lights.instanceMatrix.needsUpdate = true;
       if (lights.instanceColor) lights.instanceColor.needsUpdate = true;
     },
+    /** Traffic on, or (zombie mode) every vehicle abandoned on the roads and the cruisers gone. */
+    setTraffic(on: boolean, px: number, pz: number) {
+      traffic = on;
+      for (const car of cars) {
+        const had = wrecks.delete(car);
+        if (had) repaint(car);
+        if (car.kind === 'police') { car.mode = 'off'; continue; }
+        if (on) spawnTraffic(car, px, pz, 14);
+        else wreck(car);
+      }
+    },
+    /** Whether a vehicle is an abandoned wreck (and how badly). */
+    wreckOf(car: Car) { return wrecks.get(car) ?? null; },
     /** Head and tail lamps glow brighter as night falls (0..1). */
-    setNight(night: number) { lamps.value = 0.2 + night * 0.9; },
+    setNight(night: number) { lamps.value = traffic ? 0.2 + night * 0.9 : 0.05; },
     dispose() {
       for (const mesh of [...meshes, lights]) { scene.remove(mesh); mesh.geometry.dispose(); mesh.dispose(); }
       for (const batch of [riders, pegRiders, drivers]) { scene.remove(batch.mesh); batch.mesh.geometry.dispose(); batch.dispose(); }

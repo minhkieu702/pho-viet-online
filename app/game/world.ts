@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { BUILDINGS, COLLIDERS, LAMPS, PLOTS, ROADS, SCENERY, pathClearance, type Building, type Plot, type Prop, type Rect, type Tree } from './city';
+import { BOUND, BUILDINGS, COLLIDERS, LAMPS, PLOTS, ROADS, SCENERY, pathClearance, pointClear, type Building, type Plot, type Prop, type Rect, type Tree } from './city';
 
 export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number };
 
@@ -1386,6 +1386,102 @@ export function buildWorld(scene: THREE.Scene) {
   const identity = new THREE.Quaternion();
   const groundBase = new THREE.Color('#ffffff');
   let lastNight = -1, lastWet = -1;
+
+  // ---- Zombie mode: the power is out, everything is dusty, and the streets are full of debris. ----
+  let apocalypse = false;
+  let wreckage: THREE.Group | null = null;
+  const fires: { x: number; z: number }[] = [];
+  function buildWreckage() {
+    const group = new THREE.Group();
+    group.name = 'Apocalypse debris';
+    const r = seeded(6660);
+    const mat = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.92 });
+    const decal = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.55, polygonOffset: true, polygonOffsetFactor: -3 });
+    materials.push(mat, decal);
+    const kinds = {
+      rubble: { geometry: new THREE.DodecahedronGeometry(1, 0), material: mat, items: [] as THREE.Matrix4[], colors: [] as THREE.Color[] },
+      bag: { geometry: new THREE.CapsuleGeometry(0.17, 0.42, 3, 8).rotateZ(Math.PI / 2), material: mat, items: [] as THREE.Matrix4[], colors: [] as THREE.Color[] },
+      trash: { geometry: new THREE.SphereGeometry(1, 7, 5), material: mat, items: [] as THREE.Matrix4[], colors: [] as THREE.Color[] },
+      plank: { geometry: new THREE.BoxGeometry(1, 1, 1), material: mat, items: [] as THREE.Matrix4[], colors: [] as THREE.Color[] },
+      barrel: { geometry: new THREE.CylinderGeometry(0.3, 0.3, 0.9, 10), material: mat, items: [] as THREE.Matrix4[], colors: [] as THREE.Color[] },
+      stain: { geometry: new THREE.CircleGeometry(1, 10).rotateX(-Math.PI / 2), material: decal, items: [] as THREE.Matrix4[], colors: [] as THREE.Color[] },
+      paper: { geometry: new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2), material: decal, items: [] as THREE.Matrix4[], colors: [] as THREE.Color[] },
+    };
+    const put = (kind: keyof typeof kinds, x: number, y: number, z: number, sx: number, sy: number, sz: number, yaw: number, hex: string, tilt = 0) => {
+      kinds[kind].items.push(new THREE.Matrix4().compose(new THREE.Vector3(x, y, z), new THREE.Quaternion().setFromEuler(new THREE.Euler(tilt, yaw, 0)), new THREE.Vector3(sx, sy, sz)));
+      kinds[kind].colors.push(vary(hex, r()));
+    };
+    /** A random spot on a road or its sidewalks, clear of buildings. */
+    const streetSpot = (margin: number) => {
+      for (let attempt = 0; attempt < 20; attempt++) {
+        const road = ROADS[Math.floor(r() * ROADS.length)];
+        const along = (r() * 2 - 1) * (BOUND - 6), across = (r() * 2 - 1) * 12;
+        const [x, z] = r() < 0.5 ? [along, road + across] : [road + across, along];
+        if (z < ROADS[0] - 12 || !pointClear(x, z, margin)) continue;
+        return { x, z, y: groundHeight(x, z) };
+      }
+      return null;
+    };
+    for (let i = 0; i < 150; i++) {
+      const p = streetSpot(0.6);
+      if (!p) continue;
+      // Rubble piles: a few broken chunks heaped together.
+      const n = 1 + Math.floor(r() * 4);
+      for (let k = 0; k < n; k++) {
+        const s = 0.12 + r() * 0.35;
+        put('rubble', p.x + (r() - 0.5) * 1.2, p.y + s * 0.3, p.z + (r() - 0.5) * 1.2, s * (1 + r()), s * 0.6, s * (1 + r() * 0.6), r() * PI, r() < 0.5 ? '#8f877a' : '#6f675c', r());
+      }
+    }
+    for (let i = 0; i < 90; i++) {
+      const p = streetSpot(0.5);
+      if (p) put('trash', p.x, p.y + 0.22, p.z, 0.34 + r() * 0.12, 0.28, 0.32, r() * PI, r() < 0.7 ? '#1f2224' : '#2f3a2c');
+    }
+    for (let i = 0; i < 80; i++) {
+      const p = streetSpot(0.3);
+      if (p) put('stain', p.x, p.y + 0.012, p.z, 0.4 + r() * 1.1, 1, 0.3 + r() * 0.8, r() * PI, r() < 0.75 ? '#4a1510' : '#2a221e');
+    }
+    for (let i = 0; i < 160; i++) {
+      const p = streetSpot(0.2);
+      if (p) put('paper', p.x, p.y + 0.014, p.z, 0.25 + r() * 0.2, 1, 0.3 + r() * 0.2, r() * PI, r() < 0.6 ? '#d9d4c4' : '#b9b09a');
+    }
+    // Sandbag walls and plank barriers across the roads near some junctions, with a burning barrel.
+    for (const cx of ROADS) for (const cz of ROADS) {
+      if (r() < 0.55) continue;
+      const alongX = r() < 0.5, side = r() < 0.5 ? -1 : 1;
+      const at = (u: number, v: number) => (alongX ? { x: cx + side * 13 + v, z: cz + u } : { x: cx + u, z: cz + side * 13 + v });
+      const start = -5 + r() * 2, length = 4 + Math.floor(r() * 4);
+      for (let k = 0; k < length; k++) for (let row = 0; row < 2; row++) {
+        const p = at(start + k * 0.62 + row * 0.31, 0);
+        if (!pointClear(p.x, p.z, 0.3)) continue;
+        put('bag', p.x, groundHeight(p.x, p.z) + 0.17 + row * 0.3, p.z, 1, 1, 1, alongX ? 0 : PI / 2, '#b3a07a');
+      }
+      for (const u of [2.5, 5.2]) {
+        const p = at(u, 0.4);
+        if (!pointClear(p.x, p.z, 0.4)) continue;
+        const y = groundHeight(p.x, p.z);
+        for (const leg of [-0.7, 0.7]) put('plank', p.x + (alongX ? 0 : leg), y + 0.45, p.z + (alongX ? leg : 0), 0.08, 0.9, 0.08, 0, '#5a4330');
+        put('plank', p.x, y + 0.82, p.z, alongX ? 0.06 : 1.8, 0.16, alongX ? 1.8 : 0.06, 0, r() < 0.5 ? '#c9b24a' : '#8a6a46');
+      }
+      const b = at(start - 1.2, 1.2);
+      if (pointClear(b.x, b.z, 0.5)) {
+        put('barrel', b.x, groundHeight(b.x, b.z) + 0.45, b.z, 1, 1, 1, 0, '#7a4a2e');
+        fires.push({ x: b.x, z: b.z });
+      }
+    }
+    for (const kind of Object.values(kinds)) {
+      if (!kind.items.length) continue;
+      const mesh = new THREE.InstancedMesh(kind.geometry, kind.material, kind.items.length);
+      kind.items.forEach((m, i) => { mesh.setMatrixAt(i, m); mesh.setColorAt(i, kind.colors[i]); });
+      mesh.receiveShadow = true;
+      mesh.computeBoundingSphere();
+      group.add(mesh);
+      geometries.push(kind.geometry);
+    }
+    group.traverse((o) => { o.updateMatrix(); o.matrixAutoUpdate = false; });
+    group.updateMatrixWorld(true);
+    root.add(group);
+    return group;
+  }
   return {
     colliders,
     update(time: number) {
@@ -1412,6 +1508,19 @@ export function buildWorld(scene: THREE.Scene) {
       cut.aspect.value = camera.aspect;
       cut.radius.value = (CUT_RADIUS * cutStrength) / Math.max(1, depth * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
     },
+    /** Zombie mode on or off: power cut, dust over everything, debris and fire barrels in the streets. */
+    setApocalypse(on: boolean) {
+      apocalypse = on;
+      if (on && !wreckage) wreckage = buildWreckage();
+      if (wreckage) wreckage.visible = on;
+      roles.solid.color.set(on ? '#b9af9d' : '#ffffff');
+      roles.glass.color.set(on ? '#8c8b86' : '#ffffff');
+      roles.glassLit.color.set(on ? '#8c8b86' : '#ffffff');
+      groundBase.set(on ? '#aaa395' : '#ffffff');
+      lastNight = -1;
+    },
+    /** Burning barrels of zombie mode (empty in the normal city). */
+    get fires() { return apocalypse ? fires : []; },
     /** `night` 0..1 lights windows, lamps, signs and light pools; `wet` 0..1 darkens and glosses the paving. */
     setAtmosphere(a: { night: number; wet: number }) {
       const night = Math.min(1, Math.max(0, a.night || 0));
@@ -1419,13 +1528,15 @@ export function buildWorld(scene: THREE.Scene) {
       if (Math.abs(night - lastNight) < 0.004 && Math.abs(wet - lastWet) < 0.004) return;
       lastNight = night;
       lastWet = wet;
-      roles.glass.emissiveIntensity = night * 0.28;
-      roles.glassLit.emissiveIntensity = night * 1.25;
-      roles.lamp.emissiveIntensity = night * 2.6;
-      roles.lantern.emissiveIntensity = night * 1.1;
-      for (const g of glowMaterials) g.material.emissiveIntensity = night * g.strength;
+      // No electricity in zombie mode: dark windows, lamps and signs.
+      const power = apocalypse ? 0 : 1;
+      roles.glass.emissiveIntensity = night * 0.28 * power;
+      roles.glassLit.emissiveIntensity = night * 1.25 * power;
+      roles.lamp.emissiveIntensity = night * 2.6 * power;
+      roles.lantern.emissiveIntensity = night * 1.1 * power;
+      for (const g of glowMaterials) g.material.emissiveIntensity = night * g.strength * power;
       poolMaterial.opacity = night * 0.5;
-      pools.visible = night > 0.02;
+      pools.visible = night > 0.02 && !apocalypse;
       roles.ground.color.copy(groundBase).multiplyScalar(1 - 0.38 * wet);
       roles.ground.roughness = 0.9 - 0.62 * wet;
       roles.ground.metalness = 0.12 * wet;

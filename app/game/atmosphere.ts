@@ -21,6 +21,10 @@ export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight
   let weatherTimer = (2 + Math.random() * 3) * SECONDS_PER_HOUR;
   let rain = 0;
   let cover = 0.15;
+  // Zombie mode's mood: a smoky, sickly haze, a weaker sun, and never a clear sky.
+  let apocalypse = false;
+  let mood = 0;
+  const haze = new THREE.Color('#8d8c78'), hazeNight = new THREE.Color('#2a2c27'), emberSun = new THREE.Color('#ffb27a'), hazeTint = new THREE.Color('#b8a988');
   let lastShadowDir = new THREE.Vector3();
   const sunDirection = new THREE.Vector3(-0.45, 0.8, 0.25).normalize();
   const tint = new THREE.Color();
@@ -88,13 +92,18 @@ export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight
       return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')} · ${WEATHER_LABEL[weather]}`;
     },
     setWeather(next: Weather) { weather = next; weatherTimer = (2 + Math.random() * 4) * SECONDS_PER_HOUR; },
+    setHours(next: number) { hours = ((next % 24) + 24) % 24; },
+    setApocalypse(on: boolean) {
+      apocalypse = on;
+      if (on && weather === 'clear') weather = 'cloudy';
+    },
     /** Advances the clock; returns true when the sun moved enough that the static shadow map should be redrawn. */
     update(dt: number, time: number, focus: THREE.Vector3, spread = 60) {
       hours = (hours + dt / SECONDS_PER_HOUR) % 24;
       weatherTimer -= dt;
       if (weatherTimer <= 0) {
         const roll = Math.random();
-        weather = roll < 0.45 ? 'clear' : roll < 0.72 ? 'cloudy' : 'rain';
+        weather = apocalypse ? (roll < 0.65 ? 'cloudy' : 'rain') : roll < 0.45 ? 'clear' : roll < 0.72 ? 'cloudy' : 'rain';
         weatherTimer = (2 + Math.random() * 4) * SECONDS_PER_HOUR;
       }
       const wantRain = weather === 'rain' ? 1 : 0;
@@ -112,14 +121,21 @@ export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight
       if (elevation > -0.05) sun.position.copy(sunDirection).multiplyScalar(100);
       else sun.position.set(-sunDirection.x, 0.6, -sunDirection.z).normalize().multiplyScalar(100);
       sun.color.copy(daySun).lerp(duskSun, dusk).lerp(moon, night);
-      sun.intensity = (0.35 + 3.35 * day) * (1 - rain * 0.55) * (1 - cover * 0.25);
-      hemi.intensity = (0.55 + 2.0 * day) * (1 - rain * 0.35);
+      mood += ((apocalypse ? 1 : 0) - mood) * Math.min(1, dt * 0.6);
+      sun.color.lerp(emberSun, mood * 0.45);
+      sun.intensity = (0.35 + 3.35 * day) * (1 - rain * 0.55) * (1 - cover * 0.25) * (1 - mood * 0.3);
+      hemi.intensity = (0.55 + 2.0 * day) * (1 - rain * 0.35) * (1 - mood * 0.25);
       horizon.copy(dayHorizon).lerp(duskHorizon, dusk).lerp(nightHorizon, night).lerp(rainHorizon, rain * (1 - night * 0.7));
       background.copy(horizon);
       fog.color.copy(horizon);
-      fog.near = 120 - rain * 70;
-      fog.far = 260 - rain * 110;
-      tint.copy(dayTint).lerp(duskTint, dusk).lerp(nightTint, night).lerp(rainTint, rain * (1 - night * 0.6));
+      if (mood > 0.001) {
+        horizon.lerp(night > 0.5 ? hazeNight : haze, mood * 0.7);
+        background.copy(horizon);
+        fog.color.copy(horizon);
+      }
+      fog.near = (120 - rain * 70) * (1 - mood * 0.6);
+      fog.far = (260 - rain * 110) * (1 - mood * 0.35);
+      tint.copy(dayTint).lerp(duskTint, dusk).lerp(nightTint, night).lerp(rainTint, rain * (1 - night * 0.6)).lerp(hazeTint, mood * 0.45 * (1 - night));
       material.uniforms.time.value = time;
       material.uniforms.amount.value = rain;
       material.uniforms.focus.value.copy(focus);

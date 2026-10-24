@@ -125,11 +125,12 @@ export function createExplosives(scene: THREE.Scene, ground: (x: number, z: numb
 
   return {
     /** Fires a projectile from `origin` along the normalised `direction`. */
-    launch(kind: WeaponId, def: Projectile, origin: THREE.Vector3, direction: THREE.Vector3) {
+    /** `lofted` adds the default upward loft to lobbed shells; aimed shots pass an exact arc instead. */
+    launch(kind: WeaponId, def: Projectile, origin: THREE.Vector3, direction: THREE.Vector3, lofted = true) {
       if (shells.length >= MAX_SHELLS) shells.shift();
       // Grenades are lobbed: add some loft so they arc.
       const vel = direction.clone().multiplyScalar(def.speed);
-      if (def.gravity > 0) vel.y += def.speed * 0.28;
+      if (def.gravity > 0 && lofted) vel.y += def.speed * 0.28;
       shells.push({ kind, def, pos: origin.clone(), vel, age: 0, bounced: 0, trailAt: 0 });
     },
     /** A detonation not caused by a shell, e.g. a car blowing up. */

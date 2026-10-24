@@ -168,7 +168,10 @@ export function createPolice(
     return o.body;
   }
 
+  // Off in zombie mode: there is no police left to call.
+  let enabled = true;
   function crime(severity: number, time: number) {
+    if (!enabled) return;
     heat += severity;
     wanted = Math.min(5, Math.max(wanted, 1, 1 + Math.floor(heat / 4)));
     lastSeen = time;
@@ -325,6 +328,7 @@ export function createPolice(
     get wanted() { return wanted; },
     crime,
     reset,
+    setEnabled(on: boolean) { enabled = on; if (!on) reset(); },
     restrain,
     /** True when (x, z) is on a spike strip; the strip is used up. */
     onSpikes(x: number, z: number) {

@@ -20,6 +20,7 @@ import { BIKES, CAR_STATS, MOTO_STATS, POLICE_CAR_STATS, bikeById, repairCost, t
 import { createVehicles, makeCarMesh, seatOf, vehicleStyle, CAR_HEALTH, MOTO_HEALTH, POLICE_CAR_HEALTH, type Car } from './vehicles';
 import { FLOORBOARD, MOTO_RIDER, motoParts, vehicleMaterial, type MotoStyle } from './vehicle-models';
 import { createPolice } from './police';
+import { createZombies, type Zombie } from './zombies';
 import { createSky, HORIZON } from './sky';
 import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuName, isSoftwareGpu, type QualityMode } from './quality';
 
@@ -36,7 +37,11 @@ export type Hud = {
   gangs: { name: string; anger: number; x: number; z: number }[]; hospital: { x: number; z: number }; policeStation: { x: number; z: number };
   healCost: number; respawnIn: number; arsenal: { id: WeaponId; mag: number; reserve: number }[]; stunned: boolean; flatTires: boolean;
   surrendered: boolean; gassed: boolean;
+  /** Zombie mode: wave, zombies left in it, kills, seconds of rest left, best wave reached. */
+  zombie: { wave: number; left: number; kills: number; breakLeft: number; best: number; dots: { x: number; z: number }[] } | null;
 };
+/** The normal living city, or the zombie apocalypse. */
+export type GameMode = 'city' | 'zombie';
 export type GameEvent = { type: 'store' } | { type: 'bikeshop' } | { type: 'hospital' } | { type: 'bag'; open: boolean };
 
 // Both on the sidewalk so the player never spawns in a traffic lane.
@@ -494,6 +499,22 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   });
   const vehicles = createVehicles(scene, worldClear);
   const police = createPolice(scene, vehicles, ragdolls, { clear: worldClear, sight: lineOfSight, ground: groundHeight }, (key, text, at) => sayAt(key, text, at, true));
+  const zombies = createZombies(scene, ragdolls, {
+    clear: (x, z, radius) => worldClear(x, z, radius) && !vehicles.blocked(x, z, radius),
+    sight: lineOfSight,
+    ground: groundHeight,
+    route: (fx, fz, tx, tz) => nav.route(fx, fz, tx, tz),
+  }, (zb, text) => sayAt(`zombie${zb.index}`, text, () => (zb.state === 'off' || zb.state === 'down' ? null : { x: zb.x, y: groundHeight(zb.x, zb.z) + 2, z: zb.z })));
+  let zombieMode = false;
+  /** What the residents report in a frame when there are none (zombie mode). */
+  const NO_NPC_EVENTS: ReturnType<typeof npcs.update> = { robbed: [], strikes: 0, shots: [], crowd: { outside: 0, umbrellas: 0, sheltering: 0, exposed: 0, watching: 0, chatting: 0 } };
+  let zombieBest = 0;
+  try { zombieBest = Number(localStorage.getItem('pvo-zombie-best')) || 0; } catch { /* storage blocked */ }
+  let fireAt = 0;
+  // A flashlight for zombie nights, with no power in the city.
+  const torch = new THREE.SpotLight('#fff1d0', 0, 36, 0.48, 0.55, 1.1);
+  torch.visible = false;
+  scene.add(torch, torch.target);
   const animals = createAnimals(scene, { clear: worldClear, ground: groundHeight }, (key, text, at) => sayAt(key, text, at));
   const sideMissions = createSideMissions(scene, groundHeight, reachable);
   const receivers = RECEIVERS.map((r) => ({ ...r, ...reachable(r) }));
@@ -711,6 +732,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const rayOrigin = new THREE.Vector3();
   const rayDir = new THREE.Vector3();
   const aimPoint = new THREE.Vector3();
+  const aimDir = new THREE.Vector3();
+  const aimProbe = new THREE.Vector3();
+  const reticlePoint = new THREE.Vector3();
+  const pointerPx = new THREE.Vector2();
+  /** Extra spread from firing fast; it settles back within a fraction of a second. */
+  let bloom = 0;
+  let hitMarkAt = 0;
+  let headMark = false;
   const hitPoint = new THREE.Vector3();
   const scratch = new THREE.Vector3();
   const playerPoint = new THREE.Vector3();
@@ -944,6 +973,40 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     sideMissions.cancel();
   }
 
+  /** A survivor's kit: pistol, shotgun and SMG with spare ammo, and some cash for the gun store. */
+  function zombieKit() {
+    for (const id of ['pistol', 'shotgun', 'smg'] as WeaponId[]) {
+      const def = weaponById(id);
+      owned.add(id);
+      const rounds = ammo.get(id);
+      ammo.set(id, { mag: def.magazine, reserve: Math.max(rounds?.reserve ?? 0, def.startAmmo * 2) });
+    }
+    cash = Math.max(cash, 300);
+    deliveries = Math.max(deliveries, 1);
+    equip(weapon === 'fists' ? 'pistol' : weapon);
+  }
+
+  /** Switches between the living city and the zombie apocalypse. */
+  function setMode(mode: GameMode) {
+    const zombie = mode === 'zombie';
+    zombieMode = zombie;
+    npcs.setEnabled(!zombie);
+    police.setEnabled(!zombie);
+    vehicles.setTraffic(!zombie, state.x, state.z);
+    world.setApocalypse(zombie);
+    atmosphere.setApocalypse(zombie);
+    torch.visible = zombie;
+    marker.visible = !zombie && missions.view().target !== null;
+    if (zombie) {
+      atmosphere.setHours(16.5);
+      sideMissions.cancel();
+      zombieKit();
+      zombies.start(performance.now() / 1000);
+      showBanner('ZOMBIE TRÀN NGẬP KHU PHỐ', performance.now(), 4000);
+      notify('Cả khu phố đã biến thành zombie · Sống sót qua từng đợt! Bắn vào đầu để hạ nhanh.', 6000);
+    } else zombies.stop();
+  }
+
   function teleport(at: { x: number; z: number }) {
     const spot = reachable(at);
     Object.assign(state, { x: spot.x, z: spot.z, riding: false, speed: 0 });
@@ -959,6 +1022,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     police.reset();
     teleport(LANDMARKS.hospital);
     health = MAX_HEALTH;
+    if (zombieMode) {
+      const run = zombies.stats(now / 1000);
+      showBanner(`GỤC Ở ĐỢT ${run.wave} · HẠ ${run.kills} ZOMBIE`, now, 4500);
+      notify('Bạn tỉnh lại ở bệnh viện · Lũ zombie lại kéo đến từ đầu!', 4500);
+      zombieKit();
+      zombies.start(now / 1000);
+      return;
+    }
     notify(fee ? `Xuất viện · Viện phí ${formatThousands(fee)}` : 'Xuất viện, khỏe lại rồi!', 3500);
     void now;
   }
@@ -1170,6 +1241,21 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   // Camera: right/middle drag (or one-finger drag on touch) orbits, wheel or pinch zooms.
   const canvas = renderer.domElement;
   canvas.style.touchAction = 'none';
+  // Crosshair drawn over the canvas: a ring that widens with spread and turns red over a target, a dot,
+  // and a hit marker (red for a head shot).
+  if (getComputedStyle(container).position === 'static') container.style.position = 'relative';
+  const reticle = document.createElement('div');
+  reticle.setAttribute('aria-hidden', 'true');
+  reticle.style.cssText = 'position:absolute;left:0;top:0;width:0;height:0;pointer-events:none;display:none;z-index:2;will-change:transform';
+  const reticleRing = document.createElement('div');
+  reticleRing.style.cssText = 'position:absolute;border:2px solid rgba(255,255,255,.95);border-radius:50%;box-shadow:0 0 0 1px rgba(0,0,0,.35),inset 0 0 0 1px rgba(0,0,0,.25);transform:translate(-50%,-50%)';
+  const reticleDot = document.createElement('div');
+  reticleDot.style.cssText = 'position:absolute;width:4px;height:4px;margin:-2px 0 0 -2px;border-radius:50%;background:#fff;box-shadow:0 0 0 1px rgba(0,0,0,.45)';
+  const reticleHit = document.createElement('div');
+  reticleHit.textContent = '✕';
+  reticleHit.style.cssText = 'position:absolute;transform:translate(-50%,-52%);font:800 24px/1 system-ui,sans-serif;color:#fff;text-shadow:0 0 3px #000;opacity:0';
+  for (const part of [reticleRing, reticleDot, reticleHit]) reticle.appendChild(part);
+  container.appendChild(reticle);
   const touches = new Map<number, { x: number; y: number }>();
   let rotating: { id: number; x: number; y: number } | null = null;
   function rotateBy(dx: number, dy: number) {
@@ -1187,6 +1273,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   function trackPointer(event: PointerEvent) {
     const rect = canvas.getBoundingClientRect();
     pointerNdc.set((event.clientX - rect.left) / rect.width * 2 - 1, -(event.clientY - rect.top) / rect.height * 2 + 1);
+    pointerPx.set(event.clientX - rect.left + canvas.offsetLeft, event.clientY - rect.top + canvas.offsetTop);
   }
   function onPointerDown(event: PointerEvent) {
     if (!active) return;
@@ -1359,21 +1446,94 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
   }
 
-  /** Picks the person, officer, player or body closest to `yaw`, for keyboard, touch and vehicle aiming. */
+  /** Damages a zombie; a kill tears limbs on a big hit and sometimes leaves money on the street. */
+  function hurtZombie(zb: Zombie, amount: number, vx: number, vy: number, vz: number, now: number, force: boolean, gore: number, near: THREE.Vector3 | null) {
+    const result = zombies.damage(zb, amount, vx, vy, vz, now / 1000, force);
+    if (!result?.killed) return;
+    dismember(result.body, gore, near, now);
+    if (Math.random() < 0.22) pickups.drop(zb.x, zb.z, 10 + Math.floor(Math.random() * 40), now);
+  }
+
+  /** Everything that can be shot, as upright capsules: centre (x, z), bottom and top heights, radius. */
+  function forEachTarget(callback: (x: number, z: number, y0: number, y1: number, radius: number) => void) {
+    npcs.forEachStanding((x, z, npc) => callback(x, z, npc.y, npc.y + 1.8, 0.38));
+    police.forEachUnit((x, z, onFoot) => { if (onFoot) callback(x, z, 0.1, 1.9, 0.38); });
+    for (const peer of peers.values()) if (!peer.target.down && peerVehicle(peer) === 'foot') callback(peer.group.position.x, peer.group.position.z, 0.1, 1.9, 0.4);
+    animals.forEachShadow((x, z, size) => callback(x, z, 0.05, 0.1 + size * 0.6, Math.max(0.2, size * 0.45)));
+    ragdolls.forEach((body) => { if (body !== playerBody) { ragdolls.center(body, scratch); callback(scratch.x, scratch.z, scratch.y - 0.3, scratch.y + 0.3, 0.45); } });
+    if (zombieMode) zombies.forEachStanding(callback);
+  }
+
+  /** Picks the target closest to `yaw` that can be seen, for keyboard, touch and vehicle aiming (chest high). */
   function autoAim(range: number, yaw: number, out: THREE.Vector3) {
     let bestGap = 0.42;
     let found = false;
-    const consider = (x: number, y: number, z: number) => {
+    forEachTarget((x, z, y0, y1) => {
       const d = Math.hypot(x - state.x, z - state.z);
       if (d < 0.5 || d > range) return;
       const gap = angleGap(Math.atan2(x - state.x, z - state.z), yaw);
-      if (gap < bestGap) { bestGap = gap; out.set(x, y, z); found = true; }
-    };
-    npcs.forEachStanding((x, z, npc) => consider(x, npc.y + 1.0, z));
-    police.forEachUnit((x, z, onFoot) => { if (onFoot) consider(x, 1.0, z); });
-    for (const peer of peers.values()) if (!peer.target.down) consider(peer.group.position.x, 1.0, peer.group.position.z);
-    ragdolls.forEach((body) => { if (body !== playerBody) { ragdolls.center(body, scratch); consider(scratch.x, scratch.y, scratch.z); } });
+      if (gap < bestGap && lineOfSight(state.x, state.z, x, z)) { bestGap = gap; out.set(x, y0 + (y1 - y0) * 0.62, z); found = true; }
+    });
     return found;
+  }
+
+  /**
+   * Mouse aim: the target under (or just beside) the cursor, at the height the cursor covers, so a click on
+   * a head is a head shot. With nothing there, the point under the cursor at chest height. True on a target.
+   */
+  function pointerAim(range: number, out: THREE.Vector3) {
+    raycaster.setFromCamera(pointerNdc, camera);
+    const ray = raycaster.ray;
+    const { origin, direction } = ray;
+    const flat = direction.x * direction.x + direction.z * direction.z;
+    let best = Infinity;
+    if (flat > 1e-6) forEachTarget((x, z, y0, y1, radius) => {
+      if (Math.hypot(x - state.x, z - state.z) > range + 2) return;
+      // Closest approach of the camera ray to the target's upright axis.
+      const t = ((x - origin.x) * direction.x + (z - origin.z) * direction.z) / flat;
+      if (t <= 0) return;
+      aimProbe.set(x, THREE.MathUtils.clamp(origin.y + direction.y * t, y0 + 0.05, y1 - 0.05), z);
+      const miss = ray.distanceToPoint(aimProbe);
+      // A touch of aim assist that grows with distance from the camera.
+      const tolerance = radius + 0.014 * t;
+      if (miss > tolerance) return;
+      const score = miss <= radius ? t * 0.001 : 1 + miss / tolerance;
+      if (score < best) { best = score; out.copy(aimProbe); }
+    });
+    if (best < Infinity) return true;
+    const chest = groundHeight(state.x, state.z) + 1.2;
+    out.copy(origin).addScaledVector(direction, direction.y < -0.01 ? (chest - origin.y) / direction.y : 60);
+    return false;
+  }
+
+  /** Launch direction that lands a lobbed shell on `target` along the flatter arc (45° when out of reach). */
+  function lob(from: THREE.Vector3, target: THREE.Vector3, speed: number, gravity: number, out: THREE.Vector3) {
+    const dx = target.x - from.x, dz = target.z - from.z, d = Math.max(0.5, Math.hypot(dx, dz)), h = target.y - from.y;
+    const v2 = speed * speed;
+    const root = v2 * v2 - gravity * (gravity * d * d + 2 * h * v2);
+    const angle = root >= 0 ? Math.atan2(v2 - Math.sqrt(root), gravity * d) : Math.PI / 4;
+    return out.set((dx / d) * Math.cos(angle), Math.sin(angle), (dz / d) * Math.cos(angle));
+  }
+
+  /** Places the crosshair at the cursor (mouse) or on what auto-aim would hit (keys, touch). */
+  function updateReticle(show: boolean, locked: boolean, onPointer: boolean, now: number) {
+    if (!show) { if (reticle.style.display !== 'none') reticle.style.display = 'none'; return; }
+    reticle.style.display = '';
+    let x = pointerPx.x, y = pointerPx.y;
+    if (!onPointer) {
+      aimProbe.copy(reticlePoint).project(camera);
+      x = (aimProbe.x + 1) / 2 * canvas.clientWidth + canvas.offsetLeft;
+      y = (1 - aimProbe.y) / 2 * canvas.clientHeight + canvas.offsetTop;
+    }
+    const def = weaponById(weapon);
+    const size = 16 + def.spread * (1 + bloom) * (state.riding ? 2 : 1) * 520;
+    reticle.style.transform = `translate(${x.toFixed(1)}px,${y.toFixed(1)}px)`;
+    reticleRing.style.width = reticleRing.style.height = `${size.toFixed(1)}px`;
+    reticleRing.style.borderColor = locked ? 'rgba(255,86,72,.98)' : 'rgba(255,255,255,.95)';
+    reticleDot.style.background = locked ? '#ff5648' : '#fff';
+    const mark = Math.max(0, 1 - (now - hitMarkAt) / 220);
+    reticleHit.style.opacity = mark.toFixed(2);
+    reticleHit.style.color = headMark ? '#ff5648' : '#fff';
   }
 
   function muzzle(out: THREE.Vector3) {
@@ -1417,6 +1577,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         effects.blood(hitPoint.set(peer.group.position.x, 1.4, peer.group.position.z), rayDir.set(fx, 0, fz), 4);
       }
     }
+    if (!hit && zombieMode) zombies.near(cx, cz, 0.95, (zb) => {
+      if (hit) return;
+      hit = true;
+      hurtZombie(zb, def.damage, fx * def.force, 3.5, fz * def.force, now, false, 0, null);
+      effects.blood(hitPoint.set(zb.x, 1.4, zb.z), rayDir.set(fx, 0, fz), 4);
+    });
     if (!hit) animals.near(cx, cz, 0.9, (index) => { if (!hit) { hit = true; animals.hit(index, fx * 6, 3, fz * 6); } });
     if (!hit) hit = ragdolls.push(cx, cz, 0.9, fx * 7, 3, fz * 7) > 0;
     if (hit) { playThud(); shake = Math.max(shake, 0.15); npcs.notice(cx, cz, 'fight', time); }
@@ -1444,6 +1610,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const d = Math.hypot(o.x - b.x, o.z - b.z), f = 1 - d / b.radius, dx = (o.x - b.x) / (d || 1), dz = (o.z - b.z) / (d || 1);
       police.damage(o, b.damage * f + 15, dx * (8 + 14 * f), 6 + 9 * f, dz * (8 + 14 * f), time, true);
     });
+    if (zombieMode) {
+      zombies.hear(b.x, b.z, 70, time);
+      zombies.near(b.x, b.z, b.radius, (zb) => {
+        const d = Math.hypot(zb.x - b.x, zb.z - b.z), f = 1 - d / b.radius, dx = (zb.x - b.x) / (d || 1), dz = (zb.z - b.z) / (d || 1);
+        hurtZombie(zb, b.damage * f + 20, dx * (8 + 14 * f), 6 + 9 * f, dz * (8 + 14 * f), now, true, f > 0.4 ? 0.8 : 0.3, blastPoint);
+        effects.blood(hitPoint.set(zb.x, 1, zb.z), rayDir.set(dx, 0.6, dz), 6);
+      });
+    }
     for (const [id, peer] of peers) {
       const d = Math.hypot(peer.group.position.x - b.x, peer.group.position.z - b.z);
       if (d < b.radius && byPlayer) hitPeer(id, peer, Math.min(100, b.damage * (1 - d / b.radius) + 10), (peer.group.position.x - b.x) / (d || 1), (peer.group.position.z - b.z) / (d || 1), now);
@@ -1474,18 +1648,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       }
     }
     lastShot = now;
-    // Aim: the mouse on the ground, otherwise auto-aim around the facing (or driving) direction.
+    // Aim: what the mouse points at, otherwise auto-aim around the facing (or driving) direction, otherwise
+    // straight ahead at chest height.
     let haveTarget = false;
-    const baseYaw = state.riding ? state.angle : state.angle;
-    if (triggerSource === 'mouse' && pointerInside) {
-      raycaster.setFromCamera(pointerNdc, camera);
-      const ray = raycaster.ray;
-      if (ray.direction.y < -0.01) {
-        aimPoint.copy(ray.origin).addScaledVector(ray.direction, (0.3 - ray.origin.y) / ray.direction.y);
-        haveTarget = true;
-      }
-    } else haveTarget = autoAim(def.range, baseYaw, aimPoint);
-    aimYaw = haveTarget ? Math.atan2(aimPoint.x - state.x, aimPoint.z - state.z) : baseYaw;
+    if (triggerSource === 'mouse' && pointerInside) { pointerAim(def.range, aimPoint); haveTarget = true; }
+    else haveTarget = autoAim(def.range, state.angle, aimPoint);
+    if (!haveTarget) aimPoint.set(state.x + Math.sin(state.angle) * def.range, groundHeight(state.x, state.z) + 1.2, state.z + Math.cos(state.angle) * def.range);
+    aimYaw = Math.atan2(aimPoint.x - state.x, aimPoint.z - state.z);
     if (!state.riding) state.angle = aimYaw;
     aimUntil = now + 800;
     if (def.id === 'fists') {
@@ -1500,13 +1669,20 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     firingUntil = now + 400;
     muzzle(rayOrigin);
-    const horizontal = Math.max(1, Math.hypot(aimPoint.x - rayOrigin.x, aimPoint.z - rayOrigin.z));
-    const slope = haveTarget ? THREE.MathUtils.clamp((aimPoint.y - rayOrigin.y) / horizontal, -0.7, 0.15) : -0.03;
+    // Every bullet leaves the muzzle toward the aim point, so shots land where the crosshair is; spread
+    // widens with rapid fire (bloom) and from a moving vehicle.
+    aimDir.subVectors(aimPoint, rayOrigin);
+    if (aimDir.lengthSq() < 0.04) aimDir.set(Math.sin(aimYaw), 0, Math.cos(aimYaw));
+    aimDir.normalize();
+    const spread = def.spread * (1 + bloom) * (state.riding ? 2 : 1);
+    bloom = Math.min(1.6, bloom + (def.auto ? 0.2 : 0.35));
     effects.flash(rayOrigin, now, def.projectile ? 1.3 : def.id === 'shotgun' ? 1.1 : 0.75);
     playShot(def.id);
     if (def.projectile) {
-      rayDir.set(Math.sin(aimYaw), def.projectile.gravity > 0 ? Math.max(slope, -0.2) : slope, Math.cos(aimYaw)).normalize();
-      explosives.launch(def.id, def.projectile, rayOrigin, rayDir);
+      if (def.projectile.gravity > 0) lob(rayOrigin, aimPoint, def.projectile.speed, def.projectile.gravity, rayDir);
+      else rayDir.copy(aimDir);
+      explosives.launch(def.id, def.projectile, rayOrigin, rayDir, false);
+      if (zombieMode) zombies.hear(state.x, state.z, 45, time);
       shake = Math.max(shake, 0.3);
       npcs.alarm(state.x, state.z, 45, time);
       animals.alarm(state.x, state.z, 30);
@@ -1514,8 +1690,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     let hurtSomeone = false;
     for (let pellet = 0; pellet < def.pellets; pellet++) {
-      const yaw = aimYaw + (Math.random() - 0.5) * 2 * def.spread * (state.riding ? 2 : 1);
-      rayDir.set(Math.sin(yaw), slope + (Math.random() - 0.5) * def.spread, Math.cos(yaw)).normalize();
+      rayDir.set(aimDir.x + (Math.random() - 0.5) * 2 * spread, aimDir.y + (Math.random() - 0.5) * spread, aimDir.z + (Math.random() - 0.5) * 2 * spread).normalize();
       let maxT = wallDistance(rayOrigin, rayDir, def.range);
       if (rayDir.y < 0) maxT = Math.min(maxT, (groundHeight(rayOrigin.x, rayOrigin.z) + 0.02 - rayOrigin.y) / rayDir.y);
       // Every target type is tested and the nearest one along the ray takes the bullet.
@@ -1523,15 +1698,30 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const consider = (t: number, apply: () => void) => { if (t < maxT && (!best || t < best.t)) best = { t, apply }; };
       const pointBlank = def.id === 'shotgun';
       const npcHit = npcs.raycast(rayOrigin, rayDir, maxT);
+      // Head shots (above the shoulders) do two and a half times the damage.
       if (npcHit) consider(npcHit.t, () => {
-        hurtNpc(npcHit.npc, def.damage, rayDir.x * def.force, 2.5, rayDir.z * def.force, now, false, pointBlank && npcHit.t < 4 ? 0.5 : 0.05, hitPoint.clone());
-        effects.blood(hitPoint, rayDir, def.pellets > 1 ? 3 : 7);
+        const head = hitPoint.y - npcHit.npc.y > 1.46;
+        hurtNpc(npcHit.npc, def.damage * (head ? 2.5 : 1), rayDir.x * def.force, 2.5, rayDir.z * def.force, now, false, pointBlank && npcHit.t < 4 ? 0.5 : head ? 0.2 : 0.05, hitPoint.clone());
+        effects.blood(hitPoint, rayDir, def.pellets > 1 ? 3 : head ? 10 : 7);
         hurtSomeone = true;
+        hitMarkAt = now;
+        headMark = head;
+      });
+      const zombieHit = zombieMode ? zombies.raycast(rayOrigin, rayDir, maxT) : null;
+      if (zombieHit) consider(zombieHit.t, () => {
+        const head = zombieHit.height > 1.46;
+        hurtZombie(zombieHit.zombie, def.damage * (head ? 3 : 1), rayDir.x * def.force, 2.5, rayDir.z * def.force, now, false, pointBlank && zombieHit.t < 4 ? 0.6 : head ? 0.35 : 0.08, hitPoint.clone());
+        effects.blood(hitPoint, rayDir, def.pellets > 1 ? 3 : head ? 10 : 6);
+        hitMarkAt = now;
+        headMark = head;
       });
       const officerHit = police.raycast(rayOrigin, rayDir, maxT);
       if (officerHit) consider(officerHit.t, () => {
-        police.damage(officerHit.officer, def.damage, rayDir.x * def.force, 2.5, rayDir.z * def.force, time);
+        const head = hitPoint.y - groundHeight(officerHit.officer.x, officerHit.officer.z) > 1.5;
+        police.damage(officerHit.officer, def.damage * (head ? 2.5 : 1), rayDir.x * def.force, 2.5, rayDir.z * def.force, time);
         effects.blood(hitPoint, rayDir, def.pellets > 1 ? 3 : 7);
+        hitMarkAt = now;
+        headMark = head;
       });
       const bodyHit = ragdolls.raycast(rayOrigin, rayDir, maxT);
       if (bodyHit) consider(bodyHit.t, () => {
@@ -1564,6 +1754,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         if (t > 0 && y > 0 && y < 1.9) consider(t, () => {
           hitPeer(id, peer, def.damage * (kind === 'foot' ? 1 : 0.6), rayDir.x, rayDir.z, now);
           effects.blood(hitPoint, rayDir, 5);
+          hitMarkAt = now;
+          headMark = false;
         });
       }
       const chosen = best as { t: number; apply: () => void } | null;
@@ -1576,6 +1768,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     shake = Math.max(shake, def.id === 'shotgun' ? 0.35 : def.id === 'smg' ? 0.1 : 0.15);
     npcs.alarm(state.x, state.z, 42, time);
     npcs.notice(state.x, state.z, 'shots', time);
+    if (zombieMode) zombies.hear(state.x, state.z, def.id === 'pistol' ? 38 : 50, time);
     animals.alarm(state.x, state.z, 30);
     // Shooting near the police is a crime even if nobody gets hurt.
     let policeNear = false;
@@ -1590,6 +1783,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (npcHit) t = npcHit.t;
     const officerHit = police.raycast(origin, dir, t);
     if (officerHit) t = officerHit.t;
+    const zombieHit = zombieMode ? zombies.raycast(origin, dir, t) : null;
+    if (zombieHit) t = zombieHit.t;
     const carHit = vehicles.raycast(origin, dir, t);
     if (carHit && carHit.car !== playerCar) t = carHit.t;
     return t < maxT ? t : null;
@@ -1649,6 +1844,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       thrown(o.x, o.z);
     });
     animals.near(cx, cz, radius, (index, ax, az) => { animals.hit(index, fx * speed, 3, fz * speed); thrown(ax, az); });
+    if (zombieMode) zombies.near(cx, cz, radius + 0.1, (zb) => {
+      hurtZombie(zb, speed * 6, fx * speed * 0.85, 3 + speed * 0.22, fz * speed * 0.85, now, true, gore, null);
+      thrown(zb.x, zb.z);
+    });
     for (const [id, peer] of peers) {
       const kind = peerVehicle(peer);
       if (peer.target.down || kind === 'car' || kind === 'police') continue;
@@ -1703,6 +1902,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       : down === 'busted' ? 'Đang bị còng tay, áp giải về đồn…'
       : surrendered ? 'Đang đầu hàng · Nhấn H để hạ tay xuống'
       : playerBody ? 'Đang đứng dậy…'
+      : zombieMode && !nearStore && !nearHospital && !state.riding && !(car && !nearBike) ? (rounds && rounds.mag === 0 && rounds.reserve === 0 ? 'Hết đạn · Đổi súng (1–6) hoặc mua đạn ở Tiệm súng' : 'Click/F bắn · bắn vào đầu · R nạp đạn · lên xe để chạy thoát')
       : nearMission && missionInfo.requiresOnFoot && state.riding ? 'Giảm tốc rồi nhấn E xuống xe để dọn rác'
       : nearMission && missionInfo.requiresBike && !isMotorbike() ? 'Hãy dùng xe máy để tham gia vòng đua'
       : nearMission ? missionInfo.objective
@@ -1733,11 +1933,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       bikeX: Math.round(bikeX), bikeZ: Math.round(bikeZ), targetX: Math.round(target?.x ?? state.x), targetZ: Math.round(target?.z ?? state.z), targetName: missionInfo.label, police: policePoints,
       clock: atmosphere.label(), ammo: rounds ? { mag: rounds.mag, reserve: rounds.reserve, reloading: reloadWeapon === weapon } : null,
       side: sideView ? { ...sideView, timeLeft: sideView.timeLeft === null ? null : Math.ceil(sideView.timeLeft) } : null,
-      offers: sideMissions.active ? [] : sideMissions.offers.map((o) => ({ x: Math.round(o.x), z: Math.round(o.z) })),
-      gangs: npcs.gangs.map((g) => ({ name: g.name, anger: Math.ceil(g.anger), x: Math.round(g.x), z: Math.round(g.z) })),
+      offers: sideMissions.active || zombieMode ? [] : sideMissions.offers.map((o) => ({ x: Math.round(o.x), z: Math.round(o.z) })),
+      gangs: zombieMode ? [] : npcs.gangs.map((g) => ({ name: g.name, anger: Math.ceil(g.anger), x: Math.round(g.x), z: Math.round(g.z) })),
       hospital: { x: Math.round(LANDMARKS.hospital.x), z: Math.round(LANDMARKS.hospital.z) }, policeStation: { x: Math.round(LANDMARKS.police.x), z: Math.round(LANDMARKS.police.z) },
       arsenal: [...ammo.entries()].map(([id, a]) => ({ id, mag: a.mag, reserve: a.reserve })), stunned: now < stunUntil, flatTires,
       surrendered, gassed: now < gassedUntil,
+      zombie: zombieMode ? { ...zombies.stats(now / 1000), best: zombieBest, dots: zombieDots() } : null,
       healCost: Math.ceil((MAX_HEALTH - health) * 1.2), respawnIn: down === 'wasted' || down === 'busted' ? Math.max(0, Math.ceil((downUntil - now) / 1000)) : 0,
     };
     // React re-renders only when something visible changed.
@@ -1745,6 +1946,64 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (key === lastHud) return;
     lastHud = key;
     onHud(hud);
+  }
+
+  /** Zombies within 70 m for the minimap, rounded so the HUD only re-renders when they really move. */
+  function zombieDots() {
+    const dots: { x: number; z: number }[] = [];
+    zombies.forEachStanding((x, z) => { if (dots.length < 48 && Math.hypot(x - state.x, z - state.z) < 70) dots.push({ x: Math.round(x / 2) * 2, z: Math.round(z / 2) * 2 }); });
+    return dots;
+  }
+
+  /** Zombie mode each frame: the horde, its blows, waves and supply drops, burning barrels, the flashlight. */
+  function updateZombies(dt: number, now: number, time: number) {
+    const reach = playerCar ? (playerCar.kind === 'moto' ? 0.9 : 1.6) : state.riding ? 0.9 : 0;
+    const result = zombies.update(dt, time, { x: state.x, z: state.z, down: down !== null, inVehicle: state.riding, reach, night: atmosphere.night });
+    for (const strike of result.strikes) {
+      if (down) break;
+      const d = Math.hypot(state.x - strike.x, state.z - strike.z) || 1;
+      const dx = (state.x - strike.x) / d, dz = (state.z - strike.z) / d;
+      playThud();
+      if (inCar()) { damageVehicle(strike.damage * 1.4, now); shake = Math.max(shake, 0.2); continue; }
+      damagePlayer(strike.damage * (state.riding ? 0.8 : 1), now, { x: strike.x, z: strike.z }, 'Zombie');
+      effects.blood(hitPoint.set(state.x, 1.3, state.z), rayDir.set(dx, 0.3, dz), 5);
+      shake = Math.max(shake, strike.heavy ? 0.45 : 0.18);
+      if (strike.heavy && !down && !state.riding) knockPlayer(dx * 7, 3.5, dz * 7, now);
+      else if (state.riding && !playerCar && strike.heavy) bikeHealth = Math.max(0, bikeHealth - strike.damage);
+    }
+    for (const spot of result.risen) effects.smoke(spot.x, groundHeight(spot.x, spot.z) + 0.2, spot.z, now, false, '#6b5a48');
+    if (result.waveStarted) {
+      showBanner(`ĐỢT ${result.waveStarted}`, now, 2600);
+      notify(result.waveStarted === 1 ? 'Chúng đến rồi! Bắn vào đầu, giữ khoảng cách.' : `Đợt ${result.waveStarted}: đông hơn, nhanh hơn${result.waveStarted >= 3 ? ', có cả zombie khổng lồ' : ''}!`, 3500);
+    }
+    if (result.waveCleared) {
+      const wave = result.waveCleared;
+      if (wave > zombieBest) {
+        zombieBest = wave;
+        try { localStorage.setItem('pvo-zombie-best', String(wave)); } catch { /* storage blocked */ }
+      }
+      // A supply drop between waves: ammo for every gun, some health and cash.
+      for (const [id, rounds] of ammo) rounds.reserve += Math.ceil(weaponById(id).startAmmo * 0.6);
+      health = Math.min(MAX_HEALTH, health + 30);
+      cash += 80 + wave * 40;
+      state.score += wave * 100;
+      showBanner(`ĐÃ DỌN SẠCH ĐỢT ${wave}`, now, 3000);
+      notify('Tiếp tế đã tới: đạn, máu và tiền · Nghỉ 20 giây trước đợt sau', 4500);
+    }
+    // Burning barrels near the player keep their fires going.
+    if (now > fireAt) {
+      fireAt = now + 2600;
+      const near = world.fires.filter((f) => Math.hypot(f.x - state.x, f.z - state.z) < 70).sort((a, b) => Math.hypot(a.x - state.x, a.z - state.z) - Math.hypot(b.x - state.x, b.z - state.z)).slice(0, 6);
+      for (const f of near) explosives.burn(f.x, groundHeight(f.x, f.z) + 0.95, f.z, 3.4, 0.55, now);
+    }
+    // The flashlight points where the player faces (or aims), brighter as night falls.
+    const yaw = now < aimUntil || pointerInside ? aimYaw : state.angle;
+    const y = groundHeight(state.x, state.z);
+    torch.position.set(state.x + Math.sin(yaw) * 0.3, y + 1.55, state.z + Math.cos(yaw) * 0.3);
+    torch.target.position.set(state.x + Math.sin(yaw) * 11, y, state.z + Math.cos(yaw) * 11);
+    torch.target.updateMatrixWorld();
+    torch.intensity = 60 * Math.max(0, atmosphere.night - 0.15);
+    marker.visible = false;
   }
 
   function driveVehicle(dt: number, now: number, time: number, throttle: number, steerInput: number, braking: boolean) {
@@ -2063,14 +2322,24 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
     const armed = weapon !== 'fists';
     const aiming = armed && !down && (now < aimUntil || (!state.riding && (mouseHeld || keys.has('f') || pointerInside)));
-    if (pointerInside && armed && !state.riding) {
+    bloom = Math.max(0, bloom - dt * 2.4);
+    let locked = false;
+    if (pointerInside && armed && !down) {
       // Pointing the gun follows the mouse so the person in front of the barrel knows it.
-      raycaster.setFromCamera(pointerNdc, camera);
-      const ray = raycaster.ray;
-      if (ray.direction.y < -0.01) { aimPoint.copy(ray.origin).addScaledVector(ray.direction, (0.3 - ray.origin.y) / ray.direction.y); aimYaw = Math.atan2(aimPoint.x - state.x, aimPoint.z - state.z); }
-    } else if (now > aimUntil) aimYaw = state.angle;
+      // Red only when the shot is clear: a wall in between keeps the crosshair white.
+      locked = pointerAim(weaponById(weapon).range, reticlePoint) && lineOfSight(state.x, state.z, reticlePoint.x, reticlePoint.z);
+      if (!state.riding) aimYaw = Math.atan2(reticlePoint.x - state.x, reticlePoint.z - state.z);
+    } else {
+      if (now > aimUntil) aimYaw = state.angle;
+      if (armed && !down) {
+        locked = autoAim(weaponById(weapon).range, state.angle, reticlePoint);
+        if (!locked) reticlePoint.set(state.x + Math.sin(state.angle) * 9, groundHeight(state.x, state.z) + 1.2, state.z + Math.cos(state.angle) * 9);
+      }
+    }
+    updateReticle(active && armed && !down && !bagOpen, locked, pointerInside, now);
     gangKnocks = 0;
-    const npcEvents = npcs.update(dt, time, atmosphere.hours, atmosphere.rain > 0.4, { x: state.x, z: state.z, aimYaw, armed: armed && !inCar(), aiming, inVehicle: state.riding, down: down !== null }, state.x, state.z, groundHeight);
+    if (zombieMode) updateZombies(dt, now, time);
+    const npcEvents = zombieMode ? NO_NPC_EVENTS : npcs.update(dt, time, atmosphere.hours, atmosphere.rain > 0.4, { x: state.x, z: state.z, aimYaw, armed: armed && !inCar(), aiming, inVehicle: state.riding, down: down !== null }, state.x, state.z, groundHeight);
     for (const robbery of npcEvents.robbed) {
       pickups.drop(robbery.npc.x - Math.sin(robbery.npc.yaw) * -0.6, robbery.npc.z - Math.cos(robbery.npc.yaw) * -0.6, robbery.amount, now);
       police.crime(robbery.shop ? 2 : 1, time);
@@ -2108,10 +2377,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       }
     }
 
-    if (active && !document.hidden && !down) handleMissionEvent(missions.update(Math.max(0, interval / 1000), missionPlayer()));
+    if (active && !document.hidden && !down && !zombieMode) handleMissionEvent(missions.update(Math.max(0, interval / 1000), missionPlayer()));
 
-    // Side missions.
-    const missionResult = sideMissions.update(dt, missionContext(time));
+    // Side missions (none while the dead walk).
+    const missionResult = zombieMode ? { view: null, passenger: false, completed: null, failed: null } : sideMissions.update(dt, missionContext(time));
     sideView = missionResult.view;
     passengerAboard = missionResult.passenger;
     if (missionResult.completed) {
@@ -2201,7 +2470,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     shopkeeper.armRight.rotation.x = coffeePickup && distance(PICKUP) < 14 ? -1.4 + Math.sin(time * 3) * 0.08 : 0;
     const deliveryTarget = ['coffee', 'market', 'post'].includes(mission.id) && mission.step > 0 ? mission.target : null;
     const spot = now < receiverHappyUntil ? receiverSpot : deliveryTarget;
-    receiver.group.visible = spot !== null;
+    receiver.group.visible = spot !== null && !zombieMode;
     if (spot) {
       const rx = spot.x + 1.2, rz = spot.z + 1.2;
       receiver.group.position.set(rx, groundHeight(rx, rz) - 0.02, rz);
@@ -2285,6 +2554,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     // Floating health bars over anyone hurt recently, and speech bubbles.
     effects.beginBars(camera);
     npcs.forEachHurt(time, (x, y, z, f) => effects.bar(x, y, z, f));
+    if (zombieMode) zombies.forEachHurt(time, (x, y, z, f) => effects.bar(x, y, z, f));
     police.forEachHurt(time, (x, y, z, f) => effects.bar(x, y, z, f));
     for (const peer of peers.values()) {
       const peerHealth = Math.max(0, (peer.target.health ?? MAX_HEALTH) - peer.predicted);
@@ -2293,7 +2563,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     effects.endBars();
     bubbles.update(now, cameraTarget.x, cameraTarget.z);
     effects.update(now, dt);
-    canvas.style.cursor = !active ? '' : rotating ? 'grabbing' : armed ? 'crosshair' : '';
+    canvas.style.cursor = !active ? '' : rotating ? 'grabbing' : armed ? 'none' : '';
     world.update(time);
     sky.update(camera, time, atmosphere.sunDirection, atmosphere.tint, atmosphere.cover, 1 - atmosphere.night);
     renderer.render(scene, camera);
@@ -2418,7 +2688,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       else { levelFailures.clear(); levelBlockedUntil.clear(); }
       emitHud(performance.now());
     },
-    reset() {
+    reset(mode: GameMode = 'city') {
       if (playerCar) { playerCar.mode = 'parked'; playerCar = null; }
       Object.assign(state, { x: START.x, z: START.z, angle: Math.PI / 2, riding: false, speed: 0, score: 0 });
       if (bikeId !== 'scooter') rebuildBike('scooter');
@@ -2451,6 +2721,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       Object.assign(view, CAMERA_DEFAULT);
       missionLabelKey = '';
       setMissionLabel();
+      setMode(mode);
       clearKeys();
       emitHud(performance.now());
     },
@@ -2466,6 +2737,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       document.removeEventListener('visibilitychange', onVisibility);
       canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.removeEventListener('pointermove', onPointerMove);
+      reticle.remove();
+      zombies.dispose();
+      scene.remove(torch, torch.target);
+      torch.dispose();
       canvas.removeEventListener('pointerup', onPointerUp);
       canvas.removeEventListener('pointercancel', onPointerUp);
       canvas.removeEventListener('pointerleave', onPointerLeave);

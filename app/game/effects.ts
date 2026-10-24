@@ -46,9 +46,11 @@ export function createEffects(scene: THREE.Scene, ground: (x: number, z: number)
   const root = new THREE.Group();
   scene.add(root);
 
-  const TRACERS = 32;
+  // Bullet streaks: a short bright segment that flies from the muzzle to the hit at bullet speed.
+  const TRACERS = 48, BULLET_SPEED = 260, STREAK = 4;
   const tracerPositions = new Float32Array(TRACERS * 6);
   const tracerExpiry = new Float64Array(TRACERS);
+  const tracerPath = new Float64Array(TRACERS * 8);
   const tracerGeometry = new THREE.BufferGeometry();
   const tracerAttribute = new THREE.BufferAttribute(tracerPositions, 3).setUsage(THREE.DynamicDrawUsage);
   tracerGeometry.setAttribute('position', tracerAttribute);
@@ -215,9 +217,9 @@ export function createEffects(scene: THREE.Scene, ground: (x: number, z: number)
     pool(x: number, z: number, size = 2.2) { splat(x, z, size); },
     tracer(from: THREE.Vector3, to: THREE.Vector3, now: number) {
       const i = tracerIndex++ % TRACERS;
-      tracerPositions.set([from.x, from.y, from.z, to.x, to.y, to.z], i * 6);
-      tracerExpiry[i] = now + 70;
-      tracerAttribute.needsUpdate = true;
+      const length = Math.max(0.01, from.distanceTo(to));
+      tracerPath.set([from.x, from.y, from.z, (to.x - from.x) / length, (to.y - from.y) / length, (to.z - from.z) / length, length, now], i * 8);
+      tracerExpiry[i] = now + (length / BULLET_SPEED) * 1000 + 40;
       tracersLive = true;
     },
     flash(at: THREE.Vector3, now: number, size = 1) {
@@ -265,11 +267,21 @@ export function createEffects(scene: THREE.Scene, ground: (x: number, z: number)
         tracersLive = false;
         for (let i = 0; i < TRACERS; i++) {
           if (tracerExpiry[i] === 0) continue;
+          tracerAttribute.needsUpdate = true;
           if (now > tracerExpiry[i]) {
             tracerExpiry[i] = 0;
             tracerPositions.fill(0, i * 6, i * 6 + 6);
-            tracerAttribute.needsUpdate = true;
-          } else tracersLive = true;
+            continue;
+          }
+          tracersLive = true;
+          // The head starts a streak's length out of the barrel so even one frame shows the shot.
+          const p = i * 8, length = tracerPath[p + 6];
+          const head = Math.min(length, STREAK + ((now - tracerPath[p + 7]) / 1000) * BULLET_SPEED);
+          const tail = Math.max(0, head - STREAK);
+          for (let k = 0; k < 3; k++) {
+            tracerPositions[i * 6 + k] = tracerPath[p + k] + tracerPath[p + 3 + k] * tail;
+            tracerPositions[i * 6 + 3 + k] = tracerPath[p + k] + tracerPath[p + 3 + k] * head;
+          }
         }
       }
       for (const puff of smokes) {
