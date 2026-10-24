@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { BOUND, BUILDINGS, COLLIDERS, LAMPS, PLOTS, ROADS, SCENERY, pathClearance, pointClear, type Building, type Plot, type Prop, type Rect, type Tree } from './city';
+import { BOUND, BUILDINGS, COLLIDERS, LAMPS, PLOTS, ROADS, SCENERY, VENUES, pathClearance, pointClear, type Building, type Plot, type Prop, type Rect, type Tree } from './city';
 
 export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number };
 
@@ -31,7 +31,7 @@ export function groundHeight(x: number, z: number) {
 
 type Kind = 'box' | 'cylinder' | 'cone' | 'ball' | 'bead' | 'gable' | 'hip' | 'pyramid' | 'puff' | 'trunk' | 'frond';
 /** Material families: each is one shared material, so colour variety costs no extra draw calls. */
-type Role = 'solid' | 'ground' | 'glass' | 'glassLit' | 'lamp' | 'lantern' | 'water';
+type Role = 'solid' | 'ground' | 'glass' | 'glassLit' | 'lamp' | 'lantern' | 'water' | 'neon';
 type ColorLike = string | THREE.Color;
 type Quad = { cell: number; x: number; y: number; z: number; w: number; h: number; yaw: number };
 
@@ -139,7 +139,13 @@ export function buildWorld(scene: THREE.Scene) {
     lamp: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.5, emissive: '#ffdca0', emissiveIntensity: 0 }),
     lantern: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.6, emissive: '#ff5a2c', emissiveIntensity: 0 }),
     water: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.22, metalness: 0.08 }),
+    // Neon tubes glow in their own (instance) colour, brighter at night.
+    neon: new THREE.MeshStandardMaterial({ color: '#3a3a3a', roughness: 0.4, emissive: '#ffffff', emissiveIntensity: 0.5 }),
   };
+  roles.neon.onBeforeCompile = (shader) => {
+    shader.fragmentShader = shader.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance *= vColor;');
+  };
+  roles.neon.customProgramCacheKey = () => 'neon-tubes';
   materials.push(...Object.values(roles));
 
   const batches = new Map<string, { kind: Kind; role: Role; shadow: boolean; m: number[]; c: number[]; big: boolean[] }>();
@@ -1030,6 +1036,67 @@ export function buildWorld(scene: THREE.Scene) {
   pools.renderOrder = 2;
   root.add(pools);
 
+  // ---- The nightlife strip ("phố đèn đỏ"): banners across the road at both ends, strings of red lanterns,
+  // neon frames on every venue's sign, canopy and door, "18+" badges, and coloured light pools at night. ----
+  const neonPools: { x: number; z: number; color: string; size: number }[] = [];
+  for (const v of VENUES) {
+    const b = v.building, f = b.facing, s = Math.sin(f), c = Math.cos(f);
+    const front = b.d / 2;
+    const at = (lx: number, lz: number) => ({ x: b.x + lx * c + lz * s, z: b.z - lx * s + lz * c });
+    const tube = (lx: number, y: number, lz: number, length: number, vertical: boolean) => {
+      const p = at(lx, lz);
+      box(v.neon, p.x, y, p.z, vertical ? 0.07 : length, vertical ? length : 0.07, 0.07, f, false, 'neon');
+    };
+    // Around the shop sign (the main sign hangs at 3.8 m, 1.25 m tall).
+    const sw = b.w - 0.45, sy = Math.min(b.h - 0.65, 3.8);
+    tube(0, sy + 0.68, front + 0.42, sw + 0.1, false);
+    tube(0, sy - 0.68, front + 0.42, sw + 0.1, false);
+    tube(-sw / 2 - 0.05, sy, front + 0.42, 1.36, true);
+    tube(sw / 2 + 0.05, sy, front + 0.42, 1.36, true);
+    // Along the canopy edge and around the door.
+    tube(0, 2.58, front + 2.2, b.w - 0.7, false);
+    const doorLx = (v.door.x - b.x) * c - (v.door.z - b.z) * s;
+    const doorLz = (v.door.x - b.x) * s + (v.door.z - b.z) * c;
+    for (const dx of [-0.95, 0.95]) tube(doorLx + dx, 1.3, doorLz + 0.08, 2.3, true);
+    tube(doorLx, 2.48, doorLz + 0.08, 1.97, false);
+    if (v.kind !== 'beer' && v.kind !== 'spa') {
+      const badge = at(sw / 2 - 0.6, front + 0.45);
+      sign('18+', 'NGƯỜI LỚN', '#ffffff', badge.x, sy + 1.05, badge.z, 0.9, 0.5, f, v.neon);
+    }
+    const glow = at(doorLx, front + 1.6);
+    neonPools.push({ x: glow.x, z: glow.z, color: v.neon, size: 5.5 });
+  }
+  const STRIP_Z = 54;
+  // Banners across the road, hung between the facades at each end of the strip.
+  for (const bx of [63, 94]) {
+    box('#22121c', bx, 6.6, STRIP_Z + 4, 0.25, 0.9, 20.6, 0, false);
+    sign('PHỐ ĐÈN ĐỎ', 'BAR • KARAOKE • VŨ TRƯỜNG • SPA • 18+', '#ff4f8b', bx - 0.14, 6.6, STRIP_Z + 4, 9.5, 1.4, -HALF_PI, '#1a0b16');
+    sign('PHỐ ĐÈN ĐỎ', 'BAR • KARAOKE • VŨ TRƯỜNG • SPA • 18+', '#ff4f8b', bx + 0.14, 6.6, STRIP_Z + 4, 9.5, 1.4, HALF_PI, '#1a0b16');
+    for (const dy of [-0.5, 0.5]) for (const dx of [-0.16, 0.16]) box('#ff3d7f', bx + dx, 6.6 + dy, STRIP_Z + 4, 0.06, 0.06, 20.4, 0, false, 'neon');
+  }
+  // Strings of lanterns sagging across the road between the banners.
+  for (let lx = 68; lx <= 90; lx += 5.5) {
+    box('#2a2226', lx, 5.75, STRIP_Z + 4, 0.03, 0.03, 20.8, 0, false);
+    for (let t = 0.06; t < 1; t += 0.085) {
+      const lz = STRIP_Z - 6.4 + t * 20.8, ly = 5.55 - Math.sin(t * PI) * 0.55;
+      shape('ball', t * 12 % 2 < 1 ? '#d8402c' : '#ff4f8b', lx, ly, lz, 0.2, 0.26, 0.2, 0, 0, false, 'lantern');
+    }
+  }
+  const neonPoolMaterial = new THREE.MeshBasicMaterial({ map: poolTexture, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false, toneMapped: false });
+  materials.push(neonPoolMaterial);
+  const neonPoolMesh = new THREE.InstancedMesh(poolGeometry, neonPoolMaterial, neonPools.length);
+  neonPools.forEach((pool, i) => {
+    matrix.compose(position.set(pool.x, groundHeight(pool.x, pool.z) + 0.04, pool.z), quaternion.identity(), scale.set(pool.size, 1, pool.size));
+    neonPoolMesh.setMatrixAt(i, matrix);
+    neonPoolMesh.setColorAt(i, tmpColor.set(pool.color));
+  });
+  neonPoolMesh.instanceMatrix.needsUpdate = true;
+  if (neonPoolMesh.instanceColor) neonPoolMesh.instanceColor.needsUpdate = true;
+  neonPoolMesh.computeBoundingSphere();
+  neonPoolMesh.visible = false;
+  neonPoolMesh.renderOrder = 2;
+  root.add(neonPoolMesh);
+
   // ---- Solid props from the layout. ----
   function prop(pr: Prop) {
     const { part, at, solid } = frame(pr.x, pr.z, pr.yaw);
@@ -1358,10 +1425,12 @@ export function buildWorld(scene: THREE.Scene) {
   // Cutaway: when a building stands between the camera and the player, everything in front of the player
   // inside a soft circle around them on screen is discarded (dithered at the rim), so they stay visible.
   const cut = { center: { value: new THREE.Vector2() }, depth: { value: 0 }, radius: { value: 0 }, aspect: { value: 1 } };
-  const uncut = new Set<THREE.Material>([roles.ground, poolMaterial, puddleMaterial, waveMaterial]);
+  const uncut = new Set<THREE.Material>([roles.ground, poolMaterial, neonPoolMaterial, puddleMaterial, waveMaterial]);
   for (const material of materials) {
     if (uncut.has(material)) continue;
-    material.onBeforeCompile = (shader) => {
+    const previous = material.onBeforeCompile.bind(material);
+    material.onBeforeCompile = (shader, renderer) => {
+      previous(shader, renderer);
       Object.assign(shader.uniforms, { cutCenter: cut.center, cutDepth: cut.depth, cutRadius: cut.radius, cutAspect: cut.aspect });
       shader.vertexShader = shader.vertexShader
         .replace('#include <common>', '#include <common>\nvarying vec4 vCutClip;\nvarying float vCutDepth;')
@@ -1537,6 +1606,9 @@ export function buildWorld(scene: THREE.Scene) {
       for (const g of glowMaterials) g.material.emissiveIntensity = night * g.strength * power;
       poolMaterial.opacity = night * 0.5;
       pools.visible = night > 0.02 && !apocalypse;
+      roles.neon.emissiveIntensity = (0.45 + night * 1.9) * (apocalypse ? 0.03 : 1);
+      neonPoolMaterial.opacity = night * 0.75;
+      neonPoolMesh.visible = night > 0.02 && !apocalypse;
       roles.ground.color.copy(groundBase).multiplyScalar(1 - 0.38 * wet);
       roles.ground.roughness = 0.9 - 0.62 * wet;
       roles.ground.metalness = 0.12 * wet;

@@ -1,18 +1,20 @@
 import * as THREE from 'three';
 import { BIKES, type BikeId } from './bikes';
 import { WEAPONS, formatCash, type WeaponId } from './weapons';
+import { VENUE_SERVICES, type VenueRoom } from './venues';
 
 /**
  * Inside the shops you can buy from: the gun store, the motorbike showroom and the hospital. Each is a
- * closed room built far off the map (the camera looks away from the city), stocked with exactly what the
+ * closed room built far off the map (the nightlife venues too) (the camera looks away from the city), stocked with exactly what the
  * shop sells using the game's own models, with price tags, a clerk and a customer (the player). The game
  * moves the camera in while the shop is open and can fly it to any product.
  */
-export type InteriorKind = 'gun' | 'bike' | 'hospital';
+export type InteriorKind = 'gun' | 'bike' | 'hospital' | VenueRoom;
 type Vec3 = [number, number, number];
 /** `grow`: the object is centred on the product (a gun holder, a turntable) so it can scale and turn in place. */
 type Product = { id: string; object: THREE.Object3D; center: THREE.Vector3; eye: THREE.Vector3; tag: THREE.Sprite | null; spin: number; grow: boolean; label: () => string };
-type Room = { group: THREE.Group; eye: THREE.Vector3; look: THREE.Vector3; products: Map<string, Product>; clerk: THREE.Object3D | null };
+/** `dancers` bob to the music; `lights` are glow materials whose colour cycles (dance floor, beams). */
+type Room = { group: THREE.Group; eye: THREE.Vector3; look: THREE.Vector3; products: Map<string, Product>; clerk: THREE.Object3D | null; dancers?: THREE.Object3D[]; lights?: THREE.MeshBasicMaterial[] };
 export type InteriorFactories = {
   gun: (id: Exclude<WeaponId, 'fists'>) => THREE.Object3D;
   bike: (id: BikeId, color: string) => THREE.Object3D;
@@ -322,7 +324,202 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     hospital.look.copy(world(g, [0, 1.1, -2.6]));
   }
 
-  const rooms: Record<InteriorKind, Room> = { gun, bike, hospital };
+
+  // ---- The nightlife strip's venues. Each service on the menu is a product the camera can look at. ----
+  const service = (venue: VenueRoom, id: string) => {
+    const def = VENUE_SERVICES[venue].services.find((x) => x.id === id)!;
+    return () => `${def.name}\n${formatCash(def.price)}`;
+  };
+  const venueRoom = (index: number): Room => ({ group: room(index), eye: new THREE.Vector3(), look: new THREE.Vector3(), products: new Map(), clerk: null, dancers: [], lights: [] });
+  /** A glow material of its own (so it can change colour without touching others). */
+  const light = (r: Room, color: string) => {
+    const m = new THREE.MeshBasicMaterial({ color, toneMapped: false });
+    materials.push(m);
+    r.lights!.push(m);
+    return m;
+  };
+  const person = (r: Room, shirt: string, hair: string, at: Vec3, yaw = 0, dancing = false) => {
+    const figure = make.person(shirt, hair);
+    figure.position.set(...at);
+    figure.rotation.y = yaw;
+    figure.userData.yaw = yaw;
+    r.group.add(figure);
+    if (dancing) r.dancers!.push(figure);
+    return figure;
+  };
+
+  // Bar: counter with stools, glowing bottle shelves, beer taps, cocktails, a neon sign.
+  const bar = venueRoom(3);
+  {
+    const g = bar.group;
+    shell(g, 10, 8, 3.4, '#2a1f24', '#3a2430', '#1c1418');
+    sign(g, [{ text: 'BAR NEON', size: 84, color: '#ff4f8b' }, { text: 'COCKTAIL • RƯỢU • 18+', size: 30, color: '#ffd1e3', weight: 600 }], '#12080e', [0, 2.95, -3.86], 3.2, 0, '#ff4f8b');
+    cube(g, '#151012', [0, 1.7, -3.9], [8, 1.6, 0.05]);
+    for (let row = 0; row < 3; row++) {
+      cube(g, '#5a3a2a', [0, 1.05 + row * 0.55, -3.75], [7.6, 0.05, 0.3]);
+      for (let k = 0; k < 18; k++) drum(g, glow(['#ff4f8b', '#ffc23d', '#3dd6ff', '#7dff9b', '#b04dff'][(k + row) % 5]), [-3.6 + k * 0.42, 1.25 + row * 0.55, -3.72], 0.06, 0.32);
+    }
+    cube(g, '#4a2e22', [0, 0.55, -1.6], [6.4, 1.1, 0.7]);
+    cube(g, '#c9a27a', [0, 1.13, -1.6], [6.6, 0.06, 0.85]);
+    cube(g, glow('#ff4f8b'), [0, 0.95, -1.22], [6.3, 0.04, 0.02]);
+    for (let i = 0; i < 6; i++) {
+      drum(g, '#9a1f3a', [-2.6 + i * 1.05, 0.78, -0.7], 0.22, 0.08);
+      drum(g, '#3a3436', [-2.6 + i * 1.05, 0.38, -0.7], 0.04, 0.76);
+    }
+    const taps = new THREE.Group();
+    g.add(taps);
+    for (let i = 0; i < 3; i++) {
+      drum(taps, mat('#c9cfd2', 0.25, 0.6), [1.6 + i * 0.25, 1.32, -1.7], 0.035, 0.36);
+      drum(taps, glow('#ffc23d'), [1.6 + i * 0.25, 1.22, -1.5], 0.06, 0.16);
+    }
+    product(bar, 'beer', taps, [1.85, 1.3, -1.6], [1.4, 2.4, 0.9], service('bar', 'beer'), [1.85, 1.85, -1.6], { tagScale: 0.34 });
+    const cocktails = new THREE.Group();
+    g.add(cocktails);
+    for (let i = 0; i < 4; i++) {
+      put(cocktails, new THREE.ConeGeometry(0.09, 0.16, 10), glow(['#ff4f8b', '#3dd6ff', '#7dff9b', '#ffc23d'][i]), [-1.6 + i * 0.3, 1.28, -1.55], [1, 1, 1], [PI, 0, 0]);
+      drum(cocktails, '#d9e2e4', [-1.6 + i * 0.3, 1.19, -1.55], 0.012, 0.1);
+    }
+    product(bar, 'cocktail', cocktails, [-1.15, 1.3, -1.6], [-0.8, 2.4, 0.9], service('bar', 'cocktail'), [-1.15, 1.85, -1.6], { tagScale: 0.34 });
+    const bottles = new THREE.Group();
+    g.add(bottles);
+    for (let i = 0; i < 3; i++) drum(bottles, glow('#c98a3a'), [3.2 + i * 0.25, 2.47, -3.68], 0.09, 0.42);
+    product(bar, 'whisky', bottles, [3.45, 2.4, -3.6], [2.4, 2.3, -0.3], service('bar', 'whisky'), [3.45, 2.95, -3.5], { tagScale: 0.34 });
+    bar.clerk = person(bar, '#1d1d22', '#1d1916', [0.4, 0, -2.5]);
+    person(bar, '#c9493b', '#3a2a22', [-2.9, 0, -0.35], PI + 0.4);
+    person(bar, '#3f6f9f', '#2a2220', [2.95, 0, -0.35], PI - 0.4);
+    bar.eye.copy(world(g, [0, 2.1, 3.6]));
+    bar.look.copy(world(g, [0, 1.4, -3]));
+  }
+
+  // Karaoke: a purple room, a big screen with lyrics, a U-shaped sofa, drinks, a disco ball.
+  const karaoke = venueRoom(4);
+  {
+    const g = karaoke.group;
+    shell(g, 9, 7, 3.2, '#3b2a52', '#2c1d3f', '#1d1429');
+    const screen = new THREE.Group();
+    g.add(screen);
+    cube(screen, '#0d0d12', [0, 1.75, -3.42], [4.2, 2.3, 0.12]);
+    sign(screen, [{ text: '♪ Hà Nội mùa thu ♪', size: 50, color: '#ffffff' }, { text: 'Hát cùng nhau nào…', size: 40, color: '#7fd6ff', weight: 600 }], '#1a2a6a', [0, 1.75, -3.35], 3.9);
+    for (const x of [-2.6, 2.6]) cube(screen, '#1a1a1e', [x, 0.9, -3.2], [0.7, 1.8, 0.6]);
+    put(screen, cyl, mat('#2a2a2e', 0.4, 0.5), [0.6, 0.95, -0.6], [0.025, 0.25, 0.025], [0.3, 0, 0.4]);
+    product(karaoke, 'sing', screen, [0, 1.7, -3.3], [0.2, 1.8, 0.6], service('karaoke', 'sing'), [0, 3.0, -3.3], { tagScale: 0.36 });
+    const sofa = new THREE.Group();
+    g.add(sofa);
+    cube(sofa, '#8a1f3a', [0, 0.25, 1.8], [4.6, 0.5, 0.9]);
+    cube(sofa, '#8a1f3a', [0, 0.7, 2.2], [4.6, 0.6, 0.2]);
+    for (const x of [-2.6, 2.6]) {
+      cube(sofa, '#8a1f3a', [x, 0.25, 0.4], [0.9, 0.5, 2.6]);
+      cube(sofa, '#8a1f3a', [x + Math.sign(x) * 0.4, 0.7, 0.4], [0.2, 0.6, 2.6]);
+    }
+    cube(sofa, '#2a2026', [0, 0.32, 0.5], [2.6, 0.06, 1.2]);
+    for (let i = 0; i < 6; i++) drum(sofa, glow(['#ffc23d', '#ff4f8b', '#7dff9b'][i % 3]), [-1 + i * 0.4, 0.45, 0.4 + (i % 2) * 0.3], 0.05, 0.2);
+    drum(sofa, '#e8e2d0', [0.6, 0.38, 0.75], 0.25, 0.04);
+    product(karaoke, 'vip', sofa, [0, 0.5, 1.2], [2.6, 2.6, -1.6], service('karaoke', 'vip'), [0, 1.35, 0.5], { tagScale: 0.36 });
+    put(g, new THREE.IcosahedronGeometry(0.28, 1), glow('#e8ecf2'), [0, 2.85, -0.6], [1, 1, 1]);
+    for (const [x, color] of [[-2, '#ff4f8b'], [2, '#3dd6ff']] as const) put(g, new THREE.ConeGeometry(0.7, 2.6, 16, 1, true), (() => { const m = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.12, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }); materials.push(m); return m; })(), [x, 1.9, -1.5], [1, 1, 1], [0.15, 0, x > 0 ? -0.2 : 0.2]);
+    person(karaoke, '#b04dff', '#1d1916', [-0.8, 0, -1.8], 0.2, true);
+    person(karaoke, '#ffc23d', '#3a2a22', [0.8, 0, -1.9], -0.2, true);
+    karaoke.clerk = person(karaoke, '#1d1d22', '#1d1916', [3.6, 0, -2.4], -0.6);
+    karaoke.eye.copy(world(g, [2.9, 2.75, 3.1]));
+    karaoke.look.copy(world(g, [-0.4, 1.3, -2.2]));
+  }
+
+  // Club: a glowing dance floor, a DJ booth, speaker stacks, coloured light beams, dancers, a VIP booth.
+  const club = venueRoom(5);
+  {
+    const g = club.group;
+    shell(g, 14, 10, 4.2, '#0e0e14', '#141420', '#0a0a10');
+    sign(g, [{ text: 'MOONLIGHT', size: 90, color: '#3dd6ff' }, { text: 'DJ • NHẢY TỚI SÁNG • 18+', size: 30, color: '#d6f6ff', weight: 600 }], '#06060c', [0, 3.55, -4.86], 3.6, 0, '#3dd6ff');
+    const floor = new THREE.Group();
+    g.add(floor);
+    const tiles = ['#ff4f8b', '#3dd6ff', '#b04dff', '#ffc23d'].map((c) => light(club, c));
+    for (let i = 0; i < 6; i++) for (let k = 0; k < 4; k++) cube(floor, tiles[(i + k) % 4], [-2.5 + i, 0.02, -2.6 + k], [0.94, 0.04, 0.94]);
+    product(club, 'dance', floor, [0, 0.8, -1.1], [0.2, 2.6, 2.6], service('club', 'dance'), [0, 2.9, -1.1], { tagScale: 0.4 });
+    cube(g, '#1d1d26', [0, 0.6, -4.2], [3.2, 1.2, 0.9]);
+    cube(g, light(club, '#3dd6ff'), [0, 0.6, -3.74], [3.0, 0.08, 0.02]);
+    for (const x of [-0.8, 0.8]) drum(g, '#2a2a30', [x, 1.24, -4.2], 0.28, 0.04);
+    person(club, '#1d1d22', '#1d1916', [0, 0, -4.75], 0, true);
+    for (const x of [-5.2, 5.2]) for (let k = 0; k < 3; k++) cube(g, '#16161c', [x, 0.6 + k * 1.1, -4.3], [1.2, 1.05, 0.9]);
+    const beams = ['#ff4f8b', '#3dd6ff', '#7dff9b', '#b04dff'].map((c) => { const m = new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.16, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }); materials.push(m); return m; });
+    beams.forEach((m, i) => put(g, new THREE.ConeGeometry(0.9, 4.1, 16, 1, true), m, [-4.5 + i * 3, 2.1, -1.4], [1, 1, 1], [0.12 * (i % 2 ? 1 : -1), 0, 0.25 * (i - 1.5)]));
+    const shirts = ['#ff4f8b', '#3dd6ff', '#f2efe6', '#b04dff', '#ffc23d', '#2f3a48', '#7dff9b', '#c9493b'];
+    shirts.forEach((shirt, i) => person(club, shirt, i % 2 ? '#1d1916' : '#3a2a22', [-2.2 + (i % 4) * 1.45, 0.04, -2.3 + Math.floor(i / 4) * 1.6], (i * 1.3) % (PI * 2), true));
+    const booth = new THREE.Group();
+    g.add(booth);
+    cube(booth, '#4a1030', [5.4, 0.3, 1.6], [2, 0.6, 3.2]);
+    cube(booth, '#4a1030', [6.3, 0.8, 1.6], [0.25, 0.8, 3.2]);
+    cube(booth, '#1d1d22', [4.3, 0.42, 1.6], [0.9, 0.06, 1.6]);
+    for (let i = 0; i < 4; i++) drum(booth, glow('#ffc23d'), [4.1 + (i % 2) * 0.35, 0.58, 1.1 + i * 0.3], 0.06, 0.28);
+    product(club, 'vip', booth, [5, 0.7, 1.6], [2.4, 2.2, 3.4], service('club', 'vip'), [5, 1.9, 1.6], { tagScale: 0.4 });
+    club.clerk = person(club, '#1d1d22', '#1d1916', [-6, 0, 2.6], 0.6);
+    club.eye.copy(world(g, [0, 2.9, 4.6]));
+    club.look.copy(world(g, [0, 1.0, -2]));
+  }
+
+  // Spa: massage beds with towels, a sauna cabin, candles, plants and stones, a therapist.
+  const spa = venueRoom(6);
+  {
+    const g = spa.group;
+    shell(g, 10, 8, 3.2, '#a8835c', '#efe3d0', '#f4ead8');
+    sign(g, [{ text: 'SPA & MASSAGE', size: 70, color: '#8a5a7a' }, { text: 'THƯ GIÃN • XÔNG HƠI', size: 32, color: '#6f5a4a', weight: 600 }], '#fbf3e6', [0, 2.6, -3.86], 3.0, 0, '#d9a8c4');
+    const beds = new THREE.Group();
+    g.add(beds);
+    for (const x of [-0.4, 2.2]) {
+      cube(beds, '#7a5a3c', [x, 0.35, -1.8], [0.8, 0.7, 2.0]);
+      cube(beds, '#f6f4ee', [x, 0.75, -1.8], [0.84, 0.1, 2.04]);
+      cube(beds, '#d9a8c4', [x, 0.81, -1.4], [0.86, 0.03, 0.9]);
+      drum(beds, '#f6f4ee', [x, 0.86, -2.55], 0.1, 0.5, [0, 0, PI / 2]);
+    }
+    product(spa, 'massage', beds, [0.9, 0.8, -1.8], [1.2, 2.2, 1.2], service('spa', 'massage'), [0.9, 1.6, -1.8], { tagScale: 0.36 });
+    const sauna = new THREE.Group();
+    g.add(sauna);
+    cube(sauna, '#b07a48', [-3.6, 1.2, -2.4], [2.2, 2.4, 2.4]);
+    cube(sauna, '#e6c99a', [-3.6, 1.3, -1.18], [0.7, 1.4, 0.04]);
+    cube(sauna, glow('#ffb36b'), [-3.6, 1.6, -1.16], [0.4, 0.5, 0.01]);
+    product(spa, 'sauna', sauna, [-3.6, 1.3, -1.6], [-1.8, 1.9, 1.6], service('spa', 'sauna'), [-3.6, 2.75, -1.2], { tagScale: 0.36 });
+    for (let i = 0; i < 6; i++) drum(g, glow('#ffd59a'), [-1.2 + i * 0.5, 0.06, -3.6], 0.05, 0.12);
+    for (const x of [-4.5, 4.5]) {
+      drum(g, '#8a6f52', [x, 0.3, -3.5], 0.3, 0.6);
+      put(g, new THREE.DodecahedronGeometry(0.55, 0), mat('#5f9a55'), [x, 1.0, -3.5], [1, 1.3, 1]);
+    }
+    spa.clerk = person(spa, '#8fbfae', '#1d1916', [1.0, 0, -3.0]);
+    spa.eye.copy(world(g, [0, 2.1, 3.6]));
+    spa.look.copy(world(g, [0, 1.0, -2.4]));
+  }
+
+  // Motel: a room with a double bed, nightstands and lamps, a TV, a fan, a window and a wall clock.
+  const motel = venueRoom(7);
+  {
+    const g = motel.group;
+    shell(g, 8, 7, 3.0, '#7a3f3f', '#e8d9c8', '#efe6da');
+    const bed = new THREE.Group();
+    g.add(bed);
+    cube(bed, '#5a3a2a', [0, 0.25, -1.9], [2.0, 0.5, 2.3]);
+    cube(bed, '#f2ece2', [0, 0.58, -1.9], [1.96, 0.18, 2.26]);
+    cube(bed, '#b8323a', [0, 0.69, -1.5], [2.0, 0.06, 1.5]);
+    for (const x of [-0.5, 0.5]) cube(bed, '#ffffff', [x, 0.75, -2.8], [0.8, 0.16, 0.4]);
+    cube(bed, '#5a3a2a', [0, 0.9, -3.1], [2.1, 1.1, 0.1]);
+    product(motel, 'rest', bed, [0, 0.7, -1.9], [0.4, 2.1, 0.9], service('motel', 'rest'), [0, 1.55, -1.9], { tagScale: 0.36 });
+    for (const x of [-1.5, 1.5]) {
+      cube(g, '#6a4a34', [x, 0.3, -2.9], [0.6, 0.6, 0.5]);
+      drum(g, glow('#ffe1a8'), [x, 0.8, -2.9], 0.14, 0.3);
+    }
+    cube(g, '#4a3a30', [3.2, 0.45, -0.8], [0.6, 0.9, 1.6]);
+    cube(g, '#111418', [3.15, 1.25, -0.8], [0.1, 0.6, 1.0]);
+    const window_ = new THREE.Group();
+    g.add(window_);
+    cube(window_, glow('#2a3f6a'), [-3.92, 1.6, -0.6], [0.03, 1.2, 1.6]);
+    for (const dz of [-1.0, 1.0]) cube(window_, '#b8323a', [-3.88, 1.6, -0.6 + dz * 0.95], [0.04, 1.6, 0.35]);
+    sign(window_, [{ text: '7:00', size: 90, color: '#233b32' }], '#f4efe4', [-3.88, 2.55, 0.9], 0.6, PI / 2);
+    product(motel, 'night', window_, [-3.9, 1.7, -0.3], [-1.4, 1.9, 1.4], service('motel', 'night'), [-3.6, 2.6, -0.6], { tagScale: 0.36 });
+    put(g, cyl, mat('#f2f2ee'), [0, 2.95, 0.5], [0.08, 0.1, 0.08]);
+    for (let i = 0; i < 3; i++) cube(g, '#f2f2ee', [0, 2.88, 0.5], [1.1, 0.02, 0.14], [0, (i * PI) / 3, 0]);
+    motel.clerk = person(motel, '#c95a5a', '#1d1916', [2.6, 0, 1.2], -2.2);
+    motel.eye.copy(world(g, [0.4, 2.0, 3.2]));
+    motel.look.copy(world(g, [0, 0.9, -1.8]));
+  }
+
+  const rooms: Record<InteriorKind, Room> = { gun, bike, hospital, bar, karaoke, club, spa, motel };
   // Price tags get their text now that every product exists.
   // The customer: the player, seen from behind just inside the door.
   const visitor = make.person('#e77641');
@@ -386,6 +583,13 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
       }
       // The clerk shifts their weight now and then.
       if (r.clerk) r.clerk.rotation.z = Math.sin(time * 0.8) * 0.02;
+      // Dancers bounce and sway to the beat; the dance floor and beams cycle colour.
+      r.dancers?.forEach((d, i) => {
+        d.position.y = Math.abs(Math.sin(time * 4.2 + i * 1.7)) * 0.12;
+        d.rotation.z = Math.sin(time * 2.1 + i) * 0.08;
+        d.rotation.y = d.userData.yaw + Math.sin(time * 1.3 + i * 2.1) * 0.6;
+      });
+      r.lights?.forEach((m, i) => m.color.setHSL((time * 0.12 + i * 0.25) % 1, 0.9, 0.58));
     },
     dispose() {
       for (const r of Object.values(rooms)) scene.remove(r.group);

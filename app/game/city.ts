@@ -716,3 +716,29 @@ export const SCENERY = {
   park: PARK, square: SQUARE, gardens: GARDENS, yards: YARDS,
   promenade: { minX: -200, maxX: 200, minZ: -136.5, maxZ: -118 } as Rect,
 };
+
+// ---- The nightlife strip ("phố đèn đỏ"): the six shophouses on the road at z = 54, east of x = 54. ----
+export type VenueKind = 'bar' | 'karaoke' | 'motel' | 'club' | 'spa' | 'beer';
+export type Venue = { kind: VenueKind; building: Building; door: Point; name: string; neon: string };
+const VENUE_LOOKS: Record<VenueKind, { name: string; subtitle: string; neon: string }> = {
+  bar: { name: 'BAR NEON', subtitle: 'COCKTAIL • RƯỢU • 18+', neon: '#ff3d7f' },
+  karaoke: { name: 'KARAOKE ÁNH SAO', subtitle: 'PHÒNG VIP • ÂM THANH CHUẨN', neon: '#b04dff' },
+  motel: { name: 'NHÀ NGHỈ HOA HỒNG', subtitle: 'THEO GIỜ • QUA ĐÊM', neon: '#ff4a4a' },
+  club: { name: 'VŨ TRƯỜNG MOONLIGHT', subtitle: 'DJ • NHẢY TỚI SÁNG • 18+', neon: '#3dd6ff' },
+  spa: { name: 'SPA & MASSAGE', subtitle: 'THƯ GIÃN • XÔNG HƠI', neon: '#ff8ad1' },
+  beer: { name: 'BIA HƠI HÀ NỘI', subtitle: 'BIA TƯƠI • ĐỒ NHẮM', neon: '#ffc23d' },
+};
+/** The venues west to east: bar, karaoke and motel face the road from the north, club, spa and beer from the south. */
+export const VENUES: Venue[] = [];
+{
+  const strip = BUILDINGS.filter((b) => b.door.x > 58 && b.door.x < 96 && Math.abs(b.door.z - 54) < 14);
+  const side = (north: boolean) => strip.filter((b) => (b.door.z > 54) === north).sort((a, b) => a.door.x - b.door.x);
+  const order: [Building[], VenueKind[]][] = [[side(true), ['bar', 'karaoke', 'motel']], [side(false), ['club', 'spa', 'beer']]];
+  for (const [row, kinds] of order) row.slice(0, 3).forEach((b, i) => {
+    const look = VENUE_LOOKS[kinds[i]];
+    b.name = look.name;
+    b.subtitle = look.subtitle;
+    PLOTS[b.id].signColor = look.neon;
+    VENUES.push({ kind: kinds[i], building: b, door: { ...b.door }, name: look.name, neon: look.neon });
+  });
+}

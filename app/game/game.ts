@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { buildWorld, groundHeight } from './world';
-import { BOUND, LANDMARKS } from './city';
+import { BOUND, LANDMARKS, VENUES } from './city';
 import { createNav } from './nav';
 import { createRagdolls, type BodyPart, type RagdollBody, type RagdollLook } from './ragdoll';
 import { createNpcs, GANGS, type Npc } from './npcs';
@@ -22,6 +22,7 @@ import { FLOORBOARD, MOTO_RIDER, motoParts, vehicleMaterial, type MotoStyle } fr
 import { createPolice } from './police';
 import { createZombies, type Zombie } from './zombies';
 import { createInteriors, type InteriorKind } from './interiors';
+import { VENUE_SERVICES, serviceOf, type VenueRoom } from './venues';
 import { createSky, HORIZON } from './sky';
 import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuName, isSoftwareGpu, type QualityMode } from './quality';
 
@@ -43,7 +44,7 @@ export type Hud = {
 };
 /** The normal living city, or the zombie apocalypse. */
 export type GameMode = 'city' | 'zombie';
-export type GameEvent = { type: 'store' } | { type: 'bikeshop' } | { type: 'hospital' } | { type: 'bag'; open: boolean } | { type: 'product'; id: string };
+export type GameEvent = { type: 'store' } | { type: 'bikeshop' } | { type: 'hospital' } | { type: 'bag'; open: boolean } | { type: 'product'; id: string } | { type: 'venue'; kind: VenueRoom };
 
 // Both on the sidewalk so the player never spawns in a traffic lane.
 const START = { x: 12.6, z: 12.4 };
@@ -645,6 +646,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const storeRing = placeRing('#3f6f9f', '#1d3f63', 'TIỆM SÚNG', '#2f4a6b', STORE);
   const bikeShopRing = placeRing('#5e927c', '#2f5a48', 'CỬA HÀNG XE MÁY', '#2f5a48', BIKE_SHOP);
   const hospitalRing = placeRing('#e05a5a', '#8a2020', 'BỆNH VIỆN · HỒI MÁU', '#a03030', LANDMARKS.hospital);
+  // The nightlife strip's doors: walk in with E.
+  const venueDoors = VENUES.filter((v) => v.kind !== 'beer').map((v) => {
+    const f = v.building.facing;
+    const at = { x: v.door.x + Math.sin(f) * 1.6, z: v.door.z + Math.cos(f) * 1.6 };
+    return { kind: v.kind as VenueRoom, name: v.name, at, ring: placeRing(v.neon, v.neon, `${v.name} · 18+`, '#1a0b16', at) };
+  });
+  /** A tipsy spell after drinks: the camera sways and walking wanders until this time. */
+  let drunkUntil = 0;
   marker.traverse((o) => { o.castShadow = false; });
 
   const peers = new Map<string, Peer>();
@@ -1177,6 +1186,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (!state.riding && distance(STORE) < 3.5) { onEvent({ type: 'store' }); return; }
     if (!state.riding && distance(BIKE_SHOP) < 3.5) { onEvent({ type: 'bikeshop' }); return; }
     if (!state.riding && distance(LANDMARKS.hospital) < 3.5) { onEvent({ type: 'hospital' }); return; }
+    const venue = !state.riding ? venueDoors.find((door) => distance(door.at) < 2.6) : undefined;
+    if (venue) {
+      if (zombieMode) notify(`${venue.name} đã đóng cửa từ khi dịch bùng phát.`, 2500);
+      else onEvent({ type: 'venue', kind: venue.kind });
+      return;
+    }
     if (state.riding) { exitVehicle(); return; }
     const car = nearestCar(3.4);
     const bikeDistance = Math.hypot(state.x - bikeX, state.z - bikeZ);
@@ -1917,6 +1932,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const nearStore = !state.riding && distance(STORE) < 3.5;
     const nearBikeShop = !state.riding && distance(BIKE_SHOP) < 3.5;
     const nearHospital = !state.riding && distance(LANDMARKS.hospital) < 3.5;
+    const nearVenue = !state.riding ? venueDoors.find((door) => distance(door.at) < 2.6) : undefined;
     const offer = sideMissions.nearOffer(state.x, state.z);
     const car = !state.riding ? nearestCar(3.4) : null;
     const rounds = ammo.get(weapon);
@@ -1933,6 +1949,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       : nearStore ? (deliveries ? 'Nhấn E để vào Tiệm súng' : 'Tiệm súng: hoàn thành 1 nhiệm vụ giao hàng để mở khóa')
       : nearBikeShop ? 'Nhấn E để vào Cửa hàng xe máy'
       : nearHospital ? 'Nhấn E để khám và hồi máu'
+      : nearVenue ? `Nhấn E để vào ${nearVenue.name} (18+)`
       : missionInfo.status !== 'active' ? 'Nhấn M để chọn nhiệm vụ mới hoặc chơi lại'
       : state.riding ? (weapon !== 'fists' ? 'W ga · S phanh/lùi · A/D lái · Space phanh tay · Click bắn' : 'W ga · S phanh/lùi · A/D lái · Space phanh tay · E xuống xe')
       : car && !nearBike ? (car.mode === 'lane' ? (car.kind === 'moto' ? 'Nhấn E để cướp xe máy (bị truy nã)' : 'Nhấn E để cướp xe (bị truy nã)') : car.health <= 0 ? 'Xe này đã hỏng' : 'Nhấn E để lên xe')
@@ -2138,7 +2155,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const length = Math.hypot(dirX, dirZ) || 1;
     const headingX = aiming && moving ? dirX / length : Math.sin(state.angle);
     const headingZ = aiming && moving ? dirZ / length : Math.cos(state.angle);
-    const dx = headingX * velocity * dt, dz = headingZ * velocity * dt;
+    // Tipsy: the path weaves from side to side.
+    const tipsy = Math.max(0, Math.min(1, (drunkUntil - now) / 20000));
+    const weave = tipsy * Math.sin(now / 420) * 0.55;
+    const dx = (headingX * Math.cos(weave) + headingZ * Math.sin(weave)) * velocity * dt, dz = (headingZ * Math.cos(weave) - headingX * Math.sin(weave)) * velocity * dt;
     if (clearAt(state.x + dx, state.z, 0.4)) state.x += dx;
     if (clearAt(state.x, state.z + dz, 0.4)) state.z += dz;
     if (velocity > 0.5) ragdolls.push(state.x, state.z, 0.55, headingX * velocity * 1.2, 1.2, headingZ * velocity * 1.2);
@@ -2491,6 +2511,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     pin.rotation.y = time * 0.35;
     missionRing.ring.scale.setScalar(1 + Math.sin(time * 2.5) * 0.045);
     for (const [ring, phase] of [[storeRing, 1.5], [bikeShopRing, 3], [hospitalRing, 4.5]] as const) ring.ring.scale.setScalar(1 + Math.sin(time * 2.5 + phase) * 0.045);
+    venueDoors.forEach((door, i) => door.ring.ring.scale.setScalar(1 + Math.sin(time * 2.5 + i) * 0.045));
     const mission = missions.view();
     const coffeePickup = mission.id === 'coffee' && mission.status === 'active' && mission.step === 0;
     shopkeeperCup.visible = coffeePickup;
@@ -2572,6 +2593,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       camera.position.lerp(camDesired, cameraBlend);
     }
     camera.lookAt(interior ? interiorLook : cameraTarget);
+    const sway = !interior && now < drunkUntil ? Math.min(1, (drunkUntil - now) / 20000) : 0;
+    if (sway > 0) camera.rotateZ(Math.sin(now / 900) * 0.06 * sway);
     const fov = interior ? 52 : 42 + (state.riding ? Math.min(1, Math.abs(velocity) / 26) * 10 : 0);
     if (Math.abs(camera.fov - fov) > 0.05) { camera.fov += (fov - camera.fov) * (1 - Math.exp(-dt * 3)); camera.updateProjectionMatrix(); }
     if (shake > 0.001) {
@@ -2639,6 +2662,31 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         camera.position.copy(shot.eye);
         interiorLook.copy(shot.look);
       } else camera.position.copy(cameraTarget).add(offsetFor(smoothView.yaw, smoothView.pitch, smoothView.dist, cameraOffset));
+    },
+    /**
+     * Pays for a service in a nightlife venue: the screen dips to black and the effect applies (health,
+     * a tipsy spell, points, time passing, the police losing track). Returns an error message, or null.
+     */
+    useService(venue: VenueRoom, id: string): string | null {
+      const def = serviceOf(venue, id);
+      if (!def) return 'Dịch vụ không tồn tại.';
+      if (cash < def.price) return `Không đủ tiền: cần ${formatThousands(def.price)}.`;
+      cash -= def.price;
+      const e = def.effect;
+      const now = performance.now();
+      if (e.full) health = MAX_HEALTH;
+      else if (e.heal) health = Math.min(MAX_HEALTH, health + e.heal);
+      if (e.drunk) drunkUntil = Math.max(drunkUntil, now) + e.drunk * 1000;
+      if (e.score) state.score += e.score;
+      if (e.hours) atmosphere.setHours(atmosphere.hours + e.hours);
+      if (e.wakeAt !== undefined) atmosphere.setHours(e.wakeAt);
+      let hidden = false;
+      if (e.hide !== undefined && police.wanted > 0 && police.wanted <= e.hide) { police.reset(); hidden = true; }
+      dip();
+      const parts = [e.full ? 'hồi đầy máu' : e.heal ? `+${e.heal} máu` : '', e.score ? `+${e.score} điểm` : '', e.drunk ? 'hơi say' : '', hidden ? 'cảnh sát đã mất dấu bạn' : ''].filter(Boolean);
+      notify(`${def.name} · ${VENUE_SERVICES[venue].title.toLowerCase()} xong${parts.length ? ` · ${parts.join(', ')}` : ''}`, 3500);
+      emitHud(now);
+      return null;
     },
     /** Points the shop camera at one product (an item hovered in the shop panel), or back at the shop. */
     focusProduct(id: string | null) {
