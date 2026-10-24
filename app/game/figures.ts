@@ -322,13 +322,31 @@ export function umbrellaGeometry(panels = 8) {
  * Where a traffic rider sits on the scooter model, in moto-local metres (the model is real-world size:
  * seat top 0.82 m, floorboard 0.65 m, handlebar 1.12 m high at z 0.52, grips about 0.36 m out).
  */
-export const RIDER = {
-  scale: 0.82, hipY: 0.9, hipZ: -0.22, lean: 0.34,
-  grip: [0.36, 1.13, 0.5] as number[],
-  foot: [0.2, 0.655, 0.2] as number[],
+export type RiderPose = {
+  scale: number; hipY: number; hipZ: number; lean: number;
+  grip: number[]; foot: number[];
   /** Which way knees and elbows bend (x is mirrored per side). */
-  knee: [0.9, 0.55, 0.25] as number[],
-  elbow: [0.9, -0.45, -0.2] as number[],
+  knee: number[]; elbow: number[];
+};
+export const RIDER: RiderPose = {
+  scale: 0.82, hipY: 0.9, hipZ: -0.22, lean: 0.34,
+  grip: [0.36, 1.13, 0.5],
+  foot: [0.2, 0.655, 0.2],
+  knee: [0.9, 0.55, 0.25],
+  elbow: [0.9, -0.45, -0.2],
+};
+/** The same rider on a manual bike: feet on the footpegs beside the engine instead of a floorboard. */
+export const PEG_RIDER: RiderPose = { ...RIDER, foot: [0.2, 0.37, -0.03], knee: [0.9, 0.35, 0.6] };
+/**
+ * A car driver relative to their hip (the seat position is added by the caller): leaning back a little,
+ * hands on the wheel, feet on the pedals. Smaller, so the stylised head clears a sedan roof.
+ */
+export const CAR_DRIVER: RiderPose = {
+  scale: 0.62, hipY: 0, hipZ: 0, lean: -0.12,
+  grip: [0.17, 0.4, 0.3],
+  foot: [0.14, -0.36, 0.26],
+  knee: [0.3, 0.7, 0.6],
+  elbow: [0.9, -0.45, -0.2],
 };
 
 /** Two-bone joint (elbow or knee) between `a` and `b` for segment lengths l1, l2, bent toward `hint`. */
@@ -357,25 +375,25 @@ function alongSegment(parts: FigureParts, a: THREE.Vector3, b: THREE.Vector3, sc
  * floorboard. Built in moto-local metres so the scooter's own instance matrix (with its lean) places it.
  * Palette: shirt, pants, skin, hair (brows), helmet; parts SLEEVE, MASK, MASK_DARK and HELMET.
  */
-export function riderGeometry() {
+export function riderGeometry(pose: RiderPose = RIDER, head: 'rider' | 'all' = 'rider') {
   const parts = new FigureParts();
   const { SHIRT, PANTS, SKIN } = SLOT;
-  const S = RIDER.scale;
+  const S = pose.scale;
   const xAxis = new THREE.Vector3(1, 0, 0);
   const body = new THREE.Matrix4()
-    .compose(new THREE.Vector3(0, RIDER.hipY, RIDER.hipZ), new THREE.Quaternion().setFromAxisAngle(xAxis, RIDER.lean), new THREE.Vector3(S, S, S))
+    .compose(new THREE.Vector3(0, pose.hipY, pose.hipZ), new THREE.Quaternion().setFromAxisAngle(xAxis, pose.lean), new THREE.Vector3(S, S, S))
     .multiply(new THREE.Matrix4().makeTranslation(0, -FIGURE.hipY, 0));
   parts.base.copy(body);
   addTorso(parts, false);
   // The head tips back up so the rider looks down the road rather than at the handlebar.
   parts.base.copy(body).multiply(new THREE.Matrix4().compose(
-    new THREE.Vector3(0, FIGURE.headY, 0.015), new THREE.Quaternion().setFromAxisAngle(xAxis, -RIDER.lean * 0.85), new THREE.Vector3(FIGURE.headR, FIGURE.headR, FIGURE.headR)));
-  addHead(parts, 'rider');
+    new THREE.Vector3(0, FIGURE.headY, 0.015), new THREE.Quaternion().setFromAxisAngle(xAxis, -pose.lean * 0.85), new THREE.Vector3(FIGURE.headR, FIGURE.headR, FIGURE.headR)));
+  addHead(parts, head);
   for (const side of [-1, 1]) {
     // Arm: shoulder to grip, elbow bent outward and down.
     const shoulder = new THREE.Vector3(side * FIGURE.shoulderX, FIGURE.shoulderY, 0).applyMatrix4(body);
-    const grip = new THREE.Vector3(side * RIDER.grip[0], RIDER.grip[1], RIDER.grip[2]);
-    const elbow = joint(shoulder, grip, 0.29 * S * 1.08, 0.31 * S * 1.08, new THREE.Vector3(side * RIDER.elbow[0], RIDER.elbow[1], RIDER.elbow[2]));
+    const grip = new THREE.Vector3(side * pose.grip[0], pose.grip[1], pose.grip[2]);
+    const elbow = joint(shoulder, grip, 0.29 * S * 1.08, 0.31 * S * 1.08, new THREE.Vector3(side * pose.elbow[0], pose.elbow[1], pose.elbow[2]));
     alongSegment(parts, shoulder, elbow, S, 0, 0.29);
     parts.add(sphere(0.092, 7, 5), { at: [0, -0.02, 0], slot: SHIRT });
     parts.add(tube(0.092, 0.08, 0.3, 7), { at: [0, -0.15, 0], slot: SHIRT });
@@ -388,8 +406,8 @@ export function riderGeometry() {
     parts.add(sphere(0.078, 6, 4), { at: [0, -0.6, 0.005], scale: [0.85, 1.12, 0.95], slot: SKIN });
     // Leg: hip to ankle with the knee up and out, the foot flat on the floorboard.
     const hip = new THREE.Vector3(side * FIGURE.hipX, FIGURE.hipY, 0).applyMatrix4(body);
-    const ankle = new THREE.Vector3(side * RIDER.foot[0], RIDER.foot[1] + 0.098 * S, RIDER.foot[2] - 0.05 * S);
-    const knee = joint(hip, ankle, 0.345 * S, 0.315 * S, new THREE.Vector3(side * RIDER.knee[0], RIDER.knee[1], RIDER.knee[2]));
+    const ankle = new THREE.Vector3(side * pose.foot[0], pose.foot[1] + 0.098 * S, pose.foot[2] - 0.05 * S);
+    const knee = joint(hip, ankle, 0.345 * S, 0.315 * S, new THREE.Vector3(side * pose.knee[0], pose.knee[1], pose.knee[2]));
     alongSegment(parts, hip, knee, S, 0, 0.345);
     parts.add(sphere(0.118, 7, 5), { at: [0, -0.02, 0], slot: PANTS });
     parts.add(tube(0.116, 0.104, 0.36, 8), { at: [0, -0.18, 0], slot: PANTS });

@@ -17,7 +17,8 @@ import { createMissions, type MissionEvent, type MissionId, type MissionView } f
 import { createPeerInterpolator, createSnapshotClock } from './peer-interpolation';
 import type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
 import { BIKES, CAR_STATS, MOTO_STATS, POLICE_CAR_STATS, bikeById, repairCost, type BikeId } from './bikes';
-import { createVehicles, makeCarMesh, CAR_HEALTH, MOTO_HEALTH, POLICE_CAR_HEALTH, type Car } from './vehicles';
+import { createVehicles, makeCarMesh, seatOf, vehicleStyle, CAR_HEALTH, MOTO_HEALTH, POLICE_CAR_HEALTH, type Car } from './vehicles';
+import { FLOORBOARD, MOTO_RIDER, motoParts, vehicleMaterial, type MotoStyle } from './vehicle-models';
 import { createPolice } from './police';
 import { createSky, HORIZON } from './sky';
 import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuName, isSoftwareGpu, type QualityMode } from './quality';
@@ -246,12 +247,12 @@ function makePerson(color = '#e77641', riding = false, hair?: string) {
   if (riding) {
     limbLeft.rotation.x = -0.65;
     limbRight.rotation.x = -0.65;
-    armLeft.rotation.x = -1;
-    armRight.rotation.x = -1;
-    body.rotation.x = 0.06;
-    // Rider sits inside the bike group, which is already scaled to BIKE_SCALE.
+    armLeft.rotation.x = -1.15;
+    armRight.rotation.x = -1.15;
+    body.rotation.x = 0.2;
+    // Rider sits inside the bike group, which is already scaled to BIKE_SCALE, hip on the saddle point.
     group.scale.setScalar(PERSON_SCALE / BIKE_SCALE);
-    group.position.set(0, 0.42, -0.3);
+    group.position.set(0, (MOTO_RIDER.hip[1] - HIP * PERSON_SCALE) / BIKE_SCALE, MOTO_RIDER.hip[2] / BIKE_SCALE);
   } else group.scale.setScalar(PERSON_SCALE);
   return { group, limbLeft, limbRight, armLeft, armRight };
 }
@@ -294,78 +295,39 @@ function makeBike(kind: BikeId = 'scooter', color = '#ed763e', riderColor?: stri
     if (riderColor) { const person = makePerson(riderColor, true); person.group.position.y = HORSE_SEAT; group.add(person.group); }
     group.scale.setScalar(BIKE_SCALE);
     group.traverse((o) => { o.castShadow = false; });
-    return { group, wheels: [] as THREE.Mesh[], legs };
+    return { group, wheels: [] as THREE.Mesh[], legs, wheelRadius: 1 };
   }
-  const paint = material(color, 0.4);
-  const cream = material('#f9e6c4', 0.5);
-  const rubber = material('#293535');
-  const chrome = new THREE.MeshStandardMaterial({ color: '#b8c8c4', roughness: 0.32, metalness: 0.65 });
-  const seat = material('#493e37');
-  const dark = material('#2b3230', 0.6);
+  // Real-size models from vehicle-models.ts inside the BIKE_SCALE group; the wheels are separate so they spin.
+  const style = kind as MotoStyle;
+  const { body, wheel, wheels: hubs } = motoParts(style, color);
+  const { material: finish } = vehicleMaterial();
+  const model = new THREE.Mesh(body, finish);
+  model.scale.setScalar(1 / BIKE_SCALE);
+  group.add(model);
   const wheels: THREE.Mesh[] = [];
-  const reach = kind === 'sport' ? 1.28 : kind === 'cub' ? 1.15 : 1.17;
-  for (const z of [-reach, reach]) {
-    const wheel = cylinder(group, 0.57, 0.57, kind === 'sport' ? 0.38 : 0.3, [0, 0.58, z], rubber, 16);
-    wheel.rotation.z = Math.PI / 2;
-    wheels.push(wheel);
-    const hub = cylinder(group, 0.31, 0.31, 0.32, [0, 0.58, z], chrome, 12);
-    hub.rotation.z = Math.PI / 2;
+  for (const z of [hubs.front, hubs.rear]) {
+    const mesh = new THREE.Mesh(z === hubs.front ? wheel : wheel.clone(), finish);
+    mesh.scale.setScalar(1 / BIKE_SCALE);
+    mesh.position.set(0, hubs.r / BIKE_SCALE, z / BIKE_SCALE);
+    group.add(mesh);
+    wheels.push(mesh);
   }
-  if (kind === 'scooter' || kind === 'vespa') {
-    const rear = sphere(group, 0.83, [0, 0.95, -0.75], paint);
-    rear.scale.set(kind === 'vespa' ? 0.95 : 0.77, kind === 'vespa' ? 0.85 : 0.75, kind === 'vespa' ? 1.05 : 1.16);
-    box(group, [1.02, 0.18, 1.75], [0, 0.7, 0], paint);
-    box(group, [0.88, 0.17, 1.15], [0, 0.81, 0.25], kind === 'vespa' ? chrome : cream);
-    const front = box(group, [0.91, 1.25, 0.24], [0, 1.32, 0.77], paint);
-    front.rotation.x = -0.16;
-    const panel = box(group, [0.63, 0.85, 0.05], [0, 1.38, 0.935], cream);
-    panel.rotation.x = -0.16;
-    box(group, [0.93, 0.23, 1.22], [0, 1.45, -0.58], seat);
-    const head = sphere(group, 0.31, [0, 1.97, 0.94], paint);
-    head.scale.set(1.25, 1, 0.7);
-    if (kind === 'vespa') box(group, [0.7, 0.08, 0.5], [0, 1.62, -1.2], chrome);
-    box(group, [0.55, 0.15, 0.1], [0, 1.13, -1.54], material('#d95031'));
-  } else if (kind === 'cub') {
-    box(group, [0.34, 0.34, 1.9], [0, 1.0, 0.05], paint);
-    const shield = box(group, [0.72, 0.95, 0.12], [0, 1.28, 0.72], paint);
-    shield.rotation.x = -0.2;
-    box(group, [0.62, 0.2, 1.1], [0, 1.42, -0.55], seat);
-    box(group, [0.5, 0.3, 0.9], [0, 1.12, -0.95], paint);
-    box(group, [0.45, 0.4, 0.5], [0, 0.75, 0.05], dark);
-    box(group, [0.6, 0.35, 0.42], [0, 1.78, 1.15], material('#c9b48a'));
-    box(group, [0.4, 0.12, 0.08], [0, 1.15, -1.42], material('#d95031'));
-  } else {
-    const tank = box(group, [0.72, 0.45, 0.9], [0, 1.52, 0.2], paint);
-    tank.rotation.x = 0.1;
-    const fairing = box(group, [0.78, 0.7, 0.5], [0, 1.5, 0.95], paint);
-    fairing.rotation.x = -0.5;
-    const screen = box(group, [0.55, 0.3, 0.06], [0, 1.95, 1.08], material('#2b3a40', 0.2));
-    screen.rotation.x = -0.6;
-    box(group, [0.55, 0.15, 0.8], [0, 1.52, -0.55], seat);
-    const tail = box(group, [0.45, 0.25, 0.7], [0, 1.62, -1.05], paint);
-    tail.rotation.x = 0.25;
-    box(group, [0.6, 0.55, 0.7], [0, 0.9, 0.1], dark);
-    const pipe = cylinder(group, 0.09, 0.09, 0.9, [0.38, 0.85, -0.75], chrome, 8);
-    pipe.rotation.x = Math.PI / 2;
-  }
-  const barY = kind === 'sport' ? 1.78 : 1.93;
-  box(group, [1.37, 0.11, 0.13], [0, barY, 0.79], chrome);
-  box(group, [0.28, 0.15, 0.2], [-0.72, barY + 0.01, 0.79], rubber);
-  box(group, [0.28, 0.15, 0.2], [0.72, barY + 0.01, 0.79], rubber);
-  const lamp = cylinder(group, 0.2, 0.2, 0.08, [0, kind === 'sport' ? 1.62 : 1.98, kind === 'sport' ? 1.22 : 1.13], material('#fff6c8', 0.3));
-  lamp.rotation.x = Math.PI / 2;
-  if (kind !== 'sport') {
-    for (const x of [-0.61, 0.61]) {
-      const stalk = cylinder(group, 0.035, 0.035, 0.48, [x, 2.17, 0.78], chrome, 6);
-      stalk.rotation.z = x < 0 ? -0.2 : 0.2;
-      const mirror = sphere(group, 0.18, [x * 1.08, 2.4, 0.78], chrome);
-      mirror.scale.set(1, 0.7, 0.27);
-    }
-  }
-  if (riderColor) group.add(makePerson(riderColor, true).group);
+  if (riderColor) seatOn(makePerson(riderColor, true), style);
   group.scale.setScalar(BIKE_SCALE);
   group.traverse((o) => { o.castShadow = false; });
-  return { group, wheels, legs: [] as THREE.Group[] };
+  return { group, wheels, legs: [] as THREE.Group[], wheelRadius: hubs.r };
+
+  function seatOn(person: ReturnType<typeof makePerson>, bikeStyle: MotoStyle) {
+    footing(person, bikeStyle);
+    group.add(person.group);
+  }
+}
+
+/** Legs of a seated rider: feet forward on a scooter's floorboard, or down on the pegs of a manual bike. */
+function footing(person: ReturnType<typeof makePerson>, style: MotoStyle) {
+  const angle = FLOORBOARD[style] ? -1.05 : -0.6;
+  person.limbLeft.rotation.x = angle;
+  person.limbRight.rotation.x = angle;
 }
 
 function makeRing(color: string, emissive: string, radius = 2.6) {
@@ -541,12 +503,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   let bikeId: BikeId = 'scooter';
   let bike = makeBike(bikeId, bikeById(bikeId).color);
   const rider = makePerson('#ed763e', true);
+  footing(rider, 'scooter');
   rider.group.visible = false;
   bike.group.add(rider.group);
   scene.add(bike.group);
   // A passenger rides pillion for taxi missions.
   const passenger = makePerson('#6f86a8', true, '#2a2220');
-  passenger.group.position.set(0, 0.5, -0.95);
+  passenger.group.position.set(0, 0.36, -1.0);
   passenger.armLeft.rotation.x = -0.3;
   passenger.armRight.rotation.x = -0.3;
   passenger.group.visible = false;
@@ -2013,6 +1976,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (atmosphere.update(dt, time, cameraTarget, THREE.MathUtils.clamp(smoothView.dist * 2.4, 50, 220)) && shadowsAllowed) renderer.shadowMap.needsUpdate = true;
     applyShadows();
     world.setAtmosphere?.({ night: atmosphere.night, wet: atmosphere.rain });
+    vehicles.setNight(atmosphere.night);
     setRain(active ? atmosphere.rain : 0);
     crossing.length = 0;
     npcs.forEachCrossing((x, z) => crossing.push({ x, z }));
@@ -2190,8 +2154,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     seatHolder.visible = !!playerCar && state.riding;
     if (playerCar && state.riding) {
       const moto = playerCar.kind === 'moto';
-      // Seat offsets in metres: a scooter saddle, or the left-hand driver's seat of a car.
-      const lx = moto ? 0 : -0.45, ly = moto ? -0.05 : -0.46, lz = moto ? -0.19 : 0.04;
+      // The seated figure's hip lands on the vehicle's seat: the saddle, or the left-hand driver's seat
+      // (shrunk a little so the head clears a car roof). Vehicle models stand 0.04 m into the ground.
+      const fit = moto ? 1 : 0.82;
+      const seat = seatOf(playerCar);
+      seatHolder.scale.setScalar(BIKE_SCALE * fit);
+      if (moto) footing(seated, vehicleStyle(playerCar) as MotoStyle);
+      else { seated.limbLeft.rotation.x = -1.35; seated.limbRight.rotation.x = -1.35; }
+      const lx = seat[0], ly = seat[1] - fit * MOTO_RIDER.hip[1] - 0.04, lz = seat[2] - fit * MOTO_RIDER.hip[2];
       const c = Math.cos(playerCar.yaw), s = Math.sin(playerCar.yaw);
       seatHolder.position.set(playerCar.x + lx * c + lz * s, groundHeight(playerCar.x, playerCar.z) + ly, playerCar.z - lx * s + lz * c);
       seatHolder.rotation.set(0, playerCar.yaw, moto ? -steer * Math.min(1, Math.abs(velocity) / 8) * 0.3 : 0, 'YXZ');
@@ -2208,7 +2178,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     lean = THREE.MathUtils.damp(lean, onBike ? -steer * Math.min(1, Math.abs(velocity) / 8) * 0.32 : 0, 6, dt);
     bike.group.position.set(bikeX, groundHeight(bikeX, bikeZ) + (bikeBroken && !onBike ? 0.18 : -0.04), bikeZ);
     bike.group.rotation.set(0, bikeAngle, bikeBroken && !onBike ? 1.35 : lean, 'YXZ');
-    if (onBike) for (const wheel of bike.wheels) wheel.rotation.x -= velocity * dt / (0.57 * BIKE_SCALE);
+    if (onBike) for (const wheel of bike.wheels) wheel.rotation.x += velocity * dt / bike.wheelRadius;
     if (bike.legs.length) {
       const pace = onBike ? Math.abs(velocity) : 0;
       gallop += pace * dt * 1.6;
@@ -2344,7 +2314,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     disposeTree(bike.group);
     bikeId = id;
     bike = makeBike(id, bikeById(id).color);
-    rider.group.position.y = id === 'horse' ? HORSE_SEAT : 0.42;
+    rider.group.position.y = id === 'horse' ? HORSE_SEAT : (MOTO_RIDER.hip[1] - 1.04 * PERSON_SCALE) / BIKE_SCALE;
+    if (id === 'horse') { rider.limbLeft.rotation.x = -0.65; rider.limbRight.rotation.x = -0.65; }
+    else footing(rider, id);
     bike.group.add(rider.group, passenger.group);
     scene.add(bike.group);
     bikeHealth = bikeById(id).health;
