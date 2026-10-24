@@ -50,3 +50,6 @@
 
 /* Nightlife venues: neon eyebrow, intro and the 18+ check. */
 .eyebrow.neon i{background:#ff4f8b}.venue-intro{font-size:12px;line-height:1.6;color:#6f7c69;margin:0 0 12px}.age-actions{display:flex;gap:8px;margin-top:14px}.age-actions button{flex:1;padding:12px 10px;border-radius:6px;font-weight:700;font-size:12px}.age-actions button:first-child{background:#d6336c;color:#fff}.age-actions button:last-child{background:#e9ecdd;color:var(--ink)}
+
+/* Wanted while the call is still pending: dim, slowly blinking stars and a countdown. */
+.hud-stack .wanted.pending{animation:none;background:#2a3348e6}.wanted.pending b.on{color:#ffd15c;animation:star-wait 1.2s ease-in-out infinite;text-shadow:none}.wanted.pending small{margin-left:6px;font-size:10px;font-weight:700;color:#ffd9a0;font-variant-numeric:tabular-nums;white-space:nowrap}@keyframes star-wait{50%{opacity:.35}}

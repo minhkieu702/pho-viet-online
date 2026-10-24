@@ -293,6 +293,7 @@ export function createNpcs(
   const base = new THREE.Matrix4(), local = new THREE.Matrix4(), outM = new THREE.Matrix4();
   const quat = new THREE.Quaternion(), quat2 = new THREE.Quaternion(), pos = new THREE.Vector3(), size = new THREE.Vector3(1, 1, 1);
   const euler = new THREE.Euler();
+  const bodyEuler = new THREE.Euler(0, 0, 0, 'YXZ');
   const xAxis = new THREE.Vector3(1, 0, 0), yAxis = new THREE.Vector3(0, 1, 0);
   // Holding an umbrella: right arm forward, the shaft from the hand up past the right cheek to a canopy over the head.
   const UMBRELLA_ARM = -0.95, UMBRELLA_TWIST = -0.04;
@@ -312,9 +313,11 @@ export function createNpcs(
     const sit = npc.pose === 'sit';
     const { width, height } = d.style;
     const intent = npc.mind.intent;
+    // Walkers lean slightly into their stride, runners a lot.
+    const lean = npc.pose === 'run' ? 0.2 : npc.pose === 'walk' ? 0.05 : 0;
     base.compose(
       pos.set(npc.x, npc.y - (sit ? FIGURE.sitDrop * BODY_SCALE * height : 0), npc.z),
-      quat.setFromAxisAngle(yAxis, npc.yaw),
+      quat.setFromEuler(bodyEuler.set(lean, npc.yaw, 0)),
       size.set(BODY_SCALE * width, BODY_SCALE * height, BODY_SCALE * width),
     );
     const swing = npc.swing;
@@ -323,6 +326,7 @@ export function createNpcs(
     let armL = -swing * 0.8, armR = swing * 0.8, twistL = 0, twistR = 0;
     if (npc.pose === 'hands') { armL = -2.85; armR = -2.85 + Math.sin(time * 9) * 0.08; }
     else if (npc.pose === 'run' && npc.state === 'fleeing') { armL = -2.4; armR = -2.5; }
+    else if (npc.pose === 'run') { armL = -0.35 - swing * 1.25; armR = -0.35 + swing * 1.25; }
     else if (npc.pose === 'fight') { armL = -1.3; armR = time % 1.1 < 0.25 ? -1.75 : -1.1; }
     else if (sit) { armL = -0.7; armR = -0.7; }
     else if (npc.pose === 'idle') {

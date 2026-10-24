@@ -39,6 +39,8 @@ export type Hud = {
   gangs: { name: string; anger: number; x: number; z: number }[]; hospital: { x: number; z: number }; policeStation: { x: number; z: number };
   healCost: number; respawnIn: number; arsenal: { id: WeaponId; mag: number; reserve: number }[]; stunned: boolean; flatTires: boolean;
   surrendered: boolean; gassed: boolean;
+  /** Seconds until the police arrive after a crime was reported (0 when they are here or not coming). */
+  policeIn: number;
   /** Zombie mode: wave, zombies left in it, kills, seconds of rest left, best wave reached. */
   zombie: { wave: number; left: number; kills: number; breakLeft: number; best: number; dots: { x: number; z: number }[] } | null;
 };
@@ -191,12 +193,16 @@ function makePerson(color = '#e77641', riding = false, hair?: string) {
       { g: block(0.14, 0.4, 0.3), c: HAIR, at: h(0.93, -0.06, 0.22), s: hs(1), r: [0, 0.35, 0] },
       { g: ball(0.5, 8, 5), c: HAIR, at: h(0.22, 0.6, 0.66), s: hs([1.4, 0.5, 0.75]), r: [-0.55, 0, -0.3] },
     );
-  } else {
-    // The delivery rider's insulated box on shoulder straps.
+  }
+  // The delivery rider's insulated box hangs from the straps' top (its pivot) so it can bounce.
+  const PACK_TOP = 1.9;
+  const packPieces: Piece[] = hair ? [] : [
+    { g: block(0.6, 0.66, 0.34), c: '#365e52', at: [0, 1.52 - PACK_TOP, -0.43] },
+    { g: block(0.64, 0.08, 0.38), c: '#4c7a6b', at: [0, 1.88 - PACK_TOP, -0.43] },
+    { g: block(0.42, 0.13, 0.02), c: '#e7b04a', at: [0, 1.56 - PACK_TOP, -0.605] },
+  ];
+  if (!hair) {
     pieces.push(
-      { g: block(0.6, 0.66, 0.34), c: '#365e52', at: [0, y(1.52), -0.43] },
-      { g: block(0.64, 0.08, 0.38), c: '#4c7a6b', at: [0, y(1.88), -0.43] },
-      { g: block(0.42, 0.13, 0.02), c: '#e7b04a', at: [0, y(1.56), -0.605] },
       { g: block(0.06, 0.4, 0.035), c: '#2b4a40', at: [-0.22, y(1.68), 0.262], r: [0.1, 0, 0] },
       { g: block(0.06, 0.4, 0.035), c: '#2b4a40', at: [0.22, y(1.68), 0.262], r: [0.1, 0, 0] },
       { g: block(0.06, 0.035, 0.5), c: '#2b4a40', at: [-0.22, y(1.89), -0.02] },
@@ -208,6 +214,9 @@ function makePerson(color = '#e77641', riding = false, hair?: string) {
   body.position.y = HIP;
   const group = new THREE.Group();
   group.add(body);
+  const pack = new THREE.Group();
+  pack.position.set(0, PACK_TOP - HIP, 0);
+  if (packPieces.length) { pack.add(new THREE.Mesh(merge(packPieces), cloth)); body.add(pack); }
   if (!hair) {
     // Motorbike half helmet with a peak and a stripe in the shirt colour.
     const helmet = merge([
@@ -217,40 +226,58 @@ function makePerson(color = '#e77641', riding = false, hair?: string) {
     ]);
     body.add(new THREE.Mesh(helmet, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.05 })));
   }
-  // Legs pivot at the hip: trousers with a cuff, and sneakers with laces in the shirt colour.
-  const leg = () => new THREE.Mesh(merge([
+  // Legs: the thigh pivots at the hip and the shin (with the sneaker) at the knee, so strides can fold.
+  const KNEE = 0.46, ELBOW = 0.36;
+  const thigh = () => new THREE.Mesh(merge([
     { g: ball(0.175, 10, 7), c: TROUSERS, at: [0, -0.03, 0] },
-    { g: tube(0.175, 0.15, 0.48), c: TROUSERS, at: [0, -0.24, 0] },
-    { g: tube(0.152, 0.128, 0.4), c: TROUSERS, at: [0, -0.64, 0] },
-    { g: tube(0.14, 0.14, 0.06), c: shade(TROUSERS, 0.8), at: [0, -0.82, 0] },
-    { g: block(0.24, 0.15, 0.4), c: SHOE, at: [0, -0.905, 0.07] },
-    { g: ball(0.12, 8, 5), c: SHOE, at: [0, -0.915, 0.25], s: [1, 0.62, 1.05] },
-    { g: block(0.26, 0.05, 0.47), c: '#c8b593', at: [0, -0.985, 0.085] },
-    { g: block(0.13, 0.025, 0.16), c: color, at: [0, -0.826, 0.12], r: [-0.25, 0, 0] },
+    { g: tube(0.175, 0.152, 0.48), c: TROUSERS, at: [0, -0.24, 0] },
+  ]), cloth);
+  const shin = () => new THREE.Mesh(merge([
+    { g: ball(0.152, 9, 6), c: TROUSERS, at: [0, 0, 0] },
+    { g: tube(0.152, 0.128, 0.4), c: TROUSERS, at: [0, -0.64 + KNEE, 0] },
+    { g: tube(0.14, 0.14, 0.06), c: shade(TROUSERS, 0.8), at: [0, -0.82 + KNEE, 0] },
+    { g: block(0.24, 0.15, 0.4), c: SHOE, at: [0, -0.905 + KNEE, 0.07] },
+    { g: ball(0.12, 8, 5), c: SHOE, at: [0, -0.915 + KNEE, 0.25], s: [1, 0.62, 1.05] },
+    { g: block(0.26, 0.05, 0.47), c: '#c8b593', at: [0, -0.985 + KNEE, 0.085] },
+    { g: block(0.13, 0.025, 0.16), c: color, at: [0, -0.826 + KNEE, 0.12], r: [-0.25, 0, 0] },
   ]), cloth);
   const limbLeft = new THREE.Group();
   const limbRight = new THREE.Group();
+  const kneeLeft = new THREE.Group();
+  const kneeRight = new THREE.Group();
   limbLeft.position.set(-0.26, 1.04, 0);
   limbRight.position.set(0.26, 1.04, 0);
-  limbLeft.add(leg());
-  limbRight.add(leg());
+  for (const [hip, knee] of [[limbLeft, kneeLeft], [limbRight, kneeRight]] as const) {
+    knee.position.y = -KNEE;
+    knee.add(shin());
+    hip.add(thigh(), knee);
+  }
   group.add(limbLeft, limbRight);
-  // Arms pivot at the shoulder so they can swing, steer, wave and aim: short sleeve, forearm, hand and thumb.
-  const arm = (inward: number) => new THREE.Mesh(merge([
+  // Arms pivot at the shoulder (short sleeve) and the elbow (forearm, hand and thumb). They hang from the
+  // torso, so they stay on the shoulders when it leans or twists.
+  const upperArm = () => new THREE.Mesh(merge([
     { g: ball(0.15, 10, 7), c: color, at: [0, -0.02, 0] },
     { g: tube(0.15, 0.13, 0.36), c: color, at: [0, -0.18, 0] },
     { g: tube(0.142, 0.142, 0.06), c: shade(color, 0.85), at: [0, -0.35, 0] },
-    { g: tube(0.105, 0.088, 0.3, 9), c: SKIN, at: [0, -0.5, 0] },
-    { g: ball(0.12, 9, 7), c: SKIN, at: [0, -0.725, 0.01], s: [0.88, 1.08, 0.95] },
-    { g: ball(0.05, 6, 4), c: SKIN, at: [inward * 0.08, -0.68, 0.07] },
+  ]), cloth);
+  const forearm = (inward: number) => new THREE.Mesh(merge([
+    { g: ball(0.1, 8, 6), c: SKIN, at: [0, 0, 0] },
+    { g: tube(0.105, 0.088, 0.3, 9), c: SKIN, at: [0, -0.5 + ELBOW, 0] },
+    { g: ball(0.12, 9, 7), c: SKIN, at: [0, -0.725 + ELBOW, 0.01], s: [0.88, 1.08, 0.95] },
+    { g: ball(0.05, 6, 4), c: SKIN, at: [inward * 0.08, -0.68 + ELBOW, 0.07] },
   ]), cloth);
   const armLeft = new THREE.Group();
   const armRight = new THREE.Group();
-  armLeft.position.set(-0.57, 1.76, 0.04);
-  armRight.position.set(0.57, 1.76, 0.04);
-  armLeft.add(arm(1));
-  armRight.add(arm(-1));
-  group.add(armLeft, armRight);
+  const elbowLeft = new THREE.Group();
+  const elbowRight = new THREE.Group();
+  armLeft.position.set(-0.57, 1.76 - HIP, 0.04);
+  armRight.position.set(0.57, 1.76 - HIP, 0.04);
+  for (const [shoulder, elbow, inward] of [[armLeft, elbowLeft, 1], [armRight, elbowRight, -1]] as const) {
+    elbow.position.y = -ELBOW;
+    elbow.add(forearm(inward));
+    shoulder.add(upperArm(), elbow);
+  }
+  body.add(armLeft, armRight);
   if (riding) {
     limbLeft.rotation.x = -0.65;
     limbRight.rotation.x = -0.65;
@@ -261,7 +288,7 @@ function makePerson(color = '#e77641', riding = false, hair?: string) {
     group.scale.setScalar(PERSON_SCALE / BIKE_SCALE);
     group.position.set(0, (MOTO_RIDER.hip[1] - HIP * PERSON_SCALE) / BIKE_SCALE, MOTO_RIDER.hip[2] / BIKE_SCALE);
   } else group.scale.setScalar(PERSON_SCALE);
-  return { group, limbLeft, limbRight, armLeft, armRight };
+  return { group, body, pack, limbLeft, limbRight, kneeLeft, kneeRight, armLeft, armRight, elbowLeft, elbowRight };
 }
 
 /** A horse in bike units: legs pivot at the hip so they can gallop. */
@@ -332,9 +359,11 @@ function makeBike(kind: BikeId = 'scooter', color = '#ed763e', riderColor?: stri
 
 /** Legs of a seated rider: feet forward on a scooter's floorboard, or down on the pegs of a manual bike. */
 function footing(person: ReturnType<typeof makePerson>, style: MotoStyle) {
-  const angle = FLOORBOARD[style] ? -1.05 : -0.6;
-  person.limbLeft.rotation.x = angle;
-  person.limbRight.rotation.x = angle;
+  // Thighs forward along the saddle, shins down to the floorboard or back to the pegs.
+  const [thigh, knee] = FLOORBOARD[style] ? [-1.3, 1.2] : [-0.95, 1.35];
+  person.limbLeft.rotation.x = person.limbRight.rotation.x = thigh;
+  person.kneeLeft.rotation.x = person.kneeRight.rotation.x = knee;
+  person.elbowLeft.rotation.x = person.elbowRight.rotation.x = -0.3;
 }
 
 function makeRing(color: string, emissive: string, radius = 2.6) {
@@ -551,18 +580,18 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   for (const id of ['pistol', 'shotgun', 'smg', 'grenade', 'rpg'] as const) {
     const gun = makeGun(id);
     gun.group.rotation.x = Math.PI / 2;
-    gun.group.position.set(0, -0.74, 0.06);
+    gun.group.position.set(0, -0.74 + 0.36, 0.06);
     gun.group.visible = false;
     const muzzle = new THREE.Object3D();
     muzzle.position.set(0, 0.1, gun.length);
     gun.group.add(muzzle);
-    walker.armRight.add(gun.group);
+    walker.elbowRight.add(gun.group);
     guns.set(id, { group: gun.group, muzzle });
     const riderGun = makeGun(id).group;
     riderGun.rotation.x = Math.PI / 2;
-    riderGun.position.set(0, -0.74, 0.06);
+    riderGun.position.set(0, -0.74 + 0.36, 0.06);
     riderGun.visible = false;
-    rider.armRight.add(riderGun);
+    rider.elbowRight.add(riderGun);
     riderGuns.set(id, riderGun);
   }
   walker.group.traverse((o) => { o.castShadow = false; });
@@ -577,16 +606,16 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   for (const id of ['pistol', 'shotgun', 'smg', 'grenade', 'rpg'] as const) {
     const gun = makeGun(id).group;
     gun.rotation.x = Math.PI / 2;
-    gun.position.set(0, -0.74, 0.06);
+    gun.position.set(0, -0.74 + 0.36, 0.06);
     gun.visible = false;
-    seated.armRight.add(gun);
+    seated.elbowRight.add(gun);
     seatedGuns.set(id, gun);
   }
   // Handcuffs on the wrists during an arrest.
   const cuffMaterial = new THREE.MeshStandardMaterial({ color: '#c9ced3', metalness: 0.8, roughness: 0.3 });
-  const cuffs = [walker.armLeft, walker.armRight].map((arm) => {
+  const cuffs = [walker.elbowLeft, walker.elbowRight].map((arm) => {
     const cuff = new THREE.Mesh(new THREE.TorusGeometry(0.17, 0.05, 6, 12), cuffMaterial);
-    cuff.position.set(0, -0.62, 0);
+    cuff.position.set(0, -0.62 + 0.36, 0);
     cuff.rotation.x = Math.PI / 2;
     cuff.visible = false;
     arm.add(cuff);
@@ -924,6 +953,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (down === 'wasted' || down === 'busted') return;
     health = Math.max(0, health - amount);
     lastDamage = now / 1000;
+    motion.hitAt = now;
     shake = Math.max(shake, 0.25);
     const dx = from ? state.x - from.x : 0, dz = from ? state.z - from.z : 0, d = Math.hypot(dx, dz) || 1;
     effects.blood(hitPoint.set(state.x, inCar() ? 1.3 : 1.1, state.z), rayDir.set(dx / d, 0, dz / d), inCar() ? 2 : 5);
@@ -1427,9 +1457,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         for (const id of ['pistol', 'shotgun', 'smg', 'grenade', 'rpg'] as const) {
           const gun = makeGun(id).group;
           gun.rotation.x = Math.PI / 2;
-          gun.position.set(0, -0.74, 0.06);
+          gun.position.set(0, -0.74 + 0.36, 0.06);
           gun.visible = false;
-          foot.armRight.add(gun);
+          foot.elbowRight.add(gun);
           peerGuns.set(id, gun);
         }
         group.add(foot.group, peerBike.group, label);
@@ -1977,7 +2007,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       gangs: zombieMode ? [] : npcs.gangs.map((g) => ({ name: g.name, anger: Math.ceil(g.anger), x: Math.round(g.x), z: Math.round(g.z) })),
       hospital: { x: Math.round(LANDMARKS.hospital.x), z: Math.round(LANDMARKS.hospital.z) }, policeStation: { x: Math.round(LANDMARKS.police.x), z: Math.round(LANDMARKS.police.z) },
       arsenal: [...ammo.entries()].map(([id, a]) => ({ id, mag: a.mag, reserve: a.reserve })), stunned: now < stunUntil, flatTires,
-      surrendered, gassed: now < gassedUntil,
+      surrendered, gassed: now < gassedUntil, policeIn: Math.ceil(police.responseIn(now / 1000)),
       zombie: zombieMode ? { ...zombies.stats(now / 1000), best: zombieBest, dots: zombieDots() } : null,
       healCost: Math.ceil((MAX_HEALTH - health) * 1.2), respawnIn: down === 'wasted' || down === 'busted' ? Math.max(0, Math.ceil((downUntil - now) / 1000)) : 0,
     };
@@ -2139,6 +2169,91 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
   }
 
+  // ---- The player's body: procedural animation driven by speed, turning, jumps, punches and hits. ----
+  const motion = { lean: 0, roll: 0, lastAngle: 0, lastSpeed: 0, land: 0, hitAt: -1e9, pack: 0, packV: 0 };
+  /** Poses the walker for this frame. */
+  function animateWalker(dt: number, now: number, time: number, walking: boolean, o: { twoHanded: boolean; kneeling: boolean; handsUp: boolean; armed: boolean }) {
+    const w = walker;
+    const speed = walking ? Math.abs(velocity) : 0;
+    const go = Math.min(1, speed / 1.2);
+    const run = THREE.MathUtils.clamp((speed - 3.2) / 3.2, 0, 1);
+    // Longer, slower-cadence strides as the pace picks up.
+    walkClock += speed * dt * (1.95 - 0.5 * run);
+    const phase = walkClock * 2, sinP = Math.sin(phase), cosP = Math.cos(phase);
+    const amp = (0.48 + 0.34 * run) * go;
+    // Thighs swing; a knee folds while its leg comes forward, and stays a little bent when running.
+    let thighL = sinP * amp, thighR = -sinP * amp;
+    let kneeL = (Math.max(0, -cosP) * (0.55 + 1.05 * run) + 0.12 * run) * go;
+    let kneeR = (Math.max(0, cosP) * (0.55 + 1.05 * run) + 0.12 * run) * go;
+    // Arms swing against the legs; elbows pump when running.
+    let armL = -thighL * (0.8 + 0.3 * run), armR = -thighR * (0.8 + 0.3 * run);
+    let elbowL = -(0.18 + 1.15 * run) * go - Math.max(0, -armL) * 0.35;
+    let elbowR = -(0.18 + 1.15 * run) * go - Math.max(0, -armR) * 0.35;
+    let armLz = 0, armRz = 0;
+    // The torso leans into speed and acceleration, banks into turns and twists against the stride.
+    const accel = THREE.MathUtils.clamp((speed - motion.lastSpeed) / Math.max(dt, 1e-3), -12, 12);
+    motion.lastSpeed = speed;
+    const turnRate = Math.atan2(Math.sin(state.angle - motion.lastAngle), Math.cos(state.angle - motion.lastAngle)) / Math.max(dt, 1e-3);
+    motion.lastAngle = state.angle;
+    motion.lean = THREE.MathUtils.damp(motion.lean, 0.04 * go + 0.2 * run + accel * 0.012, 7, dt);
+    motion.roll = THREE.MathUtils.damp(motion.roll, THREE.MathUtils.clamp(turnRate * speed * 0.01, -0.2, 0.2), 6, dt);
+    let lean = motion.lean, twist = sinP * (0.06 + 0.1 * run) * go, drop = 0;
+    // Highest as the legs pass each other, lowest on each footfall.
+    let bob = (0.5 - 0.5 * Math.cos(phase * 2)) * (0.02 + 0.05 * run) * go;
+    // Breathing while standing.
+    w.body.scale.set(1, 1 + Math.sin(time * 2.3) * 0.012 * (1 - go), 1);
+    if (jumpY > 0) {
+      // Airborne: knees tucked, arms out for balance.
+      thighL = -0.95; kneeL = 1.25; thighR = -0.3; kneeR = 0.7;
+      armL = -0.9; armR = -0.6; elbowL = elbowR = -0.5; armLz = 0.35; armRz = -0.35;
+      lean = 0.12; bob = 0;
+    }
+    if (motion.land > 0) {
+      // Landing: the legs soak up the impact.
+      const k = motion.land;
+      thighL -= 0.5 * k; thighR -= 0.5 * k; kneeL += 1.0 * k; kneeR += 1.0 * k;
+      drop += 0.13 * k; lean += 0.15 * k;
+      motion.land = Math.max(0, motion.land - dt * 5.5);
+    }
+    if (now < punchUntil) {
+      // A jab: the right arm drives out from a cocked elbow, the shoulders turn into it, the left guards.
+      const t = 1 - (punchUntil - now) / 180;
+      armR = -1.55; elbowR = -1.5 * (1 - Math.min(1, t * 1.8)); armRz = 0;
+      twist = -0.35 * Math.sin(Math.PI * Math.min(1, t * 1.3));
+      armL = -1.2; elbowL = -1.7; lean += 0.08;
+    } else if (o.armed) {
+      // Aiming: the right arm straight out; long guns are steadied with the left hand.
+      armR = -Math.PI / 2; elbowR = 0; armRz = 0;
+      if (o.twoHanded) { armL = -1.25; elbowL = -0.35; armLz = 0.45; }
+    }
+    if (o.handsUp) { armL = armR = -2.9; elbowL = elbowR = -0.25; armLz = armRz = 0; }
+    // A hit snaps the torso back for a moment.
+    const hit = 1 - (now - motion.hitAt) / 280;
+    if (hit > 0) { lean -= 0.4 * hit; armLz += 0.4 * hit; armRz -= 0.4 * hit; }
+    if (o.kneeling) {
+      // Forced to kneel, hands cuffed behind the back.
+      thighL = thighR = 0.15; kneeL = kneeR = 1.45; drop = 0.36 * PERSON_SCALE / 0.68;
+      armL = armR = 0.6; elbowL = elbowR = 0; armLz = 0.5; armRz = -0.5; lean = 0.1; twist = 0; bob = 0;
+    }
+    if (now < stunUntil) { armLz = Math.sin(time * 40) * 0.3; armRz = Math.cos(time * 37) * 0.3; thighL = Math.sin(time * 33) * 0.15; }
+    w.group.position.y += bob - drop;
+    w.body.rotation.set(lean, twist, motion.roll);
+    w.limbLeft.rotation.set(thighL, 0, 0);
+    w.limbRight.rotation.set(thighR, 0, 0);
+    w.kneeLeft.rotation.x = kneeL;
+    w.kneeRight.rotation.x = kneeR;
+    w.armLeft.rotation.set(armL, 0, armLz);
+    w.armRight.rotation.set(armR, 0, armRz);
+    w.elbowLeft.rotation.x = elbowL;
+    w.elbowRight.rotation.x = elbowR;
+    // The delivery box lags behind the bounce on its straps (a damped spring).
+    const packTarget = -bob * 1.6 + (jumpY > 0 ? -0.05 : 0);
+    motion.packV += ((packTarget - motion.pack) * 90 - motion.packV * 9) * dt;
+    motion.pack += motion.packV * dt;
+    w.pack.position.y = 0.86 + motion.pack;
+    w.pack.rotation.x = -lean * 0.4 + motion.packV * 0.15;
+  }
+
   function walk(dt: number, now: number, vertical: number, horizontal: number) {
     // On foot, movement is relative to where the camera is looking.
     const forwardX = -Math.sin(smoothView.yaw), forwardZ = -Math.cos(smoothView.yaw);
@@ -2295,6 +2410,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       x: state.x, z: state.z, car: playerCar, riding: state.riding, heading: state.angle, speed: Math.abs(velocity), down: down !== null, stunned: now < stunUntil,
       armed: weapon !== 'fists' && !inCar(), surrendered, pinned: down === 'crash' && now < pinnedUntil, night: atmosphere.night,
     });
+    if (policeResult.called) notify('Có người đã báo công an! Cảnh sát đang trên đường tới, tranh thủ chuồn đi.', 4000);
+    if (policeResult.arrived) notify('Cảnh sát đã tới hiện trường!', 2200);
     if (policeResult.tackled && !down) {
       knockPlayer(Math.sin(state.angle) * 3, 2, Math.cos(state.angle) * 3, now);
       pinnedUntil = now + 3200;
@@ -2366,7 +2483,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (jumpV !== 0 || jumpY > 0) {
       jumpV -= 18 * dt;
       jumpY = Math.max(0, jumpY + jumpV * dt);
-      if (jumpY === 0) { jumpV = 0; if (!state.riding) shake = Math.max(shake, 0.05); }
+      if (jumpY === 0) { jumpV = 0; motion.land = 1; if (!state.riding) shake = Math.max(shake, 0.05); }
     }
     if (state.riding || down) { jumpY = 0; jumpV = 0; }
 
@@ -2442,29 +2559,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     walker.group.visible = !state.riding && !playerBody;
     walker.group.position.set(state.x, groundHeight(state.x, state.z) - 0.02 + jumpY, state.z);
     walker.group.rotation.y = state.angle;
-    walkClock += Math.abs(velocity) * dt * 1.9;
-    const stride = moving && active && !state.riding ? Math.sin(walkClock * 2) * 0.62 : 0;
-    // In the air the legs tuck up; otherwise they stride.
-    walker.limbLeft.rotation.x = jumpY > 0 ? -0.7 : stride;
-    walker.limbRight.rotation.x = jumpY > 0 ? -0.25 : -stride;
     const twoHanded = weapon === 'shotgun' || weapon === 'smg' || weapon === 'rpg' || weapon === 'grenade';
     const arrestTime = down === 'busted' ? now - bustedAt : -1;
     const kneeling = arrestTime > 900;
     const handsUp = surrendered || (arrestTime >= 0 && !kneeling);
-    walker.armLeft.rotation.set(handsUp ? -2.9 : twoHanded ? -1.25 : -stride * 0.7, 0, twoHanded && !handsUp ? 0.45 : 0);
-    walker.armRight.rotation.set(handsUp ? -2.9 : now < punchUntil ? -1.65 : armed ? -Math.PI / 2 : stride * 0.7, 0, 0);
-    if (kneeling) {
-      // Forced to kneel with the hands cuffed behind the back.
-      walker.group.position.y -= 0.36 * PERSON_SCALE / 0.68;
-      walker.limbLeft.rotation.x = 1.25;
-      walker.limbRight.rotation.x = 1.25;
-      walker.armLeft.rotation.set(0.6, 0, 0.5);
-      walker.armRight.rotation.set(0.6, 0, -0.5);
-    }
+    animateWalker(dt, now, time, moving && active && !state.riding, { twoHanded, kneeling, handsUp, armed: armed && now < aimUntil + 600 });
     for (const cuff of cuffs) cuff.visible = kneeling;
     for (const [id, gun] of guns) gun.group.visible = id === weapon && !kneeling && !handsUp;
-    if (now < stunUntil) { walker.armLeft.rotation.z = Math.sin(time * 40) * 0.3; walker.armRight.rotation.z = Math.cos(time * 37) * 0.3; walker.limbLeft.rotation.x = Math.sin(time * 33) * 0.15; }
-    else walker.armRight.rotation.z = 0;
     const onBike = state.riding && !playerCar;
     rider.group.visible = onBike;
     seatHolder.visible = !!playerCar && state.riding;
@@ -2476,7 +2577,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const seat = seatOf(playerCar);
       seatHolder.scale.setScalar(BIKE_SCALE * fit);
       if (moto) footing(seated, vehicleStyle(playerCar) as MotoStyle);
-      else { seated.limbLeft.rotation.x = -1.35; seated.limbRight.rotation.x = -1.35; }
+      else { seated.limbLeft.rotation.x = seated.limbRight.rotation.x = -1.4; seated.kneeLeft.rotation.x = seated.kneeRight.rotation.x = 1.35; }
       const lx = seat[0], ly = seat[1] - fit * MOTO_RIDER.hip[1] - 0.04, lz = seat[2] - fit * MOTO_RIDER.hip[2];
       const c = Math.cos(playerCar.yaw), s = Math.sin(playerCar.yaw);
       seatHolder.position.set(playerCar.x + lx * c + lz * s, groundHeight(playerCar.x, playerCar.z) + ly, playerCar.z - lx * s + lz * c);
@@ -2640,7 +2741,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     bikeId = id;
     bike = makeBike(id, bikeById(id).color);
     rider.group.position.y = id === 'horse' ? HORSE_SEAT : (MOTO_RIDER.hip[1] - 1.04 * PERSON_SCALE) / BIKE_SCALE;
-    if (id === 'horse') { rider.limbLeft.rotation.x = -0.65; rider.limbRight.rotation.x = -0.65; }
+    if (id === 'horse') { rider.limbLeft.rotation.x = rider.limbRight.rotation.x = -0.65; rider.kneeLeft.rotation.x = rider.kneeRight.rotation.x = 0.55; }
     else footing(rider, id);
     bike.group.add(rider.group, passenger.group);
     scene.add(bike.group);

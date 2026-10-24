@@ -85,6 +85,11 @@ export function createPolice(
   let heat = 0;
   let lastSeen = 0;
   let dispatchAt = 0;
+  // A fresh crime has to be phoned in and a car has to get there: no unit moves before `responseAt`.
+  let responseAt = 0;
+  let callPending = false;
+  let reported = false;
+  let playerX = 0, playerZ = 0;
   let spikeAt = 0;
   let blockAt = 0;
   const spikes: Spike[] = [];
@@ -127,7 +132,8 @@ export function createPolice(
   const base = new THREE.Matrix4(), local = new THREE.Matrix4(), out = new THREE.Matrix4();
   const hidden = new THREE.Matrix4().makeScale(0, 0, 0);
   const quat = new THREE.Quaternion(), pos = new THREE.Vector3(), size = new THREE.Vector3();
-  const euler = new THREE.Euler(), yAxis = new THREE.Vector3(0, 1, 0);
+  const euler = new THREE.Euler();
+  const bodyEuler = new THREE.Euler(0, 0, 0, 'YXZ');
   // A limb hanging from its pivot, swung forward by `angle` and turned inward by `twist`.
   const limb = (batch: FigureBatch, px: number, py: number, angle: number, look: Float32Array, twist = 0) => {
     local.compose(pos.set(px, py, 0), quat.setFromEuler(euler.set(angle, 0, twist)), size.set(1, 1, 1));
@@ -137,7 +143,8 @@ export function createPolice(
   function draw(o: Officer) {
     if (o.state !== 'chase' && o.state !== 'return') return;
     const style = styleOf(o.swat ? SWAT_LOOK : LOOK);
-    base.compose(pos.set(o.x, world.ground(o.x, o.z), o.z), quat.setFromAxisAngle(yAxis, o.yaw), size.set(SCALE * style.width, SCALE * style.height, SCALE * style.width));
+    // Officers lean into a run.
+    base.compose(pos.set(o.x, world.ground(o.x, o.z), o.z), quat.setFromEuler(bodyEuler.set(Math.min(0.2, o.pace * 0.03), o.yaw, 0)), size.set(SCALE * style.width, SCALE * style.height, SCALE * style.width));
     const swing = Math.sin(o.stride) * Math.min(0.75, o.pace * 0.12);
     const holding = o.escort;
     const diving = o.state === 'chase' && lastTime - o.lunge < 0.45;
@@ -172,14 +179,28 @@ export function createPolice(
   let enabled = true;
   function crime(severity: number, time: number) {
     if (!enabled) return;
+    const fresh = wanted === 0;
     heat += severity;
     wanted = Math.min(5, Math.max(wanted, 1, 1 + Math.floor(heat / 4)));
-    lastSeen = time;
+    if (fresh) {
+      // Officers already nearby act at once; otherwise a witness calls it in (worse crimes get a faster
+      // response) and the first cars arrive after that.
+      const onScene = officers.some((o) => (o.state === 'chase' || o.state === 'return') && Math.hypot(o.x - playerX, o.z - playerZ) < 35)
+        || vehicles.cars.some((c) => c.kind === 'police' && c.mode !== 'off' && Math.hypot(c.x - playerX, c.z - playerZ) < 45);
+      const delay = onScene ? 0 : Math.max(5, 14 - severity * 2.5) + Math.random() * 4;
+      responseAt = time + delay;
+      callPending = delay > 0;
+      reported = reported || callPending;
+    }
+    // Losing them only counts from when they get there.
+    lastSeen = Math.max(time, responseAt);
   }
 
   function standDown() {
     wanted = 0;
     heat = 0;
+    responseAt = 0;
+    callPending = false;
     for (const o of officers) if (o.state === 'chase') o.state = 'return';
   }
   let lastTime = 0;
@@ -326,6 +347,8 @@ export function createPolice(
 
   return {
     get wanted() { return wanted; },
+    /** Seconds until the first police arrive after a crime is reported (0 once they are on their way in). */
+    responseIn(time: number) { return wanted > 0 && callPending ? Math.max(0, responseAt - time) : 0; },
     crime,
     reset,
     setEnabled(on: boolean) { enabled = on; if (!on) reset(); },
@@ -377,6 +400,12 @@ export function createPolice(
     },
     update(dt: number, time: number, player: PlayerView) {
       lastTime = time;
+      playerX = player.x;
+      playerZ = player.z;
+      const called = reported;
+      reported = false;
+      let arrived = false;
+      if (callPending && time >= responseAt) { callPending = false; arrived = true; }
       let tackled = false;
       let pulledOut = false;
       const gas: GasThrow[] = [];
@@ -387,12 +416,13 @@ export function createPolice(
       let blocked = false;
       const inVehicle = player.riding;
       // Dispatch more cruisers as the wanted level climbs.
-      if (wanted > 0 && time > dispatchAt) {
+      if (wanted > 0 && time > dispatchAt && time >= responseAt) {
         dispatchAt = time + 1.5;
         const active = vehicles.cars.filter((c) => c.kind === 'police' && (c.mode === 'chase' || c.mode === 'hold')).length;
-        // More cruisers, bigger crews and closer spawns as the stars climb.
+        // More cruisers, bigger crews and closer spawns as the stars climb; the first answer to a call
+        // comes from further off, so the cars are seen driving in with sirens.
         if (active < [0, 1, 2, 3, 4, 6][wanted]) {
-          const car = vehicles.spawnPolice(player.x, player.z, 50 - wanted * 4, 90);
+          const car = active === 0 ? vehicles.spawnPolice(player.x, player.z, 60, 110) : vehicles.spawnPolice(player.x, player.z, 50 - wanted * 4, 90);
           if (car) {
             let crew = 0;
             for (const o of officers) {
@@ -581,8 +611,8 @@ export function createPolice(
       if (spiked) say('spikes', pick(LINES.spikes), () => null);
       // Lose the police by staying out of sight long enough.
       if (seen) lastSeen = time;
-      if (wanted > 0 && time - lastSeen > 6 + 3 * wanted) standDown();
-      return { shots, strikes, arrested, evading: wanted > 0 && !seen, spiked, blocked, tackled, pulledOut, gas };
+      if (wanted > 0 && !callPending && time - lastSeen > 6 + 3 * wanted) standDown();
+      return { shots, strikes, arrested, evading: wanted > 0 && !seen && !callPending, spiked, blocked, tackled, pulledOut, gas, called, arrived };
     },
     dispose() {
       scene.remove(heli, spot);
