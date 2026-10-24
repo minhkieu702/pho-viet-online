@@ -7,7 +7,7 @@ export type Session = { room: string; id: string; token: string };
 export type PlayerState = {
   x: number; z: number; angle: number; riding: boolean; speed: number; score: number;
   health?: number; weapon?: 'fists' | 'pistol' | 'shotgun' | 'smg' | 'grenade' | 'rpg';
-  vehicle?: 'foot' | 'scooter' | 'car' | 'police';
+  vehicle?: 'foot' | 'scooter' | 'car' | 'police' | 'boat' | 'swim';
   down?: boolean; firing?: boolean; wanted?: number;
 };
 export type PeerState = PlayerState & {

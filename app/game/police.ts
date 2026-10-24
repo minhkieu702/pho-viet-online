@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { ROADS } from './city';
+import { ROADS_X, ROADS_Z } from './city';
 import type { createRagdolls, RagdollBody, RagdollLook } from './ragdoll';
 import type { Car, createVehicles } from './vehicles';
 import { FIGURE, FigureBatch, PART, armGeometry, bodyGeometry, figureMaterial, legGeometry, palette, setStyle, styleOf } from './figures';
@@ -305,7 +305,8 @@ export function createPolice(
   function roadOf(player: PlayerView) {
     const alongX = Math.abs(Math.sin(player.heading)) > Math.abs(Math.cos(player.heading));
     const cross = alongX ? player.z : player.x;
-    const road = ROADS.reduce((best, r) => (Math.abs(r - cross) < Math.abs(best - cross) ? r : best), ROADS[0]);
+    const roads = alongX ? ROADS_Z : ROADS_X;
+    const road = roads.reduce((best, r) => (Math.abs(r - cross) < Math.abs(best - cross) ? r : best), roads[0]);
     return Math.abs(road - cross) < 9 ? { alongX, road, dir: Math.sign(alongX ? Math.sin(player.heading) : Math.cos(player.heading)) || 1 } : null;
   }
 
@@ -314,7 +315,8 @@ export function createPolice(
     const lane = roadOf(player);
     if (!lane) return false;
     const ahead = (lane.alongX ? player.x : player.z) + lane.dir * (40 + Math.random() * 20);
-    if (Math.abs(ahead) > Math.max(...ROADS) + 20) return false;
+    const junctions = lane.alongX ? ROADS_X : ROADS_Z;
+    if (ahead < junctions[0] - 20 || ahead > junctions[junctions.length - 1] + 20) return false;
     if (spikes.length >= MAX_SPIKES) spikes.shift();
     spikes.push(lane.alongX ? { x: ahead, z: lane.road, alongX: true, until: time + 45 } : { x: lane.road, z: ahead, alongX: false, until: time + 45 });
     return true;
@@ -325,7 +327,7 @@ export function createPolice(
     const lane = roadOf(player);
     if (!lane) return false;
     const now = lane.alongX ? player.x : player.z;
-    const junction = ROADS.filter((r) => (r - now) * lane.dir > 35 && (r - now) * lane.dir < 95).sort((a, b) => Math.abs(a - now) - Math.abs(b - now))[0];
+    const junction = (lane.alongX ? ROADS_X : ROADS_Z).filter((r) => (r - now) * lane.dir > 35 && (r - now) * lane.dir < 95).sort((a, b) => Math.abs(a - now) - Math.abs(b - now))[0];
     if (junction === undefined) return false;
     let placed = 0;
     for (const side of [-1, 1]) {

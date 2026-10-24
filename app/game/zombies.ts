@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { BOUND, BUILDINGS, ROADS, SIDEWALK } from './city';
+import { BUILDINGS, LAND, ROADS_X, ROADS_Z, SIDEWALK, inRect } from './city';
 import type { RagdollBody, RagdollLook } from './ragdoll';
 import type { createRagdolls } from './ragdoll';
 import { FIGURE, FigureBatch, PART, armGeometry, bodyGeometry, deriveStyle, figureMaterial, legGeometry, palette, setStyle, styleOf } from './figures';
@@ -106,11 +106,11 @@ export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof cr
         if (d > 20 && d < 60 && world.clear(door.x, door.z, 0.4)) return { x: door.x, z: door.z, rise: false };
       } else {
         const a = random() * Math.PI * 2, r = 22 + random() * 33;
-        const road = ROADS.reduce((best, v) => (Math.abs(v - (pz + Math.sin(a) * r)) < Math.abs(best - (pz + Math.sin(a) * r)) ? v : best), ROADS[0]);
+        const road = ROADS_Z.reduce((best, v) => (Math.abs(v - (pz + Math.sin(a) * r)) < Math.abs(best - (pz + Math.sin(a) * r)) ? v : best), ROADS_Z[0]);
         const along = random() < 0.5;
-        const x = along ? px + Math.cos(a) * r : ROADS.reduce((best, v) => (Math.abs(v - (px + Math.cos(a) * r)) < Math.abs(best - (px + Math.cos(a) * r)) ? v : best), ROADS[0]) + (random() < 0.5 ? -1 : 1) * SIDEWALK;
+        const x = along ? px + Math.cos(a) * r : ROADS_X.reduce((best, v) => (Math.abs(v - (px + Math.cos(a) * r)) < Math.abs(best - (px + Math.cos(a) * r)) ? v : best), ROADS_X[0]) + (random() < 0.5 ? -1 : 1) * SIDEWALK;
         const z = along ? road + (random() < 0.5 ? -1 : 1) * SIDEWALK : pz + Math.sin(a) * r;
-        if (Math.abs(x) > BOUND - 3 || Math.abs(z) > BOUND - 3) continue;
+        if (!inRect(LAND, x, z, 3)) continue;
         if (Math.hypot(x - px, z - pz) > 18 && world.clear(x, z, 0.45)) return { x, z, rise: true };
       }
     }

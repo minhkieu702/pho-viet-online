@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { BOUND, BUILDINGS, COLLIDERS, LAMPS, PLOTS, ROADS, SCENERY, VENUES, pathClearance, pointClear, type Building, type Plot, type Prop, type Rect, type Tree } from './city';
+import { BUILDINGS, COLLIDERS, LAMPS, LAND, PLOTS, RIVER, RIVER_BED, ROADS_X, ROADS_Z, SCENERY, VENUES, inRect, pathClearance, pointClear, type Building, type Plot, type Prop, type Rect, type Tree } from './city';
+import { buildSkyline } from './skyline';
 
 export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number };
 
@@ -7,24 +8,44 @@ export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number 
 export const CURB_HEIGHT = 0.14;
 const ASPHALT_HALF = 7; // carriageway half-width
 const SIDEWALK_EDGE = 12.5; // the paved sidewalk runs from the curb to the house fronts
-const ROAD_SPACING = ROADS[1] - ROADS[0];
-const ROAD_FIRST = ROADS[0];
-const ROAD_LAST = ROADS[ROADS.length - 1];
-/** Distance from a coordinate to the nearest road centre line on that axis. */
-const roadDistance = (v: number) => Math.abs(v - Math.min(ROAD_LAST, Math.max(ROAD_FIRST, ROAD_FIRST + Math.round((v - ROAD_FIRST) / ROAD_SPACING) * ROAD_SPACING)));
+const ROAD_FIRST = ROADS_Z[0];
+/** Distance from a coordinate to the nearest road centre line in a list. */
+const roadDistance = (roads: number[], v: number) => {
+  let best = Infinity;
+  for (const r of roads) best = Math.min(best, Math.abs(v - r));
+  return best;
+};
+/** Pier decks stand a little above the promenade; the steps beside them run down into the water. */
+export const PIER_DECK = 0.28;
+const STEPS_TOP = -136, STEPS_DROP = 1.8 / 4.5;
 
 /** Whether a point is on a raised sidewalk (crossings over the carriageway stay at road level). */
 export function onSidewalk(x: number, z: number) {
-  const dz = roadDistance(z);
+  const dz = roadDistance(ROADS_Z, z);
   // North-south roads start at the riverside road, so south of it only the riverside sidewalk exists.
-  const dx = z > ROAD_FIRST ? roadDistance(x) : Infinity;
+  const dx = z > ROAD_FIRST ? roadDistance(ROADS_X, x) : Infinity;
   if (dz < ASPHALT_HALF || dx < ASPHALT_HALF) return false;
   return dz < SIDEWALK_EDGE || dx < SIDEWALK_EDGE;
 }
 
-/** Walkable surface height: sidewalks, the park lawn and the tiled square sit above the street. */
+/** The dock (pier or steps) under a point, if any. */
+export function dockAt(x: number, z: number) {
+  if (z > -134.6 || z < -152) return null;
+  for (const d of SCENERY.docks) if (inRect(d.pier, x, z) || inRect(d.steps, x, z)) return d;
+  return null;
+}
+
+/** Walkable surface height: sidewalks, the park lawn and the tiled square sit above the street; in the river it is the bed. */
 export function groundHeight(x: number, z: number) {
+  if (z < -136.4) {
+    for (const d of SCENERY.docks) {
+      if (inRect(d.pier, x, z)) return PIER_DECK;
+      if (inRect(d.steps, x, z)) return 0.1 + Math.min(0, z - STEPS_TOP) * STEPS_DROP;
+    }
+    return z < RIVER.maxZ ? RIVER_BED : 0.1;
+  }
   if (x > 13 && x < 43 && z > -44 && z < -22) return 0.24;
+  if (x > 228.5 && x < 257.5 && ((z > 12.5 && z < 41.5) || (z > 66.5 && z < 95.5))) return z < 50 ? 0.26 : 0.25;
   if (x > 14.5 && x < 43.5 && z > 29.5 && z < 46.5) return 0.27;
   return onSidewalk(x, z) ? 0.1 + CURB_HEIGHT : 0.1;
 }
@@ -829,6 +850,7 @@ export function buildWorld(scene: THREE.Scene) {
     }
   }
 
+  const downtown: { plot: Plot; building: Building }[] = [];
   BUILDINGS.forEach((b, i) => {
     const p = PLOTS[i];
     if (p.style === 'legacy') legacyHouse(p, b);
@@ -838,29 +860,54 @@ export function buildWorld(scene: THREE.Scene) {
     else if (p.style === 'pagoda') pagodaBuilding(p, b);
     else if (p.style === 'office') officeBuilding(p, b);
     else if (p.style === 'kiosk') kiosk(p, b);
+    else if (p.style === 'tower' || p.style === 'midrise') downtown.push({ plot: p, building: b });
     else newHouse(p, b);
   });
+  const skyline = buildSkyline({ root, materials, geometries, textures, shape, sign }, downtown);
+  {
+    // The walking-street plaza: pale granite in a grid, and the city park's lawn with gravel paths.
+    const { plaza, cityPark: park } = SCENERY;
+    const pc = centre(plaza), kc = centre(park);
+    box('#ddd6c6', pc.x, 0.17, pc.z, plaza.maxX - plaza.minX, 0.18, plaza.maxZ - plaza.minZ, 0, false, 'ground');
+    for (let x = plaza.minX + 2.9; x < plaza.maxX; x += 2.9) box('#c9c1af', x, 0.265, pc.z, 0.08, 0.01, plaza.maxZ - plaza.minZ, 0, false, 'ground');
+    for (let z = plaza.minZ + 2.9; z < plaza.maxZ; z += 2.9) box('#c9c1af', pc.x, 0.266, z, plaza.maxX - plaza.minX, 0.01, 0.08, 0, false, 'ground');
+    // The walking street's fountain: a wide basin, a bowl on a column and jets of water.
+    shape('cylinder', '#d9d2c2', pc.x, 0.55, pc.z, 3.5, 0.6, 3.5);
+    shape('cylinder', '#6fb0b4', pc.x, 0.86, pc.z, 3.15, 0.04, 3.15, 0, 0, true, 'water');
+    shape('cylinder', '#d9d2c2', pc.x, 1.5, pc.z, 0.45, 1.8, 0.45);
+    shape('cylinder', '#d9d2c2', pc.x, 2.45, pc.z, 1.7, 0.22, 1.7);
+    shape('cylinder', '#7fc0c4', pc.x, 2.58, pc.z, 1.5, 0.04, 1.5, 0, 0, false, 'water');
+    shape('cylinder', '#bfe3e6', pc.x, 3.4, pc.z, 0.1, 1.6, 0.1, 0, 0, false, 'water');
+    shape('ball', '#d7f0f2', pc.x, 4.25, pc.z, 0.32, 0.36, 0.32, 0, 0, false, 'water');
+    for (let k = 0; k < 8; k++) {
+      const a = (k / 8) * PI * 2;
+      shape('cylinder', '#bfe3e6', pc.x + Math.cos(a) * 2.3, 1.35, pc.z + Math.sin(a) * 2.3, 0.05, 1.0, 0.05, -a, 0.35, false, 'water');
+    }
+    box('#8fae7f', kc.x, 0.15, kc.z, park.maxX - park.minX, 0.2, park.maxZ - park.minZ, 0, false);
+    box('#d8cfb2', kc.x, 0.26, kc.z, 2.6, 0.04, park.maxZ - park.minZ, 0, false, 'ground');
+    box('#d8cfb2', kc.x, 0.261, kc.z, park.maxX - park.minX, 0.04, 2.6, 0, false, 'ground');
+  }
 
   // ---- Ground, roads, markings and crosswalks. ----
-  box('#b4b99a', 0, -0.22, 96.7, 660, 0.42, 466.6, 0, false);
-  box('#b4b99a', 0, -0.22, -272.5, 660, 0.42, 135, 0, false);
-  box('#d7d1bb', 0, -0.01, 39.25, 440, 0.12, 351.5, 0, false, 'ground');
-  const roads = ROADS;
-  for (const road of roads) {
-    box('#5f6a68', 0, 0.04, road, 442, 0.08, ASPHALT_HALF * 2, 0, false, 'ground');
-    box('#5f6a68', road, 0.039, 56, ASPHALT_HALF * 2, 0.08, 328, 0, false, 'ground');
-    for (let i = -211; i < 216; i += 9) {
-      if (roads.every((r) => Math.abs(r - i) > 10)) {
-        box('#e3d4a7', i, 0.076, road, 3.2, 0.015, 0.17, 0, false, 'ground');
-        if (i > -98) box('#e3d4a7', road, 0.075, i, 0.17, 0.015, 3.2, 0, false, 'ground');
-      }
-    }
-    for (const crossing of roads) {
-      // Zebra crossings sit on the walking lines, just outside the junction.
-      for (const side of [-1, 1]) for (let stripe = -5.5; stripe <= 5.5; stripe += 1.375) {
-        if (!(crossing === ROAD_FIRST && side < 0)) box('#e4e3d4', road + stripe, 0.078, crossing + side * 8.6, 0.7, 0.015, 2.6, 0, false, 'ground');
-        box('#e4e3d4', road + side * 8.6, 0.079, crossing + stripe, 2.6, 0.015, 0.7, 0, false, 'ground');
-      }
+  // East-west roads run on past the fences into the haze; north-south ones from the riverside road south.
+  const WEST = LAND.minX - 85, EAST = LAND.maxX + 85, SOUTH = LAND.maxZ + 80;
+  const groundWest = -330, groundEast = LAND.maxX + 260;
+  box('#b4b99a', (groundWest + groundEast) / 2, -0.22, 96.7, groundEast - groundWest, 0.42, 466.6, 0, false);
+  box('#b4b99a', (groundWest + groundEast) / 2, -0.22, -272.5, groundEast - groundWest, 0.42, 135, 0, false);
+  box('#d7d1bb', (WEST + EAST) / 2, -0.01, (-136.5 + SOUTH) / 2, EAST - WEST, 0.12, SOUTH + 136.5, 0, false, 'ground');
+  for (const road of ROADS_Z) {
+    box('#5f6a68', (WEST + EAST) / 2, 0.04, road, EAST - WEST, 0.08, ASPHALT_HALF * 2, 0, false, 'ground');
+    for (let i = WEST + 4; i < EAST; i += 9) if (ROADS_X.every((r) => Math.abs(r - i) > 10)) box('#e3d4a7', i, 0.076, road, 3.2, 0.015, 0.17, 0, false, 'ground');
+  }
+  for (const road of ROADS_X) {
+    box('#5f6a68', road, 0.039, (ROAD_FIRST + SOUTH) / 2, ASPHALT_HALF * 2, 0.08, SOUTH - ROAD_FIRST, 0, false, 'ground');
+    for (let i = ROAD_FIRST + 10; i < SOUTH; i += 9) if (ROADS_Z.every((r) => Math.abs(r - i) > 10)) box('#e3d4a7', road, 0.075, i, 0.17, 0.015, 3.2, 0, false, 'ground');
+  }
+  // Zebra crossings sit on the walking lines, just outside each junction.
+  for (const rx of ROADS_X) for (const rz of ROADS_Z) {
+    for (const side of [-1, 1]) for (let stripe = -5.5; stripe <= 5.5; stripe += 1.375) {
+      if (!(rz === ROAD_FIRST && side < 0)) box('#e4e3d4', rx + stripe, 0.078, rz + side * 8.6, 0.7, 0.015, 2.6, 0, false, 'ground');
+      box('#e4e3d4', rx + side * 8.6, 0.079, rz + stripe, 2.6, 0.015, 0.7, 0, false, 'ground');
     }
   }
   // Raised sidewalks: paving slabs from the curb to the house fronts, with a pale stone curb along the
@@ -892,12 +939,10 @@ export function buildWorld(scene: THREE.Scene) {
     }
     for (const [a, b] of spansBetween(cuts, ASPHALT_HALF, from, to)) place((a + b) / 2, b - a, curbAt, 0.36, slabTop + 0.015, '#d9d5ca');
   }
-  for (const road of roads) for (const side of [-1, 1]) {
-    // East-west roads: cut where north-south carriageways cross (none south of the riverside road).
-    pavement(true, road, side, -220, 220, road === ROAD_FIRST && side < 0 ? [] : roads, ASPHALT_HALF);
-    // North-south roads: from the riverside road to the north edge, leaving the corners to the east-west pavements.
-    pavement(false, road, side, ROAD_FIRST, 215, roads, SIDEWALK_EDGE);
-  }
+  // East-west roads: cut where north-south carriageways cross (none south of the riverside road).
+  for (const road of ROADS_Z) for (const side of [-1, 1]) pavement(true, road, side, WEST + 2, EAST - 2, road === ROAD_FIRST && side < 0 ? [] : ROADS_X, ASPHALT_HALF);
+  // North-south roads: from the riverside road to the edge, leaving the corners to the east-west pavements.
+  for (const road of ROADS_X) for (const side of [-1, 1]) pavement(false, road, side, ROAD_FIRST, SOUTH - 5, ROADS_Z, SIDEWALK_EDGE);
 
   // ---- The original park block and tiled square. ----
   const { park } = SCENERY;
@@ -983,7 +1028,7 @@ export function buildWorld(scene: THREE.Scene) {
   }
 
   // ---- Street trees, park trees and bamboo. ----
-  const nearRoad = (t: Tree) => roads.some((r) => Math.abs(Math.abs(t.x - r) - 9.3) < 0.6 || Math.abs(Math.abs(t.z - r) - 9.3) < 0.6);
+  const nearRoad = (t: Tree) => ROADS_X.some((r) => Math.abs(Math.abs(t.x - r) - 9.3) < 0.6) || ROADS_Z.some((r) => Math.abs(Math.abs(t.z - r) - 9.3) < 0.6);
   for (const t of SCENERY.trees) {
     lift = onPavement(t.x, t.z);
     tree(t, nearRoad(t));
@@ -1257,24 +1302,85 @@ export function buildWorld(scene: THREE.Scene) {
   }
 
   // ---- Riverside promenade, the river and the far bank. ----
-  for (let x = -198; x <= 198; x += 4) box('#cfc2a6', x, 0.056, -127, 0.06, 0.01, 18, 0, false, 'ground');
-  box('#cfc2a6', 0, 0.057, -119.8, 400, 0.01, 0.06, 0, false, 'ground');
-  box('#cfc2a6', 0, 0.057, -133.9, 400, 0.01, 0.06, 0, false, 'ground');
-  box('#bbaf96', 0, -0.55, -137.1, 660, 1.3, 1.2, 0, true);
-  box('#e2cfaa', 0, 0.45, -136.1, 400, 0.12, 0.2);
-  box('#e2cfaa', 0, 0.95, -136.1, 400, 0.1, 0.16);
-  for (let x = -198; x <= 198; x += 2.5) box('#d6c4a1', x, 0.5, -136.1, 0.16, 0.95, 0.16);
-  for (let x = -190; x <= 190; x += 3.2) {
+  const promenadeEast = LAND.maxX + 60;
+  const midX = (groundWest + groundEast) / 2, spanX = groundEast - groundWest;
+  for (let x = -198; x <= promenadeEast; x += 4) box('#cfc2a6', x, 0.056, -127, 0.06, 0.01, 18, 0, false, 'ground');
+  box('#cfc2a6', (-200 + promenadeEast) / 2, 0.057, -119.8, promenadeEast + 200, 0.01, 0.06, 0, false, 'ground');
+  box('#cfc2a6', (-200 + promenadeEast) / 2, 0.057, -133.9, promenadeEast + 200, 0.01, 0.06, 0, false, 'ground');
+  box('#bbaf96', midX, -0.55, -137.1, spanX, 1.3, 1.2, 0, true);
+  // The railing, with openings onto each pier and its steps.
+  const gaps = SCENERY.docks.flatMap((d) => [[d.pier.minX - 0.2, d.pier.maxX + 0.2], [d.steps.minX - 0.2, d.steps.maxX + 0.2]]).sort((a, b) => a[0] - b[0]);
+  let railFrom = -200;
+  for (const [g0, g1] of [...gaps, [promenadeEast, promenadeEast]]) {
+    if (g0 > railFrom) {
+      box('#e2cfaa', (railFrom + g0) / 2, 0.45, -136.1, g0 - railFrom, 0.12, 0.2);
+      box('#e2cfaa', (railFrom + g0) / 2, 0.95, -136.1, g0 - railFrom, 0.1, 0.16);
+      for (let x = railFrom; x <= g0; x += 2.5) box('#d6c4a1', x, 0.5, -136.1, 0.16, 0.95, 0.16);
+      box('#d6c4a1', g0, 0.5, -136.1, 0.16, 0.95, 0.16);
+    }
+    railFrom = g1;
+  }
+  for (let x = -190; x <= promenadeEast - 20; x += 3.2) {
     const fx = x + decor() * 1.2;
     if (softFree(fx, -120.4, 0.6)) {
       box('#a58b6b', fx, 0.2, -120.4, 1.6, 0.3, 0.7, 0, false);
       flowers(fx, 0.38, -120.4, 6, 1.4, 0.5, Math.floor(fx * 10));
     }
   }
-  box('#5f9f98', 0, -0.95, -171, 660, 0.3, 67.6, 0, false, 'water');
-  box('#bbaf96', 0, -0.55, -205, 660, 1.3, 1.4, 0, false);
+  box('#5f9f98', midX, -0.95, -171, spanX, 0.3, 67.6, 0, false, 'water');
+  box('#4f8a84', midX, RIVER_BED - 0.1, -171, spanX, 0.2, 67.6, 0, false);
+  box('#bbaf96', midX, -0.55, -205, spanX, 1.3, 1.4, 0, false);
+  // The far bank is fenced off: a railing along the top of its wall.
+  box('#c9c3b4', midX, 0.55, -204.6, spanX, 0.1, 0.12, 0, false);
+  box('#c9c3b4', midX, 1.05, -204.6, spanX, 0.1, 0.12, 0, false);
+  for (let x = LAND.minX - 60; x <= LAND.maxX + 60; x += 3) box('#b5ae9e', x, 0.6, -204.6, 0.14, 1.2, 0.14, 0, false);
+  // Buoy lines across the river where the playable water ends (a swimmer or a boat turns back there).
+  for (const bx of [RIVER.minX, RIVER.maxX]) {
+    for (let z = RIVER.maxZ - 0.6; z > RIVER.minZ; z -= 2.6) {
+      shape('ball', '#f07a2a', bx, -0.72, z, 0.45, 0.4, 0.45, 0, 0, false);
+      shape('cylinder', '#f4f1e6', bx, -0.5, z, 0.2, 0.18, 0.2, 0, 0, false);
+    }
+    box('#e9e1cf', bx, -0.62, (RIVER.minZ + RIVER.maxZ) / 2, 0.06, 0.06, RIVER.maxZ - RIVER.minZ, 0, false);
+  }
+  // Docks: a timber pier on piles out over the water, steps down beside it, a gate with the dock's name and lamps.
+  for (const dock of SCENERY.docks) {
+    const { pier, steps } = dock;
+    const px = (pier.minX + pier.maxX) / 2, pw = pier.maxX - pier.minX;
+    const deckFrom = -136.4, deckTo = pier.minZ;
+    box('#8a6a4c', px, PIER_DECK - 0.09, (deckFrom + deckTo) / 2, pw, 0.18, deckFrom - deckTo, 0, true);
+    for (let z = deckFrom - 0.3; z > deckTo; z -= 0.6) box('#7a5c40', px, PIER_DECK + 0.005, z, pw - 0.1, 0.012, 0.06, 0, false);
+    for (let z = deckFrom - 1.5; z > deckTo; z -= 3) for (const side of [-1, 1]) shape('cylinder', '#5a4330', px + side * (pw / 2 - 0.2), -1.4, z, 0.16, 3.4, 0.16, 0, 0, false);
+    for (const side of [-1, 1]) {
+      box('#6e5238', px + side * (pw / 2 - 0.05), PIER_DECK + 0.95, (deckFrom + deckTo) / 2 - 1, 0.08, 0.08, deckFrom - deckTo - 2.4, 0, false);
+      for (let z = deckFrom - 0.6; z > deckTo + 2.4; z -= 2) box('#6e5238', px + side * (pw / 2 - 0.05), PIER_DECK + 0.5, z, 0.1, 0.95, 0.1, 0, false);
+    }
+    // Mooring posts and tyres along the open end.
+    for (const side of [-1, 1]) shape('cylinder', '#3b3f42', px + side * (pw / 2 - 0.3), PIER_DECK + 0.3, deckTo + 0.4, 0.18, 0.6, 0.18, 0, 0, false);
+    for (const side of [-1, 1]) shape('cylinder', '#1f2224', px + side * (pw / 2 + 0.1), PIER_DECK - 0.45, deckTo + 3, 0.35, 0.18, 0.35, 0, HALF_PI, false);
+    // Stone steps down to the waterline.
+    const sx = (steps.minX + steps.maxX) / 2, sw = steps.maxX - steps.minX;
+    for (let k = 0; k < 9; k++) {
+      const z0 = STEPS_TOP - k * 0.5, top = 0.1 - k * 0.5 * STEPS_DROP;
+      box('#c2b59a', sx, (top - 2.9) / 2, z0 - 0.25, sw, top + 2.9, 0.5, 0, false);
+    }
+    for (const side of [-1, 1]) box('#d6c4a1', sx + side * (sw / 2 + 0.08), -0.4, -138.3, 0.12, 1.2, 4.4, 0, false);
+    // The gate: two posts and a lintel with the dock's name.
+    for (const side of [-1, 1]) box('#7a4a2e', px + side * (pw / 2 + 0.25), 1.6, -135.4, 0.3, 3.2, 0.3);
+    box('#7a4a2e', px, 3.25, -135.4, pw + 1.2, 0.35, 0.4);
+    sign(dock.name, dock.rental ? 'CA NÔ • 30.000Đ / LƯỢT' : 'TÀU BUÝT SÔNG • ĐÒ NGANG', dock.rental ? '#1f5a8a' : '#8e2b20', px, 3.9, -135.2, Math.max(pw + 1.4, 6.2), 0.9, PI, '#f6efe0');
+    for (const side of [-1, 1]) {
+      shape('cylinder', '#2b2f33', px + side * (pw / 2 - 0.2), PIER_DECK + 1.3, deckTo + 1, 0.06, 2.6, 0.06, 0, 0, false);
+      shape('ball', '#fff2c8', px + side * (pw / 2 - 0.2), PIER_DECK + 2.7, deckTo + 1, 0.22, 0.25, 0.22, 0, 0, false, 'lamp');
+    }
+    if (dock.rental) {
+      // The rental kiosk at the head of the pier and a stack of life rings.
+      box('#e8e2d0', px - pw / 2 - 2.6, 1.2, -132.4, 2.4, 2.4, 1.8);
+      box('#1f5a8a', px - pw / 2 - 2.6, 2.55, -132.4, 2.8, 0.3, 2.2);
+      shape('cylinder', '#f05a2a', px - pw / 2 - 1.1, 0.5, -134, 0.35, 0.1, 0.35, 0, HALF_PI, false);
+    }
+  }
   const farTrees = seeded(77);
-  for (let i = 0; i < 46; i++) {
+  for (let i = 0; i < 64; i++) {
     const x = -300 + i * 13.3 + farTrees() * 6;
     const s = 0.9 + farTrees() * 0.5;
     const tz = -211 - farTrees() * 8, tint = farTrees();
@@ -1284,7 +1390,7 @@ export function buildWorld(scene: THREE.Scene) {
     shape('puff', leaf('#4f8049', '#78a564', 0.35, tint), x, 4.5 * s, tz, 2.6 * s, 2.4 * s, 2.6 * s, yaw, 0, false);
     shape('puff', leaf('#4f8049', '#78a564', 0.95, tint), x + 0.8 * s, 5.9 * s, tz + 0.3 * s, 1.6 * s, 1.5 * s, 1.6 * s, yaw + 1, 0, false);
   }
-  for (let i = 0; i < 26; i++) {
+  for (let i = 0; i < 40; i++) {
     const x = -260 + i * 21;
     const h = 14 + ((i * 13) % 30);
     const zz = -232 - (i % 3) * 12;
@@ -1301,7 +1407,7 @@ export function buildWorld(scene: THREE.Scene) {
     shape('gable', '#a58d5c', bx, 0.65, bz, 1.6, 0.6, 2.6, yaw, 0, false);
   }
   const waves: { x: number; z: number; width: number }[] = [];
-  for (let i = 0; i < 46; i++) waves.push({ x: -200 + ((i * 37) % 400), z: -141 - ((i * 11) % 60), width: 2 + (i % 4) * 1.4 });
+  for (let i = 0; i < 80; i++) waves.push({ x: -200 + ((i * 37) % (LAND.maxX + 260)), z: -141 - ((i * 11) % 60), width: 2 + (i % 4) * 1.4 });
   const waveGeometry = new THREE.PlaneGeometry(1, 0.14).rotateX(-HALF_PI);
   const waveMaterial = new THREE.MeshBasicMaterial({ color: '#b5d2b7', transparent: true, opacity: 0.32 });
   geometries.push(waveGeometry);
@@ -1311,14 +1417,49 @@ export function buildWorld(scene: THREE.Scene) {
   waveMesh.frustumCulled = false;
   root.add(waveMesh);
 
-  // ---- Edge scenery: a quieter ring of houses and trees beyond the playable streets. ----
+  // ---- The fence round the land: a rendered wall with a tiled cap, and striped barriers where a road runs out. ----
+  const fenceLines: { alongX: boolean; at: number; from: number; to: number; roads: number[] }[] = [
+    { alongX: false, at: LAND.minX - 0.6, from: -136, to: LAND.maxZ + 0.6, roads: ROADS_Z },
+    { alongX: false, at: LAND.maxX + 0.6, from: -136, to: LAND.maxZ + 0.6, roads: ROADS_Z },
+    { alongX: true, at: LAND.maxZ + 0.6, from: LAND.minX - 0.6, to: LAND.maxX + 0.6, roads: ROADS_X },
+  ];
+  for (const line of fenceLines) {
+    const put = (along: number, length: number, y: number, h: number, depth: number, color: string, role: 'solid' | 'lamp' = 'solid', shadow = true) =>
+      line.alongX ? box(color, along, y, line.at, length, h, depth, 0, shadow, role) : box(color, line.at, y, along, depth, h, length, 0, shadow, role);
+    let from = line.from;
+    const cuts = line.roads.map((r) => [r - 7.2, r + 7.2]).filter(([a, b]) => b > line.from && a < line.to);
+    for (const [a, b] of [...cuts, [line.to, line.to]]) {
+      if (a > from) {
+        put((from + a) / 2, a - from, 1.1, 2.2, 0.3, '#e6dccb');
+        put((from + a) / 2, a - from + 0.1, 2.28, 0.16, 0.44, '#a5533a');
+        for (let k = from; k <= a; k += 3.2) put(k, 0.4, 1.15, 2.3, 0.42, '#d2c5ae');
+      }
+      if (b > a && b !== line.to) {
+        // A road barrier: red and white striped boards on posts, a no-entry sign and blinking lamps.
+        const mid = (a + b) / 2;
+        for (let k = -2; k < 2; k++) put(mid + (k + 0.5) * 3.4, 3.2, 0.95, 0.42, 0.14, k % 2 ? '#f4f1e6' : '#c8322a', 'solid', false);
+        for (let k = -2; k < 2; k++) put(mid + (k + 0.5) * 3.4, 3.2, 0.45, 0.32, 0.14, k % 2 ? '#c8322a' : '#f4f1e6', 'solid', false);
+        for (const k of [-6.8, -3.4, 0, 3.4, 6.8]) put(mid + k, 0.12, 0.6, 1.2, 0.12, '#3b3f42', 'solid', false);
+        for (const k of [-5, 5]) put(mid + k, 0.22, 1.32, 0.18, 0.22, '#ffb43a', 'lamp', false);
+        const sx = line.alongX ? mid + 4.6 : line.at, sz = line.alongX ? line.at : mid + 4.6;
+        shape('cylinder', '#5f6a68', sx, 1.2, sz, 0.06, 2.4, 0.06, 0, 0, false);
+        shape('cylinder', '#c8322a', sx, 2.6, sz, 0.45, 0.06, 0.45, 0, HALF_PI, false);
+        const face = line.alongX ? PI : line.at < 0 ? HALF_PI : -HALF_PI;
+        sign('ĐƯỜNG CẤM', 'HẾT KHU VỰC', '#c8322a', sx - Math.sin(face) * -0.1, 3.4, sz - Math.cos(face) * -0.1, 1.9, 0.48, face, '#f4f1e6');
+      }
+      from = Math.max(from, b);
+    }
+  }
+
+  // ---- Edge scenery: a quieter ring of houses and trees beyond the fences. ----
   const edge = seeded(911);
   const BACKGROUND = ['#d8c7a8', '#c9d1c4', '#d9b9a3', '#c6cdd6', '#e0d4b8', '#bfcab5'];
-  for (let gx = -212; gx <= 212; gx += 17) {
-    for (let gz = -134; gz <= 212; gz += 17) {
+  for (let gx = LAND.minX - 72; gx <= LAND.maxX + 40; gx += 17) {
+    for (let gz = -134; gz <= LAND.maxZ + 72; gz += 17) {
       const x = gx + (edge() - 0.5) * 4, z = gz + (edge() - 0.5) * 4;
-      if (Math.max(Math.abs(x), Math.abs(z)) < 149 || z < -112) continue;
-      if (roads.some((r) => Math.abs(x - r) < 17 || Math.abs(z - r) < 17)) continue;
+      if ((x > LAND.minX - 12 && x < LAND.maxX + 12 && z < LAND.maxZ + 12) || z < -112) continue;
+      if (x > LAND.maxX + 12 && z < LAND.maxZ + 12) continue;
+      if (ROADS_X.some((r) => Math.abs(x - r) < 17) || ROADS_Z.some((r) => Math.abs(z - r) < 17)) continue;
       if (edge() < 0.25) {
         const s = 1 + edge() * 0.5;
         const tint = edge(), yaw = edge() * 3;
@@ -1341,11 +1482,12 @@ export function buildWorld(scene: THREE.Scene) {
   // ---- Rain puddles (shown only when wet). ----
   const puddleSpots: { x: number; z: number; s: number; yaw: number }[] = [];
   const pr = seeded(2026);
-  for (let i = 0; i < 90; i++) {
-    const road = pickOf(pr, roads), along = (pr() - 0.5) * 2 * 128;
-    const offset = (pr() < 0.5 ? -1 : 1) * (4.2 + pr() * 2.4);
+  for (let i = 0; i < 160; i++) {
     const horizontal = pr() < 0.5;
-    if (roads.some((r) => Math.abs(along - r) < 9)) continue;
+    const road = pickOf(pr, horizontal ? ROADS_Z : ROADS_X);
+    const along = horizontal ? LAND.minX + 5 + pr() * (LAND.maxX - LAND.minX - 10) : ROAD_FIRST + 12 + pr() * (LAND.maxZ - ROAD_FIRST - 16);
+    const offset = (pr() < 0.5 ? -1 : 1) * (4.2 + pr() * 2.4);
+    if ((horizontal ? ROADS_X : ROADS_Z).some((r) => Math.abs(along - r) < 9)) continue;
     puddleSpots.push({ x: horizontal ? along : road + offset, z: horizontal ? road + offset : along, s: 1.2 + pr() * 2.4, yaw: pr() * PI });
   }
   const puddleGeometry = new THREE.CircleGeometry(0.5, 14).rotateX(-HALF_PI);
@@ -1483,15 +1625,18 @@ export function buildWorld(scene: THREE.Scene) {
     /** A random spot on a road or its sidewalks, clear of buildings. */
     const streetSpot = (margin: number) => {
       for (let attempt = 0; attempt < 20; attempt++) {
-        const road = ROADS[Math.floor(r() * ROADS.length)];
-        const along = (r() * 2 - 1) * (BOUND - 6), across = (r() * 2 - 1) * 12;
-        const [x, z] = r() < 0.5 ? [along, road + across] : [road + across, along];
-        if (z < ROADS[0] - 12 || !pointClear(x, z, margin)) continue;
+        const horizontal = r() < 0.5;
+        const list = horizontal ? ROADS_Z : ROADS_X;
+        const road = list[Math.floor(r() * list.length)];
+        const across = (r() * 2 - 1) * 12;
+        const along = horizontal ? LAND.minX + 6 + r() * (LAND.maxX - LAND.minX - 12) : ROAD_FIRST - 12 + r() * (LAND.maxZ - ROAD_FIRST + 6);
+        const [x, z] = horizontal ? [along, road + across] : [road + across, along];
+        if (z < ROAD_FIRST - 12 || !inRect(LAND, x, z, 2) || !pointClear(x, z, margin)) continue;
         return { x, z, y: groundHeight(x, z) };
       }
       return null;
     };
-    for (let i = 0; i < 150; i++) {
+    for (let i = 0; i < 260; i++) {
       const p = streetSpot(0.6);
       if (!p) continue;
       // Rubble piles: a few broken chunks heaped together.
@@ -1501,20 +1646,20 @@ export function buildWorld(scene: THREE.Scene) {
         put('rubble', p.x + (r() - 0.5) * 1.2, p.y + s * 0.3, p.z + (r() - 0.5) * 1.2, s * (1 + r()), s * 0.6, s * (1 + r() * 0.6), r() * PI, r() < 0.5 ? '#8f877a' : '#6f675c', r());
       }
     }
-    for (let i = 0; i < 90; i++) {
+    for (let i = 0; i < 150; i++) {
       const p = streetSpot(0.5);
       if (p) put('trash', p.x, p.y + 0.22, p.z, 0.34 + r() * 0.12, 0.28, 0.32, r() * PI, r() < 0.7 ? '#1f2224' : '#2f3a2c');
     }
-    for (let i = 0; i < 80; i++) {
+    for (let i = 0; i < 140; i++) {
       const p = streetSpot(0.3);
       if (p) put('stain', p.x, p.y + 0.012, p.z, 0.4 + r() * 1.1, 1, 0.3 + r() * 0.8, r() * PI, r() < 0.75 ? '#4a1510' : '#2a221e');
     }
-    for (let i = 0; i < 160; i++) {
+    for (let i = 0; i < 280; i++) {
       const p = streetSpot(0.2);
       if (p) put('paper', p.x, p.y + 0.014, p.z, 0.25 + r() * 0.2, 1, 0.3 + r() * 0.2, r() * PI, r() < 0.6 ? '#d9d4c4' : '#b9b09a');
     }
     // Sandbag walls and plank barriers across the roads near some junctions, with a burning barrel.
-    for (const cx of ROADS) for (const cz of ROADS) {
+    for (const cx of ROADS_X) for (const cz of ROADS_Z) {
       if (r() < 0.55) continue;
       const alongX = r() < 0.5, side = r() < 0.5 ? -1 : 1;
       const at = (u: number, v: number) => (alongX ? { x: cx + side * 13 + v, z: cz + u } : { x: cx + u, z: cz + side * 13 + v });
@@ -1551,9 +1696,11 @@ export function buildWorld(scene: THREE.Scene) {
     root.add(group);
     return group;
   }
+  const sky = new THREE.Color('#bcd2dc');
   return {
     colliders,
     update(time: number) {
+      skyline.update(time);
       waves.forEach((wave, i) => {
         matrix.compose(position.set(wave.x + Math.sin(time * 0.3 + i) * 0.6, -0.78, wave.z), identity, scale.set(wave.width, 1, 1));
         waveMesh.setMatrixAt(i, matrix);
@@ -1591,7 +1738,8 @@ export function buildWorld(scene: THREE.Scene) {
     /** Burning barrels of zombie mode (empty in the normal city). */
     get fires() { return apocalypse ? fires : []; },
     /** `night` 0..1 lights windows, lamps, signs and light pools; `wet` 0..1 darkens and glosses the paving. */
-    setAtmosphere(a: { night: number; wet: number }) {
+    setAtmosphere(a: { night: number; wet: number; sky?: THREE.Color }) {
+      if (a.sky) sky.copy(a.sky);
       const night = Math.min(1, Math.max(0, a.night || 0));
       const wet = Math.min(1, Math.max(0, a.wet || 0));
       if (Math.abs(night - lastNight) < 0.004 && Math.abs(wet - lastWet) < 0.004) return;
@@ -1609,6 +1757,7 @@ export function buildWorld(scene: THREE.Scene) {
       roles.neon.emissiveIntensity = (0.45 + night * 1.9) * (apocalypse ? 0.03 : 1);
       neonPoolMaterial.opacity = night * 0.75;
       neonPoolMesh.visible = night > 0.02 && !apocalypse;
+      skyline.setAtmosphere(night, power, sky);
       roles.ground.color.copy(groundBase).multiplyScalar(1 - 0.38 * wet);
       roles.ground.roughness = 0.9 - 0.62 * wet;
       roles.ground.metalness = 0.12 * wet;

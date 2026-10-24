@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import type { Collider } from './world';
+import { LAND, RIVER } from './city';
 import { FigureBatch, palette, figureMaterial, ragdollHeadGeometry, ragdollLimbGeometry, ragdollTorsoGeometry, styleOf } from './figures';
 
 /**
@@ -69,7 +70,6 @@ const GRAVITY = -24;
 const DRAG = 0.996;
 const RADIUS = 0.12;
 const MAX_BODIES = 18;
-const BOUND = 138;
 // Crowd-model units to ragdoll units across the torso, the head radius, and limbs a little slimmer than their physics thickness.
 const TORSO_WIDTH = 1.35;
 const HEAD_RADIUS = 0.34;
@@ -337,8 +337,9 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
         else if (least === near) { p[i + 2] = c.minZ - r; q[i + 2] = p[i + 2] + (q[i + 2] - p[i + 2]) * 0.2; }
         else { p[i + 2] = c.maxZ + r; q[i + 2] = p[i + 2] + (q[i + 2] - p[i + 2]) * 0.2; }
       }
-      p[i] = Math.max(-BOUND, Math.min(BOUND, p[i]));
-      p[i + 2] = Math.max(-BOUND, Math.min(BOUND, p[i + 2]));
+      // Bodies stay inside the fences (or in the river).
+      p[i] = Math.max(LAND.minX, Math.min(LAND.maxX, p[i]));
+      p[i + 2] = Math.max(RIVER.minZ, Math.min(LAND.maxZ, p[i + 2]));
       motion += Math.abs(p[i] - q[i]) + Math.abs(p[i + 1] - q[i + 1]) + Math.abs(p[i + 2] - q[i + 2]);
     }
     body.still = motion < 0.004 ? body.still + 1 : 0;

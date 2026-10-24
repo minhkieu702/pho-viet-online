@@ -67,11 +67,11 @@ export function playerState(value: unknown): PlayerState {
   if (typeof state.riding !== 'boolean') throw new ClientError('Trạng thái phương tiện không hợp lệ.');
   const angle = numberIn(state.angle, -1_000_000, 1_000_000);
   return {
-    x: numberIn(state.x, -85, 85), z: numberIn(state.z, -85, 85),
+    x: numberIn(state.x, -140, 355), z: numberIn(state.z, -206, 140),
     angle: ((angle + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI,
     riding: state.riding, speed: numberIn(state.speed, -36, 36), score: Math.floor(numberIn(state.score, 0, 1_000_000)),
     health: integer(state.health, 0, 100, 100), weapon: oneOf(state.weapon, ['fists', 'pistol', 'shotgun', 'smg', 'grenade', 'rpg'] as const, 'fists'),
-    vehicle: oneOf(state.vehicle, ['foot', 'scooter', 'car', 'police'] as const, state.riding ? 'scooter' : 'foot'),
+    vehicle: oneOf(state.vehicle, ['foot', 'scooter', 'car', 'police', 'boat', 'swim'] as const, state.riding ? 'scooter' : 'foot'),
     down: state.down === true, firing: state.firing === true, wanted: integer(state.wanted, 0, 5, 0),
   };
 }

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { BOUND, ROADS } from './city';
+import { LAND, ROADS_X, ROADS_Z } from './city';
 import { groundHeight } from './world';
 import type { RagdollLook } from './ragdoll';
 import { CAR_DRIVER, FigureBatch, PART, PEG_RIDER, RIDER, figureMaterial, palette, riderGeometry, setStyle, styleOf } from './figures';
@@ -36,7 +36,13 @@ export type Car = {
   health: number;
 };
 
-const EDGE = Math.max(...ROADS);
+/** Roads a vehicle can drive along an axis (east-west roads for 'x'), and the junctions it meets on the way. */
+const roadsAlong = (axis: Axis) => (axis === 'x' ? ROADS_Z : ROADS_X);
+const junctionsAlong = (axis: Axis) => (axis === 'x' ? ROADS_X : ROADS_Z);
+/** The last junction in a direction along an axis: beyond it the road only runs into the fence. */
+const lastJunction = (axis: Axis, dir: number) => { const list = junctionsAlong(axis); return dir > 0 ? list[list.length - 1] : list[0]; };
+/** How far from the player traffic is kept (and recycled from), so the streets around them stay busy. */
+const TRAFFIC_NEAR = 170, TRAFFIC_FAR = 230;
 export const CAR_HALF_WIDTH = 1.05;
 export const CAR_HALF_LENGTH = 2.3;
 export const CAR_HEALTH = 160;
@@ -109,13 +115,14 @@ function lanePoint(kind: CarKind, axis: Axis, road: number, along: number, dir: 
 
 /** Nearest point on a road centre line, used as the police destination. */
 function snapToRoad(x: number, z: number) {
-  const limit = BOUND - 3;
-  let best = { x: ROADS[0], z, axis: 'z' as Axis, road: ROADS[0], d: Infinity };
-  for (const r of ROADS) {
+  let best = { x: ROADS_X[0], z, axis: 'z' as Axis, road: ROADS_X[0], d: Infinity };
+  for (const r of ROADS_X) {
     const dv = Math.abs(x - r);
-    if (dv < best.d) best = { x: r, z: THREE.MathUtils.clamp(z, -limit, limit), axis: 'z', road: r, d: dv };
+    if (dv < best.d) best = { x: r, z: THREE.MathUtils.clamp(z, ROADS_Z[0], LAND.maxZ - 3), axis: 'z', road: r, d: dv };
+  }
+  for (const r of ROADS_Z) {
     const dh = Math.abs(z - r);
-    if (dh < best.d) best = { x: THREE.MathUtils.clamp(x, -limit, limit), z: r, axis: 'x', road: r, d: dh };
+    if (dh < best.d) best = { x: THREE.MathUtils.clamp(x, LAND.minX + 3, LAND.maxX - 3), z: r, axis: 'x', road: r, d: dh };
   }
   return best;
 }
@@ -132,7 +139,8 @@ function roadRoute(fromX: number, fromZ: number, toX: number, toZ: number): Poin
   } else {
     // Parallel roads: cross over on whichever perpendicular road is the shortest detour.
     const from = a.axis === 'z' ? a.z : a.x, to = a.axis === 'z' ? b.z : b.x;
-    const via = ROADS.reduce((best, r) => Math.abs(from - r) + Math.abs(to - r) < Math.abs(from - best) + Math.abs(to - best) ? r : best, ROADS[0]);
+    const cross = junctionsAlong(a.axis);
+    const via = cross.reduce((best, r) => Math.abs(from - r) + Math.abs(to - r) < Math.abs(from - best) + Math.abs(to - best) ? r : best, cross[0]);
     if (a.axis === 'z') route.push({ x: a.road, z: via }, { x: b.road, z: via });
     else route.push({ x: via, z: a.road }, { x: via, z: b.road });
     route.push({ x: b.x, z: b.z });
@@ -239,11 +247,12 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   function wreck(car: Car) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const axis: Axis = random() < 0.5 ? 'x' : 'z';
-      const road = ROADS[Math.floor(random() * ROADS.length)];
-      const along = -EDGE + random() * EDGE * 2;
+      const roads = roadsAlong(axis), cross = junctionsAlong(axis);
+      const road = roads[Math.floor(random() * roads.length)];
+      const along = cross[0] + random() * (cross[cross.length - 1] - cross[0]);
       const across = (random() - 0.5) * 12;
       const x = axis === 'x' ? along : road + across, z = axis === 'x' ? road + across : along;
-      if (Math.abs(x) > BOUND - 4 || Math.abs(z) > BOUND - 4 || blocked(x, z, 2.8, car) || !worldClear(x, z, 1.2)) continue;
+      if (x < LAND.minX + 4 || x > LAND.maxX - 4 || z < LAND.minZ + 4 || z > LAND.maxZ - 4 || blocked(x, z, 2.8, car) || !worldClear(x, z, 1.2)) continue;
       Object.assign(car, { mode: 'parked', x, z, yaw: random() * Math.PI * 2, speed: 0, driver: null, waypoints: [], plan: null, stuck: 0, timer: 0 });
       const burnt = car.kind !== 'moto' && random() < 0.35;
       car.health = burnt ? 0 : (car.kind === 'moto' ? MOTO_HEALTH : CAR_HEALTH) * (0.4 + random() * 0.4);
@@ -266,6 +275,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   const red = new THREE.Color('#ff2a2a'), blue = new THREE.Color('#2a6bff'), dim = new THREE.Color('#3a3a3a');
   const crossing: Point[] = [];
   const lean = new Float32Array(cars.length);
+  const lastYaw = new Float32Array(cars.length);
 
   /** True when a circle overlaps any vehicle's footprint except `exclude`. */
   function blocked(x: number, z: number, radius: number, exclude?: Car | null) {
@@ -314,14 +324,23 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     car.x = p.x; car.z = p.z; car.yaw = p.yaw;
   }
 
-  /** Puts a traffic vehicle on a random lane spot at least `minDistance` from a point. */
+  /**
+   * Puts a traffic vehicle on a random lane spot at least `minDistance` from a point, within TRAFFIC_NEAR
+   * of it where possible (the city is big; traffic is kept where the player is).
+   */
   function spawnTraffic(car: Car, awayX: number, awayZ: number, minDistance: number) {
-    for (let attempt = 0; attempt < 30; attempt++) {
+    for (let attempt = 0; attempt < 40; attempt++) {
       const axis: Axis = random() < 0.5 ? 'x' : 'z';
-      const road = ROADS[Math.floor(random() * ROADS.length)];
-      let along = -EDGE + random() * EDGE * 2;
-      if (ROADS.some((r) => Math.abs(r - along) < 9)) along += 12;
-      if (Math.abs(along) > EDGE - 2) continue;
+      const roads = roadsAlong(axis).filter((r) => Math.abs(r - (axis === 'x' ? awayZ : awayX)) < TRAFFIC_NEAR);
+      if (!roads.length) continue;
+      const road = roads[Math.floor(random() * roads.length)];
+      const cross = junctionsAlong(axis);
+      const centre = axis === 'x' ? awayX : awayZ;
+      const lo = Math.max(cross[0], centre - TRAFFIC_NEAR), hi = Math.min(cross[cross.length - 1], centre + TRAFFIC_NEAR);
+      if (hi <= lo) continue;
+      let along = lo + random() * (hi - lo);
+      if (cross.some((r) => Math.abs(r - along) < 9)) along += 12;
+      if (along < cross[0] + 2 || along > cross[cross.length - 1] - 2) continue;
       const dir = random() < 0.5 ? 1 : -1;
       const p = lanePoint(car.kind, axis, road, along, dir);
       if (Math.hypot(p.x - awayX, p.z - awayZ) < minDistance) continue;
@@ -341,14 +360,14 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   /** Decides what a lane vehicle does at the next junction, never driving into the dead-end edges. */
   function planJunction(car: Car) {
     const lane = LANES[car.kind];
-    const ahead = ROADS.filter((r) => (r - car.along) * car.dir > lane + 0.5).sort((a, b) => (a - b) * car.dir)[0];
+    const ahead = junctionsAlong(car.axis).filter((r) => (r - car.along) * car.dir > lane + 0.5).sort((a, b) => (a - b) * car.dir)[0];
     if (ahead === undefined) { car.plan = null; return; }
     const options: { axis: Axis; road: number; dir: number; at: number; along: number }[] = [];
-    if (!(Math.abs(ahead) === EDGE && Math.sign(ahead) === car.dir)) options.push({ axis: car.axis, road: car.road, dir: car.dir, at: ahead, along: NaN });
+    if (ahead !== lastJunction(car.axis, car.dir)) options.push({ axis: car.axis, road: car.road, dir: car.dir, at: ahead, along: NaN });
     const laneCoord = car.axis === 'x' ? car.road + car.dir * lane : car.road - car.dir * lane;
     const other: Axis = car.axis === 'x' ? 'z' : 'x';
     for (const nd of [1, -1]) {
-      if (Math.abs(car.road) === EDGE && Math.sign(car.road) === nd) continue;
+      if (car.road === lastJunction(other, nd)) continue;
       const at = other === 'z' ? ahead - nd * lane : ahead + nd * lane;
       options.push({ axis: other, road: ahead, dir: nd, at, along: laneCoord });
     }
@@ -395,11 +414,14 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       }
     }
     const p = lanePoint(car.kind, car.axis, car.road, car.along, car.dir);
-    // Ease into the new lane position so turns at junctions are a curve, not a jump.
-    const ease = 1 - Math.exp(-dt * 6);
-    if (car.axis === 'x') { car.x = p.x; car.z += (p.z - car.z) * ease; }
-    else { car.z = p.z; car.x += (p.x - car.x) * ease; }
-    car.yaw = angleLerp(car.yaw, p.yaw, 1 - Math.exp(-dt * 5));
+    // The body trails its lane point by a short lag, so it rounds every corner in a smooth arc (a radius of
+    // about speed x 0.3 s) instead of pivoting on the spot, and it faces the way it is actually moving.
+    const follow = 1 - Math.exp(-dt / 0.3);
+    const ox = car.x, oz = car.z;
+    car.x += (p.x - car.x) * follow;
+    car.z += (p.z - car.z) * follow;
+    const mx = car.x - ox, mz = car.z - oz;
+    if (mx * mx + mz * mz > 1e-6) car.yaw = angleLerp(car.yaw, Math.atan2(mx, mz), 1 - Math.exp(-dt * 12));
   }
 
   /** Steers toward the next waypoint; returns the distance left to the final one. */
@@ -442,11 +464,14 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     spawnPolice(px: number, pz: number, min: number, max: number) {
       const car = cars.find((c) => c.kind === 'police' && c.mode === 'off');
       if (!car) return null;
-      const limit = BOUND - 5;
-      for (let attempt = 0; attempt < 40; attempt++) {
+      for (let attempt = 0; attempt < 60; attempt++) {
         const axis: Axis = random() < 0.5 ? 'x' : 'z';
-        const road = ROADS[Math.floor(random() * ROADS.length)];
-        const along = -limit + random() * limit * 2;
+        const roads = roadsAlong(axis), cross = junctionsAlong(axis);
+        const road = roads[Math.floor(random() * roads.length)];
+        const centre = axis === 'x' ? px : pz;
+        const lo = Math.max(cross[0] - 5, centre - max), hi = Math.min(cross[cross.length - 1] + 5, centre + max);
+        if (hi <= lo) continue;
+        const along = lo + random() * (hi - lo);
         const x = axis === 'x' ? along : road, z = axis === 'x' ? road : along;
         const d = Math.hypot(x - px, z - pz);
         if (d < min || d > max || blocked(x, z, 3)) continue;
@@ -488,8 +513,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
         } else if (car.mode === 'leave') {
           if (!car.waypoints.length || time > car.routeAt) {
             const p = snapToRoad(car.x, car.z);
-            const far = BOUND - 3;
-            const awayAlong = p.axis === 'x' ? (car.x > px ? far : -far) : (car.z > pz ? far : -far);
+            const awayAlong = p.axis === 'x' ? (car.x > px ? LAND.maxX - 3 : LAND.minX + 3) : (car.z > pz ? LAND.maxZ - 3 : ROADS_Z[0]);
             car.waypoints = p.axis === 'x' ? [{ x: awayAlong, z: p.road }] : [{ x: p.road, z: awayAlong }];
             car.routeAt = time + 3;
           }
@@ -504,6 +528,8 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       crossing.push(...pedestrians);
       for (const car of cars) {
         if (car.kind === 'police') continue;
+        // Traffic that has drifted far away from the player reappears on a street nearer them, out of sight.
+        if (car.mode === 'lane' && traffic && Math.hypot(car.x - player.x, car.z - player.z) > TRAFFIC_FAR) spawnTraffic(car, player.x, player.z, 90);
         if (car.mode === 'lane') driveLane(car, dt, player);
         else if (traffic && (car.mode === 'parked' || car.mode === 'off')) {
           // Abandoned vehicles far from the player are recycled into fresh traffic.
@@ -527,11 +553,13 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
         }
         quat.setFromAxisAngle(up, car.yaw);
         const toppled = car.kind === 'moto' && car.mode === 'parked' && wrecks.has(car);
+        // How fast the vehicle is turning (a rising yaw is a left turn).
+        const yawRate = Math.atan2(Math.sin(car.yaw - lastYaw[n]), Math.cos(car.yaw - lastYaw[n])) / Math.max(dt, 1e-3);
+        lastYaw[n] = car.yaw;
         if (car.kind === 'moto') {
-          // Riders lean into corners a little.
-          const goal = car.mode === 'lane' ? lanePoint(car.kind, car.axis, car.road, car.along, car.dir).yaw : car.yaw;
-          const turn = Math.atan2(Math.sin(goal - car.yaw), Math.cos(goal - car.yaw));
-          lean[n] = toppled ? 1.42 : THREE.MathUtils.damp(lean[n], THREE.MathUtils.clamp(-turn * 0.6, -0.35, 0.35), 6, dt);
+          // Riders bank into the corner by the angle that balances it, towards the inside of the turn.
+          const bank = -Math.atan(car.speed * yawRate / 9.81);
+          lean[n] = toppled ? 1.42 : THREE.MathUtils.damp(lean[n], THREE.MathUtils.clamp(bank, -0.45, 0.45), 8, dt);
           quat.multiply(tilt.setFromAxisAngle(zAxis, lean[n]));
         }
         // Wheels on the road surface, or up on the sidewalk when a car mounts the curb.

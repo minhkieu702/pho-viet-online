@@ -15,6 +15,8 @@ type Kind = 'home' | 'work' | 'eat' | 'leisure' | 'school' | 'market' | 'hang' |
 type Activity = { start: number; end: number; kind: Kind; place: Place; outdoor: boolean };
 type State = 'inside' | 'walking' | 'at' | 'afraid' | 'fleeing' | 'chasing' | 'down' | 'away';
 type Pose = 'walk' | 'run' | 'idle' | 'sit' | 'hands' | 'fight';
+/** Little things people do while they wait somewhere, so nobody stands about like a statue. */
+type Act = 'none' | 'phone' | 'call' | 'stretch' | 'scratch' | 'wave' | 'fan' | 'sweep' | 'serve' | 'shout' | 'akimbo' | 'cross' | 'look' | 'pace';
 /** A shelter spot, café place or bus-stop seat this person has reserved. */
 type Claim = { front?: Building; slot?: number; inside?: Building; seat?: Poi };
 type Target = { x: number; z: number; curb: { x: number; z: number }; via: { x: number; z: number } | null };
@@ -43,6 +45,8 @@ export type Npc = {
   /** Waypoints from the current standing spot back onto the sidewalk network. */
   leave: Waypoint[];
   claim: Claim | null;
+  /** What they are doing on the spot, since when and until when; pacing steps away by (offX, offZ). */
+  act: Act; actFrom: number; actUntil: number; offX: number; offZ: number; gaze: number;
 };
 export type GangShot = { from: THREE.Vector3; hit: boolean };
 /** People on the street this frame, and what the rain and the brain have them doing. */
@@ -170,6 +174,7 @@ export function createNpcs(
       health: gang >= 0 ? GANG_HEALTH : MAX_HEALTH, hitAt: -99, afraidFor: 0, lastAimed: -99, robbedDay: -1,
       chatterAt: random() * 20, checkAt: random() * 2, nextAttack: 0, body: null, timer: 0, pooled: false,
       mind: createMind(mindRandom, role), leave: [], claim: null,
+      act: 'none', actFrom: 0, actUntil: random() * 4, offX: 0, offZ: 0, gaze: 0,
     });
   }
 
@@ -263,7 +268,7 @@ export function createNpcs(
   const material = figureMaterial();
   const bodies = new FigureBatch(bodyGeometry('civil'), material, npcs.length);
   const legs = new FigureBatch(legGeometry(), material, npcs.length * 2);
-  const arms = new FigureBatch(armGeometry(false), material, npcs.length * 2);
+  const arms = new FigureBatch(armGeometry(false, true), material, npcs.length * 2);
   const umbrellas = new FigureBatch(umbrellaGeometry(), material, npcs.length);
   const batches = [bodies, legs, arms, umbrellas];
   const dress = npcs.map((npc) => {
@@ -283,6 +288,8 @@ export function createNpcs(
       legs: palette([look.pants, shin, style.shoes], PART.STRAIGHT),
       seated: palette([look.pants, shin, style.shoes], PART.BENT),
       arms: palette([look.shirt, style.forearm === 'skin' ? look.skin : look.shirt, look.skin]),
+      // The right arm again, holding a phone, a fan or a broom.
+      held: [PART.PHONE, PART.FAN, PART.BROOM].map((part) => palette([look.shirt, style.forearm === 'skin' ? look.skin : look.shirt, look.skin], part)),
       umbrella: palette([canopy[0], canopy[1]]),
     };
   });
@@ -313,11 +320,22 @@ export function createNpcs(
     const sit = npc.pose === 'sit';
     const { width, height } = d.style;
     const intent = npc.mind.intent;
-    // Walkers lean slightly into their stride, runners a lot.
-    const lean = npc.pose === 'run' ? 0.2 : npc.pose === 'walk' ? 0.05 : 0;
+    // Walkers lean slightly into their stride, runners a lot; people standing about shift their weight.
+    let lean = npc.pose === 'run' ? 0.2 : npc.pose === 'walk' ? 0.05 : 0;
+    let roll = npc.pose === 'idle' ? Math.sin(time * 0.55 + npc.id * 1.7) * 0.028 : 0;
+    const act = npc.state === 'at' && (npc.pose === 'idle' || sit) ? npc.act : 'none';
+    // Each act eases in and out over a third of a second.
+    const env = act === 'none' ? 0 : Math.max(0, Math.min(1, (time - npc.actFrom) / 0.35, (npc.actUntil - time) / 0.35));
+    if (env > 0) {
+      if (act === 'sweep') lean += 0.22 * env;
+      else if (act === 'serve') lean += 0.16 * env;
+      else if (act === 'phone') lean += 0.08 * env;
+      else if (act === 'stretch') { lean -= 0.12 * env; roll *= 1 - env; }
+      else if (act === 'shout') lean -= 0.05 * env;
+    }
     base.compose(
       pos.set(npc.x, npc.y - (sit ? FIGURE.sitDrop * BODY_SCALE * height : 0), npc.z),
-      quat.setFromEuler(bodyEuler.set(lean, npc.yaw, 0)),
+      quat.setFromEuler(bodyEuler.set(lean, npc.yaw, roll)),
       size.set(BODY_SCALE * width, BODY_SCALE * height, BODY_SCALE * width),
     );
     const swing = npc.swing;
@@ -335,13 +353,35 @@ export function createNpcs(
       else if (intent === 'chat') armR = -0.35 - Math.max(0, Math.sin(time * 2.1 + npc.id)) * 0.35; // talking with a hand
       else if (intent === 'watch' && Math.sin(time * 0.7 + npc.id) > 0.75) armR = -1.45; // pointing
     }
+    let held = -1;
+    if (env > 0 && !holding) {
+      // The act's arm angles (forward swing, inward twist), blended over the stance above.
+      const t = time - npc.actFrom, k = npc.id;
+      let aL = armL, aR = armR, tL = twistL, tR = twistR;
+      switch (act) {
+        case 'phone': aR = -1.72 + Math.sin(t * 0.9 + k) * 0.05; tR = -0.5; aL = sit ? -0.7 : -0.2; held = 0; break;
+        case 'call': aR = -2.62; tR = -0.42; held = 0; break;
+        case 'stretch': aL = aR = -2.95 + Math.sin(t * 2.2) * 0.08; tL = -0.15; tR = 0.15; break;
+        case 'scratch': aR = -2.55 + Math.sin(t * 15) * 0.05; tR = -0.32; break;
+        case 'wave': aR = -2.7; tR = 0.15 + Math.sin(t * 8) * 0.38; break;
+        case 'fan': aR = -1.95; tR = -0.3 + Math.sin(t * 12) * 0.2; held = 1; break;
+        case 'sweep': aL = -0.62; aR = -0.66; tL = 0.3 + Math.sin(t * 2.6) * 0.32; tR = -0.18 + Math.sin(t * 2.6) * 0.32; held = 2; break;
+        case 'serve': aL = -1.15 + Math.sin(t * 3.1) * 0.16; aR = -1.25 - Math.sin(t * 3.1 + 1.3) * 0.18; tL = 0.25; tR = -0.25; break;
+        case 'shout': aR = -2.15; tR = -0.5; aL = -0.25; break;
+        case 'akimbo': aL = -0.25; aR = -0.25; tL = -0.62; tR = 0.62; break;
+        case 'cross': aL = aR = -0.62; tL = 0.85; tR = -0.85; break;
+        default: break;
+      }
+      armL += (aL - armL) * env; armR += (aR - armR) * env; twistL += (tL - twistL) * env; twistR += (tR - twistR) * env;
+      if (env < 0.5) held = -1;
+    }
     if (holding) { armR = UMBRELLA_ARM + Math.sin(npc.stride) * 0.03; twistR = UMBRELLA_TWIST; }
     bodies.push(base, d.body);
     // Seated people use the bent-knee legs, which already reach forward and down.
     limb(legs, -FIGURE.hipX, FIGURE.hipY, sit ? 0 : swing, sit ? d.seated : d.legs);
     limb(legs, FIGURE.hipX, FIGURE.hipY, sit ? 0 : -swing, sit ? d.seated : d.legs);
     limb(arms, -FIGURE.shoulderX, FIGURE.shoulderY, armL, d.arms, twistL);
-    limb(arms, FIGURE.shoulderX, FIGURE.shoulderY, armR, d.arms, twistR);
+    limb(arms, FIGURE.shoulderX, FIGURE.shoulderY, armR, held >= 0 ? d.held[held] : d.arms, twistR);
     if (holding) {
       // The canopy unfolds from a closed bundle; it bobs a little with the stride.
       const spread = 0.12 + 0.88 * open;
@@ -349,6 +389,67 @@ export function createNpcs(
       local.compose(umbrellaHand, quat.copy(umbrellaTilt).multiply(quat2), size.set(spread, 0.9 + 0.1 * open, spread));
       umbrellas.push(outM.multiplyMatrices(base, local), d.umbrella);
     }
+  }
+
+  // --- Standing about -------------------------------------------------------------------------
+  const ACT_TIME: Record<Act, [number, number]> = {
+    none: [1, 3.5], phone: [5, 12], call: [6, 14], stretch: [2.2, 3], scratch: [1.5, 2.4], wave: [1.6, 2.4], fan: [4, 9],
+    sweep: [6, 12], serve: [3, 7], shout: [1.8, 2.6], akimbo: [3, 6], cross: [4, 8], look: [2, 4], pace: [3, 6],
+  };
+  /** Seated people only do what they can do sitting down. */
+  const SEATED: Act[] = ['none', 'phone', 'call', 'scratch', 'fan', 'look'];
+  /**
+   * Picks what someone does next on their spot: vendors serve and call out to passers-by, shop staff sweep
+   * their frontage or check their phones, everyone stretches, looks around, paces a few steps and waves
+   * at a friendly face walking by. Between acts they just stand (or sit) for a moment.
+   */
+  function nextAct(npc: Npc, time: number, near: boolean) {
+    const spot = npc.spot!;
+    if (npc.act !== 'none') {
+      npc.act = 'none';
+      npc.offX = npc.offZ = 0;
+      npc.gaze = 0;
+    } else {
+      const intent = npc.mind.intent;
+      const kind = npc.current?.kind;
+      const place = npc.current?.place;
+      const front = !!place && 'building' in place && !place.inside;
+      let table: [Act, number][];
+      if (intent === 'watch') table = [['phone', 4], ['none', 3], ['look', 2], ['scratch', 1]];
+      else if (intent === 'chat' || intent === 'avoid') table = [['none', 1]];
+      else if (intent === 'shelter') table = [['phone', 3], ['look', 3], ['cross', 2], ['call', 1], ['none', 2]];
+      else if (npc.role === 'vendor' || kind === 'market') table = [['serve', 5], ['shout', 2], ['fan', 2], ['pace', 2], ['phone', 1], ['akimbo', 1], ['look', 1]];
+      else if (kind === 'work') table = [['sweep', front ? 2 : 0], ['phone', 3], ['cross', 2], ['akimbo', 1], ['pace', 3], ['look', 2], ['stretch', 1], ['serve', 1], ['call', 1]];
+      else table = [['phone', 3], ['call', 1], ['stretch', 1], ['scratch', 1], ['look', 3], ['pace', 3], ['cross', 1], ['akimbo', 1], ['fan', npc.role === 'retiree' ? 2 : 0.5], ['sweep', npc.role === 'retiree' && front ? 1 : 0]];
+      if (near && intent !== 'chat' && intent !== 'avoid') table.push(['wave', 3]);
+      if (spot.sit) table = table.filter(([a]) => SEATED.includes(a));
+      const total = table.reduce((sum, [, w]) => sum + w, 0);
+      let roll = Math.random() * total;
+      let chosen: Act = 'none';
+      for (const [a, w] of table) { roll -= w; if (roll <= 0) { chosen = a; break; } }
+      if (chosen === 'pace') {
+        // A few steps along the frontage (sideways from the way the spot faces), then back.
+        const side = (Math.random() < 0.5 ? -1 : 1) * (0.7 + Math.random() * 1.1);
+        const out = Math.random() * 0.4;
+        const ox = Math.cos(spot.yaw) * side + Math.sin(spot.yaw) * out, oz = -Math.sin(spot.yaw) * side + Math.cos(spot.yaw) * out;
+        if (world.clear(spot.x + ox, spot.z + oz, 0.32) && world.clear(spot.x + ox * 0.5, spot.z + oz * 0.5, 0.32)) { npc.offX = ox; npc.offZ = oz; }
+        else chosen = 'look';
+      }
+      if (chosen === 'look') npc.gaze = (Math.random() < 0.5 ? -1 : 1) * (0.6 + Math.random() * 0.7);
+      npc.act = chosen;
+    }
+    const [lo, hi] = ACT_TIME[npc.act];
+    npc.actFrom = time;
+    npc.actUntil = time + lo + Math.random() * (hi - lo);
+  }
+  /** Back to just standing (when they leave the spot or something more pressing comes up). */
+  function stopAct(npc: Npc, time: number) {
+    if (npc.act === 'none' && !npc.offX && !npc.offZ) return;
+    npc.act = 'none';
+    npc.offX = npc.offZ = 0;
+    npc.gaze = 0;
+    npc.actFrom = time;
+    npc.actUntil = time + 1 + Math.random() * 3;
   }
 
   // --- Places ---------------------------------------------------------------------------------
@@ -1094,15 +1195,32 @@ export function createNpcs(
             else { if (world.clear(npc.x + mx, npc.z, 0.3)) npc.x += mx; if (world.clear(npc.x, npc.z + mz, 0.3)) npc.z += mz; }
           }
         } else if (npc.state === 'at' && npc.spot) {
-          // Settle onto the spot (people who stop to chat step to a comfortable distance).
-          const sx = npc.spot.x - npc.x, sz = npc.spot.z - npc.z, off = Math.hypot(sx, sz);
-          if (off > 0.02) { const step = Math.min(off, 1.2 * dt); npc.x += sx / off * step; npc.z += sz / off * step; }
-          npc.speed = THREE.MathUtils.damp(npc.speed, 0, 6, dt);
-          npc.pose = npc.spot.sit ? 'sit' : 'idle';
           const focused = mind.intent === 'chat' || mind.intent === 'watch' || mind.intent === 'avoid';
-          npc.targetYaw = npc.spot.yaw + Math.sin(time * 0.2 + npc.id) * (focused ? 0.12 : 0.4);
+          // A friendly face close by (the player, not pointing a gun or speeding past) gets a wave.
+          const friendly = d < 7 && !threat.armed && !threat.inVehicle && !threat.down;
+          if (npc.gang >= 0 || (mind.intent === 'chat' && npc.act !== 'none')) stopAct(npc, time);
+          else if (time > npc.actUntil) nextAct(npc, time, friendly);
+          // Settle onto the spot (people who stop to chat step to a comfortable distance); pacing walks off and back.
+          const gx = npc.spot.x + npc.offX, gz = npc.spot.z + npc.offZ;
+          const sx = gx - npc.x, sz = gz - npc.z, off = Math.hypot(sx, sz);
+          if (off > 0.15 && !npc.spot.sit) {
+            npc.speed = THREE.MathUtils.damp(npc.speed, 0.9, 5, dt);
+            const step = Math.min(off, npc.speed * dt);
+            npc.x += sx / off * step; npc.z += sz / off * step;
+            npc.pose = 'walk';
+            npc.targetYaw = Math.atan2(sx, sz);
+          } else {
+            if (off > 0.02) { const step = Math.min(off, 1.2 * dt); npc.x += sx / off * step; npc.z += sz / off * step; }
+            npc.speed = THREE.MathUtils.damp(npc.speed, 0, 6, dt);
+            npc.pose = npc.spot.sit ? 'sit' : 'idle';
+            npc.targetYaw = npc.spot.yaw + npc.gaze + Math.sin(time * 0.2 + npc.id) * (focused ? 0.12 : 0.4);
+            // Vendors turn to the goods on either side of the stall; sweepers turn with the broom.
+            if (npc.act === 'serve') npc.targetYaw += Math.sin((time - npc.actFrom) * 0.9 + npc.id) * 0.5;
+            else if (npc.act === 'sweep') npc.targetYaw += Math.sin((time - npc.actFrom) * 1.3) * 0.35;
+            if (npc.act === 'wave' && friendly) npc.targetYaw = Math.atan2(-dx, -dz);
+          }
           if (npc.gang >= 0 && d < 9 && !threat.inVehicle) npc.targetYaw = Math.atan2(-dx, -dz);
-        }
+        } else if (npc.act !== 'none' || npc.offX || npc.offZ) stopAct(npc, time);
         npc.yaw = angleLerp(npc.yaw, npc.targetYaw, 1 - Math.exp(-dt * 8));
         npc.stride += npc.speed * dt * 2.4;
         const swingAmount = npc.pose === 'run' ? 0.85 : npc.pose === 'walk' ? 0.5 : 0;

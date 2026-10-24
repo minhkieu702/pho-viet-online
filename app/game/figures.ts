@@ -23,6 +23,8 @@ export const PART = {
   THIN: 1 << 18,
   /** Motorbike riders: long sleeves (sun jacket) and a cloth face mask, light or dark. */
   SLEEVE: 1 << 19, MASK: 1 << 20, MASK_DARK: 1 << 21,
+  /** Things a passer-by holds while standing about: a phone, a paper fan, a broom. */
+  PHONE: 1 << 22, FAN: 1 << 23, BROOM: 1 << 24,
 } as const;
 
 /** Skeleton of the crowd model (feet at y = 0, facing +z). */
@@ -276,8 +278,11 @@ export function legGeometry() {
   return parts.build();
 }
 
-/** Arm hanging from the shoulder pivot: slot 0 sleeve, 1 forearm, 2 hand; police arms can hold a weapon. */
-export function armGeometry(weapons: boolean) {
+/**
+ * Arm hanging from the shoulder pivot: slot 0 sleeve, 1 forearm, 2 hand; police arms can hold a weapon,
+ * and crowd arms (`props`) a phone, a paper fan or a broom that reaches down to the ground.
+ */
+export function armGeometry(weapons: boolean, props = false) {
   const parts = new FigureParts();
   parts.add(sphere(0.092, 7, 5), { at: [0, -0.02, 0], slot: 0 });
   parts.add(tube(0.092, 0.08, 0.3, 7), { at: [0, -0.15, 0], slot: 0 });
@@ -291,6 +296,16 @@ export function armGeometry(weapons: boolean) {
     parts.add(box(0.054, 0.08, 0.092), { at: [0, -0.84, 0.03], shade: '#24272b', part: PART.TASER });
     parts.add(box(0.065, 0.66, 0.1), { at: [0, -0.88, 0.035], shade: '#24282c', part: PART.RIFLE });
     parts.add(box(0.05, 0.16, 0.12), { at: [0, -0.84, 0.1], shade: '#2f3337', part: PART.RIFLE });
+  }
+  if (props) {
+    parts.add(box(0.075, 0.15, 0.018), { at: [0, -0.68, 0.075], shade: '#1d2024', part: PART.PHONE });
+    parts.add(box(0.062, 0.12, 0.004), { at: [0, -0.68, 0.064], shade: '#7fa6d6', part: PART.PHONE });
+    // A folding paper fan pivots in the hand and spreads out past the fingers.
+    parts.add(halfDisc(0.22, 0.012), { at: [0, -0.64, 0.05], rot: [Math.PI / 2, 0, 0], shade: '#e9d6a6', part: PART.FAN });
+    parts.add(cyl(0.024, 0.024, 0.02, 8), { at: [0, -0.64, 0.05], rot: [Math.PI / 2, 0, 0], shade: '#b8463a', part: PART.FAN });
+    parts.add(cyl(0.02, 0.02, 1.0, 5), { at: [0, -1.1, 0], shade: '#9a7a4e', part: PART.BROOM });
+    parts.add(cyl(0.035, 0.12, 0.34, 7), { at: [0, -1.74, 0], shade: '#c9a85e', part: PART.BROOM });
+    parts.add(cyl(0.03, 0.03, 0.05, 6), { at: [0, -1.58, 0], shade: '#b8463a', part: PART.BROOM });
   }
   return parts.build();
 }

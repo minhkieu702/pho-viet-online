@@ -131,8 +131,8 @@ test('authentication, replacement, state bounds/sequence and movement do not wri
   const peers = second.messages.filter(message => message.type === 'snapshot').at(-1).peers;
   assert.equal(peers.length, 1);
   assert.equal(peers[0].id, host.id);
-  assert.equal(peers[0].x, 85);
-  assert.equal(peers[0].z, -85);
+  assert.equal(peers[0].x, 355);
+  assert.equal(peers[0].z, -206);
   assert.equal(peers[0].speed, 36);
   assert.equal(peers[0].tokenHash, undefined);
   assert.equal(entry.storage.writes, writes);

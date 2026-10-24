@@ -1,4 +1,4 @@
-import { BOUND, ROADS, SIDEWALK } from './city';
+import { LAND, ROADS_X, ROADS_Z, SIDEWALK } from './city';
 
 /** A step of a walking route; `crossing` marks legs over a carriageway (on a crosswalk). */
 export type Waypoint = { x: number; z: number; crossing: boolean };
@@ -13,7 +13,6 @@ export function createNav() {
   const nodes: { x: number; z: number; edges: Edge[] }[] = [];
   const ids = new Map<string, number>();
   const segments: Segment[] = [];
-  const end = BOUND - 1;
 
   function node(x: number, z: number) {
     const key = `${Math.round(x * 10)},${Math.round(z * 10)}`;
@@ -28,18 +27,26 @@ export function createNav() {
     nodes[b].edges.push({ to: a, cost, crossing });
     segments.push({ ax, az, bx, bz, a, b, crossing });
   }
-  const breaks = [-end, ...ROADS.flatMap((r) => [r - SIDEWALK, r + SIDEWALK]), end].sort((p, q) => p - q);
-  for (const road of ROADS) {
-    for (const side of [-1, 1]) {
-      const line = road + side * SIDEWALK;
-      for (let i = 0; i < breaks.length - 1; i++) {
-        const from = breaks[i], to = breaks[i + 1];
-        const crossing = ROADS.some((r) => Math.abs(from - (r - SIDEWALK)) < 0.01 && Math.abs(to - (r + SIDEWALK)) < 0.01);
-        link(line, from, line, to, crossing);
-        link(from, line, to, line, crossing);
+  // Lines along x (at each east-west road) break where the north-south walking lines cross them, and
+  // the other way round; a leg between a road's two sidewalks is a crosswalk.
+  const breaksOf = (crossRoads: number[], lo: number, hi: number) =>
+    [lo + 1, ...crossRoads.flatMap((r) => [r - SIDEWALK, r + SIDEWALK]), hi - 1].sort((p, q) => p - q);
+  const layLines = (roads: number[], crossRoads: number[], lo: number, hi: number, alongX: boolean) => {
+    const breaks = breaksOf(crossRoads, lo, hi);
+    for (const road of roads) {
+      for (const side of [-1, 1]) {
+        const line = road + side * SIDEWALK;
+        for (let i = 0; i < breaks.length - 1; i++) {
+          const from = breaks[i], to = breaks[i + 1];
+          const crossing = crossRoads.some((r) => Math.abs(from - (r - SIDEWALK)) < 0.01 && Math.abs(to - (r + SIDEWALK)) < 0.01);
+          if (alongX) link(from, line, to, line, crossing);
+          else link(line, from, line, to, crossing);
+        }
       }
     }
-  }
+  };
+  layLines(ROADS_Z, ROADS_X, LAND.minX, LAND.maxX, true);
+  layLines(ROADS_X, ROADS_Z, LAND.minZ, LAND.maxZ, false);
 
   /** Closest point on the walking network. */
   function snap(x: number, z: number) {

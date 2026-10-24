@@ -201,7 +201,7 @@ test('HTTP sessions and real WebSocket snapshots synchronize player metadata wit
 test('stale or malformed state cannot overwrite the last accepted state; coordinates are bounded', { timeout: 20_000 }, async (t) => {
   const { a, first, second } = await fixture(t).pair();
   first.send({ type: 'state', seq: 2, state: { ...initialState, x: 10000, z: -10000, speed: 999 } });
-  await second.waitFor(peerSnapshot(a.id, (peer) => peer.x === 85 && peer.z === -85 && peer.speed === 36));
+  await second.waitFor(peerSnapshot(a.id, (peer) => peer.x === 355 && peer.z === -206 && peer.speed === 36));
   const after = second.messages.length;
   first.send({ type: 'state', seq: 1, state: { ...initialState, x: -25 } });
   first.send({ type: 'state', seq: 2, state: { ...initialState, x: -26 } });
@@ -209,7 +209,7 @@ test('stale or malformed state cannot overwrite the last accepted state; coordin
   await delay(180);
   for (const message of second.messages.slice(after).filter((item) => item.type === 'snapshot')) {
     const peer = message.peers.find((item) => item.id === a.id);
-    if (peer) assert.equal(peer.x, 85);
+    if (peer) assert.equal(peer.x, 355);
   }
   first.send({ type: 'state', seq: 4, state: { ...initialState, x: 20 } });
   await second.waitFor(peerSnapshot(a.id, (peer) => peer.x === 20), { after });

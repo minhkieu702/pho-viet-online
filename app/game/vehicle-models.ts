@@ -43,7 +43,7 @@ const tmpScale = new THREE.Vector3(), tmpEuler = new THREE.Euler(), tmpColor = n
 const Y_AXIS = new THREE.Vector3(0, 1, 0);
 
 /** Collects primitives into one non-indexed geometry with colour, paint and finish attributes. */
-class ModelParts {
+export class ModelParts {
   private positions: number[] = [];
   private normals: number[] = [];
   private colors: number[] = [];
