@@ -21,6 +21,7 @@ import { createVehicles, makeCarMesh, seatOf, vehicleStyle, CAR_HEALTH, MOTO_HEA
 import { FLOORBOARD, MOTO_RIDER, motoParts, vehicleMaterial, type MotoStyle } from './vehicle-models';
 import { createPolice } from './police';
 import { createZombies, type Zombie } from './zombies';
+import { createInteriors, type InteriorKind } from './interiors';
 import { createSky, HORIZON } from './sky';
 import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuName, isSoftwareGpu, type QualityMode } from './quality';
 
@@ -42,7 +43,7 @@ export type Hud = {
 };
 /** The normal living city, or the zombie apocalypse. */
 export type GameMode = 'city' | 'zombie';
-export type GameEvent = { type: 'store' } | { type: 'bikeshop' } | { type: 'hospital' } | { type: 'bag'; open: boolean };
+export type GameEvent = { type: 'store' } | { type: 'bikeshop' } | { type: 'hospital' } | { type: 'bag'; open: boolean } | { type: 'product'; id: string };
 
 // Both on the sidewalk so the player never spawns in a traffic lane.
 const START = { x: 12.6, z: 12.4 };
@@ -372,10 +373,6 @@ function angleLerp(from: number, to: number, t: number) {
   return from + Math.atan2(Math.sin(to - from), Math.cos(to - from)) * t;
 }
 
-function angleGap(a: number, b: number) {
-  return Math.abs(Math.atan2(Math.sin(a - b), Math.cos(a - b)));
-}
-
 function focusedInput() {
   const active = document.activeElement;
   return active instanceof HTMLElement && (['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName) || active.isContentEditable);
@@ -506,6 +503,16 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     route: (fx, fz, tx, tz) => nav.route(fx, fz, tx, tz),
   }, (zb, text) => sayAt(`zombie${zb.index}`, text, () => (zb.state === 'off' || zb.state === 'down' ? null : { x: zb.x, y: groundHeight(zb.x, zb.z) + 2, z: zb.z })));
   let zombieMode = false;
+  // Shop interiors: while one is open the camera is inside it, looking at the shop or at one product.
+  const interiors = createInteriors(scene, {
+    gun: (id) => makeGun(id).group,
+    bike: (id, color) => makeBike(id, color).group,
+    person: (shirt, hair) => makePerson(shirt, false, hair).group,
+  });
+  let interior: InteriorKind | null = null;
+  let productFocus: string | null = null;
+  let productHover: string | null = null;
+  const interiorLook = new THREE.Vector3();
   /** What the residents report in a frame when there are none (zombie mode). */
   const NO_NPC_EVENTS: ReturnType<typeof npcs.update> = { robbed: [], strikes: 0, shots: [], crowd: { outside: 0, umbrellas: 0, sheltering: 0, exposed: 0, watching: 0, chatting: 0 } };
   let zombieBest = 0;
@@ -690,7 +697,6 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   let aimYaw = 0;
   let punchUntil = 0;
   let triggerQueued = false;
-  let triggerSource: 'mouse' | 'key' = 'key';
   let mouseHeld = false;
   let pointerInside = false;
   let shake = 0;
@@ -1199,7 +1205,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const normalized = key.toLowerCase();
     if (pressed && !keys.has(normalized)) {
       if (normalized === 'e' || normalized === 'key e') action();
-      if (normalized === 'f') { triggerQueued = true; triggerSource = 'key'; unlockAudio(); }
+      if (normalized === 'f') { triggerQueued = true; unlockAudio(); }
       if (normalized === 'q') cycleWeapon();
       if (normalized === 'r') startReload(performance.now());
       if (normalized === 'v') Object.assign(view, CAMERA_DEFAULT);
@@ -1256,6 +1262,18 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   reticleHit.style.cssText = 'position:absolute;transform:translate(-50%,-52%);font:800 24px/1 system-ui,sans-serif;color:#fff;text-shadow:0 0 3px #000;opacity:0';
   for (const part of [reticleRing, reticleDot, reticleHit]) reticle.appendChild(part);
   container.appendChild(reticle);
+  // A quick dip to black when walking into or out of a shop.
+  const fade = document.createElement('div');
+  fade.setAttribute('aria-hidden', 'true');
+  fade.style.cssText = 'position:absolute;inset:0;background:#0d1210;opacity:0;pointer-events:none;z-index:2';
+  container.appendChild(fade);
+  function dip() {
+    fade.style.transition = 'none';
+    fade.style.opacity = '1';
+    void fade.offsetWidth;
+    fade.style.transition = 'opacity .45s ease-out';
+    fade.style.opacity = '0';
+  }
   const touches = new Map<number, { x: number; y: number }>();
   let rotating: { id: number; x: number; y: number } | null = null;
   function rotateBy(dx: number, dy: number) {
@@ -1275,7 +1293,21 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     pointerNdc.set((event.clientX - rect.left) / rect.width * 2 - 1, -(event.clientY - rect.top) / rect.height * 2 + 1);
     pointerPx.set(event.clientX - rect.left + canvas.offsetLeft, event.clientY - rect.top + canvas.offsetTop);
   }
+  /** The shop product under the pointer, if a shop is open. */
+  function productAt(event: PointerEvent) {
+    trackPointer(event);
+    raycaster.setFromCamera(pointerNdc, camera);
+    return interiors.pick(raycaster);
+  }
   function onPointerDown(event: PointerEvent) {
+    if (interior) {
+      // Clicking an item in the shop looks at it and picks it in the shop panel.
+      const id = productAt(event);
+      productFocus = id;
+      interiors.setHovered(id);
+      if (id) onEvent({ type: 'product', id });
+      return;
+    }
     if (!active) return;
     unlockAudio();
     if (event.pointerType === 'touch') {
@@ -1292,11 +1324,15 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     } else if (event.button === 0) {
       mouseHeld = true;
       triggerQueued = true;
-      triggerSource = 'mouse';
       capture(event.pointerId);
     }
   }
   function onPointerMove(event: PointerEvent) {
+    if (interior && event.pointerType !== 'touch') {
+      productHover = productAt(event);
+      interiors.setHovered(productHover ?? productFocus);
+      return;
+    }
     if (event.pointerType === 'touch') {
       const previous = touches.get(event.pointerId);
       if (!previous || !active) return;
@@ -1464,22 +1500,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (zombieMode) zombies.forEachStanding(callback);
   }
 
-  /** Picks the target closest to `yaw` that can be seen, for keyboard, touch and vehicle aiming (chest high). */
-  function autoAim(range: number, yaw: number, out: THREE.Vector3) {
-    let bestGap = 0.42;
-    let found = false;
-    forEachTarget((x, z, y0, y1) => {
-      const d = Math.hypot(x - state.x, z - state.z);
-      if (d < 0.5 || d > range) return;
-      const gap = angleGap(Math.atan2(x - state.x, z - state.z), yaw);
-      if (gap < bestGap && lineOfSight(state.x, state.z, x, z)) { bestGap = gap; out.set(x, y0 + (y1 - y0) * 0.62, z); found = true; }
-    });
-    return found;
+  /** Without a mouse (F key, touch): straight ahead where the player faces, at chest height. No auto-aim. */
+  function aimAhead(range: number, out: THREE.Vector3) {
+    return out.set(state.x + Math.sin(state.angle) * range, groundHeight(state.x, state.z) + 1.2, state.z + Math.cos(state.angle) * range);
   }
 
   /**
-   * Mouse aim: the target under (or just beside) the cursor, at the height the cursor covers, so a click on
-   * a head is a head shot. With nothing there, the point under the cursor at chest height. True on a target.
+   * Mouse aim, with no assist: the point under the cursor. On a target that is where the cursor covers it,
+   * so a click on a head is a head shot; otherwise the cursor at chest height. True when on a target.
    */
   function pointerAim(range: number, out: THREE.Vector3) {
     raycaster.setFromCamera(pointerNdc, camera);
@@ -1493,12 +1521,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const t = ((x - origin.x) * direction.x + (z - origin.z) * direction.z) / flat;
       if (t <= 0) return;
       aimProbe.set(x, THREE.MathUtils.clamp(origin.y + direction.y * t, y0 + 0.05, y1 - 0.05), z);
-      const miss = ray.distanceToPoint(aimProbe);
-      // A touch of aim assist that grows with distance from the camera.
-      const tolerance = radius + 0.014 * t;
-      if (miss > tolerance) return;
-      const score = miss <= radius ? t * 0.001 : 1 + miss / tolerance;
-      if (score < best) { best = score; out.copy(aimProbe); }
+      // Only a cursor actually on the target counts; the nearest such target to the camera is the one hit.
+      if (ray.distanceToPoint(aimProbe) > radius || t >= best) return;
+      best = t;
+      out.copy(aimProbe);
     });
     if (best < Infinity) return true;
     const chest = groundHeight(state.x, state.z) + 1.2;
@@ -1648,12 +1674,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       }
     }
     lastShot = now;
-    // Aim: what the mouse points at, otherwise auto-aim around the facing (or driving) direction, otherwise
-    // straight ahead at chest height.
-    let haveTarget = false;
-    if (triggerSource === 'mouse' && pointerInside) { pointerAim(def.range, aimPoint); haveTarget = true; }
-    else haveTarget = autoAim(def.range, state.angle, aimPoint);
-    if (!haveTarget) aimPoint.set(state.x + Math.sin(state.angle) * def.range, groundHeight(state.x, state.z) + 1.2, state.z + Math.cos(state.angle) * def.range);
+    // Aim: wherever the mouse cursor is over the game (click or F), otherwise straight ahead (touch).
+    if (pointerInside) pointerAim(def.range, aimPoint);
+    else aimAhead(def.range, aimPoint);
     aimYaw = Math.atan2(aimPoint.x - state.x, aimPoint.z - state.z);
     if (!state.riding) state.angle = aimYaw;
     aimUntil = now + 800;
@@ -2233,6 +2256,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     // The world moves on: weather and clock, traffic, police, gangs and residents.
     // Rain fills whatever the camera can see, so it scales with the zoom.
     if (atmosphere.update(dt, time, cameraTarget, THREE.MathUtils.clamp(smoothView.dist * 2.4, 50, 220)) && shadowsAllowed) renderer.shadowMap.needsUpdate = true;
+    if (interior) {
+      hemi.intensity = 2.3;
+      sun.intensity = 2.1;
+      sun.color.set('#fff3e2');
+      interiors.setInfo({ owned: [...owned], bike: bikeId });
+      interiors.update(dt, time);
+    }
     applyShadows();
     world.setAtmosphere?.({ night: atmosphere.night, wet: atmosphere.rain });
     vehicles.setNight(atmosphere.night);
@@ -2331,10 +2361,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (!state.riding) aimYaw = Math.atan2(reticlePoint.x - state.x, reticlePoint.z - state.z);
     } else {
       if (now > aimUntil) aimYaw = state.angle;
-      if (armed && !down) {
-        locked = autoAim(weaponById(weapon).range, state.angle, reticlePoint);
-        if (!locked) reticlePoint.set(state.x + Math.sin(state.angle) * 9, groundHeight(state.x, state.z) + 1.2, state.z + Math.cos(state.angle) * 9);
-      }
+      if (armed && !down) aimAhead(9, reticlePoint);
     }
     updateReticle(active && armed && !down && !bagOpen, locked, pointerInside, now);
     gangKnocks = 0;
@@ -2529,7 +2556,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     smoothView.yaw += (view.yaw - smoothView.yaw) * viewBlend;
     smoothView.pitch += (view.pitch - smoothView.pitch) * viewBlend;
     smoothView.dist += (view.dist - smoothView.dist) * viewBlend;
-    if (active) {
+    if (interior) {
+      const shot = interiors.view(interior, productFocus);
+      const glide = 1 - Math.exp(-dt * 4);
+      camera.position.lerp(shot.eye, glide);
+      interiorLook.lerp(shot.look, glide);
+    } else if (active) {
       camDesired.copy(cameraTarget).add(offsetFor(smoothView.yaw, smoothView.pitch, smoothView.dist, cameraOffset));
       camera.position.lerp(camDesired, 1 - Math.exp(-dt * 10));
     } else {
@@ -2539,8 +2571,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       camDesired.z += 12;
       camera.position.lerp(camDesired, cameraBlend);
     }
-    camera.lookAt(cameraTarget);
-    const fov = 42 + (state.riding ? Math.min(1, Math.abs(velocity) / 26) * 10 : 0);
+    camera.lookAt(interior ? interiorLook : cameraTarget);
+    const fov = interior ? 52 : 42 + (state.riding ? Math.min(1, Math.abs(velocity) / 26) * 10 : 0);
     if (Math.abs(camera.fov - fov) > 0.05) { camera.fov += (fov - camera.fov) * (1 - Math.exp(-dt * 3)); camera.updateProjectionMatrix(); }
     if (shake > 0.001) {
       camera.position.x += (Math.random() - 0.5) * shake;
@@ -2549,7 +2581,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     camera.updateMatrixWorld();
     // Buildings between the camera and the player open up around them.
-    world.focus(camera, desiredTarget.x, groundHeight(desiredTarget.x, desiredTarget.z) + 1.1, desiredTarget.z, dt, active);
+    world.focus(camera, desiredTarget.x, groundHeight(desiredTarget.x, desiredTarget.z) + 1.1, desiredTarget.z, dt, active && !interior);
 
     // Floating health bars over anyone hurt recently, and speech bubbles.
     effects.beginBars(camera);
@@ -2563,7 +2595,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     effects.endBars();
     bubbles.update(now, cameraTarget.x, cameraTarget.z);
     effects.update(now, dt);
-    canvas.style.cursor = !active ? '' : rotating ? 'grabbing' : armed ? 'none' : '';
+    canvas.style.cursor = interior ? (productHover ? 'pointer' : '') : !active ? '' : rotating ? 'grabbing' : armed ? 'none' : '';
     world.update(time);
     sky.update(camera, time, atmosphere.sunDirection, atmosphere.tint, atmosphere.cover, 1 - atmosphere.night);
     renderer.render(scene, camera);
@@ -2593,6 +2625,26 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   return {
+    /** Opens (or closes, with null) a shop interior: the camera cuts inside and the player stands at the door. */
+    setInterior(kind: InteriorKind | null) {
+      if (kind === interior) return;
+      interior = kind;
+      productFocus = productHover = null;
+      interiors.setHovered(null);
+      interiors.show(kind);
+      dip();
+      if (kind) {
+        interiors.setInfo({ owned: [...owned], bike: bikeId });
+        const shot = interiors.view(kind, null);
+        camera.position.copy(shot.eye);
+        interiorLook.copy(shot.look);
+      } else camera.position.copy(cameraTarget).add(offsetFor(smoothView.yaw, smoothView.pitch, smoothView.dist, cameraOffset));
+    },
+    /** Points the shop camera at one product (an item hovered in the shop panel), or back at the shop. */
+    focusProduct(id: string | null) {
+      productFocus = id;
+      interiors.setHovered(id ?? productHover);
+    },
     setActive(value: boolean) { active = value; previousTime = performance.now(); clearKeys(); rotating = null; touches.clear(); if (!value && !state.riding) velocity = 0; },
     getState(): PlayerState {
       return {
@@ -2738,6 +2790,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.removeEventListener('pointermove', onPointerMove);
       reticle.remove();
+      fade.remove();
+      interiors.dispose();
       zombies.dispose();
       scene.remove(torch, torch.target);
       torch.dispose();

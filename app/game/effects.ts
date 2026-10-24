@@ -330,6 +330,39 @@ export function makeGun(id: Exclude<WeaponId, 'fists'>) {
     part([0.12, 0.1, 0.3], [0, 0.01, 0.6], wood);
     part([0.11, 0.18, 0.42], [0, 0.0, -0.18], wood);
     length = 0.98;
+  } else if (id === 'grenade') {
+    // A stubby launcher: wide barrel, revolving drum, pistol grip and a folding stock.
+    const olive = new THREE.MeshStandardMaterial({ color: '#4f5a3a', roughness: 0.7 });
+    const tube = (r: number, len: number, pos: [number, number, number], mat: THREE.Material) => {
+      const mesh = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 12), mat);
+      mesh.rotation.x = Math.PI / 2;
+      mesh.position.set(...pos);
+      group.add(mesh);
+    };
+    tube(0.075, 0.5, [0, 0.1, 0.4], metal);
+    tube(0.13, 0.2, [0, 0.06, 0.08], olive);
+    part([0.07, 0.24, 0.1], [0, -0.1, -0.05], metal, 0.2);
+    part([0.06, 0.12, 0.4], [0, 0.05, -0.3], metal);
+    length = 0.65;
+  } else if (id === 'rpg') {
+    // A long launch tube with a warhead, grips and a sight.
+    const olive = new THREE.MeshStandardMaterial({ color: '#56603f', roughness: 0.65 });
+    const tubeMesh = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 1.15, 12), olive);
+    tubeMesh.rotation.x = Math.PI / 2;
+    tubeMesh.position.set(0, 0.12, 0.25);
+    group.add(tubeMesh);
+    const warhead = new THREE.Mesh(new THREE.ConeGeometry(0.09, 0.32, 12), olive);
+    warhead.rotation.x = Math.PI / 2;
+    warhead.position.set(0, 0.12, 1.0);
+    group.add(warhead);
+    const flare = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.06, 0.12, 12), metal);
+    flare.rotation.x = Math.PI / 2;
+    flare.position.set(0, 0.12, -0.36);
+    group.add(flare);
+    part([0.05, 0.2, 0.07], [0, -0.03, 0.2], metal, 0.15);
+    part([0.05, 0.18, 0.07], [0, -0.02, 0.45], metal, 0.15);
+    part([0.04, 0.09, 0.12], [0.07, 0.22, 0.32], metal);
+    length = 1.2;
   } else {
     part([0.11, 0.17, 0.58], [0, 0.08, 0.2], metal);
     part([0.07, 0.28, 0.1], [0, -0.12, 0.26], metal, 0.15);
