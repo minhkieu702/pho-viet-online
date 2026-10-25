@@ -11,7 +11,7 @@
     "build": "node scripts/run-framework.mjs build",
     "start": "node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js dev --config dist/server/wrangler.json --local --persist-to .wrangler/state --ip 127.0.0.1 --inspector-port 0",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
-    "test": "node --experimental-transform-types --test scripts/missions.test.mjs scripts/room.test.mjs scripts/interpolation.test.mjs scripts/room-connection.test.mjs scripts/world-snapshot.test.mjs scripts/interact-audit.test.mjs scripts/nav.test.mjs scripts/collision.test.mjs scripts/roads-legacy.test.mjs scripts/terrain.test.mjs scripts/districts.test.mjs scripts/signs.test.mjs scripts/ragdoll.test.mjs scripts/figures.test.mjs",
+    "test": "node --experimental-transform-types --test scripts/missions.test.mjs scripts/room.test.mjs scripts/interpolation.test.mjs scripts/room-connection.test.mjs scripts/world-snapshot.test.mjs scripts/interact-audit.test.mjs scripts/nav.test.mjs scripts/collision.test.mjs scripts/roads-legacy.test.mjs scripts/terrain.test.mjs scripts/districts.test.mjs scripts/signs.test.mjs scripts/ragdoll.test.mjs scripts/figures.test.mjs scripts/map-layout.test.mjs scripts/transit.test.mjs",
     "test:realtime": "node --test scripts/realtime.test.mjs",
     "bench": "node scripts/perf-bench.mjs",
     "db:generate": "drizzle-kit generate"

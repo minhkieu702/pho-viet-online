@@ -1,12 +1,26 @@
-import { LAND, ROADS_X, ROADS_Z, SIDEWALK, type Rect } from './city.ts';
+import { LEGACY_ROADS } from './map/roads-legacy.ts';
+import type { Footway, RoadGraph } from './map/roads.ts';
 
 /** A step of a walking route; `crossing` marks legs over a carriageway (on a crosswalk). */
 export type Waypoint = { x: number; z: number; crossing: boolean };
+/**
+ * What a walking leg is: part of a walking line along a road ('sidewalk'; 'hem' for the one line down the middle of
+ * a road without sidewalks, as in a hẻm), a crosswalk, a footway, or a join between walking lines that do not meet.
+ */
+export type LegKind = 'sidewalk' | 'hem' | 'crossing' | 'footway' | 'join';
+/**
+ * A walking leg from node a (its west end, or its north end if it runs more north-south than east-west) to node b.
+ * `ref` is the road edge a 'sidewalk' or 'hem' leg runs along, the crosswalk a 'crossing' is (index into
+ * roads.crosswalks) or the footway a 'footway' is (into roads.footways); -1 for a join.
+ */
+export type Segment = { ax: number; az: number; bx: number; bz: number; a: number; b: number; crossing: boolean; kind: LegKind; ref: number };
+type Leg = Omit<Segment, 'a' | 'b'>;
 type Edge = { to: number; cost: number; crossing: boolean };
-type Segment = { ax: number; az: number; bx: number; bz: number; a: number; b: number; crossing: boolean };
 export type Nav = ReturnType<typeof buildNav>;
 
 const CELL = 16;
+/** A leg that ends within this distance of another leg's interior splits that leg there, so the two connect. */
+const TEE = 0.05;
 // A* heuristic: straight-line distance to the destination. Every leg costs at least its length (crosswalks 1.4x, no
 // waits in the cost), so it is admissible and consistent; the hair under 1 keeps float rounding from breaking that.
 const HEURISTIC = 1 - 1e-9;
@@ -15,17 +29,53 @@ const STAMP_LIMIT = 0xffffffff;
 let shared: Nav | null = null;
 
 /**
- * Pedestrian network: walking lines on both sides of every road, broken at junctions into
- * sidewalk legs and crosswalk legs. Routes follow sidewalks and only cross roads on crosswalks.
- * It depends only on the fixed road grid and searches keep no state between calls, so all callers share one.
+ * Pedestrian network over the road graph: the walking lines along every road (both sidewalks, or one down the middle
+ * of a hẻm) broken at nodes into legs, the crosswalks over junction arms, footways, and joins between walking lines.
+ * Routes follow walking lines and only cross roads on crosswalks. It depends only on the road graph (today's grid,
+ * LEGACY_ROADS) and searches keep no state between calls, so all callers share one.
  */
 export function createNav() {
   if (!shared) shared = buildNav();
   return shared;
 }
 
-/** A separate network over any road grid, for tests and tools; the game uses the shared one from createNav(). */
-export function buildNav(roadsX: number[] = ROADS_X, roadsZ: number[] = ROADS_Z, land: Rect = LAND) {
+/** A leg that ends on another one's interior (a footway meeting a sidewalk mid-block) splits it at that end. */
+function splitTees(legs: Leg[]) {
+  // Legs by 16 m cell; keys stay small integers (cells within ±32 km of the origin), so lookups never box a number.
+  const cells = new Map<number, number[]>(), key = (cx: number, cz: number) => (cx + 2048) * 4096 + cz + 2048;
+  legs.forEach((l, i) => {
+    const x1 = Math.floor((Math.max(l.ax, l.bx) + TEE) / CELL), z0 = Math.floor((Math.min(l.az, l.bz) - TEE) / CELL), z1 = Math.floor((Math.max(l.az, l.bz) + TEE) / CELL);
+    for (let cx = Math.floor((Math.min(l.ax, l.bx) - TEE) / CELL); cx <= x1; cx++) for (let cz = z0; cz <= z1; cz++) {
+      const list = cells.get(key(cx, cz));
+      if (list) list.push(i); else cells.set(key(cx, cz), [i]);
+    }
+  });
+  const cuts = new Map<number, { t: number; x: number; z: number }[]>();
+  for (const l of legs) for (let end = 0; end < 2; end++) {
+    const x = end ? l.bx : l.ax, z = end ? l.bz : l.az, near = cells.get(key(Math.floor(x / CELL), Math.floor(z / CELL)));
+    if (near) for (const i of near) {
+      // Along and across the leg, both scaled by its length: past TEE from either end and within TEE of it.
+      const m = legs[i], dx = m.bx - m.ax, dz = m.bz - m.az, len2 = dx * dx + dz * dz, len = Math.sqrt(len2);
+      const along = (x - m.ax) * dx + (z - m.az) * dz, across = (x - m.ax) * dz - (z - m.az) * dx;
+      if (along <= TEE * len || along >= len2 - TEE * len || across * across > TEE * TEE * len2) continue;
+      const list = cuts.get(i), t = along / len2;
+      if (list) list.push({ t, x, z }); else cuts.set(i, [{ t, x, z }]);
+    }
+  }
+  if (!cuts.size) return legs;
+  return legs.flatMap((l, i) => {
+    const at = cuts.get(i)?.sort((p, q) => p.t - q.t);
+    if (!at) return [l];
+    const out: Leg[] = [];
+    let x = l.ax, z = l.az;
+    for (const c of at) if (c.x !== x || c.z !== z) { out.push({ ...l, ax: x, az: z, bx: c.x, bz: c.z }); x = c.x; z = c.z; }
+    out.push({ ...l, ax: x, az: z });
+    return out;
+  });
+}
+
+/** A separate network over any road graph, for tests and tools; the game uses the shared one from createNav(). */
+export function buildNav(roads: RoadGraph = LEGACY_ROADS) {
   const nodes: { x: number; z: number; edges: Edge[] }[] = [];
   const ids = new Map<string, number>();
   const segments: Segment[] = [];
@@ -36,33 +86,43 @@ export function buildNav(roadsX: number[] = ROADS_X, roadsZ: number[] = ROADS_Z,
     if (id === undefined) { id = nodes.length; nodes.push({ x, z, edges: [] }); ids.set(key, id); }
     return id;
   }
-  function link(ax: number, az: number, bx: number, bz: number, crossing: boolean) {
+  function link({ ax, az, bx, bz, crossing, kind, ref }: Leg) {
     const a = node(ax, az), b = node(bx, bz);
+    if (a === b) return;
+    // A leg laid twice (the two crosswalks over the straight-on arms where a hẻm meets a road) counts once.
+    for (const e of nodes[a].edges) if (e.to === b && e.crossing === crossing) return;
     const cost = Math.hypot(bx - ax, bz - az) * (crossing ? 1.4 : 1);
     nodes[a].edges.push({ to: b, cost, crossing });
     nodes[b].edges.push({ to: a, cost, crossing });
-    segments.push({ ax, az, bx, bz, a, b, crossing });
+    segments.push({ ax, az, bx, bz, a, b, crossing, kind, ref });
   }
-  // Lines along x (at each east-west road) break where the north-south walking lines cross them, and
-  // the other way round; a leg between a road's two sidewalks is a crosswalk.
-  const breaksOf = (crossRoads: number[], lo: number, hi: number) =>
-    [lo + 1, ...crossRoads.flatMap((r) => [r - SIDEWALK, r + SIDEWALK]), hi - 1].sort((p, q) => p - q);
-  const layLines = (roads: number[], crossRoads: number[], lo: number, hi: number, alongX: boolean) => {
-    const breaks = breaksOf(crossRoads, lo, hi);
-    for (const road of roads) {
-      for (const side of [-1, 1]) {
-        const line = road + side * SIDEWALK;
-        for (let i = 0; i < breaks.length - 1; i++) {
-          const from = breaks[i], to = breaks[i + 1];
-          const crossing = crossRoads.some((r) => Math.abs(from - (r - SIDEWALK)) < 0.01 && Math.abs(to - (r + SIDEWALK)) < 0.01);
-          if (alongX) link(from, line, to, line, crossing);
-          else link(line, from, line, to, crossing);
-        }
-      }
-    }
+  // walkLegs() lists each edge's walking lines (right side, then left, or the one down a hẻm; a leg per polyline
+  // piece), then the crosswalks (phantom ones too), the footways and the joins. Crosswalks and footways come out as
+  // stored, which checks that order.
+  const raw = roads.walkLegs(), tagged: Leg[] = [];
+  let i = 0;
+  const take = (kind: LegKind, ref: number, crossing: boolean) => {
+    const l = raw[i++];
+    tagged.push({ ax: l.ax, az: l.az, bx: l.bx, bz: l.bz, crossing, kind, ref });
   };
-  layLines(roadsZ, roadsX, land.minX, land.maxX, true);
-  layLines(roadsX, roadsZ, land.minZ, land.maxZ, false);
+  const expect = (p: Footway) => {
+    const l = raw[i];
+    if (!l || l.ax !== p.ax || l.az !== p.az || l.bx !== p.bx || l.bz !== p.bz) throw new Error('nav: walkLegs() no longer lists edges, crosswalks, footways, joins in order');
+  };
+  for (const e of roads.edges) for (let n = (e.walk > 0 ? 2 : 1) * (e.pts.length / 2 - 1); n > 0; n--) take(e.walk > 0 ? 'sidewalk' : 'hem', e.id, false);
+  for (const c of roads.crosswalks) { expect(c); take('crossing', c.id, true); }
+  roads.footways.forEach((f, n) => { expect(f); take('footway', n, false); });
+  while (i < raw.length) take('join', -1, raw[i].crossing);
+  // Sweep order, whatever order the road graph lists its edges in: legs running east-west first, row by row from the
+  // north, each from its west end; then north-south ones column by column from the west, each from its north end.
+  // The old grid builder laid its walking lines in this order, so on today's map every node and leg keeps its index
+  // (and snap() and route() break ties as before).
+  const ew = (l: Leg) => Math.abs(l.bx - l.ax) >= Math.abs(l.bz - l.az);
+  const swept = splitTees(tagged);
+  for (const l of swept) if (ew(l) ? l.bx < l.ax : l.bz < l.az) [l.ax, l.az, l.bx, l.bz] = [l.bx, l.bz, l.ax, l.az];
+  swept.sort((p, q) => Number(ew(q)) - Number(ew(p))
+    || (ew(p) ? p.az - q.az || p.ax - q.ax || p.bz - q.bz || p.bx - q.bx : p.ax - q.ax || p.az - q.az || p.bx - q.bx || p.bz - q.bz));
+  swept.forEach(link);
 
   // Packed for searching: node coordinates plus one virtual node, `goal`, placed on the destination point per route;
   // adjacency in CSR form, in the same edge order as above.
@@ -228,5 +288,8 @@ export function buildNav(roadsX: number[] = ROADS_X, roadsZ: number[] = ROADS_Z,
     return path.reverse();
   }
 
-  return { route, snap, nodeCount: () => count };
+  /** Every walking leg, in index order; read-only. */
+  const legs = (): readonly Segment[] => segments;
+
+  return { route, snap, nodeCount: () => count, legs, roads };
 }
