@@ -252,12 +252,14 @@ test('pedestrian crossings equal the ones nav.ts builds, the 9 phantom ones flag
   assert.equal(legs.length, 388);
   assert.deepEqual(new Set(legs.map(legKey)), new Set(OLD_LEGS.map(legKey)));
   assert.equal(G.footways.length, 18);
-  // And the live nav.ts (whatever its internals): same node count, and each leg is one of its segments.
+  // And the live nav.ts (whatever its internals): same node count, and each leg is one of its segments. It walks the
+  // phantom crosswalks as plain sidewalk: the river-side walking line runs on past each riverside T.
   const nav = createNav();
   assert.equal(nav.nodeCount(), 236);
+  const phantom = new Set(phantoms.map((c) => legKey({ ...c, crossing: true })));
   for (const l of legs) {
     const s = nav.snap((l.ax + l.bx) / 2, (l.az + l.bz) / 2).segment;
-    assert.equal(legKey(s), legKey(l));
+    assert.equal(legKey(s), legKey({ ...l, crossing: l.crossing && !phantom.has(legKey(l)) }));
   }
 });
 

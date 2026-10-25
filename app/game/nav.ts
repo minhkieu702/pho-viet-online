@@ -10,8 +10,8 @@ export type Waypoint = { x: number; z: number; crossing: boolean };
 export type LegKind = 'sidewalk' | 'hem' | 'crossing' | 'footway' | 'join';
 /**
  * A walking leg from node a (its west end, or its north end if it runs more north-south than east-west) to node b.
- * `ref` is the road edge a 'sidewalk' or 'hem' leg runs along, the crosswalk a 'crossing' is (index into
- * roads.crosswalks) or the footway a 'footway' is (into roads.footways); -1 for a join.
+ * `ref` is the road edge a 'sidewalk' or 'hem' leg runs along (or runs on from, past a T), the crosswalk a 'crossing'
+ * is (index into roads.crosswalks) or the footway a 'footway' is (into roads.footways); -1 for a join.
  */
 export type Segment = { ax: number; az: number; bx: number; bz: number; a: number; b: number; crossing: boolean; kind: LegKind; ref: number };
 type Leg = Omit<Segment, 'a' | 'b'>;
@@ -97,8 +97,8 @@ export function buildNav(roads: RoadGraph = LEGACY_ROADS) {
     segments.push({ ax, az, bx, bz, a, b, crossing, kind, ref });
   }
   // walkLegs() lists each edge's walking lines (right side, then left, or the one down a hẻm; a leg per polyline
-  // piece), then the crosswalks (phantom ones too), the footways and the joins. Crosswalks and footways come out as
-  // stored, which checks that order.
+  // piece), then the crosswalks, the footways and the joins. Crosswalks and footways come out as stored, which checks
+  // that order.
   const raw = roads.walkLegs(), tagged: Leg[] = [];
   let i = 0;
   const take = (kind: LegKind, ref: number, crossing: boolean) => {
@@ -110,7 +110,13 @@ export function buildNav(roads: RoadGraph = LEGACY_ROADS) {
     if (!l || l.ax !== p.ax || l.az !== p.az || l.bx !== p.bx || l.bz !== p.bz) throw new Error('nav: walkLegs() no longer lists edges, crosswalks, footways, joins in order');
   };
   for (const e of roads.edges) for (let n = (e.walk > 0 ? 2 : 1) * (e.pts.length / 2 - 1); n > 0; n--) take(e.walk > 0 ? 'sidewalk' : 'hem', e.id, false);
-  for (const c of roads.crosswalks) { expect(c); take('crossing', c.id, true); }
+  for (const c of roads.crosswalks) {
+    expect(c);
+    // A phantom crosswalk crosses an arm that is not there (the river side of today's riverside T junctions): it is
+    // only the walking line running on past the junction, from the road its first corner is on.
+    if (c.phantom) take('sidewalk', roads.nearestEdge(c.ax, c.az)?.edge.id ?? -1, false);
+    else take('crossing', c.id, true);
+  }
   roads.footways.forEach((f, n) => { expect(f); take('footway', n, false); });
   while (i < raw.length) take('join', -1, raw[i].crossing);
   // Sweep order, whatever order the road graph lists its edges in: legs running east-west first, row by row from the

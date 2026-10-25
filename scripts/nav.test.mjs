@@ -1,7 +1,8 @@
 // node --experimental-transform-types --test scripts/nav.test.mjs
 // Pedestrian routing. Step 3: A* and a snap grid, checked against a frozen copy of the old O(N²) Dijkstra and linear
 // snap. Step 12: the walking graph comes from the road graph; on today's map (LEGACY_ROADS) it is the old one index for
-// index, the 9 phantom crosswalks included, and on any graph it carries hẻm centre lines, bends, footways and joins.
+// index, except that the 9 phantom crosswalks are plain sidewalk now, and on any graph it carries hẻm centre lines,
+// bends, footways and joins.
 // Imports pure modules only. map/roads-legacy.ts imports './consts' without an extension (Vite style), which Node does
 // not resolve, so a resolve hook retries such specifiers as .ts.
 import test from 'node:test';
@@ -137,7 +138,12 @@ function mulberry32(seed) {
   };
 }
 
-const old = createOldNav();
+// Today's walking network as the old builder laid it, and the reference since the phantom crosswalks went: the same
+// legs, with the 9 at z = -116.4 over the missing north arms of the riverside T junctions plain sidewalk.
+const legacy = createOldNav();
+const phantomZ = ROADS_Z[0] - SIDEWALK;
+const isPhantom = (s) => s.crossing && s.az === phantomZ && s.bz === phantomZ;
+const old = createOldNav(undefined, undefined, undefined, legacy.segments.map((s) => (isPhantom(s) ? { ...s, crossing: false } : s)));
 const nav = createNav();
 const fields = (s) => ({ ax: s.ax, az: s.az, bx: s.bx, bz: s.bz, a: s.a, b: s.b, crossing: s.crossing });
 const sameEnds = (s, p) => (s.ax === p.ax && s.az === p.az && s.bx === p.bx && s.bz === p.bz) || (s.ax === p.bx && s.az === p.bz && s.bx === p.ax && s.bz === p.az);
@@ -210,24 +216,27 @@ function randomPairs(land, count, random, reach = 0) {
 
 const samePath = (p, q) => p.length === q.length && p.every((w, i) => Object.is(w.x, q[i].x) && Object.is(w.z, q[i].z) && w.crossing === q[i].crossing);
 
-test('one shared nav, built from the legacy road graph: the old walking network index for index, phantom crosswalks included', () => {
+test('one shared nav, built from the legacy road graph: the old walking network index for index, phantom crosswalks as sidewalk', () => {
   assert.equal(createNav(), nav);
   assert.equal(nav.roads, G);
-  assert.equal(nav.nodeCount(), old.nodeCount());
+  assert.equal(nav.nodeCount(), legacy.nodeCount());
+  assert.equal(legacy.nodeCount(), 236);
+  assert.equal(legacy.segments.length, 388);
+  assert.equal(legacy.segments.filter((s) => s.crossing).length, 180);
+  assert.equal(legacy.segments.filter(isPhantom).length, 9);
   assert.equal(old.nodeCount(), 236);
-  assert.equal(old.segments.length, 388);
-  assert.equal(old.segments.filter((s) => s.crossing).length, 180);
-  assert.equal(old.segments.filter((s) => s.crossing && s.az === -116.4 && s.bz === -116.4).length, 9);
+  assert.equal(old.segments.filter((s) => s.crossing).length, 171);
   // The same legs in the same order with the same ends and node ids, so the same nodes and adjacency in the same order.
   assert.deepStrictEqual(nav.legs().map(fields), old.segments.map(fields));
+  // Against the old network only the 9 phantom legs changed, and only their crossing flag.
+  assert.deepStrictEqual(nav.legs().map((s, i) => ({ ...fields(s), crossing: s.crossing || isPhantom(legacy.segments[i]) })), legacy.segments.map(fields));
   // Every legacy leg is found, unchanged, by snapping to its midpoint.
   for (const s of old.segments) assert.deepEqual(fields(nav.snap((s.ax + s.bx) / 2, (s.az + s.bz) / 2).segment), fields(s));
 });
 
-test('every leg knows what it is: sidewalks along their road, crosswalks (9 phantom), the promenade footways', () => {
+test('every leg knows what it is: sidewalks along their road (on past the riverside Ts), crosswalks, the promenade footways', () => {
   const legs = nav.legs(), count = (kind) => legs.filter((s) => s.kind === kind).length;
-  assert.deepEqual(['sidewalk', 'crossing', 'footway', 'hem', 'join'].map(count), [190, 180, 18, 0, 0]);
-  const phantomZ = ROADS_Z[0] - SIDEWALK;
+  assert.deepEqual(['sidewalk', 'crossing', 'footway', 'hem', 'join'].map(count), [199, 171, 18, 0, 0]);
   for (const s of legs) {
     assert.equal(s.crossing, s.kind === 'crossing');
     if (s.kind === 'sidewalk') {
@@ -236,22 +245,30 @@ test('every leg knows what it is: sidewalks along their road, crosswalks (9 phan
     } else if (s.kind === 'crossing') {
       const c = G.crosswalks[s.ref];
       assert.ok(sameEnds(s, c));
-      assert.equal(c.phantom, s.az === phantomZ && s.bz === phantomZ);
+      assert.equal(c.phantom, false);
     } else assert.ok(sameEnds(s, G.footways[s.ref]));
   }
-  // Each crosswalk and footway is one leg.
-  assert.deepEqual(legs.filter((s) => s.kind === 'crossing').map((s) => s.ref).sort((p, q) => p - q), G.crosswalks.map((c) => c.id));
+  // Where the road graph has a phantom crosswalk, the river-side walking line of Đường Bờ Sông runs on past the T.
+  const past = legs.filter((s) => G.crosswalks.some((c) => c.phantom && sameEnds(s, c)));
+  assert.equal(past.length, 9);
+  for (const s of past) assert.deepEqual([s.kind, s.az, s.bz, G.edges[s.ref].name], ['sidewalk', phantomZ, phantomZ, 'ĐƯỜNG BỜ SÔNG']);
+  // Each real crosswalk and each footway is one leg.
+  assert.deepEqual(legs.filter((s) => s.kind === 'crossing').map((s) => s.ref).sort((p, q) => p - q), G.crosswalks.filter((c) => !c.phantom).map((c) => c.id));
   assert.equal(new Set(legs.filter((s) => s.kind === 'footway').map((s) => s.ref)).size, G.footways.length);
 });
 
-test('phantom crosswalks (legacy): the promenade side of Đường Bờ Sông waits at 9 roads that are not there', () => {
-  const z = ROADS_Z[0] - SIDEWALK;
-  const path = nav.route(LAND.minX + 2, z, LAND.maxX - 2, z);
+test('no phantom crosswalks: the promenade side of Đường Bờ Sông walks on past the 9 riverside T junctions', () => {
+  const [fx, tx, z] = [LAND.minX + 2, LAND.maxX - 2, phantomZ];
+  const path = nav.route(fx, z, tx, z);
   assert.ok(path.every((w) => w.z === z), 'straight along the walking line');
-  const crossings = path.filter((w) => w.crossing);
-  assert.equal(crossings.length, 9);
-  // One per riverside T junction, where no road leaves north.
-  assert.deepEqual(crossings.map((w) => w.x), ROADS_X.map((x) => x + SIDEWALK));
+  assert.equal(path.filter((w) => w.crossing).length, 0);
+  // The old network sent the same walk over 9 roads that are not there (one per T, where no road leaves north),
+  // each a crossing to wait at, costed 1.4x its length.
+  const before = legacy.route(fx, z, tx, z), cost = legacy.lastCost();
+  assert.deepEqual(before.filter((w) => w.crossing).map((w) => w.x), ROADS_X.map((x) => x + SIDEWALK));
+  assert.ok(samePath(path, before.map((w) => ({ ...w, crossing: false }))));
+  old.route(fx, z, tx, z);
+  assert.ok(Math.abs(cost - old.lastCost() - 9 * 2 * SIDEWALK * 0.4) < 1e-9);
 });
 
 test('snap equals the linear scan on 20k seeded points', () => {
@@ -323,9 +340,9 @@ test('any full grid: its road graph gives the old builder\'s walking network, in
     assert.equal(mine.nodeCount(), ref.nodeCount());
     assert.deepStrictEqual(mine.legs().map(fields), ref.segments.map(fields), `${roadsX.length}x${roadsZ.length} grid`);
   }
-  // Today's grid with its north arms is today's walking network: the phantom crosswalks are real ones there.
+  // Today's grid with its north arms is the old walking network: the phantom crosswalks were real ones there.
   const full = buildNav(gridRoads(ROADS_X, ROADS_Z, LAND));
-  assert.deepStrictEqual(full.legs().map(fields), nav.legs().map(fields));
+  assert.deepStrictEqual(full.legs().map(fields), legacy.segments.map(fields));
   assert.equal(full.legs().filter((s) => s.kind === 'footway').length, 0);
 });
 
