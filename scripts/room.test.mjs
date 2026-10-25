@@ -3,7 +3,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handleRoom, handleRoomSocket } from '../lib/room-service.ts';
 import { RealtimeRoom } from '../lib/realtime-room.ts';
-import { playerState, playerHit, hashToken, ACTIVE_MS, SESSION_MS } from '../lib/room-validation.ts';
+import { playerState, playerHit, hashToken, worldVersion, ACTIVE_MS, SESSION_MS } from '../lib/room-validation.ts';
+import { PEER_BOUNDS, WORLD_BOUNDS, WORLD_VERSION } from '../lib/world-bounds.ts';
 
 function memory() {
   const values = new Map();
@@ -262,4 +263,48 @@ test('state and hit validation keep numerical bounds and reject NaN/impersonatio
   assert.equal(bounded.wanted, 5);
   assert.equal(bounded.weapon, 'fists');
   assert.equal(bounded.vehicle, 'foot');
+});
+
+test('peer positions are clamped to the shared world bounds, which cover the playable world with slack', () => {
+  // Today's numbers: the playable rectangle x -138..352, z -203.6..137.5, accepted as x -140..355, z -206..140.
+  assert.deepEqual(PEER_BOUNDS, { minX: -140, maxX: 355, minZ: -206, maxZ: 140 });
+  assert.deepEqual(WORLD_BOUNDS, { minX: -138, maxX: 352, minZ: -203.6, maxZ: 137.5 });
+  for (const side of ['minX', 'minZ']) assert.ok(PEER_BOUNDS[side] <= WORLD_BOUNDS[side] - 2);
+  for (const side of ['maxX', 'maxZ']) assert.ok(PEER_BOUNDS[side] >= WORLD_BOUNDS[side] + 2);
+  const low = playerState({ ...state, x: -1e6, z: -1e6 }), high = playerState({ ...state, x: 1e6, z: 1e6 });
+  assert.deepEqual([low.x, low.z, high.x, high.z], [PEER_BOUNDS.minX, PEER_BOUNDS.minZ, PEER_BOUNDS.maxX, PEER_BOUNDS.maxZ]);
+  for (const [x, z] of [[WORLD_BOUNDS.minX, WORLD_BOUNDS.minZ], [WORLD_BOUNDS.maxX, WORLD_BOUNDS.maxZ], [0, 0]]) {
+    const kept = playerState({ ...state, x, z });
+    assert.deepEqual([kept.x, kept.z], [x, z]);
+  }
+});
+
+test('room joins carry the world version; old clients count as version 1', async t => {
+  assert.equal(worldVersion(undefined), 1);
+  assert.equal(worldVersion(WORLD_VERSION), WORLD_VERSION);
+  for (const bad of [0, -1, 1.5, NaN, Infinity, '1', null, {}, 2_000_000]) assert.throws(() => worldVersion(bad), /bản đồ/);
+  // The lifecycle accepts the field on create and join, and without it.
+  const { rooms } = namespace(t);
+  const host = await call(rooms, { action: 'create', name: 'Host', world: WORLD_VERSION });
+  assert.equal(host.status, 201);
+  assert.equal((await call(rooms, { action: 'join', name: 'Guest', code: host.body.room, world: WORLD_VERSION })).status, 200);
+  assert.equal((await call(rooms, { action: 'join', name: 'Old client', code: host.body.room })).status, 200);
+  // A client building another layout cannot join, and the room is left as it was.
+  const newer = await call(rooms, { action: 'join', name: 'Newer', code: host.body.room, world: WORLD_VERSION + 1 });
+  assert.equal(newer.status, 409);
+  assert.match(newer.body.error, /phiên bản khác/);
+  assert.equal((await call(rooms, { action: 'join', name: 'Bad', code: host.body.room, world: 'x' })).status, 400);
+  const next = await call(rooms, { action: 'create', name: 'Next', world: WORLD_VERSION + 1 });
+  assert.equal(next.status, 201);
+  assert.equal((await call(rooms, { action: 'join', name: 'Current', code: next.body.room, world: WORLD_VERSION })).status, 409);
+  assert.equal((await call(rooms, { action: 'join', name: 'Old client', code: next.body.room })).status, 409);
+  assert.equal((await call(rooms, { action: 'join', name: 'Peer', code: next.body.room, world: WORLD_VERSION + 1 })).status, 200);
+  // Rooms saved before the field existed are version 1.
+  const saved = memory();
+  await saved.put('room', { code: 'OLD123', createdAt: Date.now(), lastActivity: Date.now(), players: [] });
+  const legacy = actor(saved);
+  const legacyRooms = { idFromName: code => code, get: () => ({ fetch: request => legacy.room.fetch(request) }) };
+  t.after(() => legacy.room.reset());
+  assert.equal((await call(legacyRooms, { action: 'join', name: 'Old', code: 'OLD123' })).status, 200);
+  assert.equal((await call(legacyRooms, { action: 'join', name: 'Newer', code: 'OLD123', world: WORLD_VERSION + 1 })).status, 409);
 });

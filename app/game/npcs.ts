@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { BUILDINGS, POIS, type Building, type Poi } from './city';
 import { createNav, type Waypoint } from './nav';
+import { SECONDS_PER_HOUR } from './clock';
 import { walkOk } from './signals';
 import type { createRagdolls, RagdollBody, RagdollLook } from './ragdoll';
 import { FIGURE, FigureBatch, PART, UMBRELLA, armGeometry, bodyGeometry, deriveStyle, figureMaterial, legGeometry, palette, setStyle, umbrellaGeometry } from './figures';
@@ -58,7 +59,6 @@ export type NpcEvents = { robbed: { npc: Npc; amount: number; shop: boolean }[];
 export type Threat = { x: number; z: number; aimYaw: number; armed: boolean; aiming: boolean; inVehicle: boolean; down: boolean };
 export type { IncidentKind } from './brain';
 
-const SECONDS_PER_HOUR = 60;
 // Model units are ~2.1 m tall; scale to a 1.75 m person.
 const BODY_SCALE = 0.82;
 const RAGDOLL_SCALE = 0.7;

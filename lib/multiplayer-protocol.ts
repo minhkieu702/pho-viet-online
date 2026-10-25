@@ -4,6 +4,11 @@ export const HIT_TTL_MS = 10_000;
 export const MAX_PENDING_HITS = 128;
 
 export type Session = { room: string; id: string; token: string };
+/** POST /api/room bodies. `world` is the client's WORLD_VERSION (lib/world-bounds.ts); clients that predate it send none (version 1). */
+export type RoomRequest =
+  | { action: 'create'; name: string; world?: number }
+  | { action: 'join'; name: string; code: string; world?: number }
+  | ({ action: 'leave' } & Session);
 export type PlayerState = {
   x: number; z: number; angle: number; riding: boolean; speed: number; score: number;
   health?: number; weapon?: 'fists' | 'pistol' | 'shotgun' | 'smg' | 'grenade' | 'rpg';

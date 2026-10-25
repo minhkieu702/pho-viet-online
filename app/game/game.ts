@@ -1,15 +1,17 @@
 import * as THREE from 'three';
 import { buildWorld, dockAt, groundHeight } from './world';
-import { LAND, LANDMARKS, PLAY, PLOTS, RIVER, ROADS_X, ROADS_Z, SCENERY, VENUES, WATER_LEVEL, inRect, type Dock } from './city';
+import { LANDMARKS, PLOTS, ROADS_X, ROADS_Z, SCENERY, VENUES, WATER_LEVEL, inRect, type Dock } from './city';
+import { SWIM_DEPTH, TERRAIN, bankNear, bounds, deep as deepWater, inBounds, inWater, navigable, pierNear, walkable, waterLevel } from './map/terrain';
 import { createBoats, makeBoatMesh, type Boat } from './boats';
 import { createNav } from './nav';
+import { createCollisionIndex, OWNER } from './map/collision';
 import { createRagdolls, type BodyPart, type RagdollBody, type RagdollLook } from './ragdoll';
 import { createNpcs, GANGS, type Npc } from './npcs';
 import { createEffects, makeGun } from './effects';
 import { createExplosives, type Explosion } from './explosives';
 import { createPickups } from './pickups';
 import { createBubbles } from './bubbles';
-import { createAtmosphere } from './atmosphere';
+import { createAtmosphere, type Weather } from './atmosphere';
 import { createAnimals } from './animals';
 import { createSideMissions, type SideMissionView } from './side-missions';
 import { playBoom, playCrash, playHorn, playShot, playThud, setRain, unlockAudio } from './audio';
@@ -475,14 +477,16 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const world = buildWorld(scene);
   const nav = createNav();
 
+  // One spatial index over the static solids (world.colliders is final once the world is built; like the old linear
+  // scans it treats them as infinitely tall) and one over the building blocks with their roof heights.
+  const solids = createCollisionIndex();
+  for (const c of world.colliders) solids.add(c.minX, c.minZ, c.maxX, c.maxZ, -Infinity, Infinity, OWNER.legacy, c);
+  const roofs = createCollisionIndex();
+  for (const p of PLOTS) roofs.add(p.full.minX, p.full.minZ, p.full.maxX, p.full.maxZ, 0, p.h, OWNER.roof, p);
+  const roofHits: number[] = [];
+
   function worldClear(x: number, z: number, radius: number) {
-    if (!inRect(LAND, x, z, radius)) return false;
-    for (const collider of world.colliders) {
-      const nearX = Math.max(collider.minX, Math.min(collider.maxX, x));
-      const nearZ = Math.max(collider.minZ, Math.min(collider.maxZ, z));
-      if ((x - nearX) ** 2 + (z - nearZ) ** 2 < radius * radius) return false;
-    }
-    return true;
+    return walkable(x, z, radius) && solids.clear(x, z, radius);
   }
   /** A point people can stand on: the point itself if clear, otherwise the nearest walking line. */
   function reachable(p: { x: number; z: number }) {
@@ -493,30 +497,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   /** Distance along a ray to the first building wall, treating colliders as infinitely tall. */
   function wallDistance(origin: THREE.Vector3, dir: THREE.Vector3, maxT: number) {
-    let best = maxT;
-    for (const c of world.colliders) {
-      let enter = 0, exit = best;
-      for (const [o, d, min, max] of [[origin.x, dir.x, c.minX, c.maxX], [origin.z, dir.z, c.minZ, c.maxZ]]) {
-        if (Math.abs(d) < 1e-9) {
-          if (o < min || o > max) { enter = Infinity; break; }
-          continue;
-        }
-        let t1 = (min - o) / d, t2 = (max - o) / d;
-        if (t1 > t2) [t1, t2] = [t2, t1];
-        enter = Math.max(enter, t1);
-        exit = Math.min(exit, t2);
-      }
-      if (enter <= exit && enter > 0 && enter < best) best = enter;
-    }
-    return best;
+    return solids.cast(origin.x, origin.z, dir.x, dir.z, maxT, origin.y, dir.y);
   }
-  const sightOrigin = new THREE.Vector3(), sightDir = new THREE.Vector3();
   function lineOfSight(x1: number, z1: number, x2: number, z2: number) {
     const d = Math.hypot(x2 - x1, z2 - z1);
     if (d < 0.01) return true;
-    sightOrigin.set(x1, 1.2, z1);
-    sightDir.set((x2 - x1) / d, 0, (z2 - z1) / d);
-    return wallDistance(sightOrigin, sightDir, d) >= d - 0.05;
+    return solids.cast(x1, z1, (x2 - x1) / d, (z2 - z1) / d, d, 1.2, 0) >= d - 0.05;
   }
 
   const bubbles = createBubbles(scene);
@@ -742,6 +728,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   let health = MAX_HEALTH;
   let lastDamage = -99;
   let active = false;
+  // A game is running (false on the start screen): while an overlay pauses input the camera stays with the player.
+  let started = false;
+  // An opaque overlay (the big map) hides the street: the world keeps going but nothing is drawn.
+  let covered = false;
   let disposed = false;
   const missions = createMissions();
   let missionLabelKey = '';
@@ -1025,9 +1015,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   /** Open water a swimmer can be in: inside the buoys and beside (not under) the piers; the steps lead out. */
   function swimClear(x: number, z: number) {
-    if (!inRect(RIVER, x, z, 0.35)) { const d = dockAt(x, z); return !!d && inRect(d.steps, x, z); }
-    for (const d of SCENERY.docks) if (x > d.pier.minX - 0.35 && x < d.pier.maxX + 0.35 && z > d.pier.minZ - 0.35) return false;
-    return true;
+    if (!inWater(x, z, 0.35)) { const d = dockAt(x, z); return !!d && inRect(d.steps, x, z); }
+    return !pierNear(x, z, 0.35);
   }
   /** Where the player on foot can go: the land (clear of everything), the docks, or off a dock into the river. */
   function footClear(x: number, z: number) {
@@ -1038,7 +1027,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   /** The hire boat's hull at a spot: three points along it in open water, clear of the other boats. */
   function boatClear(x: number, z: number, yaw: number) {
     const fx = Math.sin(yaw) * 2.6, fz = Math.cos(yaw) * 2.6;
-    return boats.water(x, z, 1.15) && boats.water(x + fx, z + fz, 0.9) && boats.water(x - fx, z - fz, 0.9)
+    return navigable(x, z, 1.15) && navigable(x + fx, z + fz, 0.9) && navigable(x - fx, z - fz, 0.9)
       && !boats.hit(x, z, 1.1, boat) && !boats.hit(x + fx, z + fz, 0.9, boat) && !boats.hit(x - fx, z - fz, 0.9, boat);
   }
 
@@ -1442,35 +1431,49 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (state.riding || boat) return;
     if (swimming) { climbOut(); return; }
     // Facing the river from the promenade: over the railing and into the water.
-    if (state.z < -133.2 && Math.cos(state.angle) < -0.4 && !dockAt(state.x, state.z - 1.4) && swimClear(state.x, -138.6) && jumpY === 0) {
+    const vault = jumpY === 0 ? vaultSpot() : null;
+    if (vault && swimClear(vault.x, vault.z)) {
       bodyY = groundHeight(state.x, state.z) + 0.8;
-      state.z = -138.6;
+      state.x = vault.x;
+      state.z = vault.z;
       velocity = 0;
       return;
     }
     if (jumpY === 0) jumpV = 5.6;
   }
-  /** Out of the water: up onto the promenade at the wall, or onto a pier alongside. */
+  /** Facing the water from just behind a climbable bank (the promenade railing): where a vault over it lands. */
+  function vaultSpot() {
+    const hit = bankNear(state.x, state.z, Infinity, true);
+    if (!hit) return null;
+    const b = hit.bank;
+    if (!(hit.d > -b.vault) || !(Math.sin(state.angle) * b.nx + Math.cos(state.angle) * b.nz > 0.4) || dockAt(state.x + b.nx * 1.4, state.z + b.nz * 1.4)) return null;
+    return { x: hit.x + b.nx * b.drop, z: hit.z + b.nz * b.drop };
+  }
+  /** Out of the water: onto a pier alongside, or up a climbable bank (the promenade wall). */
   function climbOut() {
-    for (const d of SCENERY.docks) {
-      const p = d.pier;
-      if (state.x > p.minX - 1.4 && state.x < p.maxX + 1.4 && state.z > p.minZ - 1.4) {
-        state.x = Math.max(p.minX + 0.5, Math.min(p.maxX - 0.5, state.x));
-        state.z = Math.max(p.minZ + 0.5, Math.min(-136.6, state.z));
+    const dock = pierNear(state.x, state.z, 1.4);
+    if (dock) {
+      const p = dock.landings[0];
+      state.x = Math.max(p.minX, Math.min(p.maxX, state.x));
+      state.z = Math.max(p.minZ, Math.min(p.maxZ, state.z));
+      swimming = false;
+      bodyY = groundHeight(state.x, state.z);
+      jumpV = 2.4;
+      return;
+    }
+    const hit = bankNear(state.x, state.z, Infinity, true);
+    if (hit && hit.d < hit.bank.reach) {
+      const b = hit.bank, x = hit.x - b.nx * b.land, z = hit.z - b.nz * b.land;
+      if (clearAt(x, z, 0.4)) {
+        state.x = x;
+        state.z = z;
         swimming = false;
         bodyY = groundHeight(state.x, state.z);
         jumpV = 2.4;
         return;
       }
     }
-    if (state.z > RIVER.maxZ - 1.6 && clearAt(state.x, LAND.minZ + 0.5, 0.4)) {
-      state.z = LAND.minZ + 0.5;
-      swimming = false;
-      bodyY = groundHeight(state.x, state.z);
-      jumpV = 2.4;
-      return;
-    }
-    notify(state.z < RIVER.minZ + 2.5 ? 'Bờ bên kia có hàng rào, không lên được. Bơi về phía phố.' : 'Bơi sát bờ kè hoặc cầu tàu rồi nhấn Space để leo lên.', 2500);
+    notify(bankNear(state.x, state.z, 2.5)?.bank.kind === 'far' ? 'Bờ bên kia có hàng rào, không lên được. Bơi về phía phố.' : 'Bơi sát bờ kè hoặc cầu tàu rồi nhấn Space để leo lên.', 2500);
   }
 
   // ---- The hire boat ----
@@ -1498,8 +1501,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (Math.abs(b.speed) > 2.5) { notify('Giảm tốc trước khi rời ca nô'); return; }
     // Onto a pier or the steps if one is alongside, otherwise over the side into the water.
     let best: { x: number; z: number } | null = null, bestD = 6.5;
-    for (const d of SCENERY.docks) for (const r of [d.pier, d.steps]) {
-      const px = Math.max(r.minX + 0.5, Math.min(r.maxX - 0.5, b.x)), pz = Math.max(r.minZ + 0.5, Math.min(Math.min(r.maxZ - 0.5, -136.6), b.z));
+    for (const d of TERRAIN.docks) for (const r of d.landings) {
+      const px = Math.max(r.minX, Math.min(r.maxX, b.x)), pz = Math.max(r.minZ, Math.min(r.maxZ, b.z));
       const dd = Math.hypot(px - b.x, pz - b.z);
       if (dd < bestD) { bestD = dd; best = { x: px, z: pz }; }
     }
@@ -1517,7 +1520,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     velocity = 0;
     state.x = best.x;
     state.z = best.z;
-    bodyY = Math.max(groundHeight(state.x, state.z), WATER_LEVEL + 0.4);
+    bodyY = Math.max(groundHeight(state.x, state.z), waterLevel(state.x, state.z) + 0.4);
   }
   function driveBoat(dt: number, now: number, throttle: number, steerInput: number, braking: boolean) {
     const b = boat!;
@@ -1624,13 +1627,16 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
   /** Something taller than the jumper in the way: a building whose roof is above them, or (low down) trees and lamps. */
   function airBlocked(x: number, z: number, y: number) {
-    for (const p of PLOTS) if (p.h > y - 0.4 && inRect(p.full, x, z, -0.6)) return true;
+    for (let i = 0, n = roofs.containing(x, z, 0.6, roofHits); i < n; i++) if (roofs.top(roofHits[i]) > y - 0.4) return true;
     return y < 8 && !worldClear(x, z, 0.4);
   }
   /** The highest roof under the jumper (0 over open ground). */
   function roofUnder(x: number, z: number, y: number) {
     let roof = 0;
-    for (const p of PLOTS) if (p.h <= y + 0.5 && p.h > roof && inRect(p.full, x, z, -0.3)) roof = p.h;
+    for (let i = 0, n = roofs.containing(x, z, 0.3, roofHits); i < n; i++) {
+      const h = roofs.top(roofHits[i]);
+      if (h <= y + 0.5 && h > roof) roof = h;
+    }
     return roof;
   }
   function glideMove(dt: number, now: number, vertical: number, horizontal: number) {
@@ -1650,15 +1656,15 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const nx = state.x + Math.sin(state.angle) * g.speed * dt, nz = state.z + Math.cos(state.angle) * g.speed * dt;
     if (!airBlocked(nx, state.z, g.y)) state.x = nx; else g.speed *= 0.5;
     if (!airBlocked(state.x, nz, g.y)) state.z = nz; else g.speed *= 0.5;
-    state.x = Math.max(PLAY.minX + 1, Math.min(PLAY.maxX - 1, state.x));
-    state.z = Math.max(PLAY.minZ + 1, Math.min(PLAY.maxZ - 1, state.z));
+    state.x = Math.max(bounds.minX + 1, Math.min(bounds.maxX - 1, state.x));
+    state.z = Math.max(bounds.minZ + 1, Math.min(bounds.maxZ - 1, state.z));
     g.y += g.vy * dt;
     // Over a lower roof the canopy carries the jumper across it rather than down onto it.
     const roof = roofUnder(state.x, state.z, g.y);
     if (roof > 0 && g.y < roof + 1.3) { g.y = roof + 1.3; g.vy = Math.max(g.vy, -0.5); }
-    const ground = groundHeight(state.x, state.z);
-    const water = ground < WATER_LEVEL - 0.55;
-    if (g.y <= (water ? WATER_LEVEL : ground)) land(now, water);
+    const ground = groundHeight(state.x, state.z, g.y), level = waterLevel(state.x, state.z);
+    const water = ground < level - SWIM_DEPTH;
+    if (g.y <= (water ? level : ground)) land(now, water);
     return true;
   }
   function land(now: number, water: boolean) {
@@ -1668,7 +1674,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     jumpY = jumpV = 0;
     motion.land = 1;
     velocity = g.speed * 0.3;
-    if (water) { bodyY = WATER_LEVEL; splash(state.x, state.z, now, 2); notify(hard > 14 ? 'Ùm! Rơi thẳng xuống sông.' : 'Đáp xuống sông! Bơi vào bờ thôi.', 3000); return; }
+    if (water) { bodyY = waterLevel(state.x, state.z); splash(state.x, state.z, now, 2); notify(hard > 14 ? 'Ùm! Rơi thẳng xuống sông.' : 'Đáp xuống sông! Bơi vào bờ thôi.', 3000); return; }
     bodyY = groundHeight(state.x, state.z);
     if (hard > 14) {
       damagePlayer(Math.min(90, hard * 3), now, undefined, 'Rơi tự do');
@@ -1719,7 +1725,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   function unstick(dt: number) {
     if (glide || interior || playerBody || down) { stuckFor = 0; return; }
     const test = (x: number, z: number) => (boat ? boatClear(x, z, state.angle) : state.riding ? vehicleClear(x, z, state.angle) : footClear(x, z) || clearAt(x, z, 0.4));
-    stuckFor = test(state.x, state.z) || (boat && boats.water(state.x, state.z, 0.3)) ? 0 : stuckFor + dt;
+    stuckFor = test(state.x, state.z) || (boat && navigable(state.x, state.z, 0.3)) ? 0 : stuckFor + dt;
     if (stuckFor < 0.6) return;
     stuckFor = 0;
     const move = (x: number, z: number) => {
@@ -1733,7 +1739,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       for (let k = 0; k < 16; k++) {
         const a = (k / 16) * Math.PI * 2;
         const x = state.x + Math.cos(a) * r, z = state.z + Math.sin(a) * r;
-        if (inRect(PLAY, x, z, 0.5) && test(x, z)) { move(x, z); return; }
+        if (inBounds(x, z, 0.5) && test(x, z)) { move(x, z); return; }
       }
     }
     // Last resort: the nearest sidewalk (on foot).
@@ -2480,7 +2486,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       : !state.riding && SCENERY.docks.some((d) => d.rental && distance(d.ring) < 3) ? `Nhấn E để thuê ca nô (${formatThousands(BOAT_PRICE)})`
       : !state.riding && distance(LANDMARKS.tower.door) < 3.2 ? `Nhấn E: lên đài quan sát tầng 68 (${formatThousands(DECK_PRICE)}) và nhảy dù`
       : !state.riding && distance(LANDMARKS.bank.door) < 3.2 ? (weapon === 'fists' ? 'Ngân hàng Phương Nam · phải có súng mới cướp được' : 'Nhấn E để cướp ngân hàng (bị truy nã gắt)')
-      : !state.riding && state.z < -133.2 && Math.cos(state.angle) < -0.4 && !dockAt(state.x, state.z - 1.4) ? 'Space để nhảy qua lan can xuống sông'
+      : !state.riding && vaultSpot() ? 'Space để nhảy qua lan can xuống sông'
       : zombieMode && !nearStore && !nearHospital && !state.riding && !(car && !nearBike) ? (rounds && rounds.mag === 0 && rounds.reserve === 0 ? 'Hết đạn · Đổi súng (1–6) hoặc mua đạn ở Tiệm súng' : 'Click/F bắn · bắn vào đầu · R nạp đạn · lên xe để chạy thoát')
       : nearMission && missionInfo.requiresOnFoot && state.riding ? 'Giảm tốc rồi nhấn E xuống xe để dọn rác'
       : nearMission && missionInfo.requiresBike && !isMotorbike() ? 'Hãy dùng xe máy để tham gia vòng đua'
@@ -2894,8 +2900,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     // Holding Tab for the weapon bag slows the street down, like a weapon wheel.
     const dt = Math.min(interval / 1000, 0.05) * (bagOpen ? 0.25 : 1);
     previousTime = now;
-    adaptQuality(now, interval);
+    // Frames behind an opaque overlay say nothing about how fast the street draws.
+    adaptQuality(now, covered ? 0 : interval);
     const time = now / 1000;
+    const street = active || started;
     let moving = false;
     const def = weaponById(weapon);
 
@@ -2948,7 +2956,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
 
     // Deep water under someone on foot means swimming (weapons away); back in the shallows they walk.
-    const deep = !state.riding && !boat && !glide && !playerBody && groundHeight(state.x, state.z) < WATER_LEVEL - 0.55;
+    const deep = !state.riding && !boat && !glide && !playerBody && deepWater(state.x, state.z, bodyY);
     if (deep && !swimming) {
       swimming = true;
       jumpY = jumpV = 0;
@@ -2974,7 +2982,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     applyShadows();
     world.setAtmosphere?.({ night: atmosphere.night, wet: atmosphere.rain, sky: (scene.fog as THREE.Fog).color });
     vehicles.setNight(atmosphere.night);
-    setRain(active ? atmosphere.rain : 0);
+    setRain(street ? atmosphere.rain : 0);
     crossing.length = 0;
     npcs.forEachCrossing((x, z) => crossing.push({ x, z }));
     for (const crash of vehicles.update(dt, time, { x: state.x, z: state.z, car: playerCar }, crossing)) handleCrash(crash, now, time, false);
@@ -3201,7 +3209,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (playerBody) ragdolls.center(playerBody, scratch);
     else scratch.set(state.x, 0, state.z);
     youLabel.position.set(scratch.x, glide ? glide.y + 2.3 : swimming ? WATER_LEVEL + 1.2 : boat ? WATER_LEVEL + 2.4 : inCar() ? 3.1 : state.riding ? 2.6 : 2.3, scratch.z);
-    youLabel.visible = active;
+    youLabel.visible = street;
 
     // Mission marker, shopkeeper and receiver.
     pin.position.y = 2.7 + Math.sin(time * 2.5) * 0.2;
@@ -3267,7 +3275,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
     const cameraBlend = 1 - Math.exp(-dt * 4.5);
     const follow = playerBody ? scratch : null;
-    desiredTarget.set(active ? (follow ? follow.x : state.x) : -3, glide && active ? glide.y + 1.2 : 1, active ? (follow ? follow.z : state.z) : -5);
+    desiredTarget.set(street ? (follow ? follow.x : state.x) : -3, glide && street ? glide.y + 1.2 : 1, street ? (follow ? follow.z : state.z) : -5);
     cameraTarget.lerp(desiredTarget, cameraBlend);
     const viewBlend = 1 - Math.exp(-dt * 14);
     // The camera closes in on an arrest.
@@ -3280,7 +3288,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const glide = 1 - Math.exp(-dt * 4);
       camera.position.lerp(shot.eye, glide);
       interiorLook.lerp(shot.look, glide);
-    } else if (active) {
+    } else if (street) {
       camDesired.copy(cameraTarget).add(offsetFor(smoothView.yaw, smoothView.pitch, smoothView.dist, cameraOffset));
       camera.position.lerp(camDesired, 1 - Math.exp(-dt * 10));
     } else {
@@ -3302,7 +3310,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     camera.updateMatrixWorld();
     // Buildings between the camera and the player open up around them.
-    world.focus(camera, desiredTarget.x, glide ? glide.y + 1.1 : groundHeight(desiredTarget.x, desiredTarget.z) + 1.1, desiredTarget.z, dt, active && !interior);
+    world.focus(camera, desiredTarget.x, glide ? glide.y + 1.1 : groundHeight(desiredTarget.x, desiredTarget.z) + 1.1, desiredTarget.z, dt, street && !interior);
 
     // Floating health bars over anyone hurt recently, and speech bubbles.
     effects.beginBars(camera);
@@ -3317,9 +3325,11 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     bubbles.update(now, cameraTarget.x, cameraTarget.z);
     effects.update(now, dt);
     canvas.style.cursor = interior ? (productHover ? 'pointer' : '') : !active ? '' : rotating ? 'grabbing' : armed ? 'none' : '';
-    world.update(time);
-    sky.update(camera, time, atmosphere.sunDirection, atmosphere.tint, atmosphere.cover, 1 - atmosphere.night);
-    renderer.render(scene, camera);
+    if (!covered) {
+      world.update(time);
+      sky.update(camera, time, atmosphere.sunDirection, atmosphere.tint, atmosphere.cover, 1 - atmosphere.night);
+      renderer.render(scene, camera);
+    }
     if (now - hudTime >= 120) {
       hudTime = now;
       emitHud(now);
@@ -3352,6 +3362,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       ride: (x: number, z: number, angle: number) => { bikeX = x; bikeZ = z; bikeAngle = angle; Object.assign(state, { x, z, angle, riding: true }); velocity = 0; cameraTarget.set(x, 1, z); },
       view: (yaw: number, pitch: number, dist: number) => { Object.assign(view, { yaw, pitch, dist }); manualCameraAt = performance.now() + 1e9; },
       hours: (h: number) => atmosphere.setHours(h),
+      weather: (w: Weather) => atmosphere.setWeather(w),
       cash: (c: number) => { cash = c; },
       weapon: (id: WeaponId) => { owned.add(id); ammo.set(id, { mag: 30, reserve: 90 }); equip(id); },
       stats: () => ({ calls: renderer.info.render.calls, triangles: renderer.info.render.triangles, geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures, fps: monitor.fps }),
@@ -3406,6 +3417,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       interiors.setHovered(id ?? productHover);
     },
     setActive(value: boolean) { active = value; previousTime = performance.now(); clearKeys(); rotating = null; touches.clear(); if (!value && !state.riding) velocity = 0; },
+    /** A game is running (true from the start of a session until it is left), whatever overlay is open. */
+    setStarted(value: boolean) { started = value; },
+    /** An opaque overlay covers the whole street (the big map): skips drawing until it closes. */
+    setCovered(value: boolean) { covered = value; },
     getState(): PlayerState {
       return {
         ...state, health: Math.ceil(health), weapon, vehicle: vehicleKind(), down: down === 'wasted',

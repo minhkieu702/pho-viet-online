@@ -3,7 +3,7 @@ import type { IncomingHit, PeerState, PlayerState, ServerMessage } from './multi
 import {
   ACTIVE_MS, SESSION_MS, MAX_PLAYERS, MAX_BODY_BYTES, COLORS, UUID, ClientError,
   finite, hashToken, incomingHit, payload, playerHit, playerName, playerState,
-  randomHex, readPayload, reply, roomCode, sameOrigin,
+  randomHex, readPayload, reply, roomCode, sameOrigin, worldVersion,
 } from './room-validation.ts';
 import { roomError } from './room-service.ts';
 
@@ -14,7 +14,8 @@ const RETRY_MS = 500;
 const RECEIPT_TTL_MS = 20_000;
 const MAX_RECEIPTS = 4096;
 type SavedPlayer = { id: string; name: string; color: string; tokenHash: string; joinedAt: number; lastSeen: number };
-type SavedRoom = { code: string; createdAt: number; lastActivity: number; players: SavedPlayer[] };
+/** `world` is the layout version (lib/world-bounds.ts WORLD_VERSION) every player in the room builds; rooms saved before it existed are version 1. */
+type SavedRoom = { code: string; createdAt: number; lastActivity: number; players: SavedPlayer[]; world?: number };
 type Player = SavedPlayer & { state?: PlayerState; updatedAt: number; vx: number; vz: number; connection?: Connection; damageWindow: number; damage: number };
 type Connection = {
   socket: WebSocket; player?: Player; seq: number; closed: boolean; timer: ReturnType<typeof setTimeout>;
@@ -70,12 +71,15 @@ export class RealtimeRoom implements DurableObject {
         this.prune(now);
         const code = roomCode(body.room);
         if (body.action === 'create' || body.action === 'join') {
-          const name = playerName(body.name);
+          const name = playerName(body.name), world = worldVersion(body.world);
           if (body.action === 'create') {
             if (this.room && this.room.lastActivity > now - SESSION_MS) throw new ClientError('Mã phòng đã tồn tại.', 409);
             this.reset();
-            this.room = { code, createdAt: now, lastActivity: now, players: [] };
-          } else this.requireRoom(now, code);
+            this.room = { code, createdAt: now, lastActivity: now, players: [], world };
+          } else {
+            this.requireRoom(now, code);
+            if (world !== (this.room!.world ?? 1)) throw new ClientError('Phòng này dùng bản đồ phiên bản khác. Hãy tải lại trang.', 409);
+          }
           if (this.activeCount(now) >= MAX_PLAYERS) throw new ClientError('Phòng đã đủ 8 người. Hãy thử một phòng khác.', 409);
           const token = randomHex();
           const id = crypto.randomUUID();

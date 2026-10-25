@@ -1,9 +1,8 @@
 import * as THREE from 'three';
+import { SECONDS_PER_HOUR, clockText, createClock } from './clock';
 
 export type Weather = 'clear' | 'cloudy' | 'rain';
 const WEATHER_LABEL: Record<Weather, string> = { clear: 'Nắng', cloudy: 'Nhiều mây', rain: 'Mưa' };
-// One in-game day lasts 24 real minutes: an hour of game time per real minute.
-const SECONDS_PER_HOUR = 60;
 
 function smoothstep(a: number, b: number, x: number) {
   const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
@@ -15,7 +14,7 @@ function smoothstep(a: number, b: number, x: number) {
  * and draws rain as one shader-animated line batch that follows the camera (no per-drop CPU work).
  */
 export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight, hemi: THREE.HemisphereLight, startHour = 7.5) {
-  let hours = startHour;
+  const clock = createClock(startHour);
   let weather: Weather = 'clear';
   // Real seconds until the weather changes again.
   let weatherTimer = (2 + Math.random() * 3) * SECONDS_PER_HOUR;
@@ -80,26 +79,24 @@ export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight
   const dayTint = new THREE.Color('#ffffff'), duskTint = new THREE.Color('#f2b08a'), nightTint = new THREE.Color('#2a3550'), rainTint = new THREE.Color('#9aa2a8');
 
   return {
-    get hours() { return hours; },
+    get hours() { return clock.hours; },
+    clock,
     get weather() { return weather; },
     get rain() { return rain; },
     get night() { return 1 - smoothstep(-0.12, 0.12, sunDirection.y); },
     sunDirection,
     tint,
     get cover() { return cover; },
-    label() {
-      const h = Math.floor(hours) % 24, m = Math.floor((hours % 1) * 60);
-      return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')} · ${WEATHER_LABEL[weather]}`;
-    },
+    label() { return `${clockText(clock.hours)} · ${WEATHER_LABEL[weather]}`; },
     setWeather(next: Weather) { weather = next; weatherTimer = (2 + Math.random() * 4) * SECONDS_PER_HOUR; },
-    setHours(next: number) { hours = ((next % 24) + 24) % 24; },
+    setHours(next: number) { clock.set(next); },
     setApocalypse(on: boolean) {
       apocalypse = on;
       if (on && weather === 'clear') weather = 'cloudy';
     },
     /** Advances the clock; returns true when the sun moved enough that the static shadow map should be redrawn. */
     update(dt: number, time: number, focus: THREE.Vector3, spread = 60) {
-      hours = (hours + dt / SECONDS_PER_HOUR) % 24;
+      const hours = clock.advance(dt);
       weatherTimer -= dt;
       if (weatherTimer <= 0) {
         const roll = Math.random();
