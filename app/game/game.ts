@@ -3345,6 +3345,20 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     bikeHealth = bikeById(id).health;
   }
 
+  // Local development only: a handle for automated checks and screenshots (teleport, camera, clock, stats).
+  if (typeof location !== 'undefined' && /^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
+    (window as unknown as Record<string, unknown>).__pvo = {
+      tp: (x: number, z: number, angle = 0) => { Object.assign(state, { x, z, angle, riding: false }); bodyY = groundHeight(x, z); cameraTarget.set(x, 1, z); },
+      ride: (x: number, z: number, angle: number) => { bikeX = x; bikeZ = z; bikeAngle = angle; Object.assign(state, { x, z, angle, riding: true }); velocity = 0; cameraTarget.set(x, 1, z); },
+      view: (yaw: number, pitch: number, dist: number) => { Object.assign(view, { yaw, pitch, dist }); manualCameraAt = performance.now() + 1e9; },
+      hours: (h: number) => atmosphere.setHours(h),
+      cash: (c: number) => { cash = c; },
+      weapon: (id: WeaponId) => { owned.add(id); ammo.set(id, { mag: 30, reserve: 90 }); equip(id); },
+      stats: () => ({ calls: renderer.info.render.calls, triangles: renderer.info.render.triangles, geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures, fps: monitor.fps }),
+      info: () => ({ x: state.x, z: state.z, riding: state.riding, swimming, boat: !!boat, glide: glide ? { ...glide } : null, down, wanted: police.wanted, cash, hint: notification }),
+      scene, camera, renderer, npcs, vehicles, police, ragdolls,
+    };
+  }
   return {
     /** Opens (or closes, with null) a shop interior: the camera cuts inside and the player stands at the door. */
     setInterior(kind: InteriorKind | null) {
