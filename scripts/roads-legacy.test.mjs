@@ -419,3 +419,27 @@ test('a hand-made graph: a polyline road, a three-way signalled junction and a h
   assert.equal(g.junctionAt(1, 1), hub);
   assert.equal(g.edgeAt(40, 6.5).edge.name, 'A');
 });
+
+test('a T junction: the crosswalks over the through road are square, level with the side road\'s walking lines', () => {
+  // A boulevard north-south with a side street from the west (wider walks on the through road), and a hẻm mouth.
+  const g = createRoadGraph({
+    nodes: [{ x: 0, z: -80, control: 'none' }, { x: 0, z: 0, control: 'signal' }, { x: 0, z: 80, control: 'none' }, { x: -80, z: 0, control: 'none' }, { x: 0, z: 40, control: 'none' }, { x: 40, z: 40, control: 'none' }],
+    edges: [
+      { a: 0, b: 1, name: 'VVK', half: 11, walk: 12.4 }, { a: 1, b: 4, name: 'VVK', half: 11, walk: 12.4 }, { a: 4, b: 2, name: 'VVK', half: 11, walk: 12.4 },
+      { a: 3, b: 1, name: 'SIDE' }, { a: 4, b: 5, name: 'HẺM 1', cls: 'hem' },
+    ],
+  });
+  const at = (c) => { const n = g.nodes[c.node], a = n.arms[c.arm]; return [(c.ax - n.x) * a.hx + (c.az - n.z) * a.hz, (c.bx - n.x) * a.hx + (c.bz - n.z) * a.hz]; };
+  const t = g.crosswalks.filter((c) => c.node === 1);
+  assert.equal(t.length, 3);
+  for (const c of t) {
+    const [p, q] = at(c);
+    assert.ok(Math.abs(p - q) < 1e-9, 'square across the road');
+    const e = g.edges[c.edge];
+    for (const [x, z] of [[c.ax, c.az], [c.bx, c.bz]]) assert.ok(Math.abs(Math.abs(g.project(e, x, z).off) - e.walk) < 1e-9, 'ends on the walking lines');
+  }
+  // Over the boulevard north and south of the side street: level with its walking lines (8.4 m off its centre).
+  assert.deepEqual(t.filter((c) => g.edges[c.edge].name === 'VVK').map((c) => Math.abs(at(c)[0])), [8.4, 8.4]);
+  // At the hẻm mouth both crosswalks over the boulevard run along the hẻm's centre line.
+  for (const c of g.crosswalks.filter((m) => m.node === 4)) assert.deepEqual([c.az, c.bz], [40, 40]);
+});

@@ -45,9 +45,12 @@ export type RoadNode = { id: number; x: number; z: number; control: Control; arm
 export type RoadApproach = { id: number; node: number; arm: number; edge: number; dir: 1 | -1; group: number; stop: number; hx: number; hz: number; pole: { x: number; z: number } };
 /**
  * A crosswalk over one arm of a junction, from the corner on the arm's left to the one on its right, held by
- * the arm's signal group. `phantom` ones cross an arm that does not exist (edge and arm -1): legacy data.
+ * the arm's signal group; over the through road of a T the end on the straight side is level with the other
+ * (inside that walking line). `phantom` ones cross an arm that does not exist (edge and arm -1): legacy data.
+ * `informal` ones cross the through road at a hẻm mouth (every arm off it is a hẻm): one per mouth (both arms of
+ * the through road point to it), with no zebra; traffic does not stop for it, people cross on a gap.
  */
-export type Crosswalk = { id: number; node: number; arm: number; edge: number; group: number; ax: number; az: number; bx: number; bz: number; phantom: boolean };
+export type Crosswalk = { id: number; node: number; arm: number; edge: number; group: number; ax: number; az: number; bx: number; bz: number; phantom: boolean; informal: boolean };
 /** A crosswalk over a road that is not there (direction from the node), kept for parity with the old walking graph. */
 export type Phantom = { node: number; hx: number; hz: number; walk: number };
 export type Footway = { ax: number; az: number; bx: number; bz: number };
@@ -152,6 +155,8 @@ export function createRoadGraph(input: RoadInput) {
     // map with north up is on its right). Straight on there is no corner and the lines run through the node.
     const n = list.length;
     let radius = n ? Math.max(...list.map((a) => a.half)) : 0;
+    // Sides whose neighbour runs straight on (bit 0: left, bit 1: right): no corner there.
+    const straight = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       const a = list[i];
       if (n === 1) { a.trim[0] = a.trim[1] = node.control === 'fence-end' ? FENCE_TRIM : 0; continue; }
@@ -161,16 +166,21 @@ export function createRoadGraph(input: RoadInput) {
       const cap = 2 * Math.max(a.walk, l.walk, r.walk);
       a.trim[0] = Number.isNaN(left) ? 0 : Math.max(-cap, left);
       a.trim[1] = Number.isNaN(right) ? 0 : Math.max(-cap, right);
+      straight[i] = (Number.isNaN(left) ? 1 : 0) | (Number.isNaN(right) ? 2 : 0);
       const corner = meet(-a.hz * a.half, a.hx * a.half, a.hx, a.hz, r.hz * r.half, -r.hx * r.half, r.hx, r.hz);
       if (!Number.isNaN(corner) && corner > 0) radius = Math.max(radius, Math.hypot(corner, a.half));
     }
     node.radius = r2(radius);
     const junction = n >= 3 && node.control !== 'fence-end';
+    // Hẻm mouths on a through road (one, or two staggered across it): the crosswalks over its two arms would lie on
+    // top of each other; one informal one.
+    const hem = list.filter((a) => a.arm >= 0 && edges[node.arms[a.arm].edge].cls === 'hem'), through = list.filter((a) => !hem.includes(a));
+    const side = (a: WalkArm) => Math.sign(through[0].hx * a.hz - through[0].hz * a.hx);
+    const informal = junction && through.length === 2 && through[0].hx * through[1].hx + through[0].hz * through[1].hz < -0.9 && (hem.length === 1 || (hem.length === 2 && side(hem[0]) * side(hem[1]) < 0));
+    let mouth = -1;
     /** The end of an arm's walking line on its left (0) or right (1); a centre line (hẻm) ends at the farther trim. */
-    const corner = (a: WalkArm, side: 0 | 1) => {
-      const t = a.walk > 0 ? a.trim[side] : Math.max(a.trim[0], a.trim[1]), s = side ? a.walk : -a.walk;
-      return { x: node.x + a.hx * t + -a.hz * s, z: node.z + a.hz * t + a.hx * s };
-    };
+    const at = (a: WalkArm, t: number, side: 0 | 1) => { const s = side ? a.walk : -a.walk; return { x: node.x + a.hx * t + -a.hz * s, z: node.z + a.hz * t + a.hx * s }; };
+    const corner = (a: WalkArm, side: 0 | 1) => at(a, a.walk > 0 ? a.trim[side] : Math.max(a.trim[0], a.trim[1]), side);
     for (let i = 0; i < n; i++) {
       const a = list[i];
       if (a.arm >= 0 && junction) node.arms[a.arm].setback = r2(Math.max(a.trim[0], a.trim[1], 0) + STOP_GAP);
@@ -180,9 +190,13 @@ export function createRoadGraph(input: RoadInput) {
         if (Math.hypot(p.x - q.x, p.z - q.z) > 0.01) joins.push({ ax: p.x, az: p.z, bx: q.x, bz: q.z, crossing: Math.hypot(mx, mz) < Math.max(a.half, list[(i + 1) % n].half) });
       }
       if (!junction || a.walk <= 0) continue;
-      const p = corner(a, 0), q = corner(a, 1), arm = a.arm >= 0 ? node.arms[a.arm] : null;
+      // Square across the road: where the road runs straight on (the through road of a T) there is no corner on
+      // that side, so that end takes the other side's distance.
+      const st = straight[i], p = at(a, a.trim[st & 1 ? 1 : 0], 0), q = at(a, a.trim[st & 2 ? 0 : 1], 1), arm = a.arm >= 0 ? node.arms[a.arm] : null;
+      if (informal && mouth >= 0) { if (arm) arm.crosswalk = mouth; continue; }
       if (arm) arm.crosswalk = crosswalks.length;
-      crosswalks.push({ id: crosswalks.length, node: node.id, arm: a.arm, edge: arm ? arm.edge : -1, group: a.group, ax: p.x, az: p.z, bx: q.x, bz: q.z, phantom: !arm });
+      if (informal) mouth = crosswalks.length;
+      crosswalks.push({ id: crosswalks.length, node: node.id, arm: a.arm, edge: arm ? arm.edge : -1, group: a.group, ax: p.x, az: p.z, bx: q.x, bz: q.z, phantom: !arm, informal });
     }
     if (node.control !== 'signal') continue;
     node.arms.forEach((arm, i) => {
