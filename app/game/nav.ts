@@ -1,15 +1,31 @@
-import { LAND, ROADS_X, ROADS_Z, SIDEWALK } from './city';
+import { LAND, ROADS_X, ROADS_Z, SIDEWALK, type Rect } from './city.ts';
 
 /** A step of a walking route; `crossing` marks legs over a carriageway (on a crosswalk). */
 export type Waypoint = { x: number; z: number; crossing: boolean };
 type Edge = { to: number; cost: number; crossing: boolean };
 type Segment = { ax: number; az: number; bx: number; bz: number; a: number; b: number; crossing: boolean };
+export type Nav = ReturnType<typeof buildNav>;
+
+const CELL = 16;
+// A* heuristic: straight-line distance to the destination. Every leg costs at least its length (crosswalks 1.4x, no
+// waits in the cost), so it is admissible and consistent; the hair under 1 keeps float rounding from breaking that.
+const HEURISTIC = 1 - 1e-9;
+const STAMP_LIMIT = 0xffffffff;
+
+let shared: Nav | null = null;
 
 /**
  * Pedestrian network: walking lines on both sides of every road, broken at junctions into
  * sidewalk legs and crosswalk legs. Routes follow sidewalks and only cross roads on crosswalks.
+ * It depends only on the fixed road grid and searches keep no state between calls, so all callers share one.
  */
 export function createNav() {
+  if (!shared) shared = buildNav();
+  return shared;
+}
+
+/** A separate network over any road grid, for tests and tools; the game uses the shared one from createNav(). */
+export function buildNav(roadsX: number[] = ROADS_X, roadsZ: number[] = ROADS_Z, land: Rect = LAND) {
   const nodes: { x: number; z: number; edges: Edge[] }[] = [];
   const ids = new Map<string, number>();
   const segments: Segment[] = [];
@@ -45,57 +61,172 @@ export function createNav() {
       }
     }
   };
-  layLines(ROADS_Z, ROADS_X, LAND.minX, LAND.maxX, true);
-  layLines(ROADS_X, ROADS_Z, LAND.minZ, LAND.maxZ, false);
+  layLines(roadsZ, roadsX, land.minX, land.maxX, true);
+  layLines(roadsX, roadsZ, land.minZ, land.maxZ, false);
+
+  // Packed for searching: node coordinates plus one virtual node, `goal`, placed on the destination point per route;
+  // adjacency in CSR form, in the same edge order as above.
+  const count = nodes.length, goal = count;
+  const nodeX = new Float64Array(count + 1), nodeZ = new Float64Array(count + 1), first = new Int32Array(count + 1);
+  nodes.forEach((n, i) => { nodeX[i] = n.x; nodeZ[i] = n.z; first[i + 1] = first[i] + n.edges.length; });
+  const edgeTo = new Int32Array(first[count]), edgeCost = new Float64Array(first[count]), edgeCrossing = new Uint8Array(first[count]);
+  nodes.forEach((n, i) => n.edges.forEach((e, k) => { edgeTo[first[i] + k] = e.to; edgeCost[first[i] + k] = e.cost; edgeCrossing[first[i] + k] = e.crossing ? 1 : 0; }));
+
+  // Snap grid: each 16 m cell lists the segments passing through it.
+  const segAX = Float64Array.from(segments, (s) => s.ax), segAZ = Float64Array.from(segments, (s) => s.az);
+  const segBX = Float64Array.from(segments, (s) => s.bx), segBZ = Float64Array.from(segments, (s) => s.bz);
+  let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
+  for (const s of segments) {
+    minX = Math.min(minX, s.ax, s.bx); maxX = Math.max(maxX, s.ax, s.bx);
+    minZ = Math.min(minZ, s.az, s.bz); maxZ = Math.max(maxZ, s.az, s.bz);
+  }
+  const cols = Math.floor((maxX - minX) / CELL) + 1, rows = Math.floor((maxZ - minZ) / CELL) + 1;
+  const col = (x: number) => Math.max(0, Math.min(cols - 1, Math.floor((x - minX) / CELL)));
+  const row = (z: number) => Math.max(0, Math.min(rows - 1, Math.floor((z - minZ) / CELL)));
+  const cellFirst = new Int32Array(cols * rows + 1);
+  const eachCell = (i: number, fn: (cell: number) => void) => {
+    for (let r = row(Math.min(segAZ[i], segBZ[i])); r <= row(Math.max(segAZ[i], segBZ[i])); r++)
+      for (let c = col(Math.min(segAX[i], segBX[i])); c <= col(Math.max(segAX[i], segBX[i])); c++) fn(r * cols + c);
+  };
+  segments.forEach((_, i) => eachCell(i, (cell) => cellFirst[cell + 1]++));
+  for (let k = 0; k < cols * rows; k++) cellFirst[k + 1] += cellFirst[k];
+  const cellSegments = new Int32Array(cellFirst[cols * rows]), fill = cellFirst.slice(0, -1);
+  segments.forEach((_, i) => eachCell(i, (cell) => { cellSegments[fill[cell]++] = i; }));
+
+  // Per-search scratch, valid only where its stamp matches the current search, so nothing is cleared or allocated.
+  const segStamp = new Uint32Array(segments.length);
+  const g = new Float64Array(count + 1), previous = new Int32Array(count + 1), crossingInto = new Uint8Array(count + 1);
+  const seen = new Uint32Array(count + 1), closed = new Uint32Array(count + 1);
+  let snapStamp = 0, stamp = 0;
+  // Open list: binary min-heap on g + h with lazy deletion. A node is expanded once and pushes at most once per leg,
+  // plus two seeds and two finishes, so it only grows if float rounding ever reopens a node.
+  let heapNode = new Int32Array(edgeTo.length + 8), heapKey = new Float64Array(edgeTo.length + 8);
+  let heapSize = 0;
+  // Result of the last nearest(): segment index, closest point and squared distance.
+  let nearSeg = 0, nearX = 0, nearZ = 0, nearD = Infinity;
+
+  function consider(i: number, x: number, z: number) {
+    const ax = segAX[i], az = segAZ[i], dx = segBX[i] - ax, dz = segBZ[i] - az;
+    const t = Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / (dx * dx + dz * dz || 1)));
+    const px = ax + dx * t, pz = az + dz * t;
+    const d = (px - x) ** 2 + (pz - z) ** 2;
+    if (d < nearD || (d === nearD && i < nearSeg)) { nearSeg = i; nearX = px; nearZ = pz; nearD = d; }
+  }
+  function scanCell(cell: number, x: number, z: number) {
+    for (let k = cellFirst[cell]; k < cellFirst[cell + 1]; k++) {
+      const i = cellSegments[k];
+      if (segStamp[i] !== snapStamp) { segStamp[i] = snapStamp; consider(i, x, z); }
+    }
+  }
+  /** Closest segment, searched in growing rings of cells; on ties the lowest index wins, as in a linear scan. */
+  function nearest(x: number, z: number) {
+    nearSeg = 0; nearX = x; nearZ = z; nearD = Infinity;
+    if (!(Math.abs(x) < 1e9 && Math.abs(z) < 1e9)) { for (let i = 0; i < segments.length; i++) consider(i, x, z); return; }
+    if (++snapStamp === STAMP_LIMIT) { segStamp.fill(0); snapStamp = 1; }
+    const cx = col(x), cz = row(z);
+    for (let ring = 0; ; ring++) {
+      const c0 = cx - ring, c1 = cx + ring, r0 = cz - ring, r1 = cz + ring;
+      for (let r = Math.max(r0, 0); r <= Math.min(r1, rows - 1); r++) {
+        if (r === r0 || r === r1) for (let c = Math.max(c0, 0); c <= Math.min(c1, cols - 1); c++) scanCell(r * cols + c, x, z);
+        else {
+          if (c0 >= 0) scanCell(r * cols + c0, x, z);
+          if (c1 < cols) scanCell(r * cols + c1, x, z);
+        }
+      }
+      // Any segment not seen yet only passes through cells outside this block, so it is at least `reach` away.
+      let reach = Infinity;
+      if (c0 > 0) reach = x - (minX + c0 * CELL);
+      if (c1 < cols - 1) reach = Math.min(reach, minX + (c1 + 1) * CELL - x);
+      if (r0 > 0) reach = Math.min(reach, z - (minZ + r0 * CELL));
+      if (r1 < rows - 1) reach = Math.min(reach, minZ + (r1 + 1) * CELL - z);
+      if (reach === Infinity || (reach > 1e-6 && nearD < (reach - 1e-6) ** 2)) return;
+    }
+  }
+
+  function push(id: number, key: number) {
+    if (heapSize === heapNode.length) {
+      const nodes = new Int32Array(heapSize * 2), keys = new Float64Array(heapSize * 2);
+      nodes.set(heapNode); keys.set(heapKey); heapNode = nodes; heapKey = keys;
+    }
+    let i = heapSize++;
+    while (i > 0) {
+      const up = (i - 1) >> 1;
+      if (heapKey[up] <= key) break;
+      heapNode[i] = heapNode[up]; heapKey[i] = heapKey[up]; i = up;
+    }
+    heapNode[i] = id; heapKey[i] = key;
+  }
+  function pop() {
+    const top = heapNode[0], id = heapNode[--heapSize], key = heapKey[heapSize];
+    let i = 0;
+    for (;;) {
+      let c = 2 * i + 1;
+      if (c >= heapSize) break;
+      if (c + 1 < heapSize && heapKey[c + 1] < heapKey[c]) c++;
+      if (heapKey[c] >= key) break;
+      heapNode[i] = heapNode[c]; heapKey[i] = heapKey[c]; i = c;
+    }
+    heapNode[i] = id; heapKey[i] = key;
+    return top;
+  }
+  function open(id: number, cost: number, via: number, crossing: number) {
+    if (seen[id] === stamp) {
+      if (cost > g[id]) return;
+      if (cost === g[id]) {
+        // An equal-cost way in: keep the one Dijkstra kept, through the node it settles first (lower cost, then lower
+        // index), so routes stay the same as before the rewrite. Every such node is expanded before the goal.
+        const prev = previous[id];
+        if (prev >= 0 && (g[via] < g[prev] || (g[via] === g[prev] && via < prev))) { previous[id] = via; crossingInto[id] = crossing; }
+        return;
+      }
+      closed[id] = 0;
+    }
+    seen[id] = stamp; g[id] = cost; previous[id] = via; crossingInto[id] = crossing;
+    const dx = nodeX[id] - nodeX[goal], dz = nodeZ[id] - nodeZ[goal];
+    push(id, cost + HEURISTIC * Math.sqrt(dx * dx + dz * dz));
+  }
 
   /** Closest point on the walking network. */
   function snap(x: number, z: number) {
-    let best = { x, z, segment: segments[0], d: Infinity };
-    for (const s of segments) {
-      const dx = s.bx - s.ax, dz = s.bz - s.az;
-      const t = Math.max(0, Math.min(1, ((x - s.ax) * dx + (z - s.az) * dz) / (dx * dx + dz * dz || 1)));
-      const px = s.ax + dx * t, pz = s.az + dz * t;
-      const d = (px - x) ** 2 + (pz - z) ** 2;
-      if (d < best.d) best = { x: px, z: pz, segment: s, d };
-    }
-    return best;
+    nearest(x, z);
+    return { x: nearX, z: nearZ, segment: segments[nearSeg], d: nearD };
   }
 
   /** Walking route between two points on (or near) the network; the start point itself is not included. */
   function route(fromX: number, fromZ: number, toX: number, toZ: number): Waypoint[] {
-    const from = snap(fromX, fromZ), to = snap(toX, toZ);
-    if (from.segment === to.segment) return [{ x: to.x, z: to.z, crossing: to.segment.crossing }];
-    const count = nodes.length;
-    const dist = new Float64Array(count).fill(Infinity);
-    const previous = new Int32Array(count).fill(-1);
-    const crossingInto = new Uint8Array(count);
-    const done = new Uint8Array(count);
-    const seed = (id: number, x: number, z: number) => {
-      const cost = Math.hypot(nodes[id].x - x, nodes[id].z - z) * (from.segment.crossing ? 1.4 : 1);
-      if (cost < dist[id]) { dist[id] = cost; crossingInto[id] = from.segment.crossing ? 1 : 0; }
-    };
-    seed(from.segment.a, from.x, from.z);
-    seed(from.segment.b, from.x, from.z);
-    for (let n = 0; n < count; n++) {
-      let u = -1, best = Infinity;
-      for (let i = 0; i < count; i++) if (!done[i] && dist[i] < best) { best = dist[i]; u = i; }
-      if (u < 0) break;
-      done[u] = 1;
-      for (const edge of nodes[u].edges) {
-        const next = dist[u] + edge.cost;
-        if (next < dist[edge.to]) { dist[edge.to] = next; previous[edge.to] = u; crossingInto[edge.to] = edge.crossing ? 1 : 0; }
+    nearest(fromX, fromZ);
+    const from = segments[nearSeg], fx = nearX, fz = nearZ;
+    nearest(toX, toZ);
+    const to = segments[nearSeg], tx = nearX, tz = nearZ;
+    if (from === to) return [{ x: tx, z: tz, crossing: to.crossing }];
+    if (++stamp === STAMP_LIMIT) { seen.fill(0); closed.fill(0); stamp = 1; }
+    heapSize = 0;
+    nodeX[goal] = tx; nodeZ[goal] = tz;
+    const scale = from.crossing ? 1.4 : 1, crossing = from.crossing ? 1 : 0;
+    open(from.a, Math.hypot(nodeX[from.a] - fx, nodeZ[from.a] - fz) * scale, -1, crossing);
+    open(from.b, Math.hypot(nodeX[from.b] - fx, nodeZ[from.b] - fz) * scale, -1, crossing);
+    while (heapSize > 0) {
+      const u = pop();
+      if (closed[u] === stamp) continue;
+      closed[u] = stamp;
+      if (u === goal) break;
+      const gu = g[u];
+      for (let k = first[u]; k < first[u + 1]; k++) open(edgeTo[k], gu + edgeCost[k], u, edgeCrossing[k]);
+      // Finish through whichever end of the destination leg is cheaper (its `a` end on a tie).
+      if (u === to.a || u === to.b) {
+        const tail = gu + Math.hypot(nodeX[u] - tx, nodeZ[u] - tz);
+        if (seen[goal] !== stamp || tail < g[goal] || (tail === g[goal] && u === to.a)) {
+          seen[goal] = stamp; g[goal] = tail; previous[goal] = u; push(goal, tail);
+        }
       }
     }
-    // Finish through whichever end of the destination leg is cheaper.
-    const tail = (id: number) => dist[id] + Math.hypot(nodes[id].x - to.x, nodes[id].z - to.z);
-    let last = tail(to.segment.a) <= tail(to.segment.b) ? to.segment.a : to.segment.b;
-    const path: Waypoint[] = [{ x: to.x, z: to.z, crossing: to.segment.crossing }];
-    while (last >= 0) {
-      path.unshift({ x: nodes[last].x, z: nodes[last].z, crossing: crossingInto[last] === 1 });
-      last = previous[last];
-    }
-    return path;
+    if (seen[goal] !== stamp) return [{ x: nodeX[to.a], z: nodeZ[to.a], crossing: false }, { x: tx, z: tz, crossing: to.crossing }];
+    // A destination exactly on the `a` end ties with the goal in the heap and may not be expanded yet; its g is final.
+    if (seen[to.a] === stamp && g[to.a] + Math.hypot(nodeX[to.a] - tx, nodeZ[to.a] - tz) <= g[goal]) previous[goal] = to.a;
+    const path: Waypoint[] = [{ x: tx, z: tz, crossing: to.crossing }];
+    for (let v = previous[goal]; v >= 0; v = previous[v]) path.push({ x: nodeX[v], z: nodeZ[v], crossing: crossingInto[v] === 1 });
+    return path.reverse();
   }
 
-  return { route, snap, nodeCount: () => nodes.length };
+  return { route, snap, nodeCount: () => count };
 }

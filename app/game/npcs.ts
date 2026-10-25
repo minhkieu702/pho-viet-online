@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { BUILDINGS, POIS, type Building, type Poi } from './city';
 import { createNav, type Waypoint } from './nav';
+import { SECONDS_PER_HOUR } from './clock';
 import { walkOk } from './signals';
 import { seatHeight } from './world';
 import type { FallMode, HitKind, createRagdolls, RagdollBody, RagdollLook } from './ragdoll';
@@ -69,7 +70,6 @@ export type NpcEvents = { robbed: { npc: Npc; amount: number; shop: boolean }[];
 export type Threat = { x: number; z: number; aimYaw: number; armed: boolean; aiming: boolean; inVehicle: boolean; down: boolean };
 export type { IncidentKind } from './brain';
 
-const SECONDS_PER_HOUR = 60;
 // A standing person (1.71 m at BODY_SCALE, a little more with a hat) for hits and health bars.
 const HIT_RADIUS = 0.34;
 const HEIGHT = 1.8;

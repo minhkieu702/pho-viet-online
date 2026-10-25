@@ -4,22 +4,14 @@
  * deterministic (seeded), so gameplay, pedestrian routines and the renderer in world.ts all agree on the same
  * city. No three.js in here.
  */
+// The constant tables live in map/consts.ts (page.tsx imports them without running this generator).
+import {
+  CITY_PARK, DOCKS, DOWNTOWN_X, GARDENS, LAND, PARK, PLAZA, PROMENADE, ROADS_X, ROADS_Z, SIDEWALK, SQUARE, STREETS_H, STREETS_V, VENUE_LOOKS, YARDS,
+  type Point, type Rect, type VenueKind,
+} from './map/consts.ts';
+export { DOWNTOWN_X, LAND, PLAY, RIVER, RIVER_BED, ROADS_X, ROADS_Z, SIDEWALK, WATER_LEVEL } from './map/consts.ts';
+export type { Dock, Point, Rect, VenueKind } from './map/consts.ts';
 
-/** North-south road centre lines (x). The four east of 108 run through downtown. Roads are 20 m wide, asphalt 14 m. */
-export const ROADS_X = [-108, -54, 0, 54, 108, 162, 216, 270, 324];
-/** East-west road centre lines (z); they cross the whole map, An Hòa and downtown alike. */
-export const ROADS_Z = [-108, -54, 0, 54, 108];
-export const SIDEWALK = 8.4; // pedestrians walk on lines at road centre ± 8.4
-/** Dry land inside the fences: An Hòa (x -135..135) and downtown (x 135..351). The river lies north of it. */
-export const LAND: Rect = { minX: -138, maxX: 352, minZ: -135, maxZ: 137.5 };
-/** Open water from the promenade wall to the far bank's wall, between the buoy lines at either end. */
-export const RIVER: Rect = { minX: -138, maxX: 352, minZ: -203.6, maxZ: -137.6 };
-/** Everything the player can reach. */
-export const PLAY: Rect = { minX: LAND.minX, maxX: LAND.maxX, minZ: RIVER.minZ, maxZ: LAND.maxZ };
-export const WATER_LEVEL = -0.8;
-export const RIVER_BED = -2.8;
-/** Where downtown ("Quận Trung Tâm") begins, east of An Hòa. */
-export const DOWNTOWN_X = 135;
 /** Whether (x, z) lies inside `r`, at least `margin` from its edges. */
 export function inRect(r: Rect, x: number, z: number, margin = 0) {
   return x >= r.minX + margin && x <= r.maxX - margin && z >= r.minZ + margin && z <= r.maxZ - margin;
@@ -27,7 +19,6 @@ export function inRect(r: Rect, x: number, z: number, margin = 0) {
 
 export type BuildingKind = 'home' | 'shop' | 'cafe' | 'food' | 'office' | 'school' | 'hospital' | 'police' | 'post' | 'gunstore' | 'bikeshop' | 'pagoda'
   | 'bank' | 'mall' | 'hotel' | 'theatre';
-export type Point = { x: number; z: number };
 export type Building = {
   id: number; x: number; z: number; w: number; d: number; h: number; facing: number;
   name: string; subtitle: string; kind: BuildingKind; color: string;
@@ -36,10 +27,6 @@ export type Building = {
 export type PoiKind = 'park' | 'square' | 'market' | 'cafe-seat' | 'bench' | 'bus-stop' | 'pagoda-yard' | 'school-yard';
 export type Poi = { id: number; kind: PoiKind; x: number; z: number; yaw: number; curb: Point; seat: boolean };
 
-/** Axis-aligned footprint; the same shape as world.ts' Collider. */
-export type Rect = { minX: number; maxX: number; minZ: number; maxZ: number;
-  /** Height of a low solid (a planter, a stall counter) a falling body can land on; walls without one are infinitely tall. */
-  top?: number };
 /** Render-only details of a building, parallel to BUILDINGS (same id). */
 export type PlotStyle = 'legacy' | 'home' | 'shop' | 'kiosk' | 'hospital' | 'police' | 'school' | 'pagoda' | 'office' | 'tower' | 'midrise';
 /** Downtown building shapes (see skyline.ts). */
@@ -228,10 +215,7 @@ draft({
   name: 'NƯỚC MÍA', subtitle: 'MÍA ÉP • DỪA TƯƠI', color: '#e9c873', sign: true, signColor: '#3e7a3a', jobs: 1,
 });
 
-// New rows of tube houses facing the roads, in attached groups with alleys between them.
-const STREETS_H = new Map([[-108, 'ĐƯỜNG BỜ SÔNG'], [-54, 'ĐƯỜNG HOA SỮA'], [0, 'ĐƯỜNG AN HÒA'], [54, 'ĐƯỜNG PHƯỢNG VĨ'], [108, 'ĐƯỜNG CHỢ CŨ']]);
-const STREETS_V = new Map([[-108, 'ĐƯỜNG TRE XANH'], [-54, 'ĐƯỜNG BÀNG LĂNG'], [0, 'ĐƯỜNG TRUNG TÂM'], [54, 'ĐƯỜNG BƯU ĐIỆN'], [108, 'ĐƯỜNG BỆNH VIỆN'],
-  [162, 'ĐƯỜNG ĐỒNG KHỞI'], [216, 'ĐẠI LỘ NGUYỄN HUỆ'], [270, 'ĐƯỜNG HÀM NGHI'], [324, 'ĐƯỜNG TÔN ĐỨC THẮNG']]);
+// New rows of tube houses facing the roads, in attached groups with alleys between them (street names: STREETS_H/V).
 const HOME_COLORS = ['#e9cf8f', '#f0dcae', '#cfe0c8', '#e3b9a3', '#c9d7e3', '#efe6d2', '#d9a6a0', '#bcd0b5', '#f2c47a', '#d7c4dd', '#a9c9c2', '#e6c3a0'];
 const NEW_SHOPS: [string, string, BuildingKind][] = [
   ['TIỆM MAY', 'MAY ĐO • SỬA ĐỒ', 'shop'], ['QUÁN CƠM', 'CƠM TẤM • CƠM NHÀ', 'food'],
@@ -426,9 +410,7 @@ function addLamp(x: number, z: number, hx: number, hz: number, kind: Lamp['kind'
 }
 const insideAnyFull = (x: number, z: number, margin = 0) => drafts.some((d) => rectDistance(d.full, x, z) <= margin);
 
-// Park block: lawn, fountain and trees (legacy positions); two of the old trees are now flame trees.
-const PARK: Rect = { minX: 13, maxX: 43, minZ: -44, maxZ: -22 };
-const SQUARE: Rect = { minX: 14.5, maxX: 43.5, minZ: 29.5, maxZ: 46.5 };
+// Park block (PARK): lawn, fountain and trees (legacy positions); two of the old trees are now flame trees.
 addProp('fountain', 28, -33, 7, 7);
 ([[17, -40, 'round'], [39, -40, 'flame'], [17, -26, 'flame'], [39, -26, 'round']] as const).forEach(([x, z, s]) => addTree(s, x, z, 1.15));
 for (const [x, z] of [[17, 33], [42, 33], [17, 44], [42, 44]]) addTree('palm', x, z, 1);
@@ -486,8 +468,7 @@ busStop('h', -108, -1, -76);
 busStop('h', 108, 1, 38);
 busStop('v', 108, 1, -36);
 busStop('v', -108, -1, -19.5);
-// Corner gardens and the promenade.
-const GARDENS: Rect[] = [{ minX: 118.6, maxX: 137, minZ: 118.6, maxZ: 137 }, { minX: -137, maxX: -118.6, minZ: 118.6, maxZ: 137 }];
+// Corner gardens (GARDENS) and the promenade.
 addTree('flame', 130, 130, 1.25);
 addTree('flame', -130, 130, 1.25);
 benches.push({ x: 121.6, z: 127.5, yaw: -HALF_PI }, { x: 127.5, z: 121.6, yaw: PI });
@@ -495,34 +476,21 @@ benches.push({ x: -121.6, z: 127.5, yaw: HALF_PI }, { x: -127.5, z: 121.6, yaw: 
 const PROMENADE_BENCHES = [-122, -86, -42, -14, 14, 42, 92, 122];
 for (const x of PROMENADE_BENCHES) benches.push({ x, z: -133, yaw: PI });
 for (const x of [-104, -64, -28, 28, 104]) addTree('palm', x, -131, 1);
-// Pagoda and school yards are paved; the promenade runs the whole northern edge.
-const YARDS: Rect[] = [{ minX: -41, maxX: -13, minZ: 120, maxZ: 137 }, { minX: 11, maxX: 43, minZ: 120, maxZ: 137 }];
+// Pagoda and school yards (YARDS) are paved; the promenade runs the whole northern edge.
 
-// Downtown: the walking-street plaza in front of the theatre, a fountain in the middle, palms at the corners.
-const PLAZA: Rect = { minX: 228.5, maxX: 257.5, minZ: 12.5, maxZ: 41.5 };
+// Downtown: the walking-street plaza (PLAZA) in front of the theatre, a fountain in the middle, palms at the corners.
 addProp('fountain', 243, 27, 7, 7);
 for (const [x, z] of [[231.5, 15.5], [254.5, 15.5], [231.5, 38.5], [254.5, 38.5]]) addTree('palm', x, z, 1.1);
 for (const [x, z] of [[236, 19], [250, 19], [236, 35], [250, 35]]) addProp('planter', x, z, 2.2, 1.1, 0);
 benches.push({ x: 232.5, z: 22, yaw: HALF_PI }, { x: 232.5, z: 32, yaw: HALF_PI }, { x: 253.5, z: 22, yaw: -HALF_PI }, { x: 253.5, z: 32, yaw: -HALF_PI });
-// The city park: shade trees, a lawn and benches along its paths.
-const CITY_PARK: Rect = { minX: 228.5, maxX: 257.5, minZ: 66.5, maxZ: 95.5 };
+// The city park (CITY_PARK): shade trees, a lawn and benches along its paths.
 for (const [x, z, sp] of [[233, 71, 'round'], [253, 71, 'flame'], [233, 91, 'flame'], [253, 91, 'round'], [243, 76, 'tall'], [238, 86, 'round'], [249, 86, 'tall']] as const) addTree(sp, x, z, 1.2);
 benches.push({ x: 243, z: 70.5, yaw: 0 }, { x: 243, z: 91.5, yaw: PI }, { x: 234, z: 81, yaw: HALF_PI }, { x: 252, z: 81, yaw: -HALF_PI });
 // The riverfront continues downtown: benches facing the water and palms.
 for (const x of [150, 176, 230, 262, 286, 336]) benches.push({ x, z: -133, yaw: PI });
 for (const x of [160, 214, 250, 278, 326]) addTree('palm', x, -131, 1);
 
-/**
- * Docks on the river: a pier out over the water and steps beside it down to the waterline (where a swimmer
- * climbs out). `rental` docks hire out speedboats; the river bus stops at the others.
- */
-export type Dock = { x: number; name: string; rental: boolean; pier: Rect; steps: Rect; ring: Point };
-const DOCKS: Dock[] = ([[-80, 'BẾN ĐÒ AN HÒA', false], [2, 'BẾN AN HÒA • THUÊ CA NÔ', true], [190, 'BẾN BẠCH ĐẰNG', false], [300, 'BẾN DU THUYỀN • THUÊ CA NÔ', true]] as const).map(([x, name, rental]) => ({
-  x, name, rental,
-  pier: { minX: x - 2, maxX: x + 2, minZ: -152, maxZ: -134.6 },
-  steps: { minX: x + 2.6, maxX: x + 5, minZ: -140.5, maxZ: -134.6 },
-  ring: { x, z: -149.5 },
-}));
+// Docks on the river (DOCKS): piers, steps for swimmers, speedboat hire and the river bus.
 
 // ---------------------------------------------------------------------------------------------------------
 // Doors and curbs.
@@ -857,21 +825,12 @@ export const LANDMARKS: { hospital: Point; police: Point; tower: Building; bank:
 export const SCENERY = {
   trees, lamps, props, benches, busStops, tables: CAFE_TABLES,
   park: PARK, square: SQUARE, gardens: GARDENS, yards: YARDS,
-  promenade: { minX: -200, maxX: LAND.maxX + 70, minZ: -136.5, maxZ: -118 } as Rect,
+  promenade: PROMENADE,
   plaza: PLAZA, cityPark: CITY_PARK, docks: DOCKS,
 };
 
-// ---- The nightlife strip ("phố đèn đỏ"): the six shophouses on the road at z = 54, east of x = 54. ----
-export type VenueKind = 'bar' | 'karaoke' | 'motel' | 'club' | 'spa' | 'beer';
+// ---- The nightlife strip ("phố đèn đỏ"): the six shophouses on the road at z = 54, east of x = 54 (looks: VENUE_LOOKS). ----
 export type Venue = { kind: VenueKind; building: Building; door: Point; name: string; neon: string };
-const VENUE_LOOKS: Record<VenueKind, { name: string; subtitle: string; neon: string }> = {
-  bar: { name: 'BAR NEON', subtitle: 'COCKTAIL • RƯỢU • 18+', neon: '#ff3d7f' },
-  karaoke: { name: 'KARAOKE ÁNH SAO', subtitle: 'PHÒNG VIP • ÂM THANH CHUẨN', neon: '#b04dff' },
-  motel: { name: 'NHÀ NGHỈ HOA HỒNG', subtitle: 'THEO GIỜ • QUA ĐÊM', neon: '#ff4a4a' },
-  club: { name: 'VŨ TRƯỜNG MOONLIGHT', subtitle: 'DJ • NHẢY TỚI SÁNG • 18+', neon: '#3dd6ff' },
-  spa: { name: 'SPA & MASSAGE', subtitle: 'THƯ GIÃN • XÔNG HƠI', neon: '#ff8ad1' },
-  beer: { name: 'BIA HƠI HÀ NỘI', subtitle: 'BIA TƯƠI • ĐỒ NHẮM', neon: '#ffc23d' },
-};
 /** The venues west to east: bar, karaoke and motel face the road from the north, club, spa and beer from the south. */
 export const VENUES: Venue[] = [];
 {

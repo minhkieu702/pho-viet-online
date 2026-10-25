@@ -2,54 +2,14 @@ import * as THREE from 'three';
 import { BUILDINGS, COLLIDERS, LAMPS, LAND, PLOTS, RIVER, RIVER_BED, ROADS_X, ROADS_Z, SCENERY, VENUES, inRect, pathClearance, pointClear, type Building, type Plot, type Prop, type Rect, type Tree } from './city';
 import { buildSkyline } from './skyline';
 import { APPROACHES, lightFor, type Light } from './signals';
+import { createSigns } from './map/signs';
+import { ASPHALT_HALF, CURB_HEIGHT, PIER_DECK, SIDEWALK_EDGE, STEPS_DROP, STEPS_TOP, groundHeight, onSidewalk } from './map/terrain';
 
 export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number; top?: number };
 
-/** Sidewalks stand this much above the carriageway, behind a stone curb. */
-export const CURB_HEIGHT = 0.14;
-const ASPHALT_HALF = 7; // carriageway half-width
-const SIDEWALK_EDGE = 12.5; // the paved sidewalk runs from the curb to the house fronts
+// The ground (sidewalks, raised squares, docks, the river bed) lives in map/terrain.ts; it stays importable from here.
+export { CURB_HEIGHT, PIER_DECK, dockAt, groundHeight, onSidewalk } from './map/terrain';
 const ROAD_FIRST = ROADS_Z[0];
-/** Distance from a coordinate to the nearest road centre line in a list. */
-const roadDistance = (roads: number[], v: number) => {
-  let best = Infinity;
-  for (const r of roads) best = Math.min(best, Math.abs(v - r));
-  return best;
-};
-/** Pier decks stand a little above the promenade; the steps beside them run down into the water. */
-export const PIER_DECK = 0.28;
-const STEPS_TOP = -136, STEPS_DROP = 1.8 / 4.5;
-
-/** Whether a point is on a raised sidewalk (crossings over the carriageway stay at road level). */
-export function onSidewalk(x: number, z: number) {
-  const dz = roadDistance(ROADS_Z, z);
-  // North-south roads start at the riverside road, so south of it only the riverside sidewalk exists.
-  const dx = z > ROAD_FIRST ? roadDistance(ROADS_X, x) : Infinity;
-  if (dz < ASPHALT_HALF || dx < ASPHALT_HALF) return false;
-  return dz < SIDEWALK_EDGE || dx < SIDEWALK_EDGE;
-}
-
-/** The dock (pier or steps) under a point, if any. */
-export function dockAt(x: number, z: number) {
-  if (z > -134.6 || z < -152) return null;
-  for (const d of SCENERY.docks) if (inRect(d.pier, x, z) || inRect(d.steps, x, z)) return d;
-  return null;
-}
-
-/** Walkable surface height: sidewalks, the park lawn and the tiled square sit above the street; in the river it is the bed. */
-export function groundHeight(x: number, z: number) {
-  if (z < -136.4) {
-    for (const d of SCENERY.docks) {
-      if (inRect(d.pier, x, z)) return PIER_DECK;
-      if (inRect(d.steps, x, z)) return 0.1 + Math.min(0, z - STEPS_TOP) * STEPS_DROP;
-    }
-    return z < RIVER.maxZ ? RIVER_BED : 0.1;
-  }
-  if (x > 13 && x < 43 && z > -44 && z < -22) return 0.24;
-  if (x > 228.5 && x < 257.5 && ((z > 12.5 && z < 41.5) || (z > 66.5 && z < 95.5))) return z < 50 ? 0.26 : 0.25;
-  if (x > 14.5 && x < 43.5 && z > 29.5 && z < 46.5) return 0.27;
-  return onSidewalk(x, z) ? 0.1 + CURB_HEIGHT : 0.1;
-}
 
 /** Seat tops of the street furniture above its base (the base is world y 0 on the road, sunk 0.08 below the asphalt). */
 export const SEAT_TOP = { bench: 0.46, stool: 0.42 } as const;
@@ -62,7 +22,6 @@ type Kind = 'box' | 'cylinder' | 'cone' | 'ball' | 'bead' | 'gable' | 'hip' | 'p
 /** Material families: each is one shared material, so colour variety costs no extra draw calls. */
 type Role = 'solid' | 'ground' | 'glass' | 'glassLit' | 'lamp' | 'lantern' | 'water' | 'neon';
 type ColorLike = string | THREE.Color;
-type Quad = { cell: number; x: number; y: number; z: number; w: number; h: number; yaw: number };
 
 const PI = Math.PI;
 const HALF_PI = PI / 2;
@@ -235,73 +194,15 @@ export function buildWorld(scene: THREE.Scene) {
     }
   }
 
-  // ---- Canvas signs and number plates, packed into texture atlases and drawn as merged quads. ----
-  const signCells: { text: string; subtitle: string; color: string; background: string }[] = [];
-  const signKeys = new Map<string, number>();
-  const signQuads: Quad[] = [];
+  // ---- Signs and number plates: box boards with instanced glyph-atlas text (map/signs.ts). ----
+  const signs = createSigns();
   function sign(text: string, subtitle: string, color: string, x: number, y: number, z: number, w: number, h: number, yaw = 0, background = '#f3e4c7') {
-    const key = `${text}|${subtitle}|${color}|${background}`;
-    let cell = signKeys.get(key);
-    if (cell === undefined) { cell = signCells.length; signCells.push({ text, subtitle, color, background }); signKeys.set(key, cell); }
-    signQuads.push({ cell, x, y, z, w, h, yaw });
+    signs.sign(text, subtitle, color, x, y, z, w, h, yaw, background);
   }
-  const plateCells: number[] = [];
-  const plateKeys = new Map<number, number>();
-  const plateQuads: Quad[] = [];
   function plate(n: number, x: number, y: number, z: number, yaw: number) {
-    let cell = plateKeys.get(n);
-    if (cell === undefined) { cell = plateCells.length; plateCells.push(n); plateKeys.set(n, cell); }
-    plateQuads.push({ cell, x, y, z, w: 0.5, h: 0.25, yaw });
+    signs.plate(n, x, y, z, yaw);
   }
   const glowMaterials: { material: THREE.MeshStandardMaterial; strength: number }[] = [];
-  function buildAtlas(count: number, cellW: number, cellH: number, pageW: number, pageH: number, quads: Quad[], draw: (ctx: CanvasRenderingContext2D, index: number) => void, glow: number, doubleSide: boolean) {
-    const cols = pageW / cellW, perPage = cols * (pageH / cellH);
-    for (let first = 0; first < count; first += perPage) {
-      const n = Math.min(perPage, count - first);
-      let height = cellH;
-      while (height < Math.ceil(n / cols) * cellH) height *= 2;
-      const canvas = document.createElement('canvas');
-      canvas.width = pageW;
-      canvas.height = height;
-      const ctx = canvas.getContext('2d')!;
-      for (let k = 0; k < n; k++) {
-        ctx.save();
-        ctx.translate((k % cols) * cellW, Math.floor(k / cols) * cellH);
-        draw(ctx, first + k);
-        ctx.restore();
-      }
-      const texture = new THREE.CanvasTexture(canvas);
-      texture.colorSpace = THREE.SRGBColorSpace;
-      texture.anisotropy = 4;
-      textures.push(texture);
-      const list = quads.filter((q) => q.cell >= first && q.cell < first + n);
-      const positions: number[] = [], normals: number[] = [], uvs: number[] = [], index: number[] = [];
-      for (const q of list) {
-        const k = q.cell - first;
-        const u0 = ((k % cols) * cellW) / pageW, u1 = u0 + cellW / pageW;
-        const v1 = 1 - (Math.floor(k / cols) * cellH) / height, v0 = v1 - cellH / height;
-        const c = Math.cos(q.yaw), s = Math.sin(q.yaw);
-        const base = positions.length / 3;
-        for (const [lx, ly, u, v] of [[-q.w / 2, q.h / 2, u0, v1], [q.w / 2, q.h / 2, u1, v1], [-q.w / 2, -q.h / 2, u0, v0], [q.w / 2, -q.h / 2, u1, v0]]) {
-          positions.push(q.x + lx * c, q.y + ly, q.z - lx * s);
-          normals.push(s, 0, c);
-          uvs.push(u, v);
-        }
-        index.push(base, base + 2, base + 1, base + 2, base + 3, base + 1);
-      }
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-      geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
-      geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
-      geometry.setIndex(index);
-      geometry.computeBoundingSphere();
-      const material = new THREE.MeshStandardMaterial({ map: texture, emissiveMap: texture, emissive: '#ffffff', emissiveIntensity: 0, roughness: 0.95, side: doubleSide ? THREE.DoubleSide : THREE.FrontSide });
-      geometries.push(geometry);
-      materials.push(material);
-      glowMaterials.push({ material, strength: glow });
-      root.add(new THREE.Mesh(geometry, material));
-    }
-  }
 
   // ---- Small furniture shared by many places (drawn with `lift` = furnitureLift where it stands). ----
   /** A low box with a top (axis-aligned footprint w x d turned by yaw) that a falling body can land on. */
@@ -1591,36 +1492,13 @@ export function buildWorld(scene: THREE.Scene) {
   puddles.receiveShadow = true;
   root.add(puddles);
 
-  // ---- Build atlases and instanced batches. ----
-  buildAtlas(signCells.length, 1024, 256, 2048, 2048, signQuads, (ctx, i) => {
-    const { text, subtitle, color, background } = signCells[i];
-    ctx.fillStyle = background;
-    ctx.fillRect(0, 0, 1024, 256);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 7;
-    ctx.strokeRect(16, 16, 992, 224);
-    ctx.fillStyle = color;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.font = '900 94px Arial, sans-serif';
-    ctx.fillText(text, 512, 107, 930);
-    ctx.font = '500 31px Arial, sans-serif';
-    ctx.fillText(subtitle, 512, 194, 900);
-  }, 0.5, true);
-  buildAtlas(plateCells.length, 128, 64, 1024, 1024, plateQuads, (ctx, i) => {
-    ctx.fillStyle = '#1d4f9c';
-    ctx.fillRect(0, 0, 128, 64);
-    ctx.strokeStyle = '#ffffff';
-    ctx.lineWidth = 4;
-    ctx.strokeRect(5, 5, 118, 54);
-    ctx.fillStyle = '#ffffff';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.font = '700 13px Arial, sans-serif';
-    ctx.fillText('SỐ NHÀ', 64, 17);
-    ctx.font = '900 30px Arial, sans-serif';
-    ctx.fillText(String(plateCells[i]), 64, 41, 108);
-  }, 0.25, false);
+  // ---- Build the signs, then the instanced batches. ----
+  const signMeshes = signs.build();
+  root.add(...signMeshes.meshes);
+  textures.push(...signMeshes.textures);
+  materials.push(...signMeshes.materials);
+  geometries.push(...signMeshes.geometries);
+  for (const material of signMeshes.materials) glowMaterials.push({ material, strength: 1 });
 
   // Instances are bucketed into 160 m tiles so off-screen parts of the city are frustum-culled.
   const TILE = 160;

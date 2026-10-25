@@ -1,4 +1,5 @@
 import type { IncomingHit, OutgoingHit, PlayerState } from './multiplayer-protocol.ts';
+import { PEER_BOUNDS } from './world-bounds.ts';
 
 export const ACTIVE_MS = 15_000;
 export const SESSION_MS = 30 * 60_000;
@@ -67,13 +68,19 @@ export function playerState(value: unknown): PlayerState {
   if (typeof state.riding !== 'boolean') throw new ClientError('Trạng thái phương tiện không hợp lệ.');
   const angle = numberIn(state.angle, -1_000_000, 1_000_000);
   return {
-    x: numberIn(state.x, -140, 355), z: numberIn(state.z, -206, 140),
+    x: numberIn(state.x, PEER_BOUNDS.minX, PEER_BOUNDS.maxX), z: numberIn(state.z, PEER_BOUNDS.minZ, PEER_BOUNDS.maxZ),
     angle: ((angle + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI,
     riding: state.riding, speed: numberIn(state.speed, -36, 36), score: Math.floor(numberIn(state.score, 0, 1_000_000)),
     health: integer(state.health, 0, 100, 100), weapon: oneOf(state.weapon, ['fists', 'pistol', 'shotgun', 'smg', 'grenade', 'rpg'] as const, 'fists'),
     vehicle: oneOf(state.vehicle, ['foot', 'scooter', 'car', 'police', 'boat', 'swim'] as const, state.riding ? 'scooter' : 'foot'),
     down: state.down === true, firing: state.firing === true, wanted: integer(state.wanted, 0, 5, 0),
   };
+}
+/** The layout version a client sent on create or join (lib/world-bounds.ts WORLD_VERSION); clients from before it was sent build version 1. */
+export function worldVersion(value: unknown): number {
+  if (value === undefined) return 1;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 1_000_000) throw new ClientError('Phiên bản bản đồ không hợp lệ. Hãy tải lại trò chơi.');
+  return value;
 }
 export function playerHit(value: unknown, attacker: string): OutgoingHit {
   const hit = payload(value);
