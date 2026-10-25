@@ -37,7 +37,9 @@ export type PoiKind = 'park' | 'square' | 'market' | 'cafe-seat' | 'bench' | 'bu
 export type Poi = { id: number; kind: PoiKind; x: number; z: number; yaw: number; curb: Point; seat: boolean };
 
 /** Axis-aligned footprint; the same shape as world.ts' Collider. */
-export type Rect = { minX: number; maxX: number; minZ: number; maxZ: number };
+export type Rect = { minX: number; maxX: number; minZ: number; maxZ: number;
+  /** Height of a low solid (a planter, a stall counter) a falling body can land on; walls without one are infinitely tall. */
+  top?: number };
 /** Render-only details of a building, parallel to BUILDINGS (same id). */
 export type PlotStyle = 'legacy' | 'home' | 'shop' | 'kiosk' | 'hospital' | 'police' | 'school' | 'pagoda' | 'office' | 'tower' | 'midrise';
 /** Downtown building shapes (see skyline.ts). */
@@ -399,9 +401,12 @@ const lamps: Lamp[] = [];
 const benches: Seat[] = [];
 const busStops: Seat[] = [];
 
+/** Tops of the low props (world.ts draws them this tall); a ragdoll coming from above lands on them. */
+const PROP_TOP: Partial<Record<PropKind, number>> = { fountain: 0.6, planter: 0.5, stall: 1.75, fence: 1.6, urn: 1.6, scooter: 1.0, cart: 1.0 };
 function addProp(kind: PropKind, x: number, z: number, sx: number, sz: number, yaw = 0, tint = rand()) {
   props.push({ kind, x, z, sx, sz, yaw, tint });
-  COLLIDERS.push(rectAt(x, z, sx, sz));
+  const top = PROP_TOP[kind];
+  COLLIDERS.push(top === undefined ? rectAt(x, z, sx, sz) : { ...rectAt(x, z, sx, sz), top });
 }
 function trunkSize(t: Tree) {
   return t.species === 'bamboo' ? 1.1 : t.species === 'palm' ? 0.5 : 0.65;

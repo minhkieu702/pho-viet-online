@@ -2,8 +2,13 @@ import * as THREE from 'three';
 import { BUILDINGS, POIS, type Building, type Poi } from './city';
 import { createNav, type Waypoint } from './nav';
 import { walkOk } from './signals';
-import type { createRagdolls, RagdollBody, RagdollLook } from './ragdoll';
-import { FIGURE, FigureBatch, PART, UMBRELLA, armGeometry, bodyGeometry, deriveStyle, figureMaterial, legGeometry, palette, setStyle, umbrellaGeometry } from './figures';
+import { seatHeight } from './world';
+import type { FallMode, HitKind, createRagdolls, RagdollBody, RagdollLook } from './ragdoll';
+import {
+  ARM, ARM_POSES, BODY_SCALE, CLOTH, FIGURE, FigureBatch, HAND, HEAD, TORSO, chestMatrix, deriveStyle, figureGeometry, figureMaterial, gait, gripMatrix, handCode,
+  limbMatrix, mixArm, mixHand, newGait, palette, palettesOf, poseArm, setStyle, sideX, sitDrop, swingCode, twoBoneIK, umbrellaGeometry,
+  type ArmPose, type Detail, type FigurePalettes, type FigureStyle,
+} from './figures';
 import { BRAIN, INCIDENTS, createIncidents, createMind, createSense, decide, drift, engage, perceive, type Incident, type IncidentKind, type Intent, type Mind } from './brain';
 
 type Ragdolls = ReturnType<typeof createRagdolls>;
@@ -34,9 +39,15 @@ export type Npc = {
   x: number; z: number; y: number; yaw: number; targetYaw: number;
   path: Waypoint[]; pathIndex: number;
   speed: number; pace: number; run: boolean;
-  spot: { x: number; z: number; yaw: number; sit: boolean } | null;
+  /** Where they stand or sit; `top` is the seat height above the ground. */
+  spot: { x: number; z: number; yaw: number; sit: boolean; top?: number } | null;
   pose: Pose;
-  stride: number; swing: number;
+  /** Gait phase (radians, a cycle per two steps), the thigh swing it gives, and how far into a full stride (0..1). */
+  stride: number; swing: number; go: number;
+  /** Head turn and nod relative to the body, the skirt / tà / ponytail spring, the next blink, mouth moving until, last glance at the player. */
+  headYaw: number; headPitch: number; sec: number; secV: number; blinkAt: number; talkUntil: number; glanceAt: number;
+  /** Seated: how far forward the front of a skirt or tà lies to reach over the knees (radians), and the back tucked under them. */
+  lapFront: number; lapBack: number;
   health: number; hitAt: number;
   afraidFor: number; lastAimed: number; robbedDay: number;
   chatterAt: number; checkAt: number; nextAttack: number;
@@ -59,11 +70,9 @@ export type Threat = { x: number; z: number; aimYaw: number; armed: boolean; aim
 export type { IncidentKind } from './brain';
 
 const SECONDS_PER_HOUR = 60;
-// Model units are ~2.1 m tall; scale to a 1.75 m person.
-const BODY_SCALE = 0.82;
-const RAGDOLL_SCALE = 0.7;
-const HIT_RADIUS = 0.38;
-const HEIGHT = 1.85;
+// A standing person (1.71 m at BODY_SCALE, a little more with a hat) for hits and health bars.
+const HIT_RADIUS = 0.34;
+const HEIGHT = 1.8;
 const MAX_HEALTH = 60;
 const GANG_HEALTH = 90;
 export const GANGS = [
@@ -121,6 +130,39 @@ const SHOPS = new Set<Building['kind']>(['cafe', 'food', 'shop', 'bikeshop', 'po
 function angleLerp(from: number, to: number, t: number) {
   return from + Math.atan2(Math.sin(to - from), Math.cos(to - from)) * t;
 }
+const clamp = (x: number, a: number, b: number) => (x < a ? a : x > b ? b : x);
+const wrap = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
+
+/** The furniture each kind of seat is (world.ts draws it on the ground under it: seatHeight() is the top above the sitter's ground). */
+const SEAT_KIND: Partial<Record<Poi['kind'], 'stool' | 'bench'>> = { 'cafe-seat': 'stool', bench: 'bench', 'bus-stop': 'bench' };
+const SIDES = [-1, 1] as const;
+/**
+ * The stride phase as gait() takes it, warped so the thigh swings more like a triangle wave than a sine: the
+ * planted foot then keeps pace with the body instead of sliding (about 0.1 m/s of slip at a walk instead of 0.6).
+ */
+function stridePhase(phase: number) {
+  const s = Math.sin(phase);
+  const b = s + ((2 / Math.PI) * Math.asin(s) - s) * 0.85;
+  return Math.cos(phase) >= 0 ? Math.asin(b) : Math.PI - Math.asin(b);
+}
+// Arm poses beyond pose.ts ARM_POSES (right-arm convention [swing, abduct, roll, elbow, twist, flex, hand]; poseArm mirrors the left).
+const RUN_HAND = handCode(0.7, 0.65, 0.55);
+/** Fleeing in a panic: arms up and flailing. */
+const FLAIL: ArmPose = [-2.25, 0.5, 0, -0.65, 0, 0, HAND.OPEN];
+/** A jab out of the fight guard. */
+const JAB: ArmPose = [-1.5, -0.1, 0.15, -0.12, 0.4, 0, HAND.FIST];
+/** Filming an incident: the phone held up before the face, screen toward the eyes. */
+const FILM: ArmPose = [-1.08, -0.29, 0.03, -1.14, -1.09, 0.76, HAND.PHONE];
+/** Sweeping: the right fist high on the broom handle across the chest, the left lower down it. */
+const SWEEP_R: ArmPose = [0.22, -0.03, -0.94, -1.59, 0.3, -0.9, HAND.GRIP];
+const SWEEP_L: ArmPose = [-0.26, 0.16, -0.98, -0.85, 0.09, -0.25, HAND.GRIP];
+/** A glass of trà đá on the lap, upright, and raised to the lips with the elbow down in front of the chest. */
+const CUP: ArmPose = [0.12, 0.08, -0.05, -1.44, -0.07, -0.12, HAND.GRIP];
+const SIP: ArmPose = [-1.16, -0.25, -0.45, -2.02, 0.27, -0.52, HAND.GRIP];
+/** Calling out to passers-by: a cupped hand beside the mouth, the elbow out to the side. */
+const SHOUT: ArmPose = [-1.38, 0.53, -0.83, -2.33, -0.81, -0.91, HAND.CUP];
+/** Carrying a shopping bag: the arm hangs and barely swings. */
+const CARRY: ArmPose = [0.04, 0.12, 0, -0.08, 0.1, 0, HAND.GRIP];
 
 /**
  * Residents with daily routines. Everyone lives in a real building, leaves through its door, walks the
@@ -173,7 +215,9 @@ export function createNpcs(
     npcs.push({
       id: npcs.length, role, gang, home, look, schedule, current: null, state: 'inside', inside: home,
       x: home.door.x, z: home.door.z, y: 0, yaw: home.facing, targetYaw: home.facing, path: [], pathIndex: 0,
-      speed: 0, pace: 1.45 + random() * 0.45, run: false, spot: null, pose: 'idle', stride: random() * 10, swing: 0,
+      speed: 0, pace: 1.45 + random() * 0.45, run: false, spot: null, pose: 'idle', stride: random() * 10, swing: 0, go: 0,
+      // Animation state takes nothing from the seeded stream, so routines stay exactly as they were.
+      headYaw: 0, headPitch: 0, sec: 0, secV: 0, blinkAt: ((npcs.length * 0.618) % 1) * 5, talkUntil: 0, glanceAt: -99, lapFront: 1.3, lapBack: 1.2,
       health: gang >= 0 ? GANG_HEALTH : MAX_HEALTH, hitAt: -99, afraidFor: 0, lastAimed: -99, robbedDay: -1,
       chatterAt: random() * 20, checkAt: random() * 2, nextAttack: 0, body: null, timer: 0, pooled: false,
       mind: createMind(mindRandom, role), leave: [], claim: null,
@@ -265,70 +309,168 @@ export function createNpcs(
   for (let k = 0; k < 2; k++) addNpc('thief', homes[k], [], { shirt: '#3d3d3d', pants: '#1f1f1f', skin: '#c58f69' });
   for (const thief of npcs.slice(crowd)) thief.state = 'away';
 
-  // Instanced rendering: a body (torso and head), legs and arms, each one figure mesh for the whole crowd,
-  // plus open umbrellas. Everyone keeps a packed palette (clothes, skin, hair, hat or bandana); only people
-  // outdoors are drawn.
-  const material = figureMaterial();
-  const bodies = new FigureBatch(bodyGeometry('civil'), material, npcs.length);
-  const legs = new FigureBatch(legGeometry(), material, npcs.length * 2);
-  const arms = new FigureBatch(armGeometry(false, true), material, npcs.length * 2);
-  const umbrellas = new FigureBatch(umbrellaGeometry(), material, npcs.length);
-  const batches = [bodies, legs, arms, umbrellas];
-  const dress = npcs.map((npc) => {
-    const { look } = npc;
-    const style = deriveStyle(look, npc.id, npc.role);
-    if (npc.gang >= 0) {
-      style.mask = (style.mask & ~PART.CONE) | PART.BANDANA;
-      style.accent = GANGS[npc.gang].bandana;
-    }
+  // Instanced rendering: every person is a body (torso, head and face, hair, hat, clothes), a left arm, a right
+  // arm (hand and whatever it holds) and two legs, each one figure mesh for the whole crowd, plus open umbrellas:
+  // five draw calls. Elbows, wrists, fingers, knees, ankles, the head, the chest and skirts bend in the vertex
+  // shader from a pose per instance. Everyone keeps packed palettes (wardrobe.ts); from frame to frame only the
+  // part masks change (blinking, talking, what the right hand holds). Only people outdoors are drawn.
+  let detail: Detail = 'hi';
+  const materials = { body: figureMaterial('body'), arm: figureMaterial('arm'), leg: figureMaterial('leg'), rigid: figureMaterial('rigid') };
+  const bodies = new FigureBatch(figureGeometry('body', detail), materials.body, npcs.length);
+  const armsL = new FigureBatch(figureGeometry('armL', detail), materials.arm, npcs.length);
+  const armsR = new FigureBatch(figureGeometry('armR', detail), materials.arm, npcs.length);
+  const legs = new FigureBatch(figureGeometry('leg', detail), materials.leg, npcs.length * 2);
+  const umbrellas = new FigureBatch(umbrellaGeometry(), materials.rigid, npcs.length);
+  const batches = [bodies, armsL, armsR, legs, umbrellas];
+  type Dress = {
+    style: FigureStyle;
+    /** The palettes as drawn; their masks are rewritten each frame from the style's own. */
+    look: FigurePalettes;
+    umbrella: Float32Array;
+    /** What a fanning hand holds: a paper fan, or the nón lá taken off the head. */
+    fan: number;
+    /** Carries a shopping bag on the way to and from the market or home. */
+    bag: boolean;
+    /** Seated, the front tà, apron or skirt is laid over the lap. */
+    lap: boolean;
+  };
+  const dress: Dress[] = npcs.map((npc) => {
+    const style = deriveStyle(npc.look, npc.id, npc.role, npc.gang >= 0 ? { bandana: GANGS[npc.gang].bandana } : {});
     // Ragdolls of this person read the same style back from their look.
-    setStyle(look, style);
-    const shin = style.shin === 'skin' ? look.skin : look.pants;
+    setStyle(npc.look, style);
     const canopy = UMBRELLAS[npc.mind.traits.umbrellaLook % UMBRELLAS.length];
+    const k = (npc.id * 0.754877) % 1;
     return {
       style,
-      body: palette([look.shirt, look.pants, look.skin, style.hair, style.accent], style.mask),
-      legs: palette([look.pants, shin, style.shoes], PART.STRAIGHT),
-      seated: palette([look.pants, shin, style.shoes], PART.BENT),
-      arms: palette([look.shirt, style.forearm === 'skin' ? look.skin : look.shirt, look.skin]),
-      // The right arm again, holding a phone, a fan or a broom.
-      held: [PART.PHONE, PART.FAN, PART.BROOM].map((part) => palette([look.shirt, style.forearm === 'skin' ? look.skin : look.shirt, look.skin], part)),
+      look: palettesOf(style),
       umbrella: palette([canopy[0], canopy[1]]),
+      fan: (style.head & HEAD.CONE) !== 0 && k < 0.6 ? ARM.NON_LA : ARM.FAN,
+      bag: (npc.role === 'retiree' || npc.role === 'vendor') && k > 0.5,
+      lap: (style.torso & (TORSO.AO_DAI | TORSO.APRON | TORSO.SKIRT)) !== 0,
     };
   });
   for (const batch of batches) {
     batch.mesh.receiveShadow = true;
     scene.add(batch.mesh);
   }
-  const base = new THREE.Matrix4(), local = new THREE.Matrix4(), outM = new THREE.Matrix4();
-  const quat = new THREE.Quaternion(), quat2 = new THREE.Quaternion(), pos = new THREE.Vector3(), size = new THREE.Vector3(1, 1, 1);
-  const euler = new THREE.Euler();
-  const bodyEuler = new THREE.Euler(0, 0, 0, 'YXZ');
-  const xAxis = new THREE.Vector3(1, 0, 0), yAxis = new THREE.Vector3(0, 1, 0);
-  // Holding an umbrella: right arm forward, the shaft from the hand up past the right cheek to a canopy over the head.
-  const UMBRELLA_ARM = -0.95, UMBRELLA_TWIST = -0.04;
-  const umbrellaHand = new THREE.Vector3(0, -0.6, 0).applyEuler(new THREE.Euler(UMBRELLA_ARM, 0, UMBRELLA_TWIST)).add(new THREE.Vector3(FIGURE.shoulderX, FIGURE.shoulderY, 0));
-  const umbrellaTilt = new THREE.Quaternion().setFromUnitVectors(yAxis, new THREE.Vector3(0.24, FIGURE.headY + 0.98 - UMBRELLA.drop * 0.5, -0.04).sub(umbrellaHand).normalize());
-  // A limb hanging from its pivot on the body, swung forward by `angle` around the x axis and turned in by `twist`.
-  function limb(batch: FigureBatch, px: number, py: number, angle: number, look: Float32Array, twist = 0) {
-    local.compose(pos.set(px, py, 0), twist ? quat.setFromEuler(euler.set(angle, 0, twist)) : quat.setFromAxisAngle(xAxis, angle), size.set(1, 1, 1));
-    batch.push(outM.multiplyMatrices(base, local), look);
+
+  const base = new THREE.Matrix4(), torso = new THREE.Matrix4(), chest = new THREE.Matrix4(), armM = new THREE.Matrix4(), legM = new THREE.Matrix4();
+  const held = new THREE.Matrix4(), stretch = new THREE.Matrix4();
+  const quat = new THREE.Quaternion(), pos = new THREE.Vector3(), off = new THREE.Vector3(), size = new THREE.Vector3(1, 1, 1);
+  const turn = new THREE.Euler(0, 0, 0, 'YZX');
+  const walk = newGait();
+  const bodyPose = [0, 0, 0, 0], poseL = [0, 0, 0, 0], poseR = [0, 0, 0, 0], legPose = [0, 0, 0, 0];
+  const armL = [...ARM_POSES.RELAXED], armR = [...ARM_POSES.RELAXED], actL = [...ARM_POSES.RELAXED], actR = [...ARM_POSES.RELAXED];
+  // Arm tuples are kept in mutable arrays; pose.ts reads them as ArmPose.
+  const P = (a: number[]) => a as unknown as ArmPose;
+  const copy = (out: number[], a: ArmPose) => { for (let n = 0; n < 7; n++) out[n] = a[n]; return out; };
+  /** An arm swinging with the gait (relaxed when standing): from `walk`, filled for this frame. */
+  function swingArm(out: number[], side: -1 | 1, run: number) {
+    out[0] = (side < 0 ? walk.armL : walk.armR) + 0.02;
+    out[1] = 0.06 + 0.06 * run;
+    out[2] = 0;
+    out[3] = (side < 0 ? walk.elbowL : walk.elbowR) - 0.12;
+    out[4] = 0.1;
+    out[5] = 0.03;
+    out[6] = run > 0.5 ? RUN_HAND : HAND.RELAXED;
+  }
+  /** Panic: arms up, waving about. */
+  function flail(out: number[], phase: number) {
+    copy(out, FLAIL);
+    out[0] += Math.sin(phase) * 0.35;
+    out[1] += Math.sin(phase * 0.7) * 0.2;
+    out[3] += Math.sin(phase + 1) * 0.35;
+  }
+  // Toes on the ground from a high seat: the ball of the foot is FOOT_REACH from the ankle, FOOT_PHI below its line.
+  const FOOT_REACH = Math.hypot(FIGURE.ankleY, FIGURE.ball), FOOT_PHI = Math.atan2(FIGURE.ankleY, FIGURE.ball);
+  const seat = { thigh: 0, knee: 0, ankle: 0, toe: 0 };
+  /**
+   * Legs of someone sitting with their hip joints `hy` (FIGURE units) above the ground: feet flat when they reach
+   * (knees up on a low stool), the toes down to touch it from a high stool, or dangling (and swinging by `sway`)
+   * from a high bench.
+   */
+  function seatLegs(hy: number, sway: number) {
+    const T = FIGURE.thigh, S = FIGURE.shin, A = FIGURE.ankleY;
+    // Thighs slope down from the seat (or up, knees high, on a low one) so that the shins lean a little forward.
+    let slope = clamp(Math.asin(clamp((hy - A - S * Math.cos(0.2)) / T, -1, 1)), -0.8, 0.28);
+    const ky = hy - T * Math.sin(slope);
+    let shin = 0, ankle: number, toe = 0;
+    if (ky - A <= S) {
+      shin = Math.acos((ky - A) / S);
+      ankle = shin;
+    } else if (ky - S <= FOOT_REACH) {
+      ankle = Math.asin((ky - S) / FOOT_REACH) - FOOT_PHI;
+      toe = ankle * 0.8;
+    } else {
+      slope = 0.1;
+      shin = -0.08 + sway;
+      ankle = 0.45;
+    }
+    seat.thigh = slope - Math.PI / 2;
+    seat.knee = Math.PI / 2 - slope - shin;
+    seat.ankle = ankle;
+    seat.toe = toe;
+  }
+  const ikRoot = new THREE.Vector3(), ikTarget = new THREE.Vector3(), ikHint = new THREE.Vector3();
+  /** Seated arms solved for a thigh slope and lean, kept per person (they only change when those do). */
+  const laps = new Map<number, { key: number; left: number[]; right: number[] }>();
+  /**
+   * A seated arm with the hand resting on the thigh: two-bone IK from the shoulder to a point on top of the thigh
+   * (`thigh` is its swing from seatLegs), in the frame of a torso leaning `lean` about the hips; over a skirt or
+   * tà on the lap (`cloth`) the hand rests on the cloth.
+   */
+  function lapArm(out: number[], side: -1 | 1, thigh: number, lean: number, shoulderX: number, cloth: boolean) {
+    const s = Math.sin(thigh), c = Math.cos(thigh);
+    // Along the thigh from the hip and up off its top, so the palm lies on it (body space, relative to the hip).
+    const along = FIGURE.thigh * 0.6 - 0.07, up = cloth ? 0.125 : 0.1;
+    const y = -c * along - s * up, z = -s * along + c * up;
+    const cl = Math.cos(lean), sl = Math.sin(lean);
+    const sx = sideX(side);
+    ikTarget.set(sx * (FIGURE.hipX + 0.03), FIGURE.hipY + y * cl + z * sl, z * cl - y * sl);
+    ikRoot.set(sx * shoulderX, FIGURE.shoulderY, 0);
+    const ik = twoBoneIK(ikRoot, ikTarget, FIGURE.upperArm, FIGURE.foreArm, ikHint.set(sx * 0.4, -0.3, -1));
+    out[0] = ik.swing; out[1] = sx * ik.abduct; out[2] = sx * ik.roll; out[3] = ik.bend;
+    out[4] = 1.2; out[5] = 0.2; out[6] = HAND.RELAXED;
+  }
+  /**
+   * Where a skirt or tà lies on a seated lap: the front from its pivot (panelY, in front) over the top of the
+   * knee, the back from behind under the thighs to the underside of the knee (both from straight down, forward
+   * positive, in the hips' frame); the shader folds the cloth down again past the knee.
+   */
+  function lapCloth(npc: Npc, thigh: number) {
+    const sn = Math.sin(thigh), cs = Math.cos(thigh), r = 0.072;
+    const ky = FIGURE.hipY - FIGURE.thigh * cs, kz = -FIGURE.thigh * sn;
+    // The thigh's top surface faces (y, z) = (-sin, cos) of its swing.
+    npc.lapFront = Math.atan2(kz + r * cs - CLOTH.pivotZ, FIGURE.panelY - (ky - r * sn));
+    npc.lapBack = Math.atan2(kz - r * cs + CLOTH.pivotZ, FIGURE.panelY - (ky + r * sn));
   }
   // Off in zombie mode: nobody is drawn, hit or found while the streets belong to the dead.
   let enabled = true;
   function visible(npc: Npc) { return enabled && npc.state !== 'inside' && npc.state !== 'down' && npc.state !== 'away'; }
+  /** What the camera sees (last frame's): people outside it are not posed or drawn at all. */
+  let view: THREE.Frustum | null = null;
+  const bound = new THREE.Sphere(new THREE.Vector3(), 1.35);
   function draw(npc: Npc, i: number, time: number) {
     if (!visible(npc)) return;
-    const d = dress[i];
+    // A sphere round the whole person, an open umbrella included.
+    if (view && !view.intersectsSphere(bound.set(bound.center.set(npc.x, npc.y + 1.1, npc.z), 1.35))) return;
+    const d = dress[i], style = d.style, look = d.look, k = npc.id;
     const sit = npc.pose === 'sit';
-    const { width, height } = d.style;
+    const { width, height } = style;
     const intent = npc.mind.intent;
+    const moving = npc.pose === 'walk' || npc.pose === 'run';
+    const run = moving ? clamp((npc.speed - 2) / 1.6, 0, 1) : 0;
+    // In a skirt or an áo dài a run takes shorter steps (the thighs would sweep through the cloth).
+    const stride = run > 0 && style.torso & (TORSO.SKIRT | TORSO.AO_DAI) ? Math.min(1, 0.6 / (0.48 + 0.34 * run)) : 1;
+    gait(stridePhase(npc.stride), run, npc.go * stride, walk);
+    const still = 1 - npc.go;
     // Walkers lean slightly into their stride, runners a lot; people standing about shift their weight.
-    let lean = npc.pose === 'run' ? 0.2 : npc.pose === 'walk' ? 0.05 : 0;
-    let roll = npc.pose === 'idle' ? Math.sin(time * 0.55 + npc.id * 1.7) * 0.028 : 0;
+    const shift = Math.sin(time * 0.55 + k * 1.7);
+    let lean = npc.pose === 'run' ? 0.1 + 0.1 * run : npc.pose === 'walk' ? 0.04 : sit ? 0.05 : npc.pose === 'fight' ? 0.12 : 0;
+    let roll = npc.pose === 'idle' ? shift * 0.028 : 0;
     const act = npc.state === 'at' && (npc.pose === 'idle' || sit) ? npc.act : 'none';
     // Each act eases in and out over a third of a second.
-    const env = act === 'none' ? 0 : Math.max(0, Math.min(1, (time - npc.actFrom) / 0.35, (npc.actUntil - time) / 0.35));
+    const env = act === 'none' ? 0 : clamp(Math.min((time - npc.actFrom) / 0.35, (npc.actUntil - time) / 0.35), 0, 1);
     if (env > 0) {
       if (act === 'sweep') lean += 0.22 * env;
       else if (act === 'serve') lean += 0.16 * env;
@@ -336,61 +478,215 @@ export function createNpcs(
       else if (act === 'stretch') { lean -= 0.12 * env; roll *= 1 - env; }
       else if (act === 'shout') lean -= 0.05 * env;
     }
-    base.compose(
-      pos.set(npc.x, npc.y - (sit ? FIGURE.sitDrop * BODY_SCALE * height : 0), npc.z),
-      quat.setFromEuler(bodyEuler.set(lean, npc.yaw, roll)),
-      size.set(BODY_SCALE * width, BODY_SCALE * height, BODY_SCALE * width),
-    );
-    const swing = npc.swing;
     const open = npc.mind.umbrella;
     const holding = open > 0.04 && !sit && npc.pose !== 'hands' && npc.pose !== 'fight';
-    let armL = -swing * 0.8, armR = swing * 0.8, twistL = 0, twistR = 0;
-    if (npc.pose === 'hands') { armL = -2.85; armR = -2.85 + Math.sin(time * 9) * 0.08; }
-    else if (npc.pose === 'run' && npc.state === 'fleeing') { armL = -2.4; armR = -2.5; }
-    else if (npc.pose === 'run') { armL = -0.35 - swing * 1.25; armR = -0.35 + swing * 1.25; }
-    else if (npc.pose === 'fight') { armL = -1.3; armR = time % 1.1 < 0.25 ? -1.75 : -1.1; }
-    else if (sit) { armL = -0.7; armR = -0.7; }
-    else if (npc.pose === 'idle') {
-      armL = Math.sin(time * 1.3 + npc.id) * 0.06; armR = -armL;
-      if (intent === 'shelter' && npc.mind.needs.wet > 0.15) { armL = armR = -0.6; twistL = 0.85; twistR = -0.85; } // arms folded against the cold
-      else if (intent === 'chat') armR = -0.35 - Math.max(0, Math.sin(time * 2.1 + npc.id)) * 0.35; // talking with a hand
-      else if (intent === 'watch' && Math.sin(time * 0.7 + npc.id) > 0.75) armR = -1.45; // pointing
+    const fleeing = npc.pose === 'run' && npc.state === 'fleeing' && npc.role !== 'thief';
+    const place = npc.current?.place;
+    const cafe = sit && !!place && 'poi' in place && place.poi.kind === 'cafe-seat';
+    // The chest takes a third of a look aside and counters the stride; the head does the rest. Seated, the head
+    // alone looks about, so the hands stay on the lap.
+    let twist = sit ? 0 : npc.headYaw * 0.3 + walk.chest;
+    // What the right hand holds: a cup or a bag from the stance, or the act's own thing once it is under way.
+    let item = 0, actItem = 0, hideCone = false;
+
+    // --- Arms: the stance of the pose, then an act blended over it -----------------------------------------
+    if (npc.pose === 'hands') {
+      copy(armL, ARM_POSES.SURRENDER); copy(armR, ARM_POSES.SURRENDER);
+      armR[0] += Math.sin(time * 9) * 0.08; armL[0] += Math.sin(time * 9 + 2) * 0.06;
+    } else if (fleeing) {
+      flail(armL, time * 9 + k); flail(armR, time * 9 + k + 2.4);
+    } else if (npc.pose === 'fight') {
+      copy(armL, ARM_POSES.GUARD); copy(armR, ARM_POSES.GUARD);
+      // Guard up, a jab now and then, the right shoulder driving into it.
+      const p = (time + k * 0.37) % 1.1;
+      const jab = p < 0.3 ? Math.sin((p / 0.3) * Math.PI) : 0;
+      mixArm(P(armR), JAB, jab, armR);
+      twist += -0.25 + 0.4 * jab;
+    } else if (sit) {
+      // Hands on the thighs (the thighs' slope does not depend on the swinging shins), solved once per seat and lean.
+      seatLegs((npc.spot?.top ?? 0.5) / (BODY_SCALE * height) + FIGURE.seatClear, 0);
+      const key = Math.round(seat.thigh * 200) * 1000 + Math.round(lean * 200);
+      let lap = laps.get(k);
+      if (!lap || lap.key !== key) {
+        lap = lap ?? { key, left: [], right: [] };
+        lap.key = key;
+        lapArm(lap.left, -1, seat.thigh, lean, style.shoulderX, d.lap);
+        lapArm(lap.right, 1, seat.thigh, lean, style.shoulderX, d.lap);
+        laps.set(k, lap);
+      }
+      for (let n = 0; n < 7; n++) { armL[n] = lap.left[n]; armR[n] = lap.right[n]; }
+      if (d.lap) lapCloth(npc, seat.thigh);
+      if (cafe) {
+        // A glass of trà đá on the lap, sipped every so often.
+        const p = (time + k * 1.3) % 9;
+        mixArm(CUP, SIP, p < 2.4 ? Math.sin((p / 2.4) * Math.PI) ** 2 : 0, armR);
+        item = ARM.CUP;
+      }
+    } else {
+      swingArm(armL, -1, run); swingArm(armR, 1, run);
+      if (npc.pose === 'idle') {
+        armL[0] += Math.sin(time * 1.3 + k) * 0.05; armR[0] -= Math.sin(time * 1.3 + k) * 0.05;
+        let stance: ArmPose | null = null, both = true, amount = still;
+        if (npc.gang >= 0 && npc.state === 'at') stance = k % 2 ? ARM_POSES.CROSS : ARM_POSES.AKIMBO;
+        else if (intent === 'shelter' && npc.mind.needs.wet > 0.15) stance = ARM_POSES.CROSS; // arms folded against the cold
+        else if (intent === 'chat' && npc.state === 'at') {
+          // Talking with a hand while speaking, a little while listening.
+          stance = ARM_POSES.CHAT; both = false;
+          amount *= (time < npc.talkUntil ? 0.75 : 0.25) + 0.25 * Math.sin(time * 2.1 + k);
+        } else if (intent === 'watch' && npc.state === 'at') {
+          stance = ARM_POSES.POINT; both = false; // pointing it out now and then
+          amount *= clamp((Math.sin(time * 0.7 + k) - 0.72) / 0.12, 0, 1);
+        }
+        if (stance) {
+          mixArm(P(armR), stance, amount, armR);
+          if (stance === ARM_POSES.CHAT) armR[3] += Math.sin(time * 3.3 + k) * 0.25 * amount;
+          // Pointing follows the eyes down to whatever lies on the ground.
+          if (stance === ARM_POSES.POINT) armR[0] += npc.headPitch * amount;
+          if (both) mixArm(P(armL), stance, amount, armL);
+        }
+      }
+      if (moving && (npc.role === 'thief' || (d.bag && (npc.current?.kind === 'market' || npc.current?.kind === 'home')))) {
+        // The shopping bag (or a snatched one) swings less than a free arm.
+        mixArm(P(armR), CARRY, 0.7, armR);
+        item = ARM.BAG;
+      }
     }
-    let held = -1;
     if (env > 0 && !holding) {
-      // The act's arm angles (forward swing, inward twist), blended over the stance above.
-      const t = time - npc.actFrom, k = npc.id;
-      let aL = armL, aR = armR, tL = twistL, tR = twistR;
+      const t = time - npc.actFrom;
+      copy(actL, P(armL)); copy(actR, P(armR));
       switch (act) {
-        case 'phone': aR = -1.72 + Math.sin(t * 0.9 + k) * 0.05; tR = -0.5; aL = sit ? -0.7 : -0.2; held = 0; break;
-        case 'call': aR = -2.62; tR = -0.42; held = 0; break;
-        case 'stretch': aL = aR = -2.95 + Math.sin(t * 2.2) * 0.08; tL = -0.15; tR = 0.15; break;
-        case 'scratch': aR = -2.55 + Math.sin(t * 15) * 0.05; tR = -0.32; break;
-        case 'wave': aR = -2.7; tR = 0.15 + Math.sin(t * 8) * 0.38; break;
-        case 'fan': aR = -1.95; tR = -0.3 + Math.sin(t * 12) * 0.2; held = 1; break;
-        case 'sweep': aL = -0.62; aR = -0.66; tL = 0.3 + Math.sin(t * 2.6) * 0.32; tR = -0.18 + Math.sin(t * 2.6) * 0.32; held = 2; break;
-        case 'serve': aL = -1.15 + Math.sin(t * 3.1) * 0.16; aR = -1.25 - Math.sin(t * 3.1 + 1.3) * 0.18; tL = 0.25; tR = -0.25; break;
-        case 'shout': aR = -2.15; tR = -0.5; aL = -0.25; break;
-        case 'akimbo': aL = -0.25; aR = -0.25; tL = -0.62; tR = 0.62; break;
-        case 'cross': aL = aR = -0.62; tL = 0.85; tR = -0.85; break;
+        case 'phone':
+          // Onlookers film the incident; everyone else reads.
+          if (intent === 'watch') copy(actR, FILM);
+          else { copy(actR, ARM_POSES.PHONE); actR[0] += Math.sin(t * 0.9 + k) * 0.04; }
+          actItem = ARM.PHONE;
+          break;
+        case 'call': copy(actR, ARM_POSES.CALL); actItem = ARM.PHONE; break;
+        case 'stretch': {
+          copy(actL, ARM_POSES.STRETCH); copy(actR, ARM_POSES.STRETCH);
+          const s = Math.sin(t * 2.2) * 0.08;
+          actL[0] += s; actR[0] += s;
+          break;
+        }
+        case 'scratch':
+          copy(actR, ARM_POSES.SCRATCH);
+          actR[0] += Math.sin(t * 15) * 0.03;
+          actR[6] = mixHand(HAND.CLAW, handCode(0.8, 0.8, 0.45), 0.5 + 0.5 * Math.sin(t * 15));
+          break;
+        case 'wave': copy(actR, ARM_POSES.WAVE); actR[3] = -0.5 + 0.35 * Math.sin(t * 8); break;
+        case 'fan':
+          copy(actR, ARM_POSES.FAN); actR[5] += Math.sin(t * 12) * 0.45;
+          actItem = d.fan; hideCone = d.fan === ARM.NON_LA;
+          break;
+        case 'sweep':
+          copy(actL, SWEEP_L); copy(actR, SWEEP_R);
+          // The whole upper body swings the broom from side to side.
+          twist += Math.sin(t * 2.6) * 0.3 * env;
+          actItem = ARM.BROOM;
+          break;
+        case 'serve':
+          copy(actL, ARM_POSES.SERVE); copy(actR, ARM_POSES.SERVE);
+          actL[0] += Math.sin(t * 3.1) * 0.16; actR[0] -= Math.sin(t * 3.1 + 1.3) * 0.18;
+          actL[3] += Math.sin(t * 3.1 + 0.6) * 0.2; actR[3] += Math.sin(t * 3.1 + 2) * 0.2;
+          break;
+        case 'shout': copy(actR, SHOUT); break;
+        case 'akimbo': copy(actL, ARM_POSES.AKIMBO); copy(actR, ARM_POSES.AKIMBO); break;
+        case 'cross': copy(actL, ARM_POSES.CROSS); copy(actR, ARM_POSES.CROSS); break;
         default: break;
       }
-      armL += (aL - armL) * env; armR += (aR - armR) * env; twistL += (tL - twistL) * env; twistR += (tR - twistR) * env;
-      if (env < 0.5) held = -1;
+      mixArm(P(armL), P(actL), env, armL);
+      mixArm(P(armR), P(actR), env, armR);
+      if (env >= 0.5 && actItem) item = actItem;
+      else hideCone = false;
     }
-    if (holding) { armR = UMBRELLA_ARM + Math.sin(npc.stride) * 0.03; twistR = UMBRELLA_TWIST; }
-    bodies.push(base, d.body);
-    // Seated people use the bent-knee legs, which already reach forward and down.
-    limb(legs, -FIGURE.hipX, FIGURE.hipY, sit ? 0 : swing, sit ? d.seated : d.legs);
-    limb(legs, FIGURE.hipX, FIGURE.hipY, sit ? 0 : -swing, sit ? d.seated : d.legs);
-    limb(arms, -FIGURE.shoulderX, FIGURE.shoulderY, armL, d.arms, twistL);
-    limb(arms, FIGURE.shoulderX, FIGURE.shoulderY, armR, held >= 0 ? d.held[held] : d.arms, twistR);
     if (holding) {
-      // The canopy unfolds from a closed bundle; it bobs a little with the stride.
+      // The umbrella comes up as it opens; the canopy bobs a little with the stride. A nón lá comes off under it.
+      copy(actR, ARM_POSES.UMBRELLA);
+      actR[0] += Math.sin(npc.stride) * 0.03;
+      mixArm(P(armR), P(actR), clamp(open * 3, 0, 1), armR);
+      item = 0;
+      hideCone = open > 0.3;
+    }
+
+    // A gánh rides the right shoulder while they walk or stand about, the right hand on the pole; seated, busy
+    // with an act, running or under an umbrella they have set it down (out of sight).
+    let torsoBits = style.torso;
+    if (torsoBits & TORSO.GANH) {
+      if (!holding && act === 'none' && (npc.pose === 'walk' || npc.pose === 'idle')) copy(armR, ARM_POSES.GANH);
+      else torsoBits &= ~TORSO.GANH;
+    }
+    look.body[7] = torsoBits;
+
+    // --- Body: the torso leans about the hips, the head and chest turn in the shader ----------------------------
+    const sx = BODY_SCALE * width, sy = BODY_SCALE * height;
+    let y = npc.y + walk.bob * sy;
+    // Seated: the hip joints rest just above the seat top.
+    const top = npc.spot?.top ?? 0.5;
+    if (sit) y -= sitDrop(top, height);
+    pos.set(npc.x, y, npc.z);
+    quat.setFromEuler(turn.set(0, npc.yaw, roll));
+    base.compose(pos, quat, size.set(sx, sy, sx));
+    const hip = FIGURE.hipY * sy;
+    off.set(0, hip * (1 - Math.cos(lean)), -hip * Math.sin(lean)).applyQuaternion(quat);
+    torso.compose(pos.add(off), quat.setFromEuler(turn.set(lean, npc.yaw, roll)), size);
+    // Eyes shut for a blink every few seconds; the mouth opens and closes while they talk.
+    if (time > npc.blinkAt + 0.12) npc.blinkAt = time + 2.5 + Math.random() * 3.5;
+    let head = style.head;
+    if (time >= npc.blinkAt) head = (head & ~HEAD.EYES) | HEAD.BLINK;
+    if ((time < npc.talkUntil && Math.floor(time / 0.15 + k * 0.5) % 2 === 0) || (act === 'shout' && env > 0.5)) head |= HEAD.MOUTH;
+    if (hideCone) head &= ~HEAD.CONE;
+    look.body[6] = head;
+    bodyPose[0] = npc.headYaw - twist;
+    bodyPose[1] = npc.headPitch;
+    bodyPose[2] = twist;
+    // Leaning forward about the hips would swing skirts and tà back into the legs (and a hanging ponytail stays
+    // vertical): the secondary swings take the lean back out. The hair bounces on the same spring, more softly,
+    // and hangs when seated while the tà lies on the lap.
+    const tilt = Math.max(0, lean);
+    // The spring lags the stride, so the front of a skirt or tà also opens at least far enough for the hem to pass
+    // in front of the forward knee (thigh < 0 is forward; the hem hangs 0.5 u below its pivot).
+    // Seated, the front lies on the lap (the spring's target) while the back tà hangs behind the seat, or the back
+    // of a skirt is tucked under.
+    const ahead = sit ? 0 : npc.pose === 'fight' ? 0.3 : Math.max(0, -walk.thighL, -walk.thighR);
+    const clear = ahead > 0.2 ? Math.asin(Math.min(1, 0.9 * Math.sin(ahead) - 0.17)) + 0.05 : 0;
+    const front = Math.max(npc.sec, clear) + tilt;
+    // The back of a skirt or tà is tucked under the thighs (an apron has no back).
+    const seatedBack = d.lap ? -(npc.lapBack + tilt) * clamp(npc.sec / Math.max(0.3, npc.lapFront), 0, 1) : npc.sec + tilt;
+    bodyPose[3] = sit ? swingCode(front, tilt, seatedBack) : swingCode(front, npc.sec * 0.55 + tilt, front);
+    bodies.push(torso, look.body, bodyPose);
+    chestMatrix(torso, twist, chest);
+    poseArm(chest, -1, P(armL), armM, poseL, style.shoulderX);
+    armsL.push(armM, look.armL, poseL);
+    poseArm(chest, 1, P(armR), armM, poseR, style.shoulderX);
+    look.armR[6] = style.armR | item;
+    armsR.push(armM, look.armR, poseR);
+    if (holding) {
       const spread = 0.12 + 0.88 * open;
-      quat2.setFromEuler(euler.set(Math.sin(npc.stride) * 0.025, 0, Math.sin(npc.stride * 0.5) * 0.03));
-      local.compose(umbrellaHand, quat.copy(umbrellaTilt).multiply(quat2), size.set(spread, 0.9 + 0.1 * open, spread));
-      umbrellas.push(outM.multiplyMatrices(base, local), d.umbrella);
+      gripMatrix(armM, poseR, 1, held).multiply(stretch.makeScale(spread, 0.9 + 0.1 * open, spread));
+      umbrellas.push(held, d.umbrella);
+    }
+
+    // --- Legs ---------------------------------------------------------------------------------------------------
+    for (const side of SIDES) {
+      let thigh: number, knee: number, ankle: number, toe: number, abduct = 0;
+      if (sit) {
+        seatLegs(top / sy + FIGURE.seatClear, Math.sin(time * 1.4 + k + side) * 0.1);
+        thigh = seat.thigh; knee = seat.knee; ankle = seat.ankle; toe = seat.toe;
+        abduct = style.fem ? 0.03 : 0.12;
+      } else if (npc.pose === 'fight') {
+        // Boxer's stance: left foot forward, knees soft.
+        thigh = side < 0 ? -0.3 : 0.22; knee = side < 0 ? 0.35 : 0.3; ankle = side < 0 ? -0.08 : 0.18; toe = 0; abduct = 0.05;
+      } else {
+        thigh = side < 0 ? walk.thighL : walk.thighR;
+        knee = side < 0 ? walk.kneeL : walk.kneeR;
+        ankle = side < 0 ? walk.ankleL : walk.ankleR;
+        toe = side < 0 ? walk.toeL : walk.toeR;
+        // Standing about, the weight rests on one leg and the other knee softens.
+        if (npc.pose === 'idle') knee += Math.max(0, side * shift) * 0.12 * still;
+      }
+      limbMatrix(base, sideX(side) * FIGURE.hipX, FIGURE.hipY, thigh, sideX(side) * abduct, 0, legM);
+      legPose[0] = knee; legPose[1] = ankle; legPose[2] = toe;
+      legs.push(legM, look.legs, legPose);
     }
   }
 
@@ -553,7 +849,8 @@ export function createNpcs(
       const p = place.poi;
       const jitter = p.seat ? 0 : 0.9;
       const a = npc.id * 2.4;
-      return { x: p.x + Math.cos(a) * jitter, z: p.z + Math.sin(a) * jitter, yaw: p.yaw, sit: p.seat };
+      const seat = SEAT_KIND[p.kind];
+      return { x: p.x + Math.cos(a) * jitter, z: p.z + Math.sin(a) * jitter, yaw: p.yaw, sit: p.seat, top: seat ? seatHeight(seat, p.x, p.z) : undefined };
     }
     // Shop workers stand out front beside the door, facing the street; sheltering people in their slot.
     return frontSpot(place.building, place.slot, npc.id, { x: 0, z: 0, yaw: 0, sit: false });
@@ -626,8 +923,13 @@ export function createNpcs(
   }
 
   let saySink = hooks.say;
+  /** Time of the latest update, for things that happen between frames (lines said from outside update). */
+  let clock = 0;
   function say(npc: Npc, text: string, shout: boolean) {
-    if (text && saySink) saySink(npc, text, shout);
+    if (!text || !saySink) return;
+    saySink(npc, text, shout);
+    // The mouth moves for about as long as the line takes to say.
+    npc.talkUntil = clock + Math.min(shout ? 2.4 : 3.2, 0.5 + text.length * 0.06);
   }
   let focusX = 0, focusZ = 0;
   const nearFocus = (npc: Npc, range = 30) => Math.abs(npc.x - focusX) + Math.abs(npc.z - focusZ) < range * 1.3 && Math.hypot(npc.x - focusX, npc.z - focusZ) < range;
@@ -911,13 +1213,87 @@ export function createNpcs(
     else if (mind.intent === 'chat') talk(npc, time);
   }
 
-  function knock(npc: Npc, vx: number, vy: number, vz: number, time: number) {
+  /**
+   * Where the eyes go and how the clothes swing: the head turns toward the threat, the incident, the chat
+   * partner, the player walking past (a glance) or looks idly about, and the chest follows a little; skirts,
+   * áo dài tà and ponytails ride a spring driven by the stride.
+   */
+  function animate(npc: Npc, time: number, dt: number, threat: Threat, d: number) {
+    const mind = npc.mind, inc = mind.incident, act = npc.state === 'at' ? npc.act : 'none';
+    let tx = 0, tz = 0, ty = 1.5, target = false;
+    let yaw = 0, pitch = npc.pose === 'run' ? 0 : 0.06;
+    if (npc.state === 'afraid' || npc.state === 'chasing' || (npc.gang >= 0 && d < 9 && !threat.inVehicle) || (act === 'wave' && d < 9)) {
+      tx = threat.x; tz = threat.z; target = true;
+    } else if (mind.intent === 'watch' && inc && npc.state === 'at') {
+      tx = inc.x; tz = inc.z; target = true;
+      ty = inc.kind === 'fire' ? 3 : inc.kind === 'body' ? 0.2 : 0.9;
+    } else if (mind.intent === 'chat' && npc.state === 'at' && npcs[mind.partner]) {
+      tx = npcs[mind.partner].x; tz = npcs[mind.partner].z; target = true;
+    } else if (d < 7 && !threat.inVehicle && !threat.down && npc.state !== 'fleeing') {
+      // Someone passing close by gets a glance of a second and a half, now and then.
+      if (time - npc.glanceAt > 8 + (npc.id % 5)) npc.glanceAt = time;
+      if (time - npc.glanceAt < 1.5) { tx = threat.x; tz = threat.z; target = true; }
+    }
+    if (target) {
+      const dx = tx - npc.x, dz = tz - npc.z;
+      yaw = wrap(Math.atan2(dx, dz) - npc.yaw);
+      // Behind them: they would have to turn round, so they don't look.
+      if (Math.abs(yaw) > 2) yaw = 0;
+      pitch = clamp(Math.atan2(1.5 - ty, Math.hypot(dx, dz) + 0.5), -0.35, 0.45);
+    } else if (npc.pose === 'idle' || npc.pose === 'sit') {
+      // Looking about: a slow drift with the odd quick look aside.
+      yaw = 0.45 * Math.sin(time * 0.31 + npc.id * 2.3) + 0.3 * Math.sin(time * 0.87 + npc.id) ** 5;
+      if (act === 'look') yaw += npc.gaze * 0.6;
+    } else if (npc.pose === 'walk') {
+      // The odd look at a shop window on the way.
+      yaw = 0.55 * Math.max(0, Math.sin(time * 0.21 + npc.id * 1.9)) ** 6 * (npc.id % 2 ? 1 : -1);
+    }
+    switch (act) {
+      case 'phone': if (mind.intent !== 'watch') { yaw = 0; pitch = 0.42; } break;
+      case 'call': pitch = 0.08; break;
+      case 'stretch': yaw *= 0.3; pitch = -0.3; break;
+      case 'shout': pitch = -0.08; break;
+      case 'sweep': yaw *= 0.3; pitch = 0.35; break;
+      case 'serve': pitch = 0.18; break;
+      case 'scratch': pitch = 0.12; break;
+      default: break;
+    }
+    if (mind.intent === 'chat' && npc.state === 'at') {
+      // Nodding along while the other one talks; a little head movement while talking.
+      const other = npcs[mind.partner];
+      if (time < npc.talkUntil) pitch += 0.04 * Math.sin(time * 7 + npc.id);
+      else if (other && time < other.talkUntil) pitch += 0.08 * Math.max(0, Math.sin(time * 4.5 + npc.id));
+    }
+    npc.headYaw = THREE.MathUtils.damp(npc.headYaw, clamp(yaw, -1.1, 1.1), 6, dt);
+    npc.headPitch = THREE.MathUtils.damp(npc.headPitch, pitch, 5, dt);
+    // Secondary motion: a damped spring toward a flare that grows with the stride (sub-stepped to stay stable).
+    // Seated, an áo dài's front tà (or an apron) lies on the lap.
+    const want = npc.pose === 'sit' ? (dress[npc.id].lap ? npc.lapFront : 0) : Math.min(0.9, Math.abs(npc.swing) * 0.6 + npc.speed * 0.08);
+    const steps = Math.min(8, Math.ceil(dt / 0.02));
+    const h = dt / steps;
+    for (let s = 0; s < steps; s++) {
+      npc.secV += (60 * (want - npc.sec) - 8 * npc.secV) * h;
+      npc.sec += npc.secV * h;
+    }
+    npc.sec = clamp(npc.sec, -0.4, npc.pose === 'sit' ? 1.9 : 0.9);
+  }
+
+  /**
+   * Knocks a person down as a ragdoll of their own size and clothes (the style is remembered for the look). `hit`
+   * is where the blow landed and `kind` what dealt it; `mode` limp for the dead, else they brace or stumble.
+   */
+  function knock(npc: Npc, vx: number, vy: number, vz: number, time: number, hit?: { x: number; y: number; z: number } | null, mode?: FallMode, kind?: HitKind) {
     if (!visible(npc)) return null;
+    // Someone on a stool or bench falls from the seat (before stop() stands them up).
+    const seat = npc.pose === 'sit' && npc.spot?.sit ? npc.spot.top ?? 0.5 : null;
     stop(npc, time);
     npc.state = 'down';
     npc.timer = time + 9;
     npc.pooled = false;
-    npc.body = ragdolls.spawn({ x: npc.x, y: npc.y, z: npc.z, yaw: npc.yaw, scale: RAGDOLL_SCALE, look: npc.look, velocity: { x: vx, y: vy, z: vz } });
+    npc.body = ragdolls.spawn({
+      x: npc.x, y: npc.y + (seat ?? 0), z: npc.z, yaw: npc.yaw, scale: BODY_SCALE, look: npc.look, velocity: { x: vx, y: vy, z: vz },
+      hit, mode, kind, from: seat === null ? 'stand' : 'sit',
+    });
     return npc.body;
   }
 
@@ -950,6 +1326,8 @@ export function createNpcs(
     npcs,
     gangs: gangState,
     setSay(fn: (npc: Npc, text: string, shout: boolean) => void) { saySink = fn; },
+    /** The camera frustum the next update draws for (null: draw everyone). */
+    setView(frustum: THREE.Frustum | null) { view = frustum; },
     /** Empties (or refills) the streets; the caller stops calling `update` while disabled. */
     setEnabled(on: boolean) {
       enabled = on;
@@ -958,15 +1336,18 @@ export function createNpcs(
     knock,
     provoke,
     flee,
-    /** Applies damage. Returns what happened so callers can tear limbs, drop money or update missions. */
-    damage(npc: Npc, amount: number, vx: number, vy: number, vz: number, time: number, force = false) {
+    /**
+     * Applies damage. Returns what happened so callers can tear limbs, drop money or update missions. `at` is the
+     * world point that was hit and `kind` what hit it, for the ragdoll.
+     */
+    damage(npc: Npc, amount: number, vx: number, vy: number, vz: number, time: number, force = false, at?: { x: number; y: number; z: number } | null, kind?: HitKind) {
       if (!visible(npc)) return null;
       npc.health -= amount;
       npc.hitAt = time;
       if (npc.gang >= 0) provoke(npc.gang, 1, time);
       const killed = npc.health <= 0;
       if (killed || force) {
-        const body = knock(npc, vx, vy, vz, time);
+        const body = knock(npc, vx, vy, vz, time, at, killed ? 'limp' : undefined, kind);
         return { body, killed, npc };
       }
       if (npc.gang < 0 && npc.role !== 'thief') flee(npc, time);
@@ -1051,6 +1432,7 @@ export function createNpcs(
       stats.outside = stats.umbrellas = stats.sheltering = stats.exposed = stats.watching = stats.chatting = 0;
       focusX = fx;
       focusZ = fz;
+      clock = time;
       if (!started) { settle(hour); started = true; lastHour = hour; }
       if (hour < lastHour) day++;
       lastHour = hour;
@@ -1232,10 +1614,15 @@ export function createNpcs(
           if (npc.gang >= 0 && d < 9 && !threat.inVehicle) npc.targetYaw = Math.atan2(-dx, -dz);
         } else if (npc.act !== 'none' || npc.offX || npc.offZ) stopAct(npc, time);
         npc.yaw = angleLerp(npc.yaw, npc.targetYaw, 1 - Math.exp(-dt * 8));
-        npc.stride += npc.speed * dt * 2.4;
-        const swingAmount = npc.pose === 'run' ? 0.85 : npc.pose === 'walk' ? 0.5 : 0;
-        npc.swing = THREE.MathUtils.damp(npc.swing, Math.sin(npc.stride) * swingAmount, 14, dt);
-        npc.y = ground(npc.x, npc.z) + (npc.pose === 'walk' || npc.pose === 'run' ? Math.abs(Math.sin(npc.stride)) * 0.04 : 0);
+        // The gait advances with the distance covered (a step is as long as the legs reach), so feet do not slide.
+        const moving = npc.pose === 'walk' || npc.pose === 'run';
+        npc.go = THREE.MathUtils.damp(npc.go, moving ? Math.min(1, npc.speed / 1.3) : 0, 8, dt);
+        const run = moving ? clamp((npc.speed - 2) / 1.6, 0, 1) : 0, amp = (0.48 + 0.34 * run) * npc.go;
+        const step = 2 * FIGURE.sole * BODY_SCALE * dress[i].style.height * Math.sin(Math.max(0.2, amp)) * (1 + 0.08 * run);
+        npc.stride += (npc.speed * dt * Math.PI) / step;
+        npc.swing = Math.sin(npc.stride) * amp;
+        npc.y = ground(npc.x, npc.z);
+        animate(npc, time, dt, threat, d);
 
         // --- chatter near the player ---
         npc.chatterAt -= dt;
@@ -1273,9 +1660,18 @@ export function createNpcs(
       for (const batch of batches) batch.end();
       return events;
     },
+    /** Level of detail of the crowd's figures: 'hi' at quality levels 0-2, 'lo' (mitten hands, coarser limbs) at 3-5. */
+    setDetail(next: Detail) {
+      if (next === detail) return;
+      detail = next;
+      bodies.setGeometry(figureGeometry('body', next));
+      armsL.setGeometry(figureGeometry('armL', next));
+      armsR.setGeometry(figureGeometry('armR', next));
+      legs.setGeometry(figureGeometry('leg', next));
+    },
     dispose() {
       for (const batch of batches) { scene.remove(batch.mesh); batch.dispose(); }
-      material.dispose();
+      for (const m of Object.values(materials)) m.dispose();
     },
   };
 }

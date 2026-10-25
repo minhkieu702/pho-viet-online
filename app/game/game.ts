@@ -1,15 +1,15 @@
 import * as THREE from 'three';
-import { buildWorld, dockAt, groundHeight } from './world';
+import { buildWorld, dockAt, groundHeight, onSidewalk } from './world';
 import { LAND, LANDMARKS, PLAY, PLOTS, RIVER, ROADS_X, ROADS_Z, SCENERY, VENUES, WATER_LEVEL, inRect, type Dock } from './city';
 import { createBoats, makeBoatMesh, type Boat } from './boats';
 import { createNav } from './nav';
-import { createRagdolls, type BodyPart, type RagdollBody, type RagdollLook } from './ragdoll';
+import { createRagdolls, type BodyPart, type HitKind, type RagdollBody, type RagdollLook } from './ragdoll';
 import { createNpcs, GANGS, type Npc } from './npcs';
 import { createEffects, makeGun } from './effects';
 import { createExplosives, type Explosion } from './explosives';
 import { createPickups } from './pickups';
 import { createBubbles } from './bubbles';
-import { createAtmosphere } from './atmosphere';
+import { createAtmosphere, type Weather } from './atmosphere';
 import { createAnimals } from './animals';
 import { createSideMissions, type SideMissionView } from './side-missions';
 import { playBoom, playCrash, playHorn, playShot, playThud, setRain, unlockAudio } from './audio';
@@ -20,10 +20,14 @@ import { createPeerInterpolator, createSnapshotClock } from './peer-interpolatio
 import type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
 import { BIKES, CAR_STATS, MOTO_STATS, POLICE_CAR_STATS, bikeById, repairCost, type BikeId } from './bikes';
 import { createVehicles, makeCarMesh, seatOf, vehicleStyle, CAR_HEALTH, MASS, MOTO_HEALTH, POLICE_CAR_HEALTH, type Body, type Car, type Crash } from './vehicles';
-import { FLOORBOARD, MOTO_RIDER, motoParts, vehicleMaterial, type MotoStyle } from './vehicle-models';
+import { MOTO_RIDER, motoParts, vehicleMaterial, type MotoStyle } from './vehicle-models';
+import {
+  ARM_POSES, BODY_SCALE, CAR_DRIVER, FIGURE, HAND, HAND_SOCKET, HEAD, TORSO, armFK, createHeroFigure, deriveStyle, gait, handCode, mixHand, newGait,
+  releaseView, setBits, setStyle, sideX, socket, styleOf, twoBoneIK, type FigureLook, type HeroFigure, type WardrobeRole,
+} from './figures';
 import { createPolice } from './police';
 import { createZombies, type Zombie } from './zombies';
-import { createInteriors, type InteriorKind } from './interiors';
+import { createInteriors, type InteriorKind, type RoomAct } from './interiors';
 import { VENUE_SERVICES, serviceOf, type VenueRoom } from './venues';
 import { createSky, HORIZON } from './sky';
 import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuName, isSoftwareGpu, type QualityMode } from './quality';
@@ -62,18 +66,27 @@ const RECEIVERS = [
 export const STORE = { x: -18, z: 49.6 };
 export const BIKE_SHOP = { x: 20, z: -10.9 };
 const UP = new THREE.Vector3(0, 1, 0);
-// Model units were ~2.6 m tall; these bring people and bikes to real-world size next to the houses and cars.
-const PERSON_SCALE = 0.68;
+// People share the crowd's skeleton (figures.ts FIGURE units, a 1.71 m adult at this scale); the bike models
+// are built in units that this brings to real-world size next to the houses and cars.
+const PERSON_SCALE = BODY_SCALE;
 const BIKE_SCALE = 0.62;
 const CAMERA_DEFAULT = { yaw: Math.atan2(31, 39), pitch: Math.atan2(36, Math.hypot(31, 39)), dist: 42 };
 const PLAYER_LOOK: RagdollLook = { shirt: '#e77641', pants: '#293e4a', skin: '#dca878', helmet: '#fff4dc' };
-const RAGDOLL_SCALE = 0.68;
+// A knocked-down player lies at the standing figure's size, so the body does not pop when it falls.
+const RAGDOLL_SCALE = PERSON_SCALE;
+/** Neck height of a standing adult (m): hits above it are head shots. Officers are drawn at 0.84 (police.ts). */
+const NECK_Y = FIGURE.neckY * BODY_SCALE;
+const OFFICER_NECK_Y = FIGURE.neckY * 0.84 * 1.01;
+/**
+ * Weapon forces are gameplay values; what a body takes of them (spec-ragdoll): a pistol round topples a person
+ * instead of throwing them 5 m, a punch knocks down (a stumble and a fall) instead of launching. Rounds into a
+ * body already down move it less, and a shotgun's pellets share one shove.
+ */
+const BULLET_PUSH = 0.55, PUNCH_PUSH = 0.5, CORPSE_PUSH = 0.6, PELLET_PUSH = 0.15;
 const MAX_HEALTH = 100;
 const CRASH_SPEED = 12.5;
 // Wait after an arrest or being downed before the player is back on the street.
 const RESPAWN_MS = 5000;
-// Rider height on a horse's saddle, in bike units (the default seat is 0.42).
-const HORSE_SEAT = 1.3;
 
 function material(color: THREE.ColorRepresentation, roughness = 0.85) {
   return new THREE.MeshStandardMaterial({ color, roughness, metalness: 0.03 });
@@ -125,172 +138,446 @@ function makeLabel(text: string, bg = '#253d35', fg = '#ffffff') {
   return sprite;
 }
 
-function makePerson(color = '#e77641', riding = false, hair?: string) {
-  // Every moving part is one merged, vertex-coloured mesh (body, two legs, two arms, and a glossy helmet
-  // for the rider), so a person costs five or six draw calls however much detail it carries.
-  type Piece = { g: THREE.BufferGeometry; c: THREE.ColorRepresentation; at?: [number, number, number]; s?: number | [number, number, number]; r?: [number, number, number]; smooth?: boolean };
-  const tint = new THREE.Color(), m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), v = new THREE.Vector3(), sv = new THREE.Vector3();
-  const merge = (pieces: Piece[]) => {
-    const positions: number[] = [], normals: number[] = [], colors: number[] = [];
-    for (const p of pieces) {
-      const g = p.g.index ? p.g.toNonIndexed() : p.g;
-      if (g !== p.g) p.g.dispose();
-      if (!p.smooth) { g.deleteAttribute('normal'); g.computeVertexNormals(); }
-      const s = p.s ?? 1;
-      e.set(...(p.r ?? [0, 0, 0]));
-      g.applyMatrix4(m4.compose(v.set(...(p.at ?? [0, 0, 0])), q.setFromEuler(e), typeof s === 'number' ? sv.setScalar(s) : sv.set(...s)));
-      tint.set(p.c);
-      const pos = g.getAttribute('position'), nor = g.getAttribute('normal');
-      for (let i = 0; i < pos.count; i++) {
-        positions.push(pos.getX(i), pos.getY(i), pos.getZ(i));
-        normals.push(nor.getX(i), nor.getY(i), nor.getZ(i));
-        colors.push(tint.r, tint.g, tint.b);
-      }
-      g.dispose();
-    }
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
-    geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
-    geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
-    return geometry;
-  };
-  const ball = (r: number, w = 10, h = 7, theta = Math.PI) => new THREE.SphereGeometry(r, w, h, 0, Math.PI * 2, 0, theta);
-  const tube = (top: number, bottom: number, height: number, seg = 10) => new THREE.CylinderGeometry(top, bottom, height, seg);
-  const block = (w: number, h: number, d: number) => new THREE.BoxGeometry(w, h, d);
-  const lathe = (profile: number[], seg = 12) => new THREE.LatheGeometry(profile.reduce<THREE.Vector2[]>((out, _, i) => (i % 2 ? out : [...out, new THREE.Vector2(profile[i], profile[i + 1])]), []), seg, Math.PI / seg);
-  const shade = (hex: string, k: number) => new THREE.Color(hex).multiplyScalar(k);
-  const SKIN = '#dca878', TROUSERS = '#293e4a', SHOE = '#f6ead2', HAIR = hair ?? '#2a2220';
-  const cloth = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, metalness: 0.03 });
+// ---- People: the player, other players, shopkeepers and the people inside shops -------------------------------
 
-  // Head features in head units (radius 1, centred at HEAD), mapped onto the body.
-  const R = 0.38, HEAD = [0, 2.2, 0.02] as const, HIP = 1.04;
-  const h = (x: number, y: number, z: number): [number, number, number] => [HEAD[0] + x * R, HEAD[1] + y * R - HIP, HEAD[2] + z * R];
-  const hs = (s: number | [number, number, number]): [number, number, number] => (typeof s === 'number' ? [s * R, s * R, s * R] : [s[0] * R, s[1] * R, s[2] * R]);
-  const y = (value: number) => value - HIP;
-  const pieces: Piece[] = [
-    // Trousers, belt and a tapered shirt with a chest pocket and collar.
-    { g: lathe([0, 0.92, 0.33, 0.92, 0.37, 0.98, 0.375, 1.12, 0.36, 1.2, 0, 1.2]), c: TROUSERS, at: [0, y(0), 0], s: [1, 1, 0.64] },
-    { g: tube(0.374, 0.374, 0.075, 12), c: '#4a3828', at: [0, y(1.15), 0], s: [1, 1, 0.65] },
-    { g: block(0.1, 0.07, 0.03), c: '#d9b44a', at: [0, y(1.15), 0.245] },
-    { g: lathe([0, 1.17, 0.385, 1.17, 0.375, 1.3, 0.385, 1.46, 0.43, 1.64, 0.435, 1.76, 0.35, 1.86, 0.17, 1.93, 0, 1.93]), c: color, at: [0, y(0), 0], s: [1, 1, 0.62] },
-    { g: block(0.13, 0.13, 0.02), c: shade(color, 0.86), at: [0.18, y(1.53), 0.252], r: [-0.12, 0, 0] },
-    { g: tube(0.17, 0.2, 0.07, 10), c: shade(color, 0.85), at: [0, y(1.92), 0], s: [1, 1, 0.85] },
-    { g: tube(0.12, 0.13, 0.2, 10), c: SKIN, at: [0, y(2.0), 0] },
-    // Head: egg-shaped skull, ears, eyes, brows, nose and mouth.
-    { g: ball(1, 14, 11), c: SKIN, at: h(0, 0, 0), s: hs([1, 1.06, 0.98]), smooth: true },
-    { g: ball(0.2, 6, 5), c: shade(SKIN, 0.92), at: h(-0.97, -0.04, 0.02), s: hs([0.6, 1, 0.75]) },
-    { g: ball(0.2, 6, 5), c: shade(SKIN, 0.92), at: h(0.97, -0.04, 0.02), s: hs([0.6, 1, 0.75]) },
-    { g: ball(0.13, 8, 6), c: '#2a201b', at: h(-0.36, 0.03, 0.885), s: hs([0.95, 1.3, 0.5]) },
-    { g: ball(0.13, 8, 6), c: '#2a201b', at: h(0.36, 0.03, 0.885), s: hs([0.95, 1.3, 0.5]) },
-    { g: block(0.32, 0.075, 0.09), c: hair ?? '#3a2a22', at: h(-0.37, 0.33, 0.855), s: hs(1), r: [-0.25, 0, 0.1] },
-    { g: block(0.32, 0.075, 0.09), c: hair ?? '#3a2a22', at: h(0.37, 0.33, 0.855), s: hs(1), r: [-0.25, 0, -0.1] },
-    { g: ball(0.13, 6, 4), c: shade(SKIN, 0.97), at: h(0, -0.14, 0.95), s: hs([1, 0.85, 0.85]) },
-    { g: block(0.24, 0.05, 0.06), c: '#9b5a48', at: h(0, -0.43, 0.875), s: hs(1), r: [0.35, 0, 0] },
-  ];
-  if (hair) {
-    // Short hair: a chunky dome tilted back off the forehead, sideburns and a swept fringe.
-    pieces.push(
-      { g: ball(1.07, 14, 6, Math.PI * 0.56), c: HAIR, at: h(0, 0, 0), s: hs([1, 1.07, 0.99]), r: [-0.5, 0, 0] },
-      { g: block(0.14, 0.4, 0.3), c: HAIR, at: h(-0.93, -0.06, 0.22), s: hs(1), r: [0, -0.35, 0] },
-      { g: block(0.14, 0.4, 0.3), c: HAIR, at: h(0.93, -0.06, 0.22), s: hs(1), r: [0, 0.35, 0] },
-      { g: ball(0.5, 8, 5), c: HAIR, at: h(0.22, 0.6, 0.66), s: hs([1.4, 0.5, 0.75]), r: [-0.55, 0, -0.3] },
-    );
+type V3 = readonly [number, number, number];
+/** An arm pose [swing, abduct, roll, elbow, twist, flex, hand], written for the right arm (pose.ts ArmPose). */
+type ArmTuple = number[];
+/** A person on the shared hero geometry (figures.ts): the crowd's skeleton and wardrobe at the highest detail. */
+type Person = HeroFigure & {
+  look: FigureLook;
+  /** How it sits on a vehicle (seatOn), so the fists can follow the grips while the body rolls or twists. */
+  seat: SeatState | null;
+  /** Stride phase when another system walks it (peers). */
+  stride: number;
+};
+
+const PERSON_SKINS = ['#dca878', '#d3a179', '#c58f69', '#e0b48e', '#b98260'];
+const PERSON_PANTS = ['#293e4a', '#2b2f36', '#3a3f48', '#4a4038', '#3b4a63', '#5a4a3a'];
+/** The delivery box hangs from the top of its straps, this high in chest space, so it can bounce. */
+const PACK_Y = FIGURE.shoulderY + 0.1 - FIGURE.waistY;
+/** The fist's grip lies this far past the wrist, so arm IK runs the forearm to it. */
+const GRIP_REACH = -HAND_SOCKET.GRIP[1];
+const ONE = new THREE.Vector3(1, 1, 1);
+let personSeed = 0;
+
+/**
+ * A detailed person: the delivery rider (no `hair`: orange jacket, helmet, an insulated box on the back) or a
+ * resident with hair of that colour, dressed by the wardrobe for `role`. The joints keep their old names
+ * (limbLeft..elbowRight) and add head, handLeft/handRight (wrist sockets for guns, cups and cuffs) and the
+ * ankles, in FIGURE units with the group scaled to metres (`riding`: for a parent in bike units).
+ * Pose the joints, then call sync().
+ */
+function makePerson(color = '#e77641', riding = false, hair?: string, role: WardrobeRole | '' = '') {
+  const seed = personSeed++;
+  const look: FigureLook = hair
+    ? { shirt: color, pants: PERSON_PANTS[seed % PERSON_PANTS.length], skin: PERSON_SKINS[(seed * 3) % PERSON_SKINS.length] }
+    : { shirt: color, pants: '#293e4a', skin: '#dca878', helmet: '#fff4dc' };
+  const style = deriveStyle(look, hair ? `${hair}:${seed}` : 0, hair ? role : 'player');
+  if (hair) style.colors.hair = hair;
+  // Shopkeepers, receivers and people indoors are not carrying a gánh.
+  style.torso &= ~TORSO.GANH;
+  setStyle(look, style);
+  const person: Person = Object.assign(createHeroFigure(style), { look, seat: null, stride: 0 });
+  // Hips take swing, abduction and roll in the shoulders' order, for IK astride a saddle.
+  person.limbLeft.rotation.order = person.limbRight.rotation.order = 'XZY';
+  if (!hair) addDeliveryBox(person);
+  person.group.scale.setScalar(riding ? PERSON_SCALE / BIKE_SCALE : PERSON_SCALE);
+  setArm(person, -1, ARM_POSES.RELAXED);
+  setArm(person, 1, ARM_POSES.RELAXED);
+  person.sync();
+  return person;
+}
+
+/** Boxes merged into one vertex-coloured geometry (FIGURE units). */
+function blocks(pieces: { size: V3; at: V3; color: THREE.ColorRepresentation; tilt?: number }[]) {
+  const positions: number[] = [], normals: number[] = [], colors: number[] = [];
+  const m = new THREE.Matrix4(), tint = new THREE.Color();
+  for (const p of pieces) {
+    const g = new THREE.BoxGeometry(...p.size).toNonIndexed();
+    g.applyMatrix4(m.makeRotationX(p.tilt ?? 0).setPosition(...p.at));
+    tint.set(p.color);
+    const pos = g.getAttribute('position'), nor = g.getAttribute('normal');
+    for (let i = 0; i < pos.count; i++) {
+      positions.push(pos.getX(i), pos.getY(i), pos.getZ(i));
+      normals.push(nor.getX(i), nor.getY(i), nor.getZ(i));
+      colors.push(tint.r, tint.g, tint.b);
+    }
+    g.dispose();
   }
-  // The delivery rider's insulated box hangs from the straps' top (its pivot) so it can bounce.
-  const PACK_TOP = 1.9;
-  const packPieces: Piece[] = hair ? [] : [
-    { g: block(0.6, 0.66, 0.34), c: '#365e52', at: [0, 1.52 - PACK_TOP, -0.43] },
-    { g: block(0.64, 0.08, 0.38), c: '#4c7a6b', at: [0, 1.88 - PACK_TOP, -0.43] },
-    { g: block(0.42, 0.13, 0.02), c: '#e7b04a', at: [0, 1.56 - PACK_TOP, -0.605] },
-  ];
-  if (!hair) {
-    pieces.push(
-      { g: block(0.06, 0.4, 0.035), c: '#2b4a40', at: [-0.22, y(1.68), 0.262], r: [0.1, 0, 0] },
-      { g: block(0.06, 0.4, 0.035), c: '#2b4a40', at: [0.22, y(1.68), 0.262], r: [0.1, 0, 0] },
-      { g: block(0.06, 0.035, 0.5), c: '#2b4a40', at: [-0.22, y(1.89), -0.02] },
-      { g: block(0.06, 0.035, 0.5), c: '#2b4a40', at: [0.22, y(1.89), -0.02] },
-    );
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  return geometry;
+}
+
+/** The insulated delivery box on the back (on the bouncing pack pivot) and its two straps over the shoulders. */
+function addDeliveryBox(person: Person) {
+  const cloth = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, metalness: 0.03 });
+  const box = blocks([
+    { size: [0.41, 0.45, 0.31], at: [0, -0.235, -0.105], color: '#365e52' },
+    { size: [0.44, 0.05, 0.34], at: [0, -0.005, -0.105], color: '#4c7a6b' },
+    { size: [0.28, 0.085, 0.012], at: [0, -0.19, -0.266], color: '#e7b04a' },
+  ]);
+  person.pack.position.y = PACK_Y;
+  person.pack.add(new THREE.Mesh(box, cloth));
+  // Straps follow the jacket from the bottom of the chest over the shoulder to the top of the box (chest space).
+  const path: [number, number][] = [[1.3, 0.116], [1.4, 0.128], [1.5, 0.131], [1.59, 0.123], [1.665, 0.1], [1.728, 0.038], [1.728, -0.045], [1.668, -0.1], [1.62, -0.115]];
+  const straps: { size: V3; at: V3; color: string; tilt: number }[] = [];
+  for (const x of [-0.085, 0.085]) {
+    for (let i = 0; i + 1 < path.length; i++) {
+      const [y0, z0] = path[i], [y1, z1] = path[i + 1];
+      const length = Math.hypot(y1 - y0, z1 - z0);
+      straps.push({ size: [0.036, length + 0.008, 0.012], at: [x, (y0 + y1) / 2 - FIGURE.waistY, (z0 + z1) / 2], color: '#2b4a40', tilt: Math.atan2(z1 - z0, y1 - y0) });
+    }
   }
-  // The body pivots at the hip so a rider can lean forward; the head and helmet lean with it.
-  const body = new THREE.Mesh(merge(pieces), cloth);
-  body.position.y = HIP;
-  const group = new THREE.Group();
-  group.add(body);
-  const pack = new THREE.Group();
-  pack.position.set(0, PACK_TOP - HIP, 0);
-  if (packPieces.length) { pack.add(new THREE.Mesh(merge(packPieces), cloth)); body.add(pack); }
-  if (!hair) {
-    // Motorbike half helmet with a peak and a stripe in the shirt colour.
-    const helmet = merge([
-      { g: ball(1.15, 14, 7, Math.PI * 0.52), c: '#fff4dc', at: h(0, 0.06, -0.02), s: hs([1, 1, 1.02]), r: [-0.3, 0, 0] },
-      { g: ball(1.17, 14, 7, Math.PI * 0.5), c: color, at: h(0, 0.06, -0.02), s: hs([0.2, 1, 1.03]), r: [-0.3, 0, 0] },
-      { g: new THREE.CylinderGeometry(0.85, 0.85, 0.07, 10, 1, false, -Math.PI / 2, Math.PI), c: '#e9dfc6', at: h(0, 0.36, 0.86), s: hs([1, 1, 0.6]), r: [0.15, 0, 0] },
-    ]);
-    body.add(new THREE.Mesh(helmet, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.4, metalness: 0.05 })));
+  const strapMesh = new THREE.Mesh(blocks(straps), cloth);
+  person.chest.add(strapMesh);
+  person.pack.userData.straps = strapMesh;
+}
+/** Shows or hides the delivery box and its straps (a taxi passenger sits where the box would be). */
+function showPack(p: Person, on: boolean) {
+  p.pack.visible = on;
+  if (p.pack.userData.straps) (p.pack.userData.straps as THREE.Object3D).visible = on;
+}
+
+/** Closes the eyes for a blink every few seconds (`seed` keeps people out of step). Takes effect at sync(). */
+function blink(p: Person, time: number, seed = 0) {
+  const closed = (time + seed * 1.37) % (3.1 + (seed % 3)) < 0.12;
+  setBits(p.looks.body, 0, HEAD.EYES, !closed);
+  setBits(p.looks.body, 0, HEAD.BLINK, closed);
+}
+
+/** Poses one arm from a tuple (abduct and roll mirrored per side: the right arm hangs at -x), hand shape included. */
+function setArm(p: Person, side: 1 | -1, a: ArrayLike<number>) {
+  const sx = sideX(side);
+  (side > 0 ? p.armRight : p.armLeft).rotation.set(a[0], sx * a[2], sx * a[1]);
+  (side > 0 ? p.elbowRight : p.elbowLeft).rotation.x = a[3];
+  (side > 0 ? p.handRight : p.handLeft).rotation.set(0, -sx * a[4], -sx * a[5]);
+  if (side > 0) p.grip.right = a[6]; else p.grip.left = a[6];
+}
+/** Writes an arm tuple. */
+function arm(out: ArmTuple, swing: number, abduct: number, roll: number, elbow: number, twist: number, flex: number, hand: number) {
+  out[0] = swing; out[1] = abduct; out[2] = roll; out[3] = elbow; out[4] = twist; out[5] = flex; out[6] = hand;
+  return out;
+}
+const copyArm = (out: ArmTuple, a: ArrayLike<number>) => arm(out, a[0], a[1], a[2], a[3], a[4], a[5], a[6]);
+
+const _ik = { m: new THREE.Matrix4(), n: new THREE.Matrix4(), f: new THREE.Matrix4(), v: new THREE.Vector3(), root: new THREE.Vector3(), hint: new THREE.Vector3(), q: new THREE.Quaternion(), e: new THREE.Euler(0, 0, 0, 'XZY') };
+/** The chest's frame in the person's group space (lean, roll, breathing and twist included). */
+function chestFrame(p: Person, out: THREE.Matrix4) {
+  p.body.updateMatrix();
+  p.chest.updateMatrix();
+  return out.multiplyMatrices(p.body.matrix, p.chest.matrix);
+}
+const shoulderOf = (p: Person, side: 1 | -1, out: THREE.Vector3) => out.set(sideX(side) * p.style.shoulderX, FIGURE.shoulderY - FIGURE.waistY, 0);
+
+/**
+ * Shoulder angles and elbow bend that put a fist (its grip) on `target`, with the elbow pointing along `hint`.
+ * Both are in the person's group space (FIGURE units), or in chest space with `inChest`. Writes out[0..3].
+ */
+function reach(p: Person, side: 1 | -1, target: THREE.Vector3, hint: THREE.Vector3, out: ArmTuple, inChest = false) {
+  const t = _ik.v.copy(target), h = _ik.hint.copy(hint);
+  if (!inChest) {
+    const inverse = chestFrame(p, _ik.m).invert();
+    t.applyMatrix4(inverse);
+    h.transformDirection(inverse);
   }
-  // Legs: the thigh pivots at the hip and the shin (with the sneaker) at the knee, so strides can fold.
-  const KNEE = 0.46, ELBOW = 0.36;
-  const thigh = () => new THREE.Mesh(merge([
-    { g: ball(0.175, 10, 7), c: TROUSERS, at: [0, -0.03, 0] },
-    { g: tube(0.175, 0.152, 0.48), c: TROUSERS, at: [0, -0.24, 0] },
-  ]), cloth);
-  const shin = () => new THREE.Mesh(merge([
-    { g: ball(0.152, 9, 6), c: TROUSERS, at: [0, 0, 0] },
-    { g: tube(0.152, 0.128, 0.4), c: TROUSERS, at: [0, -0.64 + KNEE, 0] },
-    { g: tube(0.14, 0.14, 0.06), c: shade(TROUSERS, 0.8), at: [0, -0.82 + KNEE, 0] },
-    { g: block(0.24, 0.15, 0.4), c: SHOE, at: [0, -0.905 + KNEE, 0.07] },
-    { g: ball(0.12, 8, 5), c: SHOE, at: [0, -0.915 + KNEE, 0.25], s: [1, 0.62, 1.05] },
-    { g: block(0.26, 0.05, 0.47), c: '#c8b593', at: [0, -0.985 + KNEE, 0.085] },
-    { g: block(0.13, 0.025, 0.16), c: color, at: [0, -0.826 + KNEE, 0.12], r: [-0.25, 0, 0] },
-  ]), cloth);
-  const limbLeft = new THREE.Group();
-  const limbRight = new THREE.Group();
-  const kneeLeft = new THREE.Group();
-  const kneeRight = new THREE.Group();
-  limbLeft.position.set(-0.26, 1.04, 0);
-  limbRight.position.set(0.26, 1.04, 0);
-  for (const [hip, knee] of [[limbLeft, kneeLeft], [limbRight, kneeRight]] as const) {
-    knee.position.y = -KNEE;
-    knee.add(shin());
-    hip.add(thigh(), knee);
+  const ik = twoBoneIK(shoulderOf(p, side, _ik.root), t, FIGURE.upperArm, FIGURE.foreArm + GRIP_REACH, h);
+  out[0] = ik.swing; out[1] = sideX(side) * ik.abduct; out[2] = sideX(side) * ik.roll; out[3] = ik.bend;
+  return out;
+}
+
+/**
+ * Forearm twist and wrist flex that turn a hand axis (in the unmirrored hand's space, mirrored per side: (0,0,1)
+ * is the fist's channel, (-1,0,0) the palm's normal) toward `want` (group space). The rest of the arm is kept.
+ */
+function alignHand(p: Person, side: 1 | -1, a: ArmTuple, axis: V3, want: THREE.Vector3) {
+  const sx = sideX(side);
+  const base = chestFrame(p, _ik.n).multiply(_ik.m.compose(shoulderOf(p, side, _ik.root), _ik.q.setFromEuler(_ik.e.set(a[0], sx * a[2], sx * a[1], 'XZY')), ONE));
+  const ax = sx * axis[0], ay = axis[1], az = axis[2];
+  const pose = [a[3], 0, 0, 0];
+  let best = -Infinity;
+  for (let twist = -1.6; twist <= 1.61; twist += 0.08) {
+    for (let flex = -0.6; flex <= 0.61; flex += 0.1) {
+      pose[1] = twist; pose[2] = flex;
+      const e = armFK(pose, side, _ik.f).premultiply(base).elements;
+      const x = e[0] * ax + e[4] * ay + e[8] * az, y = e[1] * ax + e[5] * ay + e[9] * az, z = e[2] * ax + e[6] * ay + e[10] * az;
+      // A comfortable wrist wins a tie.
+      const score = (x * want.x + y * want.y + z * want.z) / Math.hypot(x, y, z) - 0.03 * Math.abs(flex) - 0.01 * Math.abs(twist);
+      if (score > best) { best = score; a[4] = twist; a[5] = flex; }
+    }
   }
-  group.add(limbLeft, limbRight);
-  // Arms pivot at the shoulder (short sleeve) and the elbow (forearm, hand and thumb). They hang from the
-  // torso, so they stay on the shoulders when it leans or twists.
-  const upperArm = () => new THREE.Mesh(merge([
-    { g: ball(0.15, 10, 7), c: color, at: [0, -0.02, 0] },
-    { g: tube(0.15, 0.13, 0.36), c: color, at: [0, -0.18, 0] },
-    { g: tube(0.142, 0.142, 0.06), c: shade(color, 0.85), at: [0, -0.35, 0] },
-  ]), cloth);
-  const forearm = (inward: number) => new THREE.Mesh(merge([
-    { g: ball(0.1, 8, 6), c: SKIN, at: [0, 0, 0] },
-    { g: tube(0.105, 0.088, 0.3, 9), c: SKIN, at: [0, -0.5 + ELBOW, 0] },
-    { g: ball(0.12, 9, 7), c: SKIN, at: [0, -0.725 + ELBOW, 0.01], s: [0.88, 1.08, 0.95] },
-    { g: ball(0.05, 6, 4), c: SKIN, at: [inward * 0.08, -0.68 + ELBOW, 0.07] },
-  ]), cloth);
-  const armLeft = new THREE.Group();
-  const armRight = new THREE.Group();
-  const elbowLeft = new THREE.Group();
-  const elbowRight = new THREE.Group();
-  armLeft.position.set(-0.57, 1.76 - HIP, 0.04);
-  armRight.position.set(0.57, 1.76 - HIP, 0.04);
-  for (const [shoulder, elbow, inward] of [[armLeft, elbowLeft, 1], [armRight, elbowRight, -1]] as const) {
-    elbow.position.y = -ELBOW;
-    elbow.add(forearm(inward));
-    shoulder.add(upperArm(), elbow);
+  return a;
+}
+
+/** The ankle angle that levels the foot under a hip rotation and knee bend. */
+function flatFoot(hip: THREE.Euler, knee: number) {
+  const e = _ik.m.makeRotationFromEuler(hip).elements;
+  // Foot forward = R_hip Rx(knee + ankle) (0, 0, 1); its height is -e5 sin + e9 cos.
+  let phi = Math.atan2(e[9], e[5]);
+  if (-e[6] * Math.sin(phi) + e[10] * Math.cos(phi) < 0) phi += Math.PI;
+  return Math.atan2(Math.sin(phi - knee), Math.cos(phi - knee));
+}
+
+/**
+ * How far below the hip joint a leg reaches (FIGURE units) for a thigh swing, knee, ankle and toe bend: the
+ * lowest of heel, ball and toe tip. Planting the lower foot on the ground gives the walk its natural bob.
+ */
+function legReach(thigh: number, knee: number, ankle: number, toe: number) {
+  const shin = thigh + knee, foot = shin + ankle;
+  const ankleDrop = FIGURE.thigh * Math.cos(thigh) + FIGURE.shin * Math.cos(shin);
+  const c = Math.cos(foot), s = Math.sin(foot);
+  const heel = FIGURE.ankleY * c - 0.062 * s, ball = FIGURE.ankleY * c + FIGURE.ball * s;
+  return ankleDrop + Math.max(heel, ball, ball + 0.088 * Math.sin(foot - toe));
+}
+
+// ---- Sitting on vehicles -----------------------------------------------------------------------------------------
+
+type SeatKind = MotoStyle | 'horse' | 'pillion' | 'car' | 'helm';
+/**
+ * How a person sits, in metres relative to the hip joint (vehicle axes, written for the right side and mirrored
+ * for the left): where the fists grip (null: hands on the thighs) and the soles rest, which way knees and elbows
+ * point, the run of the gripped bar or rim through the fist, the hand shape, the forward lean and how far the
+ * toes point down from level.
+ */
+type SeatSpec = { scale: number; lean: number; grip: V3 | null; foot: V3; knee: V3; elbow: V3; bar: V3; hand: number; toes: number };
+type SeatState = { kind: SeatKind; spec: SeatSpec; targets: THREE.Vector3[]; hints: THREE.Vector3[]; arms: ArmTuple[] };
+
+/**
+ * Hip joints (metres in the vehicle's frame): a motorbike rider a little forward of MOTO_RIDER.hip so the
+ * slim arms reach the grips, the pillion behind them, and the horse's saddle (the horse is built in bike units).
+ */
+const MOTO_HIP: V3 = [0, MOTO_RIDER.hip[1], MOTO_RIDER.hip[2] + 0.06];
+const PILLION_HIP: V3 = [0, 0.95, -0.56];
+const HORSE_HIP: V3 = [0, 2.61 * BIKE_SCALE + FIGURE.seatClear * PERSON_SCALE, -0.15 * BIKE_SCALE];
+const fromHip = (p: readonly number[], hip: V3): V3 => [p[0] - hip[0], p[1] - hip[1], p[2] - hip[2]];
+/** A grip with the index finger resting on the brake lever. */
+const BRAKE = handCode(0.85, 0.75, 0.7);
+const SCOOTER_SEAT: SeatSpec = { scale: PERSON_SCALE, lean: 0.3, grip: fromHip(MOTO_RIDER.grip, MOTO_HIP), foot: fromHip(MOTO_RIDER.board, MOTO_HIP), knee: [0.9, 0.55, 0.25], elbow: [0.9, -0.45, -0.2], bar: [-1, 0, 0], hand: BRAKE, toes: 0.05 };
+const PEG_SEAT: SeatSpec = { ...SCOOTER_SEAT, lean: 0.34, foot: fromHip(MOTO_RIDER.peg, MOTO_HIP), knee: [0.9, 0.35, 0.6] };
+const SEATS: Record<SeatKind, SeatSpec> = {
+  scooter: SCOOTER_SEAT, vespa: SCOOTER_SEAT, cub: PEG_SEAT, sport: { ...PEG_SEAT, lean: 0.48 },
+  // Astride the horse, feet in the stirrups, fists up on the reins over the withers.
+  horse: { scale: PERSON_SCALE, lean: 0.1, grip: [0.1, 0.27, 0.42], foot: fromHip([0.33, 1.18, -0.06], HORSE_HIP), knee: [1, 0.15, 0.5], elbow: [0.4, -0.8, -0.3], bar: [0, 1, 0.3], hand: HAND.GRIP, toes: -0.15 },
+  // Riding pillion: feet on the rear pegs, hands resting on the thighs.
+  pillion: { scale: PERSON_SCALE, lean: 0.1, grip: null, foot: fromHip([0.2, 0.42, -0.36], PILLION_HIP), knee: [0.8, 0.5, 0.35], elbow: [0.5, -0.5, -0.5], bar: [0, 0, 1], hand: HAND.RELAXED, toes: 0.1 },
+  // At a car's wheel, leaning back a little; smaller (CAR_DRIVER.scale) so the head clears the roof.
+  car: { scale: CAR_DRIVER.scale, lean: CAR_DRIVER.lean, grip: [0.17, 0.4, 0.34], foot: [0.16, -0.3, 0.58], knee: [0.3, 0.7, 0.6], elbow: [0.6, -0.8, -0.1], bar: [-0.5, 0.75, -0.4], hand: HAND.GRIP, toes: 0 },
+  // The hire boat's wheel at ten to two, feet on the deck.
+  helm: { scale: PERSON_SCALE, lean: 0.25, grip: [0.147, 0.27, 0.55], foot: [0.13, -0.28, 0.44], knee: [0.3, 0.7, 0.6], elbow: [0.6, -0.8, -0.1], bar: [-0.5, 0.7, -0.5], hand: HAND.GRIP, toes: 0 },
+};
+
+const _seat = { a: new THREE.Vector3(), b: new THREE.Vector3(), h: new THREE.Vector3() };
+/**
+ * Seats a person with the hip joint at `hip` (metres in the parent's space, whose unit is `unit` metres): legs
+ * IK'd to the footrests with the feet level, fists to the grips with the bar running through them. The pose is
+ * kept in `person.seat` so holdSeat() can follow the grips while the body rolls into a turn or twists to aim.
+ */
+function seatOn(p: Person, kind: SeatKind, hip: readonly number[] = [0, 0, 0], unit = 1) {
+  const spec = SEATS[kind], S = spec.scale;
+  p.group.scale.setScalar(S / unit);
+  p.group.position.set(hip[0] / unit, (hip[1] - FIGURE.hipY * S) / unit, hip[2] / unit);
+  p.group.rotation.set(0, 0, 0);
+  p.body.position.y = FIGURE.hipY;
+  p.body.rotation.set(spec.lean, 0, 0);
+  p.body.scale.set(1, 1, 1);
+  p.chest.rotation.set(0, 0, 0);
+  // Eyes on the road: the head tips back up against the lean.
+  p.head.rotation.set(-spec.lean * 0.75, 0, 0);
+  p.secondary = p.hair = 0;
+  // Metres from the hip to the figure's group space.
+  const local = (v: V3, side: number, out: THREE.Vector3) => out.set(sideX(side) * v[0] / S, FIGURE.hipY + v[1] / S, v[2] / S);
+  const state: SeatState = { kind, spec, targets: [], hints: [], arms: [[], []] };
+  for (const side of [-1, 1] as const) {
+    const hipJoint = side > 0 ? p.limbRight : p.limbLeft;
+    // The ankle sits above and behind the spot where the sole rests.
+    local(spec.foot, side, _seat.a).add(_seat.b.set(0, FIGURE.ankleY, -0.08));
+    const ik = twoBoneIK(_seat.b.set(sideX(side) * FIGURE.hipX, FIGURE.hipY, 0), _seat.a, FIGURE.thigh, FIGURE.shin, _seat.h.set(sideX(side) * spec.knee[0], spec.knee[1], spec.knee[2]), true);
+    hipJoint.rotation.set(ik.swing, ik.roll, ik.abduct);
+    (side > 0 ? p.kneeRight : p.kneeLeft).rotation.x = ik.bend;
+    (side > 0 ? p.ankleRight : p.ankleLeft).rotation.x = flatFoot(hipJoint.rotation, ik.bend) + spec.toes;
+    p.toe[side > 0 ? 'right' : 'left'] = 0;
   }
-  body.add(armLeft, armRight);
-  if (riding) {
-    limbLeft.rotation.x = -0.65;
-    limbRight.rotation.x = -0.65;
-    armLeft.rotation.x = -1.15;
-    armRight.rotation.x = -1.15;
-    body.rotation.x = 0.2;
-    // Rider sits inside the bike group, which is already scaled to BIKE_SCALE, hip on the saddle point.
-    group.scale.setScalar(PERSON_SCALE / BIKE_SCALE);
-    group.position.set(0, (MOTO_RIDER.hip[1] - HIP * PERSON_SCALE) / BIKE_SCALE, MOTO_RIDER.hip[2] / BIKE_SCALE);
-  } else group.scale.setScalar(PERSON_SCALE);
-  return { group, body, pack, limbLeft, limbRight, kneeLeft, kneeRight, armLeft, armRight, elbowLeft, elbowRight };
+  for (const side of [-1, 1] as const) {
+    const i = side > 0 ? 1 : 0, a = state.arms[i];
+    const hint = new THREE.Vector3(sideX(side) * spec.elbow[0], spec.elbow[1], spec.elbow[2]);
+    const target = new THREE.Vector3();
+    if (spec.grip) local(spec.grip, side, target);
+    else {
+      // Resting on the top of the thigh, a third of the way back from the knee.
+      const hipJoint = side > 0 ? p.limbRight : p.limbLeft;
+      hipJoint.updateMatrix();
+      target.set(0, -FIGURE.thigh * 0.62, 0.085).applyMatrix4(hipJoint.matrix);
+    }
+    reach(p, side, target, hint, a);
+    a[6] = spec.hand;
+    if (spec.grip) alignHand(p, side, a, [0, 0, 1], _seat.h.set(sideX(side) * spec.bar[0], spec.bar[1], spec.bar[2]).normalize());
+    else alignHand(p, side, a, [-1, 0, 0], _seat.h.set(0, -1, 0));
+    state.targets[i] = target;
+    state.hints[i] = hint;
+    setArm(p, side, a);
+  }
+  p.seat = state;
+  p.sync();
+}
+
+const _hold: ArmTuple = [];
+/**
+ * Keeps a seated person's fists on the grips while the body rolls (into a turn) and the chest twists (to aim;
+ * with `aim` the right arm points the gun and the head looks `look` radians further round).
+ */
+function holdSeat(p: Person, roll: number, twist: number, aim: boolean, look = 0) {
+  const seat = p.seat;
+  if (!seat) return;
+  p.body.rotation.z = roll;
+  p.chest.rotation.y = twist;
+  p.head.rotation.y = aim ? THREE.MathUtils.clamp(look, -0.7, 0.7) : 0;
+  for (const side of [-1, 1] as const) {
+    const i = side > 0 ? 1 : 0, saved = seat.arms[i];
+    if (side > 0 && aim) { setArm(p, 1, ARM_POSES.AIM); continue; }
+    reach(p, side, seat.targets[i], seat.hints[i], copyArm(_hold, saved));
+    setArm(p, side, _hold);
+  }
+  p.sync();
+}
+
+// ---- Guns, cups and cuffs in the hands ---------------------------------------------------------------------------
+
+type GunId = Exclude<WeaponId, 'fists'>;
+/**
+ * How each gun sits in the right fist: its scale (makeGun is sized for the old 0.68 player; the pistol is also
+ * brought down to a real pistol's size), the middle of its grip and where a support hand holds it (gun units).
+ */
+const GUN_HOLD: Record<GunId, { scale: number; grip: V3; fore: V3 | null }> = {
+  pistol: { scale: 0.62, grip: [0, -0.065, -0.036], fore: null },
+  shotgun: { scale: 0.83, grip: [0, -0.02, -0.06], fore: [0, 0.03, 0.6] },
+  smg: { scale: 0.83, grip: [0, -0.12, 0.26], fore: [0, 0.01, 0.46] },
+  grenade: { scale: 0.83, grip: [0, -0.1, -0.05], fore: [0, 0.03, 0.36] },
+  rpg: { scale: 0.83, grip: [0, -0.03, 0.2], fore: [0, -0.02, 0.45] },
+};
+const GUN_TURN = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+/** A long gun at the right shoulder, barrel level and straight ahead (solved for these guns in the hero hand). */
+const SHOULDER_ARM: ArmTuple = [-0.18, 0.64, -0.84, -2.22, -0.7, -1.05, HAND.TRIGGER];
+/** Loosely closed hands of a runner. */
+const RUN_FIST = handCode(0.7, 0.6, 0.55);
+/**
+ * Puts a gun model in a person's right fist: the grip through the fist's channel, the barrel running along the
+ * hand, so raising the arm forward points it ahead with the sights up (the convention of the crowd's guns).
+ */
+function holdGun(p: Person, id: GunId, gun: THREE.Object3D) {
+  const hold = GUN_HOLD[id];
+  gun.scale.setScalar(hold.scale);
+  gun.quaternion.copy(GUN_TURN);
+  gun.position.copy(socket('GRIP', 1)).sub(new THREE.Vector3(...hold.grip).multiplyScalar(hold.scale).applyQuaternion(GUN_TURN));
+  p.handRight.add(gun);
+  return gun;
+}
+
+/** A takeaway cup (cà phê sữa đá) standing in a fist: its axis runs through the fist's channel. */
+function holdCup(hand: THREE.Object3D, side: 1 | -1 = 1) {
+  const cup = new THREE.Group();
+  const paper = new THREE.Mesh(new THREE.CylinderGeometry(0.052, 0.042, 0.17, 12), new THREE.MeshStandardMaterial({ color: '#fff2d0', roughness: 0.7 }));
+  const lid = new THREE.Mesh(new THREE.CylinderGeometry(0.056, 0.054, 0.018, 12), new THREE.MeshStandardMaterial({ color: '#537764', roughness: 0.5 }));
+  lid.position.y = 0.09;
+  const straw = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.09, 5), new THREE.MeshStandardMaterial({ color: '#344f40', roughness: 0.6 }));
+  straw.position.set(0.015, 0.13, 0);
+  cup.add(paper, lid, straw);
+  cup.quaternion.copy(GUN_TURN);
+  cup.position.copy(socket('GRIP', side)).add(new THREE.Vector3(sideX(side) * -0.03, 0, 0.02));
+  hand.add(cup);
+  return cup;
+}
+/** A cup held at the waist, upright, ready to hand over. */
+const HOLD_CUP: ArmTuple = [-0.2, 0.12, 0, -1.45, 0, 0, HAND.CUP];
+
+// ---- People standing about (shopkeepers, receivers, people inside shops) -------------------------------------------
+
+/** Standing at ease: breathing, the weight drifting from leg to leg, the head looking round now and then. Arms relaxed. */
+function poseStanding(p: Person, time: number, seed = 0) {
+  const t = time + seed * 7.3;
+  // 0: weight on the left leg .. 1: on the right; the free knee softens.
+  const shift = 0.5 + 0.5 * Math.sin(t * 0.21);
+  p.body.rotation.set(0.02, 0, (shift - 0.5) * 0.05);
+  p.body.scale.set(1, 1 + Math.sin(t * 2.3) * 0.01, 1);
+  p.chest.rotation.y = 0;
+  p.head.rotation.set(0.05 + Math.sin(t * 0.23) * 0.06, 0.5 * Math.sin(t * 0.31) * Math.max(0, Math.sin(t * 0.13)), 0);
+  p.limbLeft.rotation.set(-0.04 * shift, 0, sideX(-1) * 0.02);
+  p.limbRight.rotation.set(-0.04 * (1 - shift), 0, sideX(1) * 0.02);
+  p.kneeLeft.rotation.x = 0.03 + 0.12 * shift;
+  p.kneeRight.rotation.x = 0.03 + 0.12 * (1 - shift);
+  p.ankleLeft.rotation.x = -0.08 * shift;
+  p.ankleRight.rotation.x = -0.08 * (1 - shift);
+  p.toe.left = p.toe.right = 0;
+  p.secondary = p.hair = 0;
+  setArm(p, -1, ARM_POSES.RELAXED);
+  setArm(p, 1, ARM_POSES.RELAXED);
+  blink(p, time, seed);
+}
+
+const _room = { a: copyArm([], ARM_POSES.RELAXED), b: copyArm([], ARM_POSES.RELAXED), v: new THREE.Vector3(), h: new THREE.Vector3() };
+const clasped = new WeakMap<Person, ArmTuple[]>();
+/**
+ * Poses someone in a shop or venue for this moment (interiors.ts): standing about, a clerk with the hands
+ * clasped in front, chatting with a hand going, or dancing. Returns how far to raise the figure (m) so the
+ * feet stay on the floor.
+ */
+function poseInRoom(p: Person, time: number, act: RoomAct) {
+  const seed = (p.style.colors.shirt.charCodeAt(2) + p.style.colors.shirt.charCodeAt(5)) * 0.37;
+  poseStanding(p, time, seed);
+  let lift = 0;
+  if (act === 'clerk') {
+    // Hands clasped in front at the waist, palms together (solved once).
+    let arms = clasped.get(p);
+    if (!arms) {
+      arms = ([-1, 1] as const).map((side) => {
+        const sx = sideX(side);
+        const a = reach(p, side, _room.v.set(sx * 0.03, 1.0, 0.17), _room.h.set(sx * 0.6, -0.4, -0.5), copyArm([], ARM_POSES.RELAXED));
+        a[6] = HAND.RELAXED;
+        return alignHand(p, side, a, [-1, 0, 0], _room.h.set(-sx, 0, 0.3).normalize());
+      });
+      clasped.set(p, arms);
+    }
+    setArm(p, -1, arms[0]);
+    setArm(p, 1, arms[1]);
+  } else if (act === 'chat') {
+    // Talking with one hand, the other hand in a loose fist at the side.
+    const t = time + seed;
+    setArm(p, 1, arm(_room.a, ARM_POSES.CHAT[0], ARM_POSES.CHAT[1], 0, -1.4 + 0.25 * Math.sin(t * 2.7), ARM_POSES.CHAT[4], 0.1 * Math.sin(t * 1.9), HAND.OPEN));
+    p.head.rotation.x = 0.02 * Math.sin(t * 5);
+  } else if (act === 'dance') {
+    const t = time * 4.2 + seed, bounce = Math.abs(Math.sin(t)), sway = Math.sin(t * 0.5);
+    p.body.rotation.set(0.08, 0, sway * 0.1);
+    p.chest.rotation.y = sway * 0.3;
+    // Skirts, tà and ponytails swing with the hips.
+    p.secondary = 0.3 * sway;
+    p.hair = 0.2 * sway;
+    p.head.rotation.set(-0.1 + 0.15 * bounce, sway * 0.25, 0);
+    // Knees bob to the beat with the feet flat on the floor.
+    const thigh = -0.25 * bounce, knee = 0.5 * bounce, ankle = -0.25 * bounce;
+    p.limbLeft.rotation.set(thigh, 0, sideX(-1) * 0.06);
+    p.limbRight.rotation.set(thigh, 0, sideX(1) * 0.06);
+    p.kneeLeft.rotation.x = p.kneeRight.rotation.x = knee;
+    p.ankleLeft.rotation.x = p.ankleRight.rotation.x = ankle;
+    lift = (legReach(thigh, knee, ankle, 0) - FIGURE.sole) * PERSON_SCALE;
+    // Three moves taking turns: both hands in the air, a pumping fist, arms swinging bent.
+    const move = Math.floor((time + seed) / 4) % 3;
+    if (move === 0) {
+      arm(_room.a, -2.6 + 0.3 * sway, 0.35, 0, -0.5, -0.3, 0, HAND.OPEN);
+      arm(_room.b, -2.6 - 0.3 * sway, 0.35, 0, -0.5, -0.3, 0, HAND.OPEN);
+    } else if (move === 1) {
+      arm(_room.a, 0.1, 0.12, 0, -1.6 + 0.3 * bounce, 0.6, 0, HAND.FIST);
+      arm(_room.b, -2.7 + 0.5 * bounce, 0.2, 0, -0.3 - 0.4 * bounce, 0.2, 0, HAND.FIST);
+    } else {
+      arm(_room.a, -0.6 + 0.6 * sway, 0.25, 0, -1.7, 0.6, 0, HAND.RELAXED);
+      arm(_room.b, -0.6 - 0.6 * sway, 0.25, 0, -1.7, 0.6, 0, HAND.RELAXED);
+    }
+    setArm(p, -1, _room.a);
+    setArm(p, 1, _room.b);
+  }
+  p.sync();
+  return lift;
 }
 
 /** A horse in bike units: legs pivot at the hip so they can gallop. */
@@ -328,7 +615,11 @@ function makeBike(kind: BikeId = 'scooter', color = '#ed763e', riderColor?: stri
   const group = new THREE.Group();
   if (kind === 'horse') {
     const legs = makeHorse(group, color);
-    if (riderColor) { const person = makePerson(riderColor, true); person.group.position.y = HORSE_SEAT; group.add(person.group); }
+    if (riderColor) {
+      const person = makePerson(riderColor, true);
+      seatOn(person, 'horse', HORSE_HIP, BIKE_SCALE);
+      group.add(person.group);
+    }
     group.scale.setScalar(BIKE_SCALE);
     group.traverse((o) => { o.castShadow = false; });
     return { group, wheels: [] as THREE.Mesh[], legs, wheelRadius: 1 };
@@ -348,24 +639,14 @@ function makeBike(kind: BikeId = 'scooter', color = '#ed763e', riderColor?: stri
     group.add(mesh);
     wheels.push(mesh);
   }
-  if (riderColor) seatOn(makePerson(riderColor, true), style);
+  if (riderColor) {
+    const person = makePerson(riderColor, true);
+    seatOn(person, style, MOTO_HIP, BIKE_SCALE);
+    group.add(person.group);
+  }
   group.scale.setScalar(BIKE_SCALE);
   group.traverse((o) => { o.castShadow = false; });
   return { group, wheels, legs: [] as THREE.Group[], wheelRadius: hubs.r };
-
-  function seatOn(person: ReturnType<typeof makePerson>, bikeStyle: MotoStyle) {
-    footing(person, bikeStyle);
-    group.add(person.group);
-  }
-}
-
-/** Legs of a seated rider: feet forward on a scooter's floorboard, or down on the pegs of a manual bike. */
-function footing(person: ReturnType<typeof makePerson>, style: MotoStyle) {
-  // Thighs forward along the saddle, shins down to the floorboard or back to the pegs.
-  const [thigh, knee] = FLOORBOARD[style] ? [-1.3, 1.2] : [-0.95, 1.35];
-  person.limbLeft.rotation.x = person.limbRight.rotation.x = thigh;
-  person.kneeLeft.rotation.x = person.kneeRight.rotation.x = knee;
-  person.elbowLeft.rotation.x = person.elbowRight.rotation.x = -0.3;
 }
 
 function makeRing(color: string, emissive: string, radius = 2.6) {
@@ -384,11 +665,17 @@ function makeRing(color: string, emissive: string, radius = 2.6) {
 
 function disposeTree(root: THREE.Object3D) {
   const geometries = new Set<THREE.BufferGeometry>();
+  const wrappers = new Set<THREE.BufferGeometry>();
   const materials = new Set<THREE.Material>();
   const textures = new Set<THREE.Texture>();
   root.traverse((object) => {
     const mesh = object as THREE.Mesh;
-    if (mesh.geometry) geometries.add(mesh.geometry);
+    // An instanced mesh (a hero figure is five) owns its instance matrix buffer: free it too.
+    if ((object as THREE.InstancedMesh).isInstancedMesh) (object as THREE.InstancedMesh).dispose();
+    // Figure geometry is shared by every person (figures.ts) and never freed. A hero figure's mesh wraps those
+    // shared buffers with its own look and pose attributes: only the wrapper and those are freed.
+    if (mesh.geometry?.userData.sharedGeometry) { if (mesh.userData.sharedGeometry) wrappers.add(mesh.geometry); }
+    else if (mesh.geometry) geometries.add(mesh.geometry);
     if (mesh.material) {
       for (const mat of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
         materials.add(mat);
@@ -397,9 +684,11 @@ function disposeTree(root: THREE.Object3D) {
     }
   });
   geometries.forEach((g) => g.dispose());
+  wrappers.forEach(releaseView);
   materials.forEach((m) => m.dispose());
   textures.forEach((t) => t.dispose());
 }
+
 
 function angleLerp(from: number, to: number, t: number) {
   return from + Math.atan2(Math.sin(to - from), Math.cos(to - from)) * t;
@@ -520,14 +809,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   const bubbles = createBubbles(scene);
-  const ragdolls = createRagdolls(scene, world.colliders, groundHeight);
+  const ragdolls = createRagdolls(scene, [...world.colliders, ...world.seats], groundHeight);
   const effects = createEffects(scene, groundHeight);
   const explosives = createExplosives(scene, groundHeight);
   const pickups = createPickups(scene, groundHeight);
   const sayAt = (key: string, text: string, at: () => { x: number; y: number; z: number } | null, shout = false) => bubbles.say(key, text, performance.now(), at, shout ? 2600 : 3400, shout ? 'shout' : 'say');
   const npcs = createNpcs(scene, ragdolls, { clear: worldClear, sight: lineOfSight }, {
     onRest: (x, z) => effects.pool(x, z),
-    say: (npc, text, shout) => sayAt(`npc${npc.id}`, text, () => (npc.state === 'inside' || npc.state === 'down' || npc.state === 'away' ? null : { x: npc.x, y: npc.y + (npc.pose === 'sit' ? 1.6 : 1.95), z: npc.z }), shout),
+    say: (npc, text, shout) => sayAt(`npc${npc.id}`, text, () => (npc.state === 'inside' || npc.state === 'down' || npc.state === 'away' ? null : { x: npc.x, y: npc.y + (npc.pose === 'sit' ? 1.7 : 1.95), z: npc.z }), shout),
   });
   const vehicles = createVehicles(scene, worldClear);
   const boats = createBoats(scene);
@@ -543,7 +832,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const interiors = createInteriors(scene, {
     gun: (id) => makeGun(id).group,
     bike: (id, color) => makeBike(id, color).group,
-    person: (shirt, hair) => makePerson(shirt, false, hair).group,
+    person: (shirt, hair) => {
+      const person = makePerson(shirt, false, hair);
+      return { group: person.group, pose: (time, act) => poseInRoom(person, time, act) };
+    },
   });
   let interior: InteriorKind | null = null;
   let productFocus: string | null = null;
@@ -563,19 +855,19 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const receivers = RECEIVERS.map((r) => ({ ...r, ...reachable(r) }));
 
   const walker = makePerson();
+  // The player's ragdoll is dressed exactly like the standing player.
+  setStyle(PLAYER_LOOK, walker.style);
   scene.add(walker.group);
   let bikeId: BikeId = 'scooter';
   let bike = makeBike(bikeId, bikeById(bikeId).color);
   const rider = makePerson('#ed763e', true);
-  footing(rider, 'scooter');
+  seatOn(rider, 'scooter', MOTO_HIP, BIKE_SCALE);
   rider.group.visible = false;
   bike.group.add(rider.group);
   scene.add(bike.group);
-  // A passenger rides pillion for taxi missions.
-  const passenger = makePerson('#6f86a8', true, '#2a2220');
-  passenger.group.position.set(0, 0.36, -1.0);
-  passenger.armLeft.rotation.x = -0.3;
-  passenger.armRight.rotation.x = -0.3;
+  // A passenger rides pillion for taxi missions (in a helmet, as the law says).
+  const passenger = makePerson('#6f86a8', true, '#2a2220', 'rider');
+  seatOn(passenger, 'pillion', PILLION_HIP, BIKE_SCALE);
   passenger.group.visible = false;
   bike.group.add(passenger.group);
   const youLabel = makeLabel('BẠN', '#fff4da', '#245442');
@@ -585,29 +877,20 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const riderGuns = new Map<WeaponId, THREE.Group>();
   for (const id of ['pistol', 'shotgun', 'smg', 'grenade', 'rpg'] as const) {
     const gun = makeGun(id);
-    gun.group.rotation.x = Math.PI / 2;
-    gun.group.position.set(0, -0.74 + 0.36, 0.06);
+    holdGun(walker, id, gun.group);
     gun.group.visible = false;
     const muzzle = new THREE.Object3D();
     muzzle.position.set(0, 0.1, gun.length);
     gun.group.add(muzzle);
-    walker.elbowRight.add(gun.group);
     guns.set(id, { group: gun.group, muzzle });
-    const riderGun = makeGun(id).group;
-    riderGun.rotation.x = Math.PI / 2;
-    riderGun.position.set(0, -0.74 + 0.36, 0.06);
+    const riderGun = holdGun(rider, id, makeGun(id).group) as THREE.Group;
     riderGun.visible = false;
-    rider.elbowRight.add(riderGun);
     riderGuns.set(id, riderGun);
   }
   walker.group.traverse((o) => { o.castShadow = false; });
-  // The player at the wheel of the hire boat, sitting in its driver's seat.
+  // The player at the wheel of the hire boat, in its driver's seat (a little forward, to reach the wheel).
   const helm = makePerson('#e77641');
-  helm.limbLeft.rotation.x = helm.limbRight.rotation.x = -1.4;
-  helm.kneeLeft.rotation.x = helm.kneeRight.rotation.x = 1.35;
-  helm.armLeft.rotation.x = helm.armRight.rotation.x = -1.0;
-  helm.elbowLeft.rotation.x = helm.elbowRight.rotation.x = -0.5;
-  helm.group.position.set(boats.rental.seat[0], 0.66 - 1.04 * PERSON_SCALE, boats.rental.seat[2]);
+  seatOn(helm, 'helm', [boats.rental.seat[0], 0.7, boats.rental.seat[2] + 0.18]);
   helm.group.visible = false;
   boats.rental.group.add(helm.group);
   // A ram-air canopy: seven cells in an arc above the jumper, on lines down to the harness.
@@ -634,44 +917,42 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     scene.add(canopy);
   }
   let horizontalInput = 0;
+  // The player in a vehicle taken from the street: the holder sits on the seat's hip point (metres).
   const seatHolder = new THREE.Group();
-  seatHolder.scale.setScalar(BIKE_SCALE);
-  const seated = makePerson('#e77641', true);
+  const seated = makePerson('#e77641');
+  let seatedKind: SeatKind | null = null;
   seatHolder.add(seated.group);
   seatHolder.visible = false;
   seatHolder.traverse((o) => { o.castShadow = false; });
   scene.add(seatHolder);
   const seatedGuns = new Map<WeaponId, THREE.Group>();
   for (const id of ['pistol', 'shotgun', 'smg', 'grenade', 'rpg'] as const) {
-    const gun = makeGun(id).group;
-    gun.rotation.x = Math.PI / 2;
-    gun.position.set(0, -0.74 + 0.36, 0.06);
+    const gun = holdGun(seated, id, makeGun(id).group) as THREE.Group;
     gun.visible = false;
-    seated.elbowRight.add(gun);
     seatedGuns.set(id, gun);
   }
-  // Handcuffs on the wrists during an arrest.
+  // Handcuffs round the wrists during an arrest.
   const cuffMaterial = new THREE.MeshStandardMaterial({ color: '#c9ced3', metalness: 0.8, roughness: 0.3 });
-  const cuffs = [walker.elbowLeft, walker.elbowRight].map((arm) => {
-    const cuff = new THREE.Mesh(new THREE.TorusGeometry(0.17, 0.05, 6, 12), cuffMaterial);
-    cuff.position.set(0, -0.62 + 0.36, 0);
+  const cuffs = [walker.handLeft, walker.handRight].map((hand) => {
+    const cuff = new THREE.Mesh(new THREE.TorusGeometry(0.04, 0.011, 6, 12), cuffMaterial);
+    cuff.position.set(0, 0.02, 0);
     cuff.rotation.x = Math.PI / 2;
     cuff.visible = false;
-    arm.add(cuff);
+    hand.add(cuff);
     return cuff;
   });
 
   // Shopkeeper hands over the coffee; a receiver waits at each delivery address.
-  const shopkeeper = makePerson('#c96f6f', false, '#2a2220');
+  const shopkeeper = makePerson('#c96f6f', false, '#2a2220', 'vendor');
   shopkeeper.group.position.set(SHOPKEEPER.x, groundHeight(SHOPKEEPER.x, SHOPKEEPER.z), SHOPKEEPER.z);
   shopkeeper.group.rotation.y = SHOPKEEPER.yaw;
   scene.add(shopkeeper.group);
   const receiver = makePerson('#6f86a8', false, '#3a2a22');
-  const receiverCup = cylinder(receiver.armRight, 0.17, 0.13, 0.32, [0, -0.86, 0.12], material('#fff2d0'), 10);
+  const receiverCup = holdCup(receiver.handRight);
   receiverCup.visible = false;
   receiver.group.visible = false;
   scene.add(receiver.group);
-  const shopkeeperCup = cylinder(shopkeeper.armRight, 0.17, 0.13, 0.32, [0, -0.86, 0.12], material('#fff2d0'), 10);
+  const shopkeeperCup = holdCup(shopkeeper.handRight);
   for (const person of [shopkeeper.group, receiver.group]) person.traverse((o) => { o.castShadow = false; });
 
   const missionRing = makeRing('#db683f', '#a33e1e');
@@ -817,6 +1098,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const flatCars = new Set<Car>();
   let thief: Npc | null = null;
   let passengerAboard = false;
+  /** Local test hook (__pvo.act): a passenger on the pillion without a taxi mission. */
+  let testPassenger = false;
   let sideView: SideMissionView = null;
   const looseBodies: { body: RagdollBody; until: number }[] = [];
   const wrecks = new Set<Car>();
@@ -846,7 +1129,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const scratch = new THREE.Vector3();
   const playerPoint = new THREE.Vector3();
   const blastPoint = new THREE.Vector3();
-  const crossing: { x: number; z: number }[] = [];
+  const crossing: { x: number; z: number; body?: boolean }[] = [];
+  const viewFrustum = new THREE.Frustum(), viewMatrix = new THREE.Matrix4();
 
   function offsetFor(yaw: number, pitch: number, dist: number, out: THREE.Vector3) {
     return out.set(Math.sin(yaw) * Math.cos(pitch) * dist, Math.sin(pitch) * dist, Math.cos(yaw) * Math.cos(pitch) * dist);
@@ -882,9 +1166,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     return moved;
   }
   function applyShadows() {
-    // Shadows only while the sun is up, and only on presets that can afford them.
+    // Shadows only on presets that can afford them, fading out as night falls. Night fades the shadow's intensity
+    // instead of switching castShadow off: that would recompile every lit material in the middle of a game.
     const preset = QUALITY_LEVELS[level];
-    const want = preset.shadows && atmosphere.night < 0.6;
+    const want = preset.shadows;
+    const fade = THREE.MathUtils.clamp((0.6 - atmosphere.night) / 0.12, 0, 1);
+    sun.shadow.intensity = fade;
     if (sun.castShadow !== want || (want && sun.shadow.mapSize.x !== preset.shadowSize)) {
       sun.castShadow = want;
       if (want) {
@@ -894,13 +1181,21 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       }
       renderer.shadowMap.needsUpdate = true;
     }
-    shadowsAllowed = want;
+    shadowsAllowed = want && fade > 0;
   }
   function applyLevel(next: number) {
     level = THREE.MathUtils.clamp(next, 0, QUALITY_LEVELS.length - 1);
     const preset = QUALITY_LEVELS[level];
     applyShadows();
     renderer.setPixelRatio(Math.max(0.5, Math.min(window.devicePixelRatio || 1, preset.maxDpr) * preset.scale));
+    // Crowd figures: 'hi' on the better presets, 'lo' (mitten hands, coarser limbs and heads) on the fast ones.
+    // Zombies drop to 'lo' a level earlier (they take the level to decide); vehicle occupants are always 'lo'.
+    npcs.setDetail(preset.figures);
+    police.setDetail(preset.figures);
+    zombies.setDetail(preset.figures, level);
+    // Ragdolls: body cap, solver iterations and how many step at full rate; figures like the crowd's.
+    ragdolls.setQuality(level);
+    ragdolls.setDetail(preset.figures);
   }
   applyLevel(level);
   renderer.shadowMap.needsUpdate = true;
@@ -946,7 +1241,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const kind = playerCar ? playerCar.kind : 'moto';
     const [hw, hl] = vehicles.halfSize(kind);
     const body: Body = { x: state.x, z: state.z, yaw: state.angle, vx: carVX, vz: carVZ, spin: -yawRate, mass: playerCar ? MASS[kind] : bikeId === 'horse' ? 520 : MASS.moto, hw, hl };
-    const crashes = vehicles.collideBody(body, playerCar, time);
+    const crashes = vehicles.collideBody(body, playerCar);
     if (!crashes.length) return;
     carVX = body.vx;
     carVZ = body.vz;
@@ -991,9 +1286,11 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const look = car.driver!;
     car.driver = null;
     const away = e.b === car ? 1 : -1;
+    // Thrown from the saddle (the hips start on the seat), limp after a violent crash.
     const body = ragdolls.spawn({
-      x: car.x, y: groundHeight(car.x, car.z) + 0.9, z: car.z, yaw: car.yaw, scale: RAGDOLL_SCALE, look,
+      x: car.x, y: groundHeight(car.x, car.z) + MOTO_RIDER.hip[1] - FIGURE.seatClear * RAGDOLL_SCALE, z: car.z, yaw: car.yaw, scale: RAGDOLL_SCALE, look, from: 'sit',
       velocity: { x: car.vx + e.nx * away * strength * 0.5, y: 2.5 + strength * 0.25, z: car.vz + e.nz * away * strength * 0.5 },
+      mode: strength > 9 ? 'limp' : undefined,
     });
     looseBodies.push({ body, until: time + 16 });
     if (strength > 9) effects.blood(hitPoint.set(car.x, 1, car.z), rayDir.set(e.nx * away, 0, e.nz * away), 6);
@@ -1177,11 +1474,17 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     velocity = 0;
   }
 
-  /** Throws the player to the ground as a ragdoll; they get up after a moment. */
-  function knockPlayer(vx: number, vy: number, vz: number, now: number, reason: Down = 'crash') {
+  /**
+   * Throws the player to the ground as a ragdoll; they get up after a moment. `hit` and `kind`: where and what
+   * struck them. Knocked down they throw their hands out; wasted they fall limp. The body is never evicted.
+   */
+  function knockPlayer(vx: number, vy: number, vz: number, now: number, reason: Down = 'crash', hit?: THREE.Vector3 | null, kind?: HitKind) {
     leaveVehicleNow();
     if (playerBody) ragdolls.remove(playerBody);
-    playerBody = ragdolls.spawn({ x: state.x, y: groundHeight(state.x, state.z) + 0.1, z: state.z, yaw: state.angle, scale: RAGDOLL_SCALE, look: PLAYER_LOOK, velocity: { x: vx, y: vy, z: vz } });
+    playerBody = ragdolls.spawn({
+      x: state.x, y: groundHeight(state.x, state.z) + 0.1, z: state.z, yaw: state.angle, scale: RAGDOLL_SCALE, look: PLAYER_LOOK, velocity: { x: vx, y: vy, z: vz },
+      hit, kind, mode: reason === 'wasted' ? 'limp' : undefined, keep: true,
+    });
     down = reason;
     downUntil = now + (reason === 'wasted' ? RESPAWN_MS : 2600);
     shake = Math.max(shake, 0.5);
@@ -1309,7 +1612,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       // Carjacking: the driver is dragged out of the left side.
       const rx = Math.cos(car.yaw), rz = -Math.sin(car.yaw);
       const side = car.kind === 'moto' ? 0.8 : 1.4;
-      const body = ragdolls.spawn({ x: car.x - rx * side, y: groundHeight(car.x, car.z) + 0.3, z: car.z - rz * side, yaw: car.yaw, scale: 0.7, look: car.driver, velocity: { x: -rx * 4.5, y: 2.5, z: -rz * 4.5 } });
+      // Pulled off the seat at the size they sat at (car drivers are drawn a little smaller to clear the roof).
+      const scale = car.kind === 'moto' ? RAGDOLL_SCALE : CAR_DRIVER.scale;
+      const body = ragdolls.spawn({
+        x: car.x - rx * side, y: groundHeight(car.x, car.z) + seatOf(car)[1] - FIGURE.seatClear * scale, z: car.z - rz * side, yaw: car.yaw,
+        scale, look: car.driver, from: 'sit', velocity: { x: -rx * 4.5, y: 2.5, z: -rz * 4.5 },
+      });
       looseBodies.push({ body, until: time + 10 });
       npcs.alarm(car.x, car.z, 20, time);
       npcs.notice(car.x, car.z, 'fight', time);
@@ -1960,11 +2268,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         label.scale.set(4, 1, 1);
         const peerGuns = new Map<WeaponId, THREE.Group>();
         for (const id of ['pistol', 'shotgun', 'smg', 'grenade', 'rpg'] as const) {
-          const gun = makeGun(id).group;
-          gun.rotation.x = Math.PI / 2;
-          gun.position.set(0, -0.74 + 0.36, 0.06);
+          const gun = holdGun(foot, id, makeGun(id).group) as THREE.Group;
           gun.visible = false;
-          foot.elbowRight.add(gun);
           peerGuns.set(id, gun);
         }
         group.add(foot.group, peerBike.group, label);
@@ -2015,11 +2320,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     pickups.drop(x, z, amount, now);
   }
 
-  /** Damages a pedestrian or gang member and handles what follows (money, limbs, missions, crimes). */
-  function hurtNpc(npc: Npc, amount: number, vx: number, vy: number, vz: number, now: number, force: boolean, gore: number, near: THREE.Vector3 | null) {
+  /**
+   * Damages a pedestrian or gang member and handles what follows (money, limbs, missions, crimes). `near` is what
+   * limbs tear nearest to; `at` and `kind` where and what struck them, for the ragdoll.
+   */
+  function hurtNpc(npc: Npc, amount: number, vx: number, vy: number, vz: number, now: number, force: boolean, gore: number, near: THREE.Vector3 | null, kind?: HitKind, at = near) {
     const time = now / 1000;
     const x = npc.x, z = npc.z;
-    const result = npcs.damage(npc, amount, vx, vy, vz, time, force);
+    const result = npcs.damage(npc, amount, vx, vy, vz, time, force, at, kind);
     if (!result) return;
     if (npc.role !== 'thief') police.crime(npc.gang >= 0 ? 0.5 : 1, time);
     npcs.notice(x, z, result.body ? 'body' : 'fight', time);
@@ -2032,9 +2340,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
   }
 
-  /** Damages a zombie; a kill tears limbs on a big hit and sometimes leaves money on the street. */
-  function hurtZombie(zb: Zombie, amount: number, vx: number, vy: number, vz: number, now: number, force: boolean, gore: number, near: THREE.Vector3 | null) {
-    const result = zombies.damage(zb, amount, vx, vy, vz, now / 1000, force);
+  /**
+   * Damages a zombie; a kill tears limbs on a big hit and sometimes leaves money on the street. `near` is what limbs
+   * tear nearest to; `at` and `kind` where and what struck it, for the ragdoll.
+   */
+  function hurtZombie(zb: Zombie, amount: number, vx: number, vy: number, vz: number, now: number, force: boolean, gore: number, near: THREE.Vector3 | null, kind?: HitKind, at = near) {
+    const result = zombies.damage(zb, amount, vx, vy, vz, now / 1000, force, at, kind);
     if (!result?.killed) return;
     dismember(result.body, gore, near, now);
     if (Math.random() < 0.22) pickups.drop(zb.x, zb.z, 10 + Math.floor(Math.random() * 40), now);
@@ -2114,8 +2425,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   function muzzle(out: THREE.Vector3) {
     if (state.riding) {
-      // Firing from a vehicle: out of the right-hand window or from the rider's hand.
-      const side = inCar() ? 1.1 : 0.55;
+      // Firing from a vehicle: out of the passenger window, or from the rider's right hand (at -x).
+      const side = inCar() ? 1.1 : -0.55;
       const c = Math.cos(state.angle), s = Math.sin(state.angle);
       return out.set(state.x + c * side + Math.sin(aimYaw) * 0.6, groundHeight(state.x, state.z) + (inCar() ? 1.45 : 1.4), state.z - s * side + Math.cos(aimYaw) * 0.6);
     }
@@ -2136,13 +2447,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     npcs.near(cx, cz, 0.9, (npc, nx, nz) => {
       if (hit) return;
       hit = true;
-      hurtNpc(npc, def.damage, fx * def.force, 3.5, fz * def.force, now, false, 0, null);
+      hurtNpc(npc, def.damage, fx * def.force * PUNCH_PUSH, 1.8, fz * def.force * PUNCH_PUSH, now, false, 0, null, 'melee', hitPoint.set(nx - fx * 0.15, npc.y + 1.3, nz - fz * 0.15));
       effects.blood(hitPoint.set(nx, 1.4, nz), rayDir.set(fx, 0, fz), 4);
     });
     if (!hit) police.near(cx, cz, 0.9, (o) => {
       if (hit) return;
       hit = true;
-      police.damage(o, def.damage, fx * def.force, 3.5, fz * def.force, time);
+      police.damage(o, def.damage, fx * def.force * PUNCH_PUSH, 1.8, fz * def.force * PUNCH_PUSH, time, false, hitPoint.set(o.x - fx * 0.15, groundHeight(o.x, o.z) + 1.3, o.z - fz * 0.15), 'melee');
       effects.blood(hitPoint.set(o.x, 1.4, o.z), rayDir.set(fx, 0, fz), 4);
     });
     if (!hit) for (const [id, peer] of peers) {
@@ -2156,11 +2467,11 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (!hit && zombieMode) zombies.near(cx, cz, 0.95, (zb) => {
       if (hit) return;
       hit = true;
-      hurtZombie(zb, def.damage, fx * def.force, 3.5, fz * def.force, now, false, 0, null);
+      hurtZombie(zb, def.damage, fx * def.force * PUNCH_PUSH, 1.8, fz * def.force * PUNCH_PUSH, now, false, 0, null, 'melee', hitPoint.set(zb.x - fx * 0.15, groundHeight(zb.x, zb.z) + 1.2, zb.z - fz * 0.15));
       effects.blood(hitPoint.set(zb.x, 1.4, zb.z), rayDir.set(fx, 0, fz), 4);
     });
     if (!hit) animals.near(cx, cz, 0.9, (index) => { if (!hit) { hit = true; animals.hit(index, fx * 6, 3, fz * 6); } });
-    if (!hit) hit = ragdolls.push(cx, cz, 0.9, fx * 7, 3, fz * 7) > 0;
+    if (!hit) hit = ragdolls.push(cx, cz, 0.9, fx * 3.5, 1.5, fz * 3.5) > 0;
     if (hit) { playThud(); shake = Math.max(shake, 0.15); npcs.notice(cx, cz, 'fight', time); }
   }
 
@@ -2179,18 +2490,18 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     effects.puff(blastPoint, now);
     npcs.near(b.x, b.z, b.radius, (npc, nx, nz) => {
       const d = Math.hypot(nx - b.x, nz - b.z), f = 1 - d / b.radius, dx = (nx - b.x) / (d || 1), dz = (nz - b.z) / (d || 1);
-      hurtNpc(npc, b.damage * f + 15, dx * (8 + 14 * f), 6 + 9 * f, dz * (8 + 14 * f), now, true, f > 0.45 ? 0.7 : 0.25, blastPoint);
+      hurtNpc(npc, b.damage * f + 15, dx * (8 + 14 * f), 6 + 9 * f, dz * (8 + 14 * f), now, true, f > 0.45 ? 0.7 : 0.25, blastPoint, 'blast');
       effects.blood(hitPoint.set(nx, 1, nz), rayDir.set(dx, 0.6, dz), 6);
     });
     police.near(b.x, b.z, b.radius, (o) => {
       const d = Math.hypot(o.x - b.x, o.z - b.z), f = 1 - d / b.radius, dx = (o.x - b.x) / (d || 1), dz = (o.z - b.z) / (d || 1);
-      police.damage(o, b.damage * f + 15, dx * (8 + 14 * f), 6 + 9 * f, dz * (8 + 14 * f), time, true);
+      police.damage(o, b.damage * f + 15, dx * (8 + 14 * f), 6 + 9 * f, dz * (8 + 14 * f), time, true, blastPoint, 'blast');
     });
     if (zombieMode) {
       zombies.hear(b.x, b.z, 70, time);
       zombies.near(b.x, b.z, b.radius, (zb) => {
         const d = Math.hypot(zb.x - b.x, zb.z - b.z), f = 1 - d / b.radius, dx = (zb.x - b.x) / (d || 1), dz = (zb.z - b.z) / (d || 1);
-        hurtZombie(zb, b.damage * f + 20, dx * (8 + 14 * f), 6 + 9 * f, dz * (8 + 14 * f), now, true, f > 0.4 ? 0.8 : 0.3, blastPoint);
+        hurtZombie(zb, b.damage * f + 20, dx * (8 + 14 * f), 6 + 9 * f, dz * (8 + 14 * f), now, true, f > 0.4 ? 0.8 : 0.3, blastPoint, 'blast');
         effects.blood(hitPoint.set(zb.x, 1, zb.z), rayDir.set(dx, 0.6, dz), 6);
       });
     }
@@ -2206,7 +2517,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (dPlayer < b.radius && down !== 'wasted' && down !== 'busted') {
       const f = 1 - dPlayer / b.radius, dx = (state.x - b.x) / (dPlayer || 1), dz = (state.z - b.z) / (dPlayer || 1);
       damagePlayer(b.damage * f * (inCar() ? 0.5 : 0.8), now, { x: b.x, z: b.z });
-      if (!inCar() && f > 0.3 && !down) knockPlayer(dx * 12 * f, 6 + 6 * f, dz * 12 * f, now);
+      if (!inCar() && f > 0.3 && !down) knockPlayer(dx * 12 * f, 6 + 6 * f, dz * 12 * f, now, 'crash', blastPoint, 'blast');
     }
     if (bikeHealth > 0 && Math.hypot(bikeX - b.x, bikeZ - b.z) < b.radius + 1 && (playerCar || !state.riding)) bikeHealth = Math.max(0, bikeHealth - b.damage);
   }
@@ -2272,10 +2583,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const consider = (t: number, apply: () => void) => { if (t < maxT && (!best || t < best.t)) best = { t, apply }; };
       const pointBlank = def.id === 'shotgun';
       const npcHit = npcs.raycast(rayOrigin, rayDir, maxT);
-      // Head shots (above the shoulders) do two and a half times the damage.
+      // Head shots (above the neck) do two and a half times the damage.
       if (npcHit) consider(npcHit.t, () => {
-        const head = hitPoint.y - npcHit.npc.y > 1.46;
-        hurtNpc(npcHit.npc, def.damage * (head ? 2.5 : 1), rayDir.x * def.force, 2.5, rayDir.z * def.force, now, false, pointBlank && npcHit.t < 4 ? 0.5 : head ? 0.2 : 0.05, hitPoint.clone());
+        const head = (npcHit as unknown as { head?: boolean }).head ?? hitPoint.y - npcHit.npc.y > NECK_Y * styleOf(npcHit.npc.look).height;
+        hurtNpc(npcHit.npc, def.damage * (head ? 2.5 : 1), rayDir.x * def.force * BULLET_PUSH, 1.4, rayDir.z * def.force * BULLET_PUSH, now, false, pointBlank && npcHit.t < 4 ? 0.5 : head ? 0.2 : 0.05, hitPoint.clone(), 'bullet');
         effects.blood(hitPoint, rayDir, def.pellets > 1 ? 3 : head ? 10 : 7);
         hurtSomeone = true;
         hitMarkAt = now;
@@ -2283,23 +2594,25 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       });
       const zombieHit = zombieMode ? zombies.raycast(rayOrigin, rayDir, maxT) : null;
       if (zombieHit) consider(zombieHit.t, () => {
-        const head = zombieHit.height > 1.46;
-        hurtZombie(zombieHit.zombie, def.damage * (head ? 3 : 1), rayDir.x * def.force, 2.5, rayDir.z * def.force, now, false, pointBlank && zombieHit.t < 4 ? 0.6 : head ? 0.35 : 0.08, hitPoint.clone());
+        // Zombies report the hit height in figure units (and whether it was above a bent-over neck).
+        const head = (zombieHit as unknown as { head?: boolean }).head ?? zombieHit.height > FIGURE.neckY;
+        hurtZombie(zombieHit.zombie, def.damage * (head ? 3 : 1), rayDir.x * def.force * BULLET_PUSH, 1.4, rayDir.z * def.force * BULLET_PUSH, now, false, pointBlank && zombieHit.t < 4 ? 0.6 : head ? 0.35 : 0.08, hitPoint.clone(), 'bullet');
         effects.blood(hitPoint, rayDir, def.pellets > 1 ? 3 : head ? 10 : 6);
         hitMarkAt = now;
         headMark = head;
       });
       const officerHit = police.raycast(rayOrigin, rayDir, maxT);
       if (officerHit) consider(officerHit.t, () => {
-        const head = hitPoint.y - groundHeight(officerHit.officer.x, officerHit.officer.z) > 1.5;
-        police.damage(officerHit.officer, def.damage * (head ? 2.5 : 1), rayDir.x * def.force, 2.5, rayDir.z * def.force, time);
+        const head = (officerHit as unknown as { head?: boolean }).head ?? hitPoint.y - groundHeight(officerHit.officer.x, officerHit.officer.z) > OFFICER_NECK_Y;
+        police.damage(officerHit.officer, def.damage * (head ? 2.5 : 1), rayDir.x * def.force * BULLET_PUSH, 1.4, rayDir.z * def.force * BULLET_PUSH, time, false, hitPoint, 'bullet');
         effects.blood(hitPoint, rayDir, def.pellets > 1 ? 3 : 7);
         hitMarkAt = now;
         headMark = head;
       });
       const bodyHit = ragdolls.raycast(rayOrigin, rayDir, maxT);
       if (bodyHit) consider(bodyHit.t, () => {
-        ragdolls.impulse(bodyHit.body, rayDir.x * def.force, 1.5 + Math.max(0, rayDir.y) * def.force, rayDir.z * def.force, bodyHit.index);
+        const push = def.force * BULLET_PUSH * (def.pellets > 1 ? PELLET_PUSH : CORPSE_PUSH);
+        ragdolls.strike(bodyHit.body, hitPoint.x, hitPoint.y, hitPoint.z, rayDir.x * push, 0.4 + Math.max(0, rayDir.y) * push, rayDir.z * push, 'bullet');
         effects.blood(hitPoint, rayDir, 3);
         if (pointBlank && bodyHit.t < 4) dismember(bodyHit.body, 0.25, hitPoint, now);
       });
@@ -2409,17 +2722,19 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (!inCar()) damageVehicle(4, now);
     };
     const gore = speed > 18 ? 0.35 : 0;
+    // The bumper strikes the shins and hips: the body folds over it and is thrown along.
+    const bumper = (x: number, z: number) => blastPoint.set(x - fx * 0.25, groundHeight(x, z) + (inCar() ? 0.5 : 0.45), z - fz * 0.25);
     npcs.near(cx, cz, radius, (npc, nx, nz) => {
-      hurtNpc(npc, speed * 5, fx * speed * 0.85, 3 + speed * 0.22, fz * speed * 0.85, now, true, gore, null);
+      hurtNpc(npc, speed * 5, fx * speed * 0.85, 3 + speed * 0.22, fz * speed * 0.85, now, true, gore, null, 'vehicle', bumper(nx, nz));
       thrown(nx, nz);
     });
     police.near(cx, cz, radius, (o) => {
-      police.damage(o, speed * 5, fx * speed * 0.85, 3 + speed * 0.22, fz * speed * 0.85, time, true);
+      police.damage(o, speed * 5, fx * speed * 0.85, 3 + speed * 0.22, fz * speed * 0.85, time, true, bumper(o.x, o.z), 'vehicle');
       thrown(o.x, o.z);
     });
     animals.near(cx, cz, radius, (index, ax, az) => { animals.hit(index, fx * speed, 3, fz * speed); thrown(ax, az); });
     if (zombieMode) zombies.near(cx, cz, radius + 0.1, (zb) => {
-      hurtZombie(zb, speed * 6, fx * speed * 0.85, 3 + speed * 0.22, fz * speed * 0.85, now, true, gore, null);
+      hurtZombie(zb, speed * 6, fx * speed * 0.85, 3 + speed * 0.22, fz * speed * 0.85, now, true, gore, null, 'vehicle', bumper(zb.x, zb.z));
       thrown(zb.x, zb.z);
     });
     for (const [id, peer] of peers) {
@@ -2430,7 +2745,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         thrown(peer.group.position.x, peer.group.position.z);
       }
     }
-    ragdolls.push(cx, cz, radius, fx * speed, 2 + speed * 0.1, fz * speed);
+    // Bodies already lying there are swept by the vehicle's box every frame (see the vehicle loop).
   }
 
   /** Traffic and police vehicles knock down a player on foot; cruisers ram the player's vehicle. */
@@ -2447,7 +2762,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (!state.riding) {
         if (Math.abs(lx) < hw + 0.4 && lz > hl - 0.8 && lz < hl + 0.6) {
           damagePlayer(Math.abs(car.speed) * 2.4, now, { x: car.x, z: car.z }, car.kind === 'police' ? 'Xe cảnh sát' : 'Xe');
-          if (!down) knockPlayer(vx * 0.8, 3 + Math.abs(car.speed) * 0.2, vz * 0.8, now);
+          if (!down) knockPlayer(vx * 0.8, 3 + Math.abs(car.speed) * 0.2, vz * 0.8, now, 'crash', hitPoint.set(car.x + Math.sin(car.yaw) * hl, groundHeight(state.x, state.z) + 0.5, car.z + Math.cos(car.yaw) * hl), 'vehicle');
           return;
         }
       }
@@ -2548,7 +2863,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       damagePlayer(strike.damage * (state.riding ? 0.8 : 1), now, { x: strike.x, z: strike.z }, 'Zombie');
       effects.blood(hitPoint.set(state.x, 1.3, state.z), rayDir.set(dx, 0.3, dz), 5);
       shake = Math.max(shake, strike.heavy ? 0.45 : 0.18);
-      if (strike.heavy && !down && !state.riding) knockPlayer(dx * 7, 3.5, dz * 7, now);
+      if (strike.heavy && !down && !state.riding) knockPlayer(dx * 7 * PUNCH_PUSH, 1.8, dz * 7 * PUNCH_PUSH, now, 'crash', hitPoint.set(state.x - dx * 0.15, groundHeight(state.x, state.z) + 1.2, state.z - dz * 0.15), 'melee');
       else if (state.riding && !playerCar && strike.heavy) bikeHealth = Math.max(0, bikeHealth - strike.damage);
     }
     for (const spot of result.risen) effects.smoke(spot.x, groundHeight(spot.x, spot.z) + 0.2, spot.z, now, false, '#6b5a48');
@@ -2685,114 +3000,174 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   // ---- The player's body: procedural animation driven by speed, turning, jumps, punches and hits. ----
   const motion = { lean: 0, roll: 0, lastAngle: 0, lastSpeed: 0, land: 0, hitAt: -1e9, pack: 0, packV: 0 };
-  /** Poses the walker for this frame. */
-  function animateWalker(dt: number, now: number, time: number, walking: boolean, o: { twoHanded: boolean; kneeling: boolean; handsUp: boolean; armed: boolean; swim: number; sky: 'deck' | 'fall' | 'chute' | null }) {
+  const walkGait = newGait();
+  const walkArms = { left: copyArm([], ARM_POSES.RELAXED), right: copyArm([], ARM_POSES.RELAXED) };
+  /** Scratch arm pose for the shopkeeper and the receiver. */
+  const handPose: ArmTuple = copyArm([], ARM_POSES.RELAXED);
+  /** Where the left hand holds each long gun under its barrel, and the cuffed hands behind the back (solved on first use). */
+  const supportArms = new Map<GunId, ArmTuple>();
+  let cuffedArms: ArmTuple[] | null = null;
+  const _fall = new THREE.Vector3(), _fallHint = new THREE.Vector3();
+  /** The left hand under a long gun's barrel while the right holds it at the shoulder (chest space, so it is solved once per gun). */
+  function supportArm(id: GunId) {
+    let a = supportArms.get(id);
+    if (a) return a;
+    const w = walker, gun = guns.get(id)!.group, fore = GUN_HOLD[id].fore ?? [0, 0, 0.4];
+    setArm(w, 1, SHOULDER_ARM);
+    const chain = [gun, w.handRight, w.elbowRight, w.armRight];
+    const point = new THREE.Vector3(...fore), barrel = new THREE.Vector3(0, 0, 1);
+    for (const o of chain) { o.updateMatrix(); point.applyMatrix4(o.matrix); barrel.transformDirection(o.matrix); }
+    a = reach(w, -1, point, new THREE.Vector3(sideX(-1) * 0.3, -1, 0), copyArm([], ARM_POSES.RIFLE_SUPPORT), true);
+    a[6] = HAND.GRIP;
+    // The barrel runs through the fist.
+    alignHand(w, -1, a, [0, 0, 1], barrel.transformDirection(chestFrame(w, _ik.n)));
+    supportArms.set(id, a);
+    return a;
+  }
+  /** Wrists together behind the lower back, palms facing, for the handcuffs (chest space). */
+  function cuffArms() {
+    if (cuffedArms) return cuffedArms;
+    const w = walker;
+    cuffedArms = ([-1, 1] as const).map((side) => {
+      const sx = sideX(side);
+      const a = reach(w, side, new THREE.Vector3(sx * 0.03, 1.1 - FIGURE.waistY, -0.17), new THREE.Vector3(sx * 0.6, -0.3, -0.8), copyArm([], ARM_POSES.RELAXED), true);
+      a[6] = HAND.FIST;
+      return alignHand(w, side, a, [-1, 0, 0], new THREE.Vector3(-sx, 0, 0));
+    });
+    return cuffedArms;
+  }
+  /** Poses the walker for this frame; `look` is how far the aim is turned from the body (radians), or null. */
+  function animateWalker(dt: number, now: number, time: number, walking: boolean, o: { gun: GunId | null; kneeling: boolean; handsUp: boolean; armed: boolean; swim: number; sky: 'deck' | 'fall' | 'chute' | null; look: number | null }) {
     const w = walker;
     const speed = walking ? Math.abs(velocity) : 0;
     const go = Math.min(1, speed / 1.2);
     const run = THREE.MathUtils.clamp((speed - 3.2) / 3.2, 0, 1);
     // Longer, slower-cadence strides as the pace picks up.
     walkClock += speed * dt * (1.95 - 0.5 * run);
-    const phase = walkClock * 2, sinP = Math.sin(phase), cosP = Math.cos(phase);
-    const amp = (0.48 + 0.34 * run) * go;
-    // Thighs swing; a knee folds while its leg comes forward, and stays a little bent when running.
-    let thighL = sinP * amp, thighR = -sinP * amp;
-    let kneeL = (Math.max(0, -cosP) * (0.55 + 1.05 * run) + 0.12 * run) * go;
-    let kneeR = (Math.max(0, cosP) * (0.55 + 1.05 * run) + 0.12 * run) * go;
-    // Arms swing against the legs; elbows pump when running.
-    let armL = -thighL * (0.8 + 0.3 * run), armR = -thighR * (0.8 + 0.3 * run);
-    let elbowL = -(0.18 + 1.15 * run) * go - Math.max(0, -armL) * 0.35;
-    let elbowR = -(0.18 + 1.15 * run) * go - Math.max(0, -armR) * 0.35;
-    let armLz = 0, armRz = 0;
-    // The torso leans into speed and acceleration, banks into turns and twists against the stride.
+    const g = gait(walkClock * 2, run, go, walkGait);
+    let thighL = g.thighL, thighR = g.thighR, kneeL = g.kneeL, kneeR = g.kneeR, ankleL = g.ankleL, ankleR = g.ankleR, toeL = g.toeL, toeR = g.toeR, spread = 0;
+    // Arms swing against the legs, a little clear of the hips; elbows pump and the hands close into a run.
+    const hand = mixHand(HAND.RELAXED, RUN_FIST, run);
+    const L = arm(walkArms.left, g.armL, 0.09, 0, g.elbowL - 0.1, 0.15, 0, hand);
+    const R = arm(walkArms.right, g.armR, 0.09, 0, g.elbowR - 0.1, 0.15, 0, hand);
+    // The torso leans into speed and acceleration and banks into turns; the shoulders turn with the swinging
+    // arms, against the legs.
     const accel = THREE.MathUtils.clamp((speed - motion.lastSpeed) / Math.max(dt, 1e-3), -12, 12);
     motion.lastSpeed = speed;
     const turnRate = Math.atan2(Math.sin(state.angle - motion.lastAngle), Math.cos(state.angle - motion.lastAngle)) / Math.max(dt, 1e-3);
     motion.lastAngle = state.angle;
     motion.lean = THREE.MathUtils.damp(motion.lean, 0.04 * go + 0.2 * run + accel * 0.012, 7, dt);
     motion.roll = THREE.MathUtils.damp(motion.roll, THREE.MathUtils.clamp(turnRate * speed * 0.01, -0.2, 0.2), 6, dt);
-    let lean = motion.lean, twist = sinP * (0.06 + 0.1 * run) * go, drop = 0;
-    // Highest as the legs pass each other, lowest on each footfall.
-    let bob = (0.5 - 0.5 * Math.cos(phase * 2)) * (0.02 + 0.05 * run) * go;
+    let lean = motion.lean, twist = g.chest, headPitch = 0, drop = 0, planted = true, cuffed = false;
+    // Where the eyes go (radians from the body's facing): the aim, or an idle look around when standing.
+    let gaze = o.look ?? 0.45 * Math.sin(time * 0.31) * Math.max(0, Math.sin(time * 0.17)) * (1 - go);
     // Breathing while standing.
-    w.body.scale.set(1, 1 + Math.sin(time * 2.3) * 0.012 * (1 - go), 1);
+    w.body.scale.set(1, 1 + Math.sin(time * 2.3) * 0.01 * (1 - go), 1);
     if (jumpY > 0) {
-      // Airborne: knees tucked, arms out for balance.
-      thighL = -0.95; kneeL = 1.25; thighR = -0.3; kneeR = 0.7;
-      armL = -0.9; armR = -0.6; elbowL = elbowR = -0.5; armLz = 0.35; armRz = -0.35;
-      lean = 0.12; bob = 0;
+      // Airborne: knees tucked, toes pointed, arms out for balance.
+      thighL = -0.95; kneeL = 1.25; thighR = -0.3; kneeR = 0.7; ankleL = 0.35; ankleR = 0.5; toeL = toeR = 0;
+      arm(L, -0.9, 0.5, 0, -0.55, 0.2, 0, HAND.OPEN);
+      arm(R, -0.6, 0.5, 0, -0.55, 0.2, 0, HAND.OPEN);
+      lean = 0.12; planted = false;
     }
     if (motion.land > 0) {
-      // Landing: the legs soak up the impact.
+      // Landing: the legs soak up the impact (the planted feet bring the hips down), the arms come forward.
       const k = motion.land;
-      thighL -= 0.5 * k; thighR -= 0.5 * k; kneeL += 1.0 * k; kneeR += 1.0 * k;
-      drop += 0.13 * k; lean += 0.15 * k;
+      thighL -= 0.5 * k; thighR -= 0.5 * k; kneeL += 1.0 * k; kneeR += 1.0 * k; ankleL -= 0.5 * k; ankleR -= 0.5 * k;
+      lean += 0.15 * k; L[0] -= 0.3 * k; R[0] -= 0.3 * k; L[3] -= 0.4 * k; R[3] -= 0.4 * k;
       motion.land = Math.max(0, motion.land - dt * 5.5);
     }
     if (now < punchUntil) {
-      // A jab: the right arm drives out from a cocked elbow, the shoulders turn into it, the left guards.
+      // A jab: the right fist drives out palm down from a cocked elbow, the shoulders turn into it (the right
+      // shoulder, at -x, comes forward: a positive turn), the left guards.
       const t = 1 - (punchUntil - now) / 180;
-      armR = -1.55; elbowR = -1.5 * (1 - Math.min(1, t * 1.8)); armRz = 0;
-      twist = -0.35 * Math.sin(Math.PI * Math.min(1, t * 1.3));
-      armL = -1.2; elbowL = -1.7; lean += 0.08;
-    } else if (o.armed) {
-      // Aiming: the right arm straight out; long guns are steadied with the left hand.
-      armR = -Math.PI / 2; elbowR = 0; armRz = 0;
-      if (o.twoHanded) { armL = -1.25; elbowL = -0.35; armLz = 0.45; }
+      arm(R, -1.5, -0.1, 0, -1.6 * (1 - Math.min(1, t * 1.8)) - 0.04, 1.2, 0, HAND.FIST);
+      copyArm(L, ARM_POSES.GUARD);
+      twist = 0.35 * Math.sin(Math.PI * Math.min(1, t * 1.3));
+      lean += 0.08;
+    } else if (o.armed && o.gun) {
+      // Aiming: a pistol at arm's length in both hands; a long gun at the shoulder, the left hand under the barrel.
+      if (o.gun === 'pistol') { copyArm(R, ARM_POSES.AIM); copyArm(L, ARM_POSES.AIM_SUPPORT); }
+      else { copyArm(R, SHOULDER_ARM); copyArm(L, supportArm(o.gun)); }
     }
-    if (o.handsUp) { armL = armR = -2.9; elbowL = elbowR = -0.25; armLz = armRz = 0; }
-    // A hit snaps the torso back for a moment.
+    if (o.handsUp) { copyArm(L, ARM_POSES.SURRENDER); copyArm(R, ARM_POSES.SURRENDER); gaze = 0; }
+    // A hit snaps the torso back for a moment and throws the hands open.
     const hit = 1 - (now - motion.hitAt) / 280;
-    if (hit > 0) { lean -= 0.4 * hit; armLz += 0.4 * hit; armRz -= 0.4 * hit; }
-    if (o.kneeling) {
-      // Forced to kneel, hands cuffed behind the back.
-      thighL = thighR = 0.15; kneeL = kneeR = 1.45; drop = 0.36 * PERSON_SCALE / 0.68;
-      armL = armR = 0.6; elbowL = elbowR = 0; armLz = 0.5; armRz = -0.5; lean = 0.1; twist = 0; bob = 0;
+    if (hit > 0) {
+      lean -= 0.4 * hit; L[1] += 0.4 * hit; R[1] += 0.4 * hit;
+      L[6] = mixHand(L[6], HAND.OPEN, hit); R[6] = mixHand(R[6], HAND.OPEN, hit);
     }
-    if (now < stunUntil) { armLz = Math.sin(time * 40) * 0.3; armRz = Math.cos(time * 37) * 0.3; thighL = Math.sin(time * 33) * 0.15; }
+    if (o.kneeling) {
+      // Forced to kneel on both knees, the tops of the feet flat, hands cuffed behind the back.
+      thighL = thighR = 0.15; kneeL = kneeR = 1.45; ankleL = ankleR = 0.9; toeL = toeR = 0;
+      drop = FIGURE.hipY - FIGURE.thigh * Math.cos(0.15) - 0.06; planted = false;
+      lean = 0.1; twist = 0; gaze = 0; headPitch = 0.15; cuffed = true;
+    }
+    if (now < stunUntil) {
+      // Tasered: limbs jerk, fingers hooked.
+      L[1] = 0.3 + Math.sin(time * 40) * 0.3; R[1] = 0.3 + Math.cos(time * 37) * 0.3; L[6] = R[6] = HAND.CLAW;
+      thighL = Math.sin(time * 33) * 0.15;
+    }
     if (o.swim > 0) {
-      // Front crawl when moving (body flat, arms windmilling, a flutter kick); treading water when still.
+      // Front crawl when moving (body flat, arms windmilling, a flutter kick); treading water when still,
+      // arms sculling out to the sides.
       const crawl = Math.max(0, (o.swim - 0.25) / 0.75);
       const stroke = time * (4 + crawl * 2.5);
       const reachL = -Math.PI + (stroke % (Math.PI * 2)), reachR = -Math.PI + ((stroke + Math.PI) % (Math.PI * 2));
       const scull = Math.sin(time * 3);
-      lean = 0.12 + crawl * 1.2; twist = Math.sin(stroke) * 0.25 * crawl; bob = 0; drop = 0;
-      armL = THREE.MathUtils.lerp(-0.45, reachL, crawl); armR = THREE.MathUtils.lerp(-0.45, reachR, crawl);
-      armLz = THREE.MathUtils.lerp(1.0 + scull * 0.3, 0.1, crawl); armRz = THREE.MathUtils.lerp(-1.0 - scull * 0.3, -0.1, crawl);
-      elbowL = reachL > 0 ? -0.7 * crawl - 0.4 * (1 - crawl) : -0.4 * (1 - crawl);
-      elbowR = reachR > 0 ? -0.7 * crawl - 0.4 * (1 - crawl) : -0.4 * (1 - crawl);
+      const lerp = THREE.MathUtils.lerp, paddle = handCode(0.15, 0.1, 0.1);
+      lean = 0.12 + crawl * 1.2; twist = Math.sin(stroke) * 0.25 * crawl; planted = false; drop = 0; gaze = 0;
+      headPitch = -0.65 * crawl;
+      arm(L, lerp(-0.45, reachL, crawl), lerp(1.0 + scull * 0.3, 0.12, crawl), 0, reachL > 0 ? -0.7 * crawl - 0.4 * (1 - crawl) : -0.4 * (1 - crawl), 0.3, 0, paddle);
+      arm(R, lerp(-0.45, reachR, crawl), lerp(1.0 + scull * 0.3, 0.12, crawl), 0, reachR > 0 ? -0.7 * crawl - 0.4 * (1 - crawl) : -0.4 * (1 - crawl), 0.3, 0, paddle);
       const kick = Math.sin(time * (crawl ? 9 : 2.6));
-      thighL = THREE.MathUtils.lerp(kick * 0.45, 1.15 + kick * 0.22, crawl); thighR = THREE.MathUtils.lerp(-kick * 0.45, 1.15 - kick * 0.22, crawl);
-      kneeL = THREE.MathUtils.lerp(0.5 + Math.max(0, kick) * 0.6, 0.2 + Math.max(0, kick) * 0.3, crawl);
-      kneeR = THREE.MathUtils.lerp(0.5 + Math.max(0, -kick) * 0.6, 0.2 + Math.max(0, -kick) * 0.3, crawl);
+      thighL = lerp(kick * 0.45, 1.15 + kick * 0.22, crawl); thighR = lerp(-kick * 0.45, 1.15 - kick * 0.22, crawl);
+      kneeL = lerp(0.5 + Math.max(0, kick) * 0.6, 0.2 + Math.max(0, kick) * 0.3, crawl);
+      kneeR = lerp(0.5 + Math.max(0, -kick) * 0.6, 0.2 + Math.max(0, -kick) * 0.3, crawl);
+      ankleL = ankleR = lerp(0.3, 0.7, crawl); toeL = toeR = 0;
     }
     if (o.sky === 'fall') {
-      // Freefall: belly to the earth, arms and legs spread wide.
-      lean = 1.25; twist = 0; bob = 0; drop = 0;
-      armL = armR = -0.5; armLz = 1.35; armRz = -1.35; elbowL = elbowR = -0.5;
-      thighL = thighR = 0.35; kneeL = kneeR = 0.8;
+      // Freefall: belly to the earth, arms out with the hands by the head, legs spread and bent.
+      lean = 1.25; twist = 0; planted = false; drop = 0; gaze = 0; headPitch = -0.75;
+      for (const [side, a] of [[-1, L], [1, R]] as const) {
+        arm(a, 0, 0, 0, 0, 0.3, 0, HAND.OPEN);
+        reach(w, side, _fall.set(sideX(side) * 0.42, FIGURE.shoulderY - FIGURE.waistY + 0.2, 0.1), _fallHint.set(sideX(side), -0.6, -0.2), a, true);
+      }
+      // The legs hang from the hips, not the leaning torso: swing them back in line, knees bent up behind.
+      thighL = thighR = lean - 0.25; kneeL = kneeR = 0.9; ankleL = ankleR = 0.6; toeL = toeR = 0; spread = 0.3;
     } else if (o.sky === 'chute') {
-      // Hanging in the harness, hands up on the steering toggles, legs dangling.
-      lean = -0.05; twist = 0; bob = 0; drop = 0;
-      armL = armR = -2.75; armLz = 0.28; armRz = -0.28; elbowL = elbowR = -0.35;
-      thighL = Math.sin(time * 1.3) * 0.15 - 0.1; thighR = -Math.sin(time * 1.3) * 0.15 - 0.1; kneeL = kneeR = 0.25;
+      // Hanging in the harness, fists up on the steering toggles, legs dangling.
+      lean = -0.05; twist = 0; planted = false; drop = 0; gaze = 0;
+      arm(L, -2.75, 0.28, 0, -0.35, 0, 0, HAND.GRIP);
+      arm(R, -2.75, 0.28, 0, -0.35, 0, 0, HAND.GRIP);
+      thighL = Math.sin(time * 1.3) * 0.15 - 0.1; thighR = -Math.sin(time * 1.3) * 0.15 - 0.1; kneeL = kneeR = 0.25; ankleL = ankleR = 0.45; toeL = toeR = 0;
     }
-    w.group.position.y += bob - drop;
-    w.body.rotation.set(lean, twist, motion.roll);
-    w.limbLeft.rotation.set(thighL, 0, 0);
-    w.limbRight.rotation.set(thighR, 0, 0);
+    // The lower foot stays on the ground: that gives the stride its bob and drops the hips into a landing.
+    const plant = planted ? Math.max(legReach(thighL, kneeL, ankleL, toeL), legReach(thighR, kneeR, ankleR, toeR)) - FIGURE.sole : 0;
+    w.group.position.y += (plant - drop) * PERSON_SCALE;
+    w.body.rotation.set(lean, 0, motion.roll);
+    w.chest.rotation.y = twist;
+    // The head turns the rest of the way to the gaze.
+    w.head.rotation.set(headPitch, THREE.MathUtils.clamp(gaze - twist, -1.1, 1.1), 0);
+    w.limbLeft.rotation.set(thighL, 0, sideX(-1) * spread);
+    w.limbRight.rotation.set(thighR, 0, sideX(1) * spread);
     w.kneeLeft.rotation.x = kneeL;
     w.kneeRight.rotation.x = kneeR;
-    w.armLeft.rotation.set(armL, 0, armLz);
-    w.armRight.rotation.set(armR, 0, armRz);
-    w.elbowLeft.rotation.x = elbowL;
-    w.elbowRight.rotation.x = elbowR;
+    w.ankleLeft.rotation.x = ankleL;
+    w.ankleRight.rotation.x = ankleR;
+    w.toe.left = toeL;
+    w.toe.right = toeR;
+    blink(w, time);
+    if (cuffed) { const [cl, cr] = cuffArms(); copyArm(L, cl); copyArm(R, cr); }
+    setArm(w, -1, L);
+    setArm(w, 1, R);
     // The delivery box lags behind the bounce on its straps (a damped spring).
-    const packTarget = -bob * 1.6 + (jumpY > 0 ? -0.05 : 0);
+    const packTarget = -plant * 1.2 + (jumpY > 0 ? -0.04 : 0);
     motion.packV += ((packTarget - motion.pack) * 90 - motion.packV * 9) * dt;
     motion.pack += motion.packV * dt;
-    w.pack.position.y = 0.86 + motion.pack;
+    w.pack.position.y = PACK_Y + motion.pack;
     w.pack.rotation.x = -lean * 0.4 + motion.packV * 0.15;
+    w.sync();
   }
 
   function walk(dt: number, now: number, vertical: number, horizontal: number) {
@@ -2826,11 +3201,52 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         splash(state.x, state.z, now, 1);
         notify('Bị thuyền va phải! Tránh xa luồng tàu.', 2000);
       }
-    } else if (velocity > 0.5) ragdolls.push(state.x, state.z, 0.55, headingX * velocity * 1.2, 1.2, headingZ * velocity * 1.2);
+    } else if (velocity > 0.5) ragdolls.push(state.x, state.z, 0.45, headingX * velocity * 1.1, 0.4, headingZ * velocity * 1.1);
     return moving;
   }
 
-  function updatePeers(now: number, time: number) {
+  const peerGait = newGait();
+  const peerArms = { left: copyArm([], ARM_POSES.RELAXED), right: copyArm([], ARM_POSES.RELAXED) };
+  /** Another player on foot or in the water, from what the network tells of them: speed and the gun out. */
+  function posePeer(p: Person, swim: boolean, speed: number, gun: GunId | null, dt: number, time: number) {
+    const s = Math.abs(speed), go = Math.min(1, s / 1.2), run = THREE.MathUtils.clamp((s - 3.2) / 3.2, 0, 1);
+    p.stride += s * dt * (1.95 - 0.5 * run) * 2;
+    const g = gait(p.stride, run, go, peerGait);
+    const hand = mixHand(HAND.RELAXED, RUN_FIST, run);
+    const L = arm(peerArms.left, g.armL, 0.09, 0, g.elbowL - 0.1, 0.15, 0, hand), R = arm(peerArms.right, g.armR, 0.09, 0, g.elbowR - 0.1, 0.15, 0, hand);
+    let lean = 0.04 * go + 0.2 * run, thighL = g.thighL, thighR = g.thighR, kneeL = g.kneeL, kneeR = g.kneeR, ankleL = g.ankleL, ankleR = g.ankleR;
+    if (swim) {
+      // A front crawl when moving, treading water otherwise.
+      const crawl = go, stroke = time * 5.5 + p.stride * 0.1;
+      const reachL = -Math.PI + (stroke % (Math.PI * 2)), reachR = -Math.PI + ((stroke + Math.PI) % (Math.PI * 2));
+      const kick = Math.sin(time * (crawl > 0.5 ? 9 : 2.6)), lerp = THREE.MathUtils.lerp;
+      lean = 0.12 + 1.2 * crawl;
+      arm(L, lerp(-0.45, reachL, crawl), lerp(1.0, 0.12, crawl), 0, -0.4, 0.3, 0, HAND.OPEN);
+      arm(R, lerp(-0.45, reachR, crawl), lerp(1.0, 0.12, crawl), 0, -0.4, 0.3, 0, HAND.OPEN);
+      thighL = lerp(kick * 0.45, 1.15 + kick * 0.22, crawl); thighR = lerp(-kick * 0.45, 1.15 - kick * 0.22, crawl);
+      kneeL = kneeR = 0.35; ankleL = ankleR = 0.5;
+    } else if (gun === 'pistol') { copyArm(R, ARM_POSES.AIM); copyArm(L, ARM_POSES.AIM_SUPPORT); }
+    else if (gun) { copyArm(R, SHOULDER_ARM); copyArm(L, supportArm(gun)); }
+    // The lower foot stays on the ground (peers stand in their own group at ground level).
+    p.group.position.y = swim ? 0 : (Math.max(legReach(thighL, kneeL, ankleL, g.toeL), legReach(thighR, kneeR, ankleR, g.toeR)) - FIGURE.sole) * PERSON_SCALE;
+    p.body.rotation.set(lean, 0, 0);
+    p.chest.rotation.y = swim ? 0 : g.chest;
+    p.head.rotation.set(swim ? -0.6 * go : 0, swim ? 0 : -g.chest * 0.8, 0);
+    p.limbLeft.rotation.set(thighL, 0, 0);
+    p.limbRight.rotation.set(thighR, 0, 0);
+    p.kneeLeft.rotation.x = kneeL;
+    p.kneeRight.rotation.x = kneeR;
+    p.ankleLeft.rotation.x = ankleL;
+    p.ankleRight.rotation.x = ankleR;
+    p.toe.left = swim ? 0 : g.toeL;
+    p.toe.right = swim ? 0 : g.toeR;
+    blink(p, time, p.look.shirt.charCodeAt(2) % 7);
+    setArm(p, -1, L);
+    setArm(p, 1, R);
+    p.sync();
+  }
+
+  function updatePeers(now: number, time: number, dt: number) {
     const renderTime = peerClock.renderTime(now);
     for (const [, peer] of peers) {
       const { target } = peer;
@@ -2858,26 +3274,27 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       }
       // Downed players lie as a local ragdoll until they respawn.
       if (target.down && !peer.body) {
-        peer.body = ragdolls.spawn({ x, y: groundHeight(x, z), z, yaw: target.angle, scale: RAGDOLL_SCALE, look: { shirt: peer.color, pants: '#293e4a', skin: '#dca878', helmet: '#fff4dc' }, velocity: { x: (Math.random() - 0.5) * 3, y: 2, z: (Math.random() - 0.5) * 3 } });
+        // Dressed like their figure (its look carries the style), limp, and never evicted to make room.
+        peer.body = ragdolls.spawn({
+          x, y: groundHeight(x, z), z, yaw: target.angle, scale: RAGDOLL_SCALE, look: peer.foot.look, mode: 'limp', keep: true,
+          velocity: { x: (Math.random() - 0.5) * 3, y: 2, z: (Math.random() - 0.5) * 3 },
+        });
         effects.blood(hitPoint.set(x, 1, z), rayDir.set(0, 0, 1), 6);
       } else if (!target.down && peer.body) {
         ragdolls.remove(peer.body);
         peer.body = null;
       }
       peer.foot.group.visible = (kind === 'foot' || kind === 'swim' || kind === 'boat') && !target.down;
-      peer.foot.body.rotation.x = kind === 'swim' && Math.abs(pose.speed) > 0.5 ? 1.2 : 0;
       peer.bike.group.visible = kind === 'scooter' && !target.down;
       peer.label.position.y = kind === 'car' || kind === 'police' ? 3.1 : kind === 'swim' ? 3.6 : 2.6;
-      const armed = target.weapon && target.weapon !== 'fists';
-      for (const [id, gun] of peer.guns) gun.visible = id === target.weapon;
-      const peerStride = Math.abs(pose.speed) > 1 ? Math.sin(time * 10) * 0.55 : 0;
-      peer.foot.limbLeft.rotation.x = peerStride;
-      peer.foot.limbRight.rotation.x = -peerStride;
-      peer.foot.armRight.rotation.x = armed ? -Math.PI / 2 : -peerStride * 0.7;
+      const gun = target.weapon && target.weapon !== 'fists' ? target.weapon : null;
+      for (const [id, model] of peer.guns) model.visible = id === gun;
+      if (peer.foot.group.visible) posePeer(peer.foot, kind === 'swim', pose.speed, gun, dt, time);
       if (target.firing && now - peer.flashAt > 160) {
         peer.flashAt = now;
+        // The muzzle of a gun held out at shoulder height.
         const a = peer.foot.group.rotation.y;
-        scratch.set(x + Math.sin(a) * 0.9 + Math.cos(a) * 0.38, 1.25, z + Math.cos(a) * 0.9 - Math.sin(a) * 0.38);
+        scratch.set(x + Math.sin(a) * 0.8 + Math.cos(a) * 0.05, 1.34, z + Math.cos(a) * 0.8 - Math.sin(a) * 0.05);
         effects.flash(scratch, now, 0.7);
         if (target.weapon && target.weapon !== 'fists' && Math.hypot(x - state.x, z - state.z) < 60) playShot(target.weapon);
       }
@@ -2977,6 +3394,16 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     setRain(active ? atmosphere.rain : 0);
     crossing.length = 0;
     npcs.forEachCrossing((x, z) => crossing.push({ x, z }));
+    // Traffic stops for a body lying in its lane (until it is taken away) instead of shoving it down the road;
+    // one lying on the sidewalk is no reason to stop.
+    ragdolls.forEach((body) => {
+      ragdolls.center(body, scratch);
+      if (!onSidewalk(scratch.x, scratch.z)) crossing.push({ x: scratch.x, z: scratch.z, body: true });
+    });
+    // People and riders outside the camera's view (last frame's) are not posed or drawn.
+    viewFrustum.setFromProjectionMatrix(viewMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
+    vehicles.setView(viewFrustum);
+    npcs.setView(viewFrustum);
     for (const crash of vehicles.update(dt, time, { x: state.x, z: state.z, car: playerCar }, crossing)) handleCrash(crash, now, time, false);
     checkRedLight(time);
     vehicleImpacts(now);
@@ -3120,7 +3547,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     // Side missions (none while the dead walk).
     const missionResult = zombieMode ? { view: null, passenger: false, completed: null, failed: null } : sideMissions.update(dt, missionContext(time));
     sideView = missionResult.view;
-    passengerAboard = missionResult.passenger;
+    passengerAboard = missionResult.passenger || testPassenger;
     if (missionResult.completed) {
       cash += missionResult.completed.reward;
       state.score += missionResult.completed.score;
@@ -3150,11 +3577,15 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     helm.group.visible = boat === boats.rental;
     if (swimming && moving && now > splashAt) { splashAt = now + 380; effects.smoke(state.x - Math.sin(state.angle) * 0.6, WATER_LEVEL + 0.1, state.z - Math.cos(state.angle) * 0.6, now, false, '#eef6f4'); }
-    const twoHanded = weapon === 'shotgun' || weapon === 'smg' || weapon === 'rpg' || weapon === 'grenade';
     const arrestTime = down === 'busted' ? now - bustedAt : -1;
     const kneeling = arrestTime > 900;
     const handsUp = surrendered || (arrestTime >= 0 && !kneeling);
-    animateWalker(dt, now, time, moving && active && !state.riding, { twoHanded, kneeling, handsUp, armed: armed && now < aimUntil + 600 && !swimming && !glide, swim: swimming ? 0.25 + swimPace * 0.75 : 0, sky: glide ? glide.phase : null });
+    // The head follows the aim (the pointer, or the last shot) while a gun is out.
+    const aimTurn = armed && aiming && !down ? Math.atan2(Math.sin(aimYaw - state.angle), Math.cos(aimYaw - state.angle)) : null;
+    animateWalker(dt, now, time, moving && active && !state.riding, {
+      gun: weapon === 'fists' ? null : weapon, kneeling, handsUp, armed: armed && now < aimUntil + 600 && !swimming && !glide,
+      swim: swimming ? 0.25 + swimPace * 0.75 : 0, sky: glide ? glide.phase : null, look: aimTurn,
+    });
     for (const cuff of cuffs) cuff.visible = kneeling;
     for (const [id, gun] of guns) gun.group.visible = id === weapon && !kneeling && !handsUp && !swimming && !glide;
     const onBike = state.riding && !playerCar;
@@ -3165,30 +3596,35 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const twoWheelsNow = state.riding && (!playerCar || playerCar.kind === 'moto');
     const balance = twoWheelsNow ? THREE.MathUtils.clamp(Math.atan(velocity * yawRate / 9.81), -0.5, 0.5) * (!playerCar && bikeId === 'horse' ? 0.3 : 1) : 0;
     lean = THREE.MathUtils.damp(lean, balance, 7, dt);
+    const drawing = armed && now < aimUntil;
+    /** How far the aim is turned from a vehicle's heading: the chest turns that way (the head the rest), the other fist stays on its grip. */
+    const aimTwist = (yaw: number) => Math.atan2(Math.sin(aimYaw - yaw), Math.cos(aimYaw - yaw));
     if (playerCar && state.riding) {
       const moto = playerCar.kind === 'moto';
-      // The seated figure's hip lands on the vehicle's seat: the saddle, or the left-hand driver's seat
-      // (shrunk a little so the head clears a car roof). Vehicle models stand 0.04 m into the ground.
-      const fit = moto ? 1 : 0.82;
-      const seat = seatOf(playerCar);
-      seatHolder.scale.setScalar(BIKE_SCALE * fit);
-      if (moto) footing(seated, vehicleStyle(playerCar) as MotoStyle);
-      else { seated.limbLeft.rotation.x = seated.limbRight.rotation.x = -1.4; seated.kneeLeft.rotation.x = seated.kneeRight.rotation.x = 1.35; }
-      const lx = seat[0], ly = seat[1] - fit * MOTO_RIDER.hip[1] - 0.04, lz = seat[2] - fit * MOTO_RIDER.hip[2];
+      // The seated figure's hip joint lands on the vehicle's seat point: the saddle, or the left-hand driver's
+      // seat (a car driver is drawn smaller so the head clears the roof). Vehicle models stand 0.04 m into the ground.
+      const kind: SeatKind = moto ? vehicleStyle(playerCar) as MotoStyle : 'car';
+      if (seatedKind !== kind) { seatOn(seated, kind); seatedKind = kind; }
+      const seat = moto ? MOTO_HIP : seatOf(playerCar);
+      const lx = seat[0], ly = seat[1] - 0.04, lz = seat[2];
       const c = Math.cos(playerCar.yaw), s = Math.sin(playerCar.yaw);
       seatHolder.position.set(playerCar.x + lx * c + lz * s, groundHeight(playerCar.x, playerCar.z) + ly, playerCar.z - lx * s + lz * c);
       seatHolder.rotation.set(0, playerCar.yaw, moto ? lean : 0, 'YXZ');
-      seated.body.rotation.z = moto ? lean * 0.25 : 0;
-      const drawing = armed && now < aimUntil;
-      seated.armRight.rotation.x = drawing ? -Math.PI / 2 : moto ? -1 : -1.15;
-      seated.armLeft.rotation.x = moto ? -1 : -1.15;
-      seated.group.rotation.y = drawing ? angleLerp(0, aimYaw - playerCar.yaw, 0.6) : 0;
+      const turn = drawing ? aimTwist(playerCar.yaw) : 0, chest = THREE.MathUtils.clamp(turn, -1.2, 1.2);
+      blink(seated, time);
+      holdSeat(seated, moto ? lean * 0.25 : 0, chest, drawing, turn - chest);
     }
-    rider.armRight.rotation.x = armed && now < aimUntil ? -Math.PI / 2 : -1;
-    rider.group.rotation.y = armed && now < aimUntil ? angleLerp(0, aimYaw - state.angle, 0.6) : 0;
     passenger.group.visible = passengerAboard && onBike && bikeId !== 'horse';
+    showPack(rider, !passenger.group.visible);
     const bikeBroken = bikeHealth <= 0;
-    rider.body.rotation.z = onBike ? lean * 0.25 : 0;
+    if (onBike) {
+      // The rider hangs a little into the corner; drawing a gun, the chest turns to the aim and the right hand lets go.
+      const turn = drawing ? aimTwist(state.angle) : 0, chest = THREE.MathUtils.clamp(turn, -1.2, 1.2);
+      blink(rider, time);
+      blink(passenger, time, 2);
+      holdSeat(rider, lean * 0.25, chest, drawing, turn - chest);
+      if (passenger.group.visible) holdSeat(passenger, lean * 0.2, 0, false);
+    }
     bike.group.position.set(bikeX, groundHeight(bikeX, bikeZ) + (bikeBroken && !onBike ? 0.18 : -0.04), bikeZ);
     bike.group.rotation.set(0, bikeAngle, bikeBroken && !onBike ? 1.35 : lean, 'YXZ');
     if (onBike) for (const wheel of bike.wheels) wheel.rotation.x += velocity * dt / bike.wheelRadius;
@@ -3213,7 +3649,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const mission = missions.view();
     const coffeePickup = mission.id === 'coffee' && mission.status === 'active' && mission.step === 0;
     shopkeeperCup.visible = coffeePickup;
-    shopkeeper.armRight.rotation.x = coffeePickup && distance(PICKUP) < 14 ? -1.4 + Math.sin(time * 3) * 0.08 : 0;
+    if (distance(SHOPKEEPER) < 60) {
+      // Standing about with the coffee ready, holding it out when the rider comes for it.
+      poseStanding(shopkeeper, time, 1);
+      if (coffeePickup) setArm(shopkeeper, 1, distance(PICKUP) < 14 ? arm(handPose, -1.25 + Math.sin(time * 3) * 0.06, 0.05, 0, -0.45, 0, -0.1, HAND.CUP) : HOLD_CUP);
+      shopkeeper.sync();
+    }
     const deliveryTarget = ['coffee', 'market', 'post'].includes(mission.id) && mission.step > 0 ? mission.target : null;
     const spot = now < receiverHappyUntil ? receiverSpot : deliveryTarget;
     receiver.group.visible = spot !== null && !zombieMode;
@@ -3224,7 +3665,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const happy = now < receiverHappyUntil;
       receiverCup.visible = happy && mission.id === 'coffee';
       const near = distance(spot) < 18;
-      receiver.armRight.rotation.set(happy ? -1.3 : near ? -2.8 : 0, 0, happy ? 0 : near ? Math.sin(time * 9) * 0.35 : 0);
+      // Waving the rider over, then lifting the coffee and bouncing on the toes.
+      poseStanding(receiver, time, 2);
+      if (happy) setArm(receiver, 1, arm(handPose, -1.05, 0.1, 0, -1.2, 0, 0, HAND.CUP));
+      else if (near) setArm(receiver, 1, arm(handPose, ARM_POSES.WAVE[0], ARM_POSES.WAVE[1], 0, -0.5 + 0.35 * Math.sin(time * 9), ARM_POSES.WAVE[4], 0, HAND.OPEN));
+      if (near || happy) receiver.head.rotation.set(-0.05, 0, 0);
+      receiver.sync();
       receiver.group.position.y += happy ? Math.abs(Math.sin(time * 7)) * 0.08 : 0;
     }
 
@@ -3238,16 +3684,28 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (car.mode === 'off') continue;
       const moto = car.kind === 'moto';
       effects.blob(car.x, groundHeight(car.x, car.z) + 0.02, car.z, moto ? 0.9 : 2.6, moto ? 2.1 : 5.2, car.yaw);
-      if ((car.mode === 'lane' || car.mode === 'chase' || car.mode === 'leave') && Math.abs(car.speed) > 2) {
-        ragdolls.push(car.x + Math.sin(car.yaw) * (moto ? 1 : 2.2), car.z + Math.cos(car.yaw) * (moto ? 1 : 2.2), moto ? 0.8 : 1.4, Math.sin(car.yaw) * car.speed, 1.5, Math.cos(car.yaw) * car.speed);
-      }
+      // Every vehicle is a moving box to the bodies on the street: they are pushed out of it (or onto the bonnet).
+      // A motorbike that lost its rider is left out (the rider's body starts inside its box).
+      if (moto && !car.driver && car.mode !== 'player') continue;
+      const [hw, hl] = vehicles.halfSize(car.kind);
+      ragdolls.sweep(car.x, car.z, car.yaw, hw, hl, moto ? 1.1 : 1.45, Math.sin(car.yaw) * car.speed, Math.cos(car.yaw) * car.speed);
     }
-    updatePeers(now, time);
+    // The player's own bike (cars the player drives are in the list above).
+    if (state.riding && !playerCar && !boat) {
+      const horse = bikeId === 'horse';
+      ragdolls.sweep(state.x, state.z, state.angle, horse ? 0.45 : 0.4, horse ? 1.2 : 1, horse ? 1.6 : 1.1, Math.sin(state.angle) * velocity, Math.cos(state.angle) * velocity);
+    }
+    updatePeers(now, time, dt);
     npcs.forEachStanding((x, z, npc) => effects.blob(x, npc.y + 0.02, z, 0.85));
     police.forEachUnit((x, z, onFoot) => { if (onFoot) effects.blob(x, groundHeight(x, z) + 0.02, z, 0.85); });
     animals.forEachShadow((x, z, size) => effects.blob(x, groundHeight(x, z) + 0.02, z, size, size * 1.6));
+    // Bodies on the street last (when the blobs run out, standing people keep theirs): along the body, smaller in the air.
+    ragdolls.forEachShadow((x, z, width, length, yaw, height) => {
+      const ground = groundHeight(x, z), lift = THREE.MathUtils.clamp(1 - (height - ground - 0.3) / 2.5, 0.35, 1);
+      effects.blob(x, ground + 0.025, z, width * lift, length * lift, yaw);
+    });
     effects.endBlobs();
-    ragdolls.update(dt);
+    ragdolls.update(dt, cameraTarget.x, cameraTarget.z);
 
     // Smoke from damaged vehicles, and bleeding stumps.
     if (now > smokeAt) {
@@ -3328,6 +3786,47 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
   setMissionLabel();
   emitHud(performance.now());
+  // Every program is compiled and drawn once now, before the first frame (into one pixel of the canvas, so the
+  // programs are the canvas' own variants): the four figure kinds included (the umbrellas' 'rigid' one would
+  // otherwise first compile when it starts to rain, mid-game), things not shown yet (the rain, empty crowds) and
+  // things out of view. The driver (ANGLE on Windows) finishes a shader at its first draw, so compiling alone would
+  // still stall. Zombie mode's flashlight changes every lit program: those variants compile in the background
+  // (parallel where the driver can) while the menu is up, and are drawn once when they are ready.
+  let warmed = 0;
+  function drawEverything(flashlight: boolean) {
+    const shown: THREE.Object3D[] = [], filled: THREE.InstancedMesh[] = [], culled: THREE.Object3D[] = [];
+    scene.traverse((o) => {
+      if (!o.visible && o !== torch) { o.visible = true; shown.push(o); }
+      if (o.frustumCulled) { o.frustumCulled = false; culled.push(o); }
+      const mesh = o as THREE.InstancedMesh;
+      if (mesh.isInstancedMesh && mesh.count === 0) { mesh.count = 1; filled.push(mesh); }
+    });
+    torch.visible = flashlight;
+    const size = renderer.getSize(new THREE.Vector2());
+    renderer.setScissorTest(true);
+    renderer.setScissor(0, 0, 1, 1);
+    renderer.setViewport(0, 0, 1, 1);
+    renderer.render(scene, camera);
+    renderer.setScissorTest(false);
+    renderer.setViewport(0, 0, size.x, size.y);
+    torch.visible = zombieMode;
+    for (const o of shown) o.visible = false;
+    for (const o of culled) o.frustumCulled = true;
+    for (const mesh of filled) mesh.count = 0;
+  }
+  function prewarm() {
+    const round = ++warmed;
+    drawEverything(false);
+    // The flashlight variants: start their compiles now without waiting, draw them once they are done.
+    const shown: THREE.Object3D[] = [];
+    scene.traverse((o) => { if (!o.visible && o !== torch) { o.visible = true; shown.push(o); } });
+    torch.visible = true;
+    const ready = renderer.compileAsync(scene, camera);
+    torch.visible = zombieMode;
+    for (const o of shown) o.visible = false;
+    ready.then(() => { if (round === warmed && !active) drawEverything(true); }).catch(() => undefined);
+  }
+  prewarm();
   frame = requestAnimationFrame(update);
 
   function rebuildBike(id: BikeId) {
@@ -3337,9 +3836,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     disposeTree(bike.group);
     bikeId = id;
     bike = makeBike(id, bikeById(id).color);
-    rider.group.position.y = id === 'horse' ? HORSE_SEAT : (MOTO_RIDER.hip[1] - 1.04 * PERSON_SCALE) / BIKE_SCALE;
-    if (id === 'horse') { rider.limbLeft.rotation.x = rider.limbRight.rotation.x = -0.65; rider.kneeLeft.rotation.x = rider.kneeRight.rotation.x = 0.55; }
-    else footing(rider, id);
+    if (id === 'horse') seatOn(rider, 'horse', HORSE_HIP, BIKE_SCALE);
+    else {
+      seatOn(rider, id, MOTO_HIP, BIKE_SCALE);
+      // The pillion sits a little higher on a sport bike's step saddle.
+      seatOn(passenger, 'pillion', id === 'sport' ? [PILLION_HIP[0], PILLION_HIP[1] + 0.04, PILLION_HIP[2] + 0.04] : PILLION_HIP, BIKE_SCALE);
+    }
     bike.group.add(rider.group, passenger.group);
     scene.add(bike.group);
     bikeHealth = bikeById(id).health;
@@ -3352,11 +3854,39 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       ride: (x: number, z: number, angle: number) => { bikeX = x; bikeZ = z; bikeAngle = angle; Object.assign(state, { x, z, angle, riding: true }); velocity = 0; cameraTarget.set(x, 1, z); },
       view: (yaw: number, pitch: number, dist: number) => { Object.assign(view, { yaw, pitch, dist }); manualCameraAt = performance.now() + 1e9; },
       hours: (h: number) => atmosphere.setHours(h),
+      weather: (w: Weather) => atmosphere.setWeather(w),
       cash: (c: number) => { cash = c; },
       weapon: (id: WeaponId) => { owned.add(id); ammo.set(id, { mag: 30, reserve: 90 }); equip(id); },
       stats: () => ({ calls: renderer.info.render.calls, triangles: renderer.info.render.triangles, geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures, fps: monitor.fps }),
       info: () => ({ x: state.x, z: state.z, riding: state.riding, swimming, boat: !!boat, glide: glide ? { ...glide } : null, down, wanted: police.wanted, cash, hint: notification }),
-      scene, camera, renderer, npcs, vehicles, police, ragdolls,
+      scene, camera, renderer, npcs, vehicles, police, ragdolls, zombies,
+      /** How a look is dressed (wardrobe bits and colours), to find people in a given outfit. */
+      style: (look: FigureLook) => styleOf(look),
+      people: { walker, rider, passenger, seated, helm, shopkeeper, receiver },
+      /** Other players to draw (as the room would send them), and a bike to ride, for checking peers and bikes. */
+      peers: (list: PeerState[]) => setPeers(list, performance.now()),
+      bike: (id: BikeId) => rebuildBike(id),
+      /** Opens a shop or venue the way walking into its door does. */
+      enter: (kind: InteriorKind) => onEvent(kind === 'gun' ? { type: 'store' } : kind === 'bike' ? { type: 'bikeshop' } : kind === 'hospital' ? { type: 'hospital' } : { type: 'venue', kind }),
+      /** Poses to check: hands up to the police, an arrest (kneeling in cuffs), a pillion passenger. */
+      act: (what: 'surrender' | 'busted' | 'passenger' | 'car' | 'boat' | 'deck' | 'fall' | 'chute') => {
+        const now = performance.now();
+        if (what === 'surrender') { police.crime(1, now / 1000); surrendered = true; }
+        else if (what === 'busted') busted(now);
+        else if (what === 'passenger') testPassenger = !testPassenger;
+        else if (what === 'car') {
+          // The nearest car (not a motorbike) still on the street.
+          let car: Car | null = null;
+          for (const c of vehicles.cars) if (c.kind !== 'moto' && c.mode !== 'off' && c.mode !== 'player' && (!car || Math.hypot(c.x - state.x, c.z - state.z) < Math.hypot(car.x - state.x, car.z - state.z))) car = c;
+          if (car) enterCar(car, now);
+          return car?.kind ?? null;
+        }
+        else if (what === 'boat') { boats.launch(state.x, state.z, state.angle); boardBoat(); }
+        else if (what === 'deck') { cash = Math.max(cash, 1000); enterDeck(); }
+        else if (what === 'fall') jumpFromDeck(now);
+        else openChute(now);
+        return null;
+      },
     };
   }
   return {
@@ -3497,6 +4027,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     setQuality(mode: QualityMode) {
       qualityMode = mode;
       if (mode !== 'auto') applyLevel(MODE_LEVEL[mode]);
+      // A preset with other shadows changes every lit program: draw them again before play, not at the first wave.
+      if (!active) prewarm();
       else { levelFailures.clear(); levelBlockedUntil.clear(); }
       emitHud(performance.now());
     },

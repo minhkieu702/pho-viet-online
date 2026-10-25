@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { LAND, RIVER, SCENERY, WATER_LEVEL, inRect } from './city';
-import { ModelParts, vehicleMaterial } from './vehicle-models';
+import { BODY_SCALE, FIGURE, HAND, bakeFigure, chestMatrix, deriveStyle, palettesOf, sideX, type FigureStyle } from './figures';
+import { ModelParts, vehicleMaterial, type Vec3 } from './vehicle-models';
+import { plantFoot, reachGrip } from './vehicles';
 
 /**
  * Boats on the river: sampans rowed by someone in a conical hat, the river bus that stops at every dock, a
@@ -56,15 +58,136 @@ function hull(parts: ModelParts, length: number, beam: number, height: number, y
   rim.holes.push(hullShape(length * 0.93, beam * 0.84, bow));
   parts.add(new THREE.ExtrudeGeometry(rim, { depth: 0.14, bevelEnabled: false, curveSegments: 6 }).rotateX(-Math.PI / 2), { at: [0, y0 + height - 0.07, 0], color: trim, finish: 'paint' });
 }
+/** Deck planking in the hull's own outline (a box would poke out where the bow narrows). */
+function deck(parts: ModelParts, length: number, beam: number, bow: number, y: number, thick: number, color: string) {
+  parts.add(new THREE.ExtrudeGeometry(hullShape(length * 0.94, beam * 0.86, bow), { depth: thick, bevelEnabled: false, curveSegments: 6 }).rotateX(-Math.PI / 2), { at: [0, y, 0], color, finish: 'cloth' });
+}
 const box = (w: number, h: number, d: number) => new THREE.BoxGeometry(w, h, d);
 const cyl = (r: number, h: number, seg = 8) => new THREE.CylinderGeometry(r, r, h, seg);
 
-/** A person at the oar or the wheel: a shirt, a head and a conical hat (or a cap), good enough from the bank. */
-function sailor(parts: ModelParts, x: number, y: number, z: number, shirt: string, hat: 'non' | 'cap') {
-  parts.add(cyl(0.2, 0.62, 7), { at: [x, y + 0.31, z], color: shirt, finish: 'cloth' });
-  parts.add(new THREE.SphereGeometry(0.15, 8, 6), { at: [x, y + 0.77, z], color: '#c58f69', finish: 'cloth', smooth: true });
-  if (hat === 'non') parts.add(new THREE.ConeGeometry(0.36, 0.26, 10), { at: [x, y + 0.98, z], color: '#e8d9a8', finish: 'cloth' });
-  else parts.add(cyl(0.16, 0.1, 8), { at: [x, y + 0.9, z], color: '#2b3a55', finish: 'cloth' });
+// ---- People aboard -------------------------------------------------------------------------------------------
+
+/**
+ * A person posed once and baked into the boat's geometry (they ride along with its bob and roll). Everything is
+ * in the person's own frame: the deck they stand or sit on is y = 0, they face +z, the data's +x is their right (mirrored to -x when solved); `at`
+ * and `yaw` put that frame on the boat. `hip` is for a build of height 1 (scaled by the person's height). Feet
+ * are planted by IK; hands close on an oar (a point on the shaft and the shaft's direction through the fist) or
+ * rest just beyond the knees.
+ */
+type Aboard = {
+  style: FigureStyle;
+  at: Vec3; yaw: number;
+  hip: Vec3; lean: number; twist?: number; pitch?: number; look?: number;
+  feet: [Vec3, Vec3]; knee: Vec3; elbow: Vec3;
+  oar?: [[Vec3, Vec3], [Vec3, Vec3]];
+};
+/** vehicle-models' 'cloth' finish (roughness, metalness, lamp glow) for the baked people. */
+const CLOTH: Vec3 = [0.85, 0, 0];
+
+/** Solves and bakes one person (lo detail, vertex coloured, indexed). */
+function bakedPerson(p: Aboard) {
+  const s = BODY_SCALE, { width: w, height: h, shoulderX } = p.style;
+  const body = new THREE.Matrix4().compose(new THREE.Vector3(...p.hip).multiplyScalar(h), new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), p.lean), new THREE.Vector3(s * w, s * h, s * w))
+    .multiply(new THREE.Matrix4().makeTranslation(0, -FIGURE.hipY, 0));
+  const inv = body.clone().invert();
+  const chest = chestMatrix(body, p.twist ?? 0), chestInv = chest.clone().invert();
+  // The data is written with the right side at +x; people face +z, so their right is at -x (sideX).
+  const hint = (v: Vec3, side: number) => new THREE.Vector3(sideX(side) * v[0], v[1], v[2]);
+  const legs = ([-1, 1] as const).map((side, k) => plantFoot(body, inv, side, new THREE.Vector3(-p.feet[k][0], p.feet[k][1], p.feet[k][2]), hint(p.knee, side)));
+  const arms = ([-1, 1] as const).map((side, k) => {
+    if (p.oar) {
+      const [point, along] = p.oar[k];
+      return reachGrip(chest, chestInv, side, shoulderX, new THREE.Vector3(...point), new THREE.Vector3(...along).normalize(), hint(p.elbow, side), HAND.GRIP, 0, null);
+    }
+    const knee = new THREE.Vector3(0, -FIGURE.thigh, 0).applyMatrix4(legs[k].matrix);
+    return reachGrip(chest, chestInv, side, shoulderX, knee.add(new THREE.Vector3(sideX(side) * 0.02, 0.03, 0.09)), new THREE.Vector3(0, 0, 1), hint(p.elbow, side), HAND.RELAXED, 0.3, [0.6, 0]);
+  });
+  const place = new THREE.Matrix4().compose(new THREE.Vector3(...p.at), new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), p.yaw), new THREE.Vector3(1, 1, 1));
+  const on = (m: THREE.Matrix4) => m.clone().premultiply(place);
+  const looks = palettesOf(p.style);
+  return bakeFigure([
+    { piece: 'body', matrix: on(body), look: looks.body, pose: [p.look ?? 0, p.pitch ?? 0, p.twist ?? 0, 0] },
+    { piece: 'armL', matrix: on(arms[0].matrix), look: looks.armL, pose: arms[0].pose },
+    { piece: 'armR', matrix: on(arms[1].matrix), look: looks.armR, pose: arms[1].pose },
+    { piece: 'leg', matrix: on(legs[0].matrix), look: looks.legs, pose: legs[0].pose },
+    { piece: 'leg', matrix: on(legs[1].matrix), look: looks.legs, pose: legs[1].pose },
+  ]);
+}
+
+/** The boat (non-indexed ModelParts) and its people (indexed) as one indexed geometry for the vehicle material. */
+function withPeople(boat: THREE.BufferGeometry, people: THREE.BufferGeometry[]) {
+  const all = [boat, ...people];
+  const total = all.reduce((n, g) => n + g.getAttribute('position').count, 0);
+  const position = new Float32Array(total * 3), normal = new Float32Array(total * 3), color = new Float32Array(total * 3);
+  const paint = new Float32Array(total), finish = new Float32Array(total * 3);
+  const index: number[] = [];
+  let at = 0;
+  for (const g of all) {
+    const n = g.getAttribute('position').count;
+    position.set(g.getAttribute('position').array as Float32Array, at * 3);
+    normal.set(g.getAttribute('normal').array as Float32Array, at * 3);
+    color.set(g.getAttribute('color').array as Float32Array, at * 3);
+    if (g === boat) {
+      paint.set(g.getAttribute('paint').array as Float32Array, at);
+      finish.set(g.getAttribute('finish').array as Float32Array, at * 3);
+      for (let i = 0; i < n; i++) index.push(at + i);
+    } else {
+      for (let i = 0; i < n; i++) finish.set(CLOTH, (at + i) * 3);
+      for (const i of g.index!.array) index.push(at + i);
+    }
+    at += n;
+    g.dispose();
+  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.BufferAttribute(position, 3));
+  out.setAttribute('normal', new THREE.BufferAttribute(normal, 3));
+  out.setAttribute('color', new THREE.BufferAttribute(color, 3));
+  out.setAttribute('paint', new THREE.BufferAttribute(paint, 1));
+  out.setAttribute('finish', new THREE.BufferAttribute(finish, 3));
+  out.setIndex(index);
+  out.computeBoundingSphere();
+  return out;
+}
+
+/**
+ * The sampan's rower stands at the stern working one long oar (chèo) that pivots on the stern post, both fists on
+ * the shaft, in áo bà ba and nón lá. Returns the baked person and the oar's handle end, pivot and blade end
+ * (boat frame) so the boat can draw the oar through the hands.
+ */
+function rower(deck: number, z: number) {
+  const style = deriveStyle({ shirt: '#3f5a6a', pants: '#1d1b1a', skin: '#c58f69', hat: '#e8d9a8' }, 'sampan-rower', 'vendor', { fem: true });
+  // Handle top in front of the chest on the right, through the pivot on the stern post and down into the river.
+  const top = new THREE.Vector3(0.12, 1.06, 0.42), pivot = new THREE.Vector3(0.5, 0.2, -0.56);
+  const shaft = pivot.clone().sub(top).normalize(), up = shaft.clone().negate();
+  const at = (k: number) => top.clone().addScaledVector(shaft, k).toArray() as Vec3;
+  const person = bakedPerson({
+    style, at: [0, deck, z], yaw: 0,
+    hip: [0, 0.8, 0], lean: 0.12, twist: 0.3, pitch: -0.02, look: 0.2,
+    feet: [[-0.12, 0, 0.26], [0.14, 0, -0.24]], knee: [0.15, 0, 1], elbow: [0.6, -0.6, -0.5],
+    oar: [[at(0.38), up.toArray() as Vec3], [at(0.05), up.toArray() as Vec3]],
+  });
+  const lift = new THREE.Vector3(0, deck, z);
+  return { person, grip: top.clone().addScaledVector(shaft, -0.1).add(lift), pivot: pivot.clone().add(lift), blade: pivot.clone().addScaledVector(shaft, 0.95).add(lift) };
+}
+
+/** A passenger sitting on the deck with knees drawn up and hands on them, under a nón lá. */
+function sitter(deck: number, at: Vec3, yaw: number) {
+  const style = deriveStyle({ shirt: '#b8463a', pants: '#2a2522', skin: '#d3a179', hat: '#e8d9a8' }, 'sampan-guest', 'retiree', { fem: true });
+  return bakedPerson({
+    style, at: [at[0], deck + at[1], at[2]], yaw,
+    hip: [0, FIGURE.seatClear * BODY_SCALE, 0], lean: -0.08, pitch: 0.1, look: -0.3,
+    feet: [[-0.12, 0, 0.44], [0.12, 0, 0.46]], knee: [0.2, 1, 0.2], elbow: [0.5, -0.6, -0.4],
+  });
+}
+
+/** A fisherman squatting on the deck the way people rest everywhere in Việt Nam, forearms on his knees. */
+function squatter(deck: number, at: Vec3, yaw: number) {
+  const style = deriveStyle({ shirt: '#86a799', pants: '#3a3f48', skin: '#b98260', hat: '#e8d9a8' }, 'fisher', 'vendor', { fem: false });
+  return bakedPerson({
+    style, at: [at[0], deck + at[1], at[2]], yaw,
+    hip: [0, 0.33, -0.08], lean: 0.42, pitch: -0.3, look: 0.25,
+    feet: [[-0.15, 0, 0.12], [0.15, 0, 0.14]], knee: [0.35, 0.6, 1], elbow: [0.4, -0.8, 0.2],
+  });
 }
 
 function boatGeometry(kind: BoatKind) {
@@ -72,12 +195,15 @@ function boatGeometry(kind: BoatKind) {
   const { length: L, beam: B } = SPEC[kind];
   if (kind === 'sampan') {
     hull(parts, L, B, 0.58, -0.32, '#7a5536', '#5a3c26', 0.36);
-    parts.add(box(B * 0.86, 0.06, L * 0.84), { at: [0, 0.12, 0], color: '#8a6a46', finish: 'cloth' });
+    deck(parts, L, B, 0.36, 0.09, 0.06, '#8a6a46');
     // The arched bamboo canopy over the middle.
     parts.add(new THREE.CylinderGeometry(0.7, 0.7, 2.3, 10, 1, true, -Math.PI / 2, Math.PI).rotateX(-Math.PI / 2), { at: [0, 0.2, 0.2], color: '#b08a4e', finish: 'cloth' });
-    sailor(parts, 0, 0.14, -2.1, '#3f5a6a', 'non');
-    parts.rod([0.15, 0.85, -2.0], [0.9, -0.5, -2.9], 0.04, { color: '#8a6a46', finish: 'cloth' });
-    sailor(parts, 0.1, 0.14, 1.6, '#b8463a', 'non');
+    // The rower's oar through both fists, pivoting on a post at the stern, its blade in the water.
+    const row = rower(0.15, -2.05);
+    parts.rod(row.grip.toArray() as Vec3, row.blade.toArray() as Vec3, 0.034, { color: '#8a6a46', finish: 'cloth' });
+    parts.add(box(0.05, 0.36, 0.05), { at: [row.pivot.x + 0.02, row.pivot.y - 0.1, row.pivot.z], color: '#5a3c26', finish: 'cloth' });
+    parts.beam(row.blade.clone().lerp(row.pivot, 0.45).toArray() as Vec3, row.blade.toArray() as Vec3, 0.15, 0.03, { color: '#8a6a46', finish: 'cloth' });
+    return withPeople(parts.build(), [row.person, sitter(0.15, [0.05, 0, 1.75], 0)]);
   } else if (kind === 'waterbus') {
     hull(parts, L, B, 1.5, -0.65, '#f2f1ec', '#1f5a8a', 0.26);
     parts.add(box(B * 0.98, 0.32, L * 0.62), { at: [0, 0.32, -0.6], color: '#1f5a8a', finish: 'paint' });
@@ -133,7 +259,7 @@ function boatGeometry(kind: BoatKind) {
     parts.add(box(0.28, 0.12, 0.2), { at: [0, 0.55, L / 2 - 0.5], color: '#fff4d6', finish: 'lamp' });
   } else {
     hull(parts, L, B, 1.1, -0.55, '#2f6fa8', '#c8322a', 0.3);
-    parts.add(box(B * 0.86, 0.08, L * 0.8), { at: [0, 0.5, 0], color: '#9a7a4e', finish: 'cloth' });
+    deck(parts, L, B, 0.3, 0.46, 0.08, '#9a7a4e');
     parts.add(box(2.0, 1.7, 2.2), { at: [0, 1.4, -L / 2 + 2], color: '#e9e4d6', finish: 'paint' });
     parts.add(box(2.04, 0.6, 2.24), { at: [0, 1.75, -L / 2 + 2], color: '#2d4552', finish: 'glass' });
     parts.add(box(2.4, 0.16, 2.6), { at: [0, 2.3, -L / 2 + 2], color: '#c8322a', finish: 'paint' });
@@ -145,7 +271,8 @@ function boatGeometry(kind: BoatKind) {
       parts.add(cyl(0.24, 0.04, 12).rotateZ(Math.PI / 2), { at: [side * (B / 2 - 0.62), 0.25, L / 2 - 1.55], color: '#f4f1e6', finish: 'paint' });
       parts.add(cyl(0.12, 0.05, 10).rotateZ(Math.PI / 2), { at: [side * (B / 2 - 0.6), 0.25, L / 2 - 1.5], color: '#1d1f22', finish: 'paint' });
     }
-    sailor(parts, 0.6, 0.55, 0.2, '#86a799', 'non');
+    // Squatting by the rail, looking out over the water.
+    return withPeople(parts.build(), [squatter(0.54, [0.75, 0, 0.2], Math.PI / 2)]);
   }
   return parts.build();
 }

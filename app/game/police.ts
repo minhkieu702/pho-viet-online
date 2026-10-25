@@ -1,8 +1,11 @@
 import * as THREE from 'three';
 import { ROADS_X, ROADS_Z } from './city';
-import type { createRagdolls, RagdollBody, RagdollLook } from './ragdoll';
+import type { FallMode, HitKind, createRagdolls, RagdollBody, RagdollLook } from './ragdoll';
 import type { Car, createVehicles } from './vehicles';
-import { FIGURE, FigureBatch, PART, armGeometry, bodyGeometry, figureMaterial, legGeometry, palette, setStyle, styleOf } from './figures';
+import {
+  ARM, ARM_POSES, FIGURE, FigureBatch, HAND, chestMatrix, deriveStyle, figureGeometry, figureMaterial, gait, limbMatrix, mixArm, mixHand, newGait,
+  palettesOf, setBits, setStyle, sideX, type ArmPose, type Detail,
+} from './figures';
 
 type Ragdolls = ReturnType<typeof createRagdolls>;
 type Vehicles = ReturnType<typeof createVehicles>;
@@ -31,6 +34,10 @@ type Officer = {
   chatterAt: number;
   weapon: CopWeapon;
   swat: boolean;
+  // Animation only: where the head looks (relative to the chest), the last baton swing and the last shot.
+  headYaw: number;
+  swingAt: number;
+  firedAt: number;
 };
 export type PoliceShot = { from: THREE.Vector3; hit: boolean; damage: number; kind: CopWeapon };
 export type PlayerView = {
@@ -54,12 +61,25 @@ const LINES = {
   spikes: ['Rải đinh!', 'Chặn đường nó lại!'],
 };
 const pick = <T,>(list: T[]) => list[Math.floor(Math.random() * list.length)];
+/** Officers are drawn a touch larger than the crowd (BODY_SCALE 0.82); their ragdolls use the same scale. */
 const SCALE = 0.84;
 const HIT_RADIUS = 0.4;
 const HEIGHT = 1.8;
-const LOOK: RagdollLook = { shirt: '#2c3e66', pants: '#1f2a40', skin: '#d3a179', helmet: '#1f2a40' };
+// Công an: olive shirt and trousers, an olive peaked cap (its red band is part of the cap).
+const LOOK: RagdollLook = { shirt: '#5a6640', pants: '#3d4a2c', skin: '#d3a179', helmet: '#46532f' };
 const SWAT_LOOK: RagdollLook = { shirt: '#1d2024', pants: '#16181b', skin: '#d3a179', helmet: '#101214' };
-const RAGDOLL_SCALE = 0.72;
+const SKINS = ['#d3a179', '#c58f69', '#e0b48e', '#b98260'];
+const clamp = THREE.MathUtils.clamp;
+const wrap = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
+// Baton: carried raised and forward, lifted overhead and brought down on a strike.
+const BATON_READY: ArmPose = [-0.75, 0.14, 0.15, -1.15, 0.25, 0.2, HAND.GRIP];
+const BATON_UP: ArmPose = [-2.45, 0.3, 0.1, -1.35, 0.4, 0.35, HAND.GRIP];
+const BATON_DOWN: ArmPose = [-0.85, -0.12, 0, -0.2, 0.3, -0.3, HAND.GRIP];
+/** Arms thrown forward for a diving tackle. */
+const DIVE: ArmPose = [-2.4, 0.15, 0, -0.1, 0, 0, HAND.OPEN];
+const RUN_HAND = mixHand(HAND.RELAXED, HAND.FIST, 0.7);
+const WEAPON_BIT: Record<CopWeapon, number> = { baton: ARM.BATON, taser: ARM.TASER, pistol: ARM.PISTOL, shotgun: ARM.RIFLE, smg: ARM.RIFLE };
+
 // Range, time between shots, hit chance and damage for each police weapon.
 const GUNS: Record<Exclude<CopWeapon, 'baton'>, { range: number; cooldown: number; chance: number; damage: number }> = {
   taser: { range: 8, cooldown: 2.6, chance: 0.55, damage: 3 },
@@ -96,82 +116,148 @@ export function createPolice(
   const officers: Officer[] = Array.from({ length: OFFICERS }, (_, index) => ({
     index, state: 'off', car: null, x: 0, z: 0, yaw: 0, stride: 0, health: 80, maxHealth: 80, hitAt: -99, nextShot: 0, burst: 0, arrest: 0,
     body: null, timer: 0, pace: 0, chatterAt: 0, weapon: 'baton', swat: false, lunge: -99, pull: 0, escort: false,
+    headYaw: 0, swingAt: -99, firedAt: -99,
   }));
 
-  // Officers are three figure meshes (body, legs, arms) shared by the whole force, plus the spike strips.
-  const material = figureMaterial();
-  const bodies = new FigureBatch(bodyGeometry('police'), material, OFFICERS);
-  const legs = new FigureBatch(legGeometry(), material, OFFICERS * 2);
-  const arms = new FigureBatch(armGeometry(true), material, OFFICERS * 2);
+  // Officers are four articulated figure meshes (body, left arm, right arm, legs) shared by the whole force,
+  // plus the spike strips.
+  const materials = { body: figureMaterial('body'), arm: figureMaterial('arm'), leg: figureMaterial('leg') };
+  let detail: Detail = 'hi';
+  const bodies = new FigureBatch(figureGeometry('body', detail), materials.body, OFFICERS);
+  const armsL = new FigureBatch(figureGeometry('armL', detail), materials.arm, OFFICERS);
+  const armsR = new FigureBatch(figureGeometry('armR', detail), materials.arm, OFFICERS);
+  const legs = new FigureBatch(figureGeometry('leg', detail), materials.leg, OFFICERS * 2);
+  const batches = [bodies, armsL, armsR, legs];
   const box = new THREE.BoxGeometry(1, 1, 1);
   const spikeMaterial = new THREE.MeshStandardMaterial({ color: '#8a9096', roughness: 0.4, metalness: 0.7 });
   const spikeMesh = new THREE.InstancedMesh(box, spikeMaterial, MAX_SPIKES * 2);
   const color = new THREE.Color();
-  // Regular officers: peaked cap with a red band, short sleeves, duty belt. SWAT: helmet, vest, long sleeves.
-  setStyle(LOOK, { mask: PART.DOME | PART.CAP | PART.KIT, hair: '#1d1916', accent: LOOK.helmet!, forearm: 'skin', shin: 'pants', shoes: '#15171a', width: 1.04, height: 1.01 });
-  setStyle(SWAT_LOOK, { mask: PART.SWAT | PART.VEST, hair: '#1d1916', accent: SWAT_LOOK.helmet!, forearm: 'shirt', shin: 'pants', shoes: '#121315', width: 1.12, height: 1.02 });
-  const WEAPON_PART: Record<CopWeapon, number> = { baton: PART.BATON, taser: PART.TASER, pistol: PART.PISTOL, shotgun: PART.RIFLE, smg: PART.RIFLE };
-  const looks = officers.map(() => ({ body: new Float32Array(16), legs: new Float32Array(16), armL: new Float32Array(16), armR: new Float32Array(16) }));
+  // Regular officers: peaked cap with a red band, short-sleeved uniform, duty belt and boots. SWAT: helmet,
+  // vest, long sleeves and gloves. Each officer has his own skin tone, and his ragdoll dresses the same.
+  const dress = officers.map((o) => {
+    const skin = SKINS[(o.index * 5 + 1) % SKINS.length];
+    const police: RagdollLook = { ...LOOK, skin }, swat: RagdollLook = { ...SWAT_LOOK, skin };
+    const styles = { police: deriveStyle(police, o.index, 'police'), swat: deriveStyle(swat, o.index, 'swat') };
+    setStyle(police, styles.police);
+    setStyle(swat, styles.swat);
+    return { looks: { police, swat }, styles, style: styles.police, palettes: palettesOf(styles.police), armed: new Float32Array(8), swat: false, weapon: 'baton' as CopWeapon };
+  });
   function paint(o: Officer) {
-    const look = o.swat ? SWAT_LOOK : LOOK;
-    const style = styleOf(look);
-    const p = looks[o.index];
-    const forearm = style.forearm === 'skin' ? look.skin : look.shirt;
-    palette([look.shirt, look.pants, look.skin, style.hair, style.accent], style.mask, p.body);
-    palette([look.pants, look.pants, style.shoes], PART.STRAIGHT, p.legs);
-    palette([look.shirt, forearm, look.skin], 0, p.armL);
-    // The weapon in the right hand: a baton, a taser, a pistol or a long gun.
-    palette([look.shirt, forearm, look.skin], WEAPON_PART[o.weapon], p.armR);
+    const d = dress[o.index];
+    d.swat = o.swat;
+    d.weapon = o.weapon;
+    d.style = o.swat ? d.styles.swat : d.styles.police;
+    d.palettes = palettesOf(d.style);
+    // The weapon in the right hand (a baton, a taser, a pistol or a long gun), shown while it is in use.
+    d.armed.set(d.palettes.armR);
+    setBits(d.armed, 0, WEAPON_BIT[o.weapon], true);
   }
   officers.forEach(paint);
   for (let i = 0; i < MAX_SPIKES * 2; i++) spikeMesh.setColorAt(i, color.set(i % 2 ? '#e0b030' : '#8a9096'));
   spikeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   spikeMesh.frustumCulled = false;
   if (spikeMesh.instanceColor) spikeMesh.instanceColor.needsUpdate = true;
-  for (const mesh of [bodies.mesh, legs.mesh, arms.mesh, spikeMesh]) scene.add(mesh);
-  const base = new THREE.Matrix4(), local = new THREE.Matrix4(), out = new THREE.Matrix4();
+  for (const mesh of [...batches.map((b) => b.mesh), spikeMesh]) scene.add(mesh);
+  const base = new THREE.Matrix4(), local = new THREE.Matrix4(), chest = new THREE.Matrix4(), limbM = new THREE.Matrix4();
   const hidden = new THREE.Matrix4().makeScale(0, 0, 0);
   const quat = new THREE.Quaternion(), pos = new THREE.Vector3(), size = new THREE.Vector3();
-  const euler = new THREE.Euler();
   const bodyEuler = new THREE.Euler(0, 0, 0, 'YXZ');
-  // A limb hanging from its pivot, swung forward by `angle` and turned inward by `twist`.
-  const limb = (batch: FigureBatch, px: number, py: number, angle: number, look: Float32Array, twist = 0) => {
-    local.compose(pos.set(px, py, 0), quat.setFromEuler(euler.set(angle, 0, twist)), size.set(1, 1, 1));
-    batch.push(out.multiplyMatrices(base, local), look);
+  const walk = newGait();
+  const bodyPose = [0, 0, 0, 0], limbPose = [0, 0, 0, 0];
+  const mixL: number[] = [], mixR: number[] = [];
+  let frameDt = 0;
+  // An arm from the chest matrix: [swing, abduct, roll, elbow, twist, flex, hand], abduct and roll mirrored on the left.
+  const arm = (side: 1 | -1, a: ArmPose, look: Float32Array, shoulderX: number, kick = 0) => {
+    const sx = sideX(side);
+    limbMatrix(chest, sx * shoulderX, FIGURE.shoulderY, a[0] + kick, sx * a[1], sx * a[2], limbM);
+    limbPose[0] = a[3]; limbPose[1] = a[4]; limbPose[2] = a[5]; limbPose[3] = a[6];
+    (side > 0 ? armsR : armsL).push(limbM, look, limbPose);
+  };
+  const leg = (side: 1 | -1, thigh: number, knee: number, ankle: number, toe: number, look: Float32Array) => {
+    limbMatrix(base, sideX(side) * FIGURE.hipX, FIGURE.hipY, thigh, 0, 0, limbM);
+    limbPose[0] = knee; limbPose[1] = ankle; limbPose[2] = toe; limbPose[3] = 0;
+    legs.push(limbM, look, limbPose);
+  };
+  // An arm swinging with the stride; fists half closed at a run.
+  const stride = (out: number[], swing: number, elbow: number, run: number): ArmPose => {
+    out[0] = swing; out[1] = 0.1; out[2] = 0; out[3] = elbow; out[4] = 0.2; out[5] = 0; out[6] = mixHand(HAND.RELAXED, RUN_HAND, run);
+    return out as unknown as ArmPose;
   };
 
   function draw(o: Officer) {
     if (o.state !== 'chase' && o.state !== 'return') return;
-    const style = styleOf(o.swat ? SWAT_LOOK : LOOK);
-    // Officers lean into a run.
-    base.compose(pos.set(o.x, world.ground(o.x, o.z), o.z), quat.setFromEuler(bodyEuler.set(Math.min(0.2, o.pace * 0.03), o.yaw, 0)), size.set(SCALE * style.width, SCALE * style.height, SCALE * style.width));
-    const swing = Math.sin(o.stride) * Math.min(0.75, o.pace * 0.12);
+    if (dress[o.index].swat !== o.swat || dress[o.index].weapon !== o.weapon) paint(o);
+    const d = dress[o.index], style = d.style, p = d.palettes;
+    const sx = SCALE * style.width, sy = SCALE * style.height;
+    const run = clamp((o.pace - 1.5) / 3.5, 0, 1), go = clamp(o.pace / 2, 0, 1);
+    gait(o.stride, run, go, walk);
     const holding = o.escort;
-    const diving = o.state === 'chase' && lastTime - o.lunge < 0.45;
+    const lunge = o.state === 'chase' ? (lastTime - o.lunge) / 0.45 : 1;
+    const diving = lunge >= 0 && lunge < 1;
     const aiming = o.state === 'chase' && o.weapon !== 'baton' && !holding && !diving;
     const longGun = aiming && o.weapon !== 'taser' && o.weapon !== 'pistol';
-    const p = looks[o.index];
-    if (holding || diving) {
-      bodies.push(base, p.body);
-      limb(legs, -FIGURE.hipX, FIGURE.hipY, diving ? 0.5 : 0, p.legs);
-      limb(legs, FIGURE.hipX, FIGURE.hipY, diving ? -0.3 : 0, p.legs);
-      limb(arms, -FIGURE.shoulderX, FIGURE.shoulderY, diving ? -2.4 : -1.0, p.armL, holding ? 0.35 : 0);
-      limb(arms, FIGURE.shoulderX, FIGURE.shoulderY, diving ? -2.4 : -1.0, p.armR, holding ? -0.35 : 0);
-      return;
+    const baton = o.state === 'chase' && o.weapon === 'baton' && !holding && !diving;
+    // A diving tackle pitches the whole body forward, peaking halfway through the lunge.
+    const dive = diving ? Math.sin(Math.PI * lunge) : 0;
+    // Officers lean into a run.
+    base.compose(pos.set(o.x, world.ground(o.x, o.z) + walk.bob * sy, o.z), quat.setFromEuler(bodyEuler.set(Math.min(0.2, o.pace * 0.03) + dive * 0.65, o.yaw, 0)), size.set(sx, sy, sx));
+    // Aimers square up behind the sights; runners counter-twist with the stride.
+    const twist = aiming ? -0.08 : holding ? 0 : walk.chest;
+    // The head turns toward the player (forward when heading back to the car), pitched down onto a cuffed one.
+    const toward = o.state === 'chase' ? clamp(wrap(Math.atan2(playerX - o.x, playerZ - o.z) - o.yaw) - twist, -1.1, 1.1) : 0;
+    o.headYaw = THREE.MathUtils.damp(o.headYaw, toward, 6, frameDt);
+    // A diver keeps his eyes on the target.
+    bodyPose[0] = o.headYaw; bodyPose[1] = holding ? 0.28 : diving ? -0.7 * dive : aiming ? 0.04 : 0.02; bodyPose[2] = twist; bodyPose[3] = 0;
+    bodies.push(base, p.body, bodyPose);
+    chestMatrix(base, twist, chest);
+    // Legs: the stride, a staggered stance when standing to aim, or a push-off and a reaching front leg in a dive.
+    const still = aiming ? 1 - go : 0;
+    if (diving) {
+      leg(-1, walk.thighL + (0.45 - walk.thighL) * dive, walk.kneeL + (0.12 - walk.kneeL) * dive, walk.ankleL + (0.45 - walk.ankleL) * dive, 0, p.legs);
+      leg(1, walk.thighR + (-0.6 - walk.thighR) * dive, walk.kneeR + (0.85 - walk.kneeR) * dive, walk.ankleR, 0, p.legs);
+    } else {
+      leg(-1, walk.thighL - 0.22 * still, walk.kneeL + 0.12 * still, walk.ankleL, walk.toeL, p.legs);
+      leg(1, walk.thighR + 0.16 * still, walk.kneeR + 0.08 * still, walk.ankleR, walk.toeR, p.legs);
     }
-    bodies.push(base, p.body);
-    limb(legs, -FIGURE.hipX, FIGURE.hipY, swing, p.legs);
-    limb(legs, FIGURE.hipX, FIGURE.hipY, -swing, p.legs);
-    limb(arms, -FIGURE.shoulderX, FIGURE.shoulderY, longGun ? -1.3 : -swing * 0.8, p.armL, longGun ? 0.45 : 0);
-    limb(arms, FIGURE.shoulderX, FIGURE.shoulderY, aiming ? -1.5 : o.weapon === 'baton' && o.state === 'chase' ? -0.6 : swing * 0.8, p.armR);
+    const left = stride(mixL, walk.armL, walk.elbowL, run), right = stride(mixR, walk.armR, walk.elbowR, run);
+    const sh = style.shoulderX;
+    if (holding) {
+      // Holding a cuffed player by the arms.
+      arm(-1, ARM_POSES.ESCORT, p.armL, sh);
+      arm(1, ARM_POSES.ESCORT, p.armR, sh);
+    } else if (diving) {
+      const t = Math.min(1, lunge * 4);
+      arm(-1, mixArm(left, DIVE, t, mixL), p.armL, sh);
+      arm(1, mixArm(right, DIVE, t, mixR), p.armR, sh);
+    } else if (aiming) {
+      // Two hands on a pistol or taser at shoulder height, or a long gun shouldered; each shot kicks the muzzle up.
+      const kick = -0.12 * Math.max(0, 1 - (lastTime - o.firedAt) / 0.14);
+      arm(-1, longGun ? ARM_POSES.RIFLE_SUPPORT : ARM_POSES.AIM_SUPPORT, p.armL, sh, kick);
+      arm(1, longGun ? ARM_POSES.RIFLE : ARM_POSES.AIM, d.armed, sh, kick);
+    } else if (baton) {
+      // Baton raised and ready; a strike lifts it overhead and brings it down, then it comes back up.
+      const t = lastTime - o.swingAt;
+      const pose = t < 0.08 ? mixArm(BATON_READY, BATON_UP, t / 0.08, mixR)
+        : t < 0.26 ? mixArm(BATON_UP, BATON_DOWN, (t - 0.08) / 0.18, mixR)
+          : t < 0.65 ? mixArm(BATON_DOWN, BATON_READY, (t - 0.26) / 0.39, mixR)
+            : mixArm(BATON_READY, right, 0.15 * run, mixR);
+      arm(-1, left, p.armL, sh);
+      arm(1, pose, d.armed, sh);
+    } else {
+      arm(-1, left, p.armL, sh);
+      arm(1, right, p.armR, sh);
+    }
   }
 
   function crewOf(car: Car) { return officers.filter((o) => o.car === car && o.state !== 'off'); }
 
-  function knock(o: Officer, vx: number, vy: number, vz: number, time: number) {
+  function knock(o: Officer, vx: number, vy: number, vz: number, time: number, hit?: { x: number; y: number; z: number } | null, mode?: FallMode, kind?: HitKind) {
     o.state = 'down';
     o.timer = time + 9;
-    o.body = ragdolls.spawn({ x: o.x, y: world.ground(o.x, o.z), z: o.z, yaw: o.yaw, scale: RAGDOLL_SCALE, look: o.swat ? SWAT_LOOK : LOOK, velocity: { x: vx, y: vy, z: vz } });
+    // The ragdoll has the standing officer's scale and build (its style is remembered for the look); the blow
+    // lands where it hit, and a killed officer falls limp.
+    const d = dress[o.index];
+    o.body = ragdolls.spawn({ x: o.x, y: world.ground(o.x, o.z), z: o.z, yaw: o.yaw, scale: SCALE, look: o.swat ? d.looks.swat : d.looks.police, velocity: { x: vx, y: vy, z: vz }, hit, mode, kind });
     return o.body;
   }
 
@@ -254,7 +340,8 @@ export function createPolice(
     }
     if (!best) best = officers.find((o) => o.state === 'off') ?? null;
     if (!best) return;
-    Object.assign(best, { state: 'chase', escort: true, x: x - Math.sin(yaw) * 0.7, z: z - Math.cos(yaw) * 0.7, yaw, pace: 0 });
+    // Behind the kneeling player and a little to their right (-x of their facing), clear of their feet.
+    Object.assign(best, { state: 'chase', escort: true, x: x - Math.sin(yaw) * 0.85 - Math.cos(yaw) * 0.25, z: z - Math.cos(yaw) * 0.85 + Math.sin(yaw) * 0.25, yaw, pace: 0 });
     if (!best.car) best.maxHealth = best.health = 80;
     say(`cop${best.index}`, pick(LINES.arrest), () => (best.state === 'chase' ? { x: best.x, y: 2.1, z: best.z } : null));
   }
@@ -278,7 +365,7 @@ export function createPolice(
       : wanted === 3 ? (Math.random() < 0.5 ? 'shotgun' : 'pistol')
       : swat ? 'smg' : 'shotgun';
     const maxHealth = swat ? 140 : 80;
-    Object.assign(o, { state: 'seated', car, health: maxHealth, maxHealth, arrest: 0, body: null, hitAt: -99, weapon, swat, burst: 0, lunge: -99, pull: 0, escort: false });
+    Object.assign(o, { state: 'seated', car, health: maxHealth, maxHealth, arrest: 0, body: null, hitAt: -99, weapon, swat, burst: 0, lunge: -99, pull: 0, escort: false, headYaw: 0, swingAt: -99, firedAt: -99 });
     paint(o);
   }
 
@@ -355,6 +442,17 @@ export function createPolice(
     reset,
     setEnabled(on: boolean) { enabled = on; if (!on) reset(); },
     restrain,
+    /** Officers on foot (read-only outside: for debugging and automated checks). */
+    officers: officers as readonly Officer[],
+    /** Figure level of detail: 'hi' at quality levels 0-2, 'lo' at 3-5. */
+    setDetail(next: Detail) {
+      if (next === detail) return;
+      detail = next;
+      bodies.setGeometry(figureGeometry('body', detail));
+      armsL.setGeometry(figureGeometry('armL', detail));
+      armsR.setGeometry(figureGeometry('armR', detail));
+      legs.setGeometry(figureGeometry('leg', detail));
+    },
     /** True when (x, z) is on a spike strip; the strip is used up. */
     onSpikes(x: number, z: number) {
       for (let i = 0; i < spikes.length; i++) {
@@ -385,12 +483,15 @@ export function createPolice(
     near(x: number, z: number, radius: number, callback: (o: Officer) => void) {
       for (const o of officers) if ((o.state === 'chase' || o.state === 'return') && (o.x - x) ** 2 + (o.z - z) ** 2 < radius * radius) callback(o);
     },
-    /** Applies damage; officers drop as ragdolls at zero health. Attacking police is always a crime. */
-    damage(o: Officer, amount: number, vx: number, vy: number, vz: number, time: number, force = false) {
+    /**
+     * Applies damage; officers drop as ragdolls at zero health (limp when killed, bracing when knocked over).
+     * `at` is the world point that was hit, if known. Attacking police is always a crime.
+     */
+    damage(o: Officer, amount: number, vx: number, vy: number, vz: number, time: number, force = false, at?: { x: number; y: number; z: number } | null, kind?: HitKind) {
       o.health -= o.swat ? amount * 0.7 : amount;
       o.hitAt = time;
       crime(3, time);
-      if (o.health <= 0 || force) { knock(o, vx, vy, vz, time); return true; }
+      if (o.health <= 0 || force) { knock(o, vx, vy, vz, time, at, o.health <= 0 ? 'limp' : undefined, kind); return true; }
       return false;
     },
     forEachUnit(callback: (x: number, z: number, onFoot: boolean) => void) {
@@ -402,6 +503,7 @@ export function createPolice(
     },
     update(dt: number, time: number, player: PlayerView) {
       lastTime = time;
+      frameDt = dt;
       playerX = player.x;
       playerZ = player.z;
       const called = reported;
@@ -480,7 +582,7 @@ export function createPolice(
       const leadX = player.x + Math.sin(player.heading) * player.speed * 0.35;
       const leadZ = player.z + Math.cos(player.heading) * player.speed * 0.35;
       const chasers = officers.filter((o) => o.state === 'chase');
-      for (const batch of [bodies, legs, arms]) batch.begin();
+      for (const batch of batches) batch.begin();
       for (const o of officers) {
         if (o.state === 'down') {
           if (time > o.timer || !o.body || o.body.removed) {
@@ -545,6 +647,7 @@ export function createPolice(
             // Up close they swing a baton, which also stops the player from simply walking off.
             if (!player.down && !player.surrendered && !inVehicle && d < 1.3 && time > o.nextShot && (o.weapon === 'baton' || Math.random() < 0.4)) {
               o.nextShot = time + 1.1 + Math.random() * 0.5;
+              o.swingAt = time;
               strikes++;
             }
             if (gun && !player.down && !player.surrendered && d < gun.range && d > 1.6 && time > o.nextShot && world.sight(o.x, o.z, player.x, player.z)) {
@@ -553,7 +656,8 @@ export function createPolice(
               else { o.burst = 0; o.nextShot = time + gun.cooldown * (1 - wanted * 0.06) + Math.random() * 0.6; }
               const moving = inVehicle && player.speed > 8 ? 0.5 : 1;
               const near = o.weapon === 'shotgun' ? Math.max(0.3, 1 - d / gun.range) : 1;
-              shots.push({ from: new THREE.Vector3(o.x + Math.sin(o.yaw) * 0.6, 1.35, o.z + Math.cos(o.yaw) * 0.6), hit: Math.random() < (gun.chance + wanted * 0.03) * moving, damage: gun.damage * near, kind: o.weapon });
+              o.firedAt = time;
+              shots.push({ from: new THREE.Vector3(o.x + Math.sin(o.yaw) * 0.6, world.ground(o.x, o.z) + 1.35, o.z + Math.cos(o.yaw) * 0.6), hit: Math.random() < (gun.chance + wanted * 0.03) * moving, damage: gun.damage * near, kind: o.weapon });
             }
           }
         } else if (o.state === 'return') {
@@ -573,7 +677,7 @@ export function createPolice(
           spikeMesh.setMatrixAt(i * 2 + k, local);
         }
       }
-      for (const batch of [bodies, legs, arms]) batch.end();
+      for (const batch of batches) batch.end();
       spikeMesh.instanceMatrix.needsUpdate = true;
       // Helicopter.
       const flying = wanted >= 4 && !player.down;
@@ -620,10 +724,10 @@ export function createPolice(
       scene.remove(heli, spot);
       for (const mesh of heliParts) mesh.geometry.dispose();
       heliPaint.dispose(); heliDark.dispose(); heliGlass.dispose(); spotMaterial.dispose(); spotGeometry.dispose();
-      for (const batch of [bodies, legs, arms]) { scene.remove(batch.mesh); batch.dispose(); }
+      for (const batch of batches) { scene.remove(batch.mesh); batch.dispose(); }
       scene.remove(spikeMesh);
       spikeMesh.dispose();
-      material.dispose();
+      for (const m of Object.values(materials)) m.dispose();
       spikeMaterial.dispose();
       box.dispose();
     },

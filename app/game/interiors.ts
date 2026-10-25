@@ -13,12 +13,24 @@ export type InteriorKind = 'gun' | 'bike' | 'hospital' | VenueRoom;
 type Vec3 = [number, number, number];
 /** `grow`: the object is centred on the product (a gun holder, a turntable) so it can scale and turn in place. */
 type Product = { id: string; object: THREE.Object3D; center: THREE.Vector3; eye: THREE.Vector3; tag: THREE.Sprite | null; spin: number; grow: boolean; label: () => string };
-/** `dancers` bob to the music; `lights` are glow materials whose colour cycles (dance floor, beams). */
-type Room = { group: THREE.Group; eye: THREE.Vector3; look: THREE.Vector3; products: Map<string, Product>; clerk: THREE.Object3D | null; dancers?: THREE.Object3D[]; lights?: THREE.MeshBasicMaterial[] };
+/** What a person in a room is doing: standing about, serving (hands clasped), chatting or dancing. */
+export type RoomAct = 'idle' | 'clerk' | 'chat' | 'dance';
+/**
+ * A person in a room: its root object, and `pose`, which animates the figure for a moment of the room's clock
+ * and returns how far to raise it (m) so its feet stay on the floor.
+ */
+export type RoomPerson = { group: THREE.Object3D; pose: (time: number, act: RoomAct) => number };
+/** Someone in a room, what they are doing and the floor height they stand on. */
+type Occupant = { figure: RoomPerson; act: RoomAct; floor: number };
+/**
+ * `people` are posed while the room is open (`dancers` also turn about); `lights` are glow materials whose
+ * colour cycles (dance floor, beams).
+ */
+type Room = { group: THREE.Group; eye: THREE.Vector3; look: THREE.Vector3; products: Map<string, Product>; people: Occupant[]; dancers?: THREE.Object3D[]; lights?: THREE.MeshBasicMaterial[] };
 export type InteriorFactories = {
   gun: (id: Exclude<WeaponId, 'fists'>) => THREE.Object3D;
   bike: (id: BikeId, color: string) => THREE.Object3D;
-  person: (shirt: string, hair?: string) => THREE.Object3D;
+  person: (shirt: string, hair?: string) => RoomPerson;
 };
 export type ShopInfo = { owned: WeaponId[]; bike: BikeId };
 
@@ -146,12 +158,24 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     const sprite = tagAt ? tag(r.group, tagAt, o.tagScale ?? 0.5) : null;
     r.products.set(id, { id, object, center: world(r.group, center), eye: world(r.group, eye), tag: sprite, spin: o.spin ?? 0, grow: o.grow ?? false, label });
   };
+  /** Puts a person in a room at `at`, facing `yaw`, doing `act`. */
+  const person = (r: Room, shirt: string, hair: string, at: Vec3, yaw = 0, act: RoomAct = 'idle') => {
+    const figure = make.person(shirt, hair);
+    figure.group.position.set(...at);
+    figure.group.rotation.y = yaw;
+    figure.group.userData.yaw = yaw;
+    r.group.add(figure.group);
+    r.people.push({ figure, act, floor: at[1] });
+    if (act === 'dance') r.dancers!.push(figure.group);
+    figure.group.position.y = at[1] + figure.pose(0, act);
+    return figure.group;
+  };
   const tyre = new THREE.TorusGeometry(0.32, 0.11, 8, 18);
   geometries.push(tyre);
   let info: ShopInfo = { owned: ['fists'], bike: 'scooter' };
 
   // ---- Gun store: pegboard wall of guns, a glass counter, ammo shelves, posters and a neon sign. ----
-  const gun: Room = { group: room(0), eye: new THREE.Vector3(), look: new THREE.Vector3(), products: new Map(), clerk: null };
+  const gun: Room = { group: room(0), eye: new THREE.Vector3(), look: new THREE.Vector3(), products: new Map(), people: [] };
   {
     const g = gun.group;
     shell(g, 10, 8, 3.4, '#5a4636', '#68736c', '#3f423e');
@@ -206,15 +230,13 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     // A shooting target poster, a flag and a camouflage net on the right wall.
     sign(g, [{ text: '◎', size: 120, color: '#c0392b' }, { text: 'TẬP BẮN MỖI NGÀY', size: 30, color: '#233b32' }], '#f2ede0', [4.86, 1.9, -1.4], 1.6, -PI / 2);
     cube(g, '#4b5a35', [4.85, 2.6, 1.4], [0.04, 1.2, 2.2]);
-    gun.clerk = make.person('#3f4a3a', '#1d1916');
-    gun.clerk.position.set(1.2, 0, -2.45);
-    g.add(gun.clerk);
+    person(gun, '#3f4a3a', '#1d1916', [1.2, 0, -2.45], 0, 'clerk');
     gun.eye.copy(world(g, [0, 2.15, 3.7]));
     gun.look.copy(world(g, [0, 1.55, -3.2]));
   }
 
   // ---- Motorbike showroom: turntables in an arc, the horse in a straw stall, a repair corner. ----
-  const bike: Room = { group: room(1), eye: new THREE.Vector3(), look: new THREE.Vector3(), products: new Map(), clerk: null };
+  const bike: Room = { group: room(1), eye: new THREE.Vector3(), look: new THREE.Vector3(), products: new Map(), people: [] };
   {
     const g = bike.group;
     shell(g, 16, 10, 4, '#e6e2d6', '#f1efe8');
@@ -265,16 +287,13 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     for (let i = 0; i < 4; i++) put(repair, tyre, mat('#1c1f21', 0.9), [-7.4, 0.11 + i * 0.22, -2.8], [1, 1, 1], [PI / 2, 0, 0]);
     for (let i = 0; i < 3; i++) drum(repair, i % 2 ? '#c0392b' : '#e2b53a', [-5.4 + i * 0.32, 1.04, -4.25], 0.11, 0.3);
     product(bike, 'repair', repair, [-6.6, 1.1, -4], [-4.6, 2.0, -0.6], () => 'Sửa xe\n', null);
-    bike.clerk = make.person('#2f5a48', '#2a2220');
-    bike.clerk.position.set(-4.2, 0, -3.8);
-    bike.clerk.rotation.y = 0.5;
-    g.add(bike.clerk);
+    person(bike, '#2f5a48', '#2a2220', [-4.2, 0, -3.8], 0.5, 'clerk');
     bike.eye.copy(world(g, [0, 2.7, 4.6]));
     bike.look.copy(world(g, [0, 0.9, -2]));
   }
 
   // ---- Hospital: reception, waiting chairs, a bed with a curtain and a monitor, a medicine cabinet. ----
-  const hospital: Room = { group: room(2), eye: new THREE.Vector3(), look: new THREE.Vector3(), products: new Map(), clerk: null };
+  const hospital: Room = { group: room(2), eye: new THREE.Vector3(), look: new THREE.Vector3(), products: new Map(), people: [] };
   {
     const g = hospital.group;
     shell(g, 12, 9, 3.4, '#cfd9d6', '#eef3f1', '#f4f6f4');
@@ -313,13 +332,8 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     for (let shelf = 0; shelf < 3; shelf++) for (let i = 0; i < 6; i++) drum(g, ['#e05a5a', '#f2c94c', '#5e9fd0', '#7fc4b0'][(i + shelf) % 4], [-5.1 + i * 0.28, 0.95 + shelf * 0.6, -4.2], 0.06, 0.22);
     cube(g, '#e05a5a', [-4.4, 2.75, -4.05], [0.3, 0.08, 0.01]);
     cube(g, '#e05a5a', [-4.4, 2.75, -4.05], [0.08, 0.3, 0.01]);
-    hospital.clerk = make.person('#f2f2ee', '#2a2220');
-    hospital.clerk.position.set(-3.6, 0, -2.0);
-    g.add(hospital.clerk);
-    const doctor = make.person('#dfe8ea', '#1d1916');
-    doctor.position.set(2.1, 0, -2.3);
-    doctor.rotation.y = -0.6;
-    g.add(doctor);
+    person(hospital, '#f2f2ee', '#2a2220', [-3.6, 0, -2.0], 0, 'clerk');
+    person(hospital, '#dfe8ea', '#1d1916', [2.1, 0, -2.3], -0.6, 'chat');
     hospital.eye.copy(world(g, [0.5, 2.3, 3.9]));
     hospital.look.copy(world(g, [0, 1.1, -2.6]));
   }
@@ -330,22 +344,13 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     const def = VENUE_SERVICES[venue].services.find((x) => x.id === id)!;
     return () => `${def.name}\n${formatCash(def.price)}`;
   };
-  const venueRoom = (index: number): Room => ({ group: room(index), eye: new THREE.Vector3(), look: new THREE.Vector3(), products: new Map(), clerk: null, dancers: [], lights: [] });
+  const venueRoom = (index: number): Room => ({ group: room(index), eye: new THREE.Vector3(), look: new THREE.Vector3(), products: new Map(), people: [], dancers: [], lights: [] });
   /** A glow material of its own (so it can change colour without touching others). */
   const light = (r: Room, color: string) => {
     const m = new THREE.MeshBasicMaterial({ color, toneMapped: false });
     materials.push(m);
     r.lights!.push(m);
     return m;
-  };
-  const person = (r: Room, shirt: string, hair: string, at: Vec3, yaw = 0, dancing = false) => {
-    const figure = make.person(shirt, hair);
-    figure.position.set(...at);
-    figure.rotation.y = yaw;
-    figure.userData.yaw = yaw;
-    r.group.add(figure);
-    if (dancing) r.dancers!.push(figure);
-    return figure;
   };
 
   // Bar: counter with stools, glowing bottle shelves, beer taps, cocktails, a neon sign.
@@ -384,9 +389,9 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     g.add(bottles);
     for (let i = 0; i < 3; i++) drum(bottles, glow('#c98a3a'), [3.2 + i * 0.25, 2.47, -3.68], 0.09, 0.42);
     product(bar, 'whisky', bottles, [3.45, 2.4, -3.6], [2.4, 2.3, -0.3], service('bar', 'whisky'), [3.45, 2.95, -3.5], { tagScale: 0.34 });
-    bar.clerk = person(bar, '#1d1d22', '#1d1916', [0.4, 0, -2.5]);
-    person(bar, '#c9493b', '#3a2a22', [-2.9, 0, -0.35], PI + 0.4);
-    person(bar, '#3f6f9f', '#2a2220', [2.95, 0, -0.35], PI - 0.4);
+    person(bar, '#1d1d22', '#1d1916', [0.4, 0, -2.5], 0, 'clerk');
+    person(bar, '#c9493b', '#3a2a22', [-2.9, 0, -0.35], PI + 0.4, 'chat');
+    person(bar, '#3f6f9f', '#2a2220', [2.95, 0, -0.35], PI - 0.4, 'chat');
     bar.eye.copy(world(g, [0, 2.1, 3.6]));
     bar.look.copy(world(g, [0, 1.4, -3]));
   }
@@ -417,9 +422,9 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     product(karaoke, 'vip', sofa, [0, 0.5, 1.2], [2.6, 2.6, -1.6], service('karaoke', 'vip'), [0, 1.35, 0.5], { tagScale: 0.36 });
     put(g, new THREE.IcosahedronGeometry(0.28, 1), glow('#e8ecf2'), [0, 2.85, -0.6], [1, 1, 1]);
     for (const [x, color] of [[-2, '#ff4f8b'], [2, '#3dd6ff']] as const) put(g, new THREE.ConeGeometry(0.7, 2.6, 16, 1, true), (() => { const m = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.12, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }); materials.push(m); return m; })(), [x, 1.9, -1.5], [1, 1, 1], [0.15, 0, x > 0 ? -0.2 : 0.2]);
-    person(karaoke, '#b04dff', '#1d1916', [-0.8, 0, -1.8], 0.2, true);
-    person(karaoke, '#ffc23d', '#3a2a22', [0.8, 0, -1.9], -0.2, true);
-    karaoke.clerk = person(karaoke, '#1d1d22', '#1d1916', [3.6, 0, -2.4], -0.6);
+    person(karaoke, '#b04dff', '#1d1916', [-0.8, 0, -1.8], 0.2, 'dance');
+    person(karaoke, '#ffc23d', '#3a2a22', [0.8, 0, -1.9], -0.2, 'dance');
+    person(karaoke, '#1d1d22', '#1d1916', [3.6, 0, -2.4], -0.6, 'clerk');
     karaoke.eye.copy(world(g, [2.9, 2.75, 3.1]));
     karaoke.look.copy(world(g, [-0.4, 1.3, -2.2]));
   }
@@ -438,12 +443,12 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     cube(g, '#1d1d26', [0, 0.6, -4.2], [3.2, 1.2, 0.9]);
     cube(g, light(club, '#3dd6ff'), [0, 0.6, -3.74], [3.0, 0.08, 0.02]);
     for (const x of [-0.8, 0.8]) drum(g, '#2a2a30', [x, 1.24, -4.2], 0.28, 0.04);
-    person(club, '#1d1d22', '#1d1916', [0, 0, -4.75], 0, true);
+    person(club, '#1d1d22', '#1d1916', [0, 0, -4.75], 0, 'dance');
     for (const x of [-5.2, 5.2]) for (let k = 0; k < 3; k++) cube(g, '#16161c', [x, 0.6 + k * 1.1, -4.3], [1.2, 1.05, 0.9]);
     const beams = ['#ff4f8b', '#3dd6ff', '#7dff9b', '#b04dff'].map((c) => { const m = new THREE.MeshBasicMaterial({ color: c, transparent: true, opacity: 0.16, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }); materials.push(m); return m; });
     beams.forEach((m, i) => put(g, new THREE.ConeGeometry(0.9, 4.1, 16, 1, true), m, [-4.5 + i * 3, 2.1, -1.4], [1, 1, 1], [0.12 * (i % 2 ? 1 : -1), 0, 0.25 * (i - 1.5)]));
     const shirts = ['#ff4f8b', '#3dd6ff', '#f2efe6', '#b04dff', '#ffc23d', '#2f3a48', '#7dff9b', '#c9493b'];
-    shirts.forEach((shirt, i) => person(club, shirt, i % 2 ? '#1d1916' : '#3a2a22', [-2.2 + (i % 4) * 1.45, 0.04, -2.3 + Math.floor(i / 4) * 1.6], (i * 1.3) % (PI * 2), true));
+    shirts.forEach((shirt, i) => person(club, shirt, i % 2 ? '#1d1916' : '#3a2a22', [-2.2 + (i % 4) * 1.45, 0.04, -2.3 + Math.floor(i / 4) * 1.6], (i * 1.3) % (PI * 2), 'dance'));
     const booth = new THREE.Group();
     g.add(booth);
     cube(booth, '#4a1030', [5.4, 0.3, 1.6], [2, 0.6, 3.2]);
@@ -451,7 +456,7 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     cube(booth, '#1d1d22', [4.3, 0.42, 1.6], [0.9, 0.06, 1.6]);
     for (let i = 0; i < 4; i++) drum(booth, glow('#ffc23d'), [4.1 + (i % 2) * 0.35, 0.58, 1.1 + i * 0.3], 0.06, 0.28);
     product(club, 'vip', booth, [5, 0.7, 1.6], [2.4, 2.2, 3.4], service('club', 'vip'), [5, 1.9, 1.6], { tagScale: 0.4 });
-    club.clerk = person(club, '#1d1d22', '#1d1916', [-6, 0, 2.6], 0.6);
+    person(club, '#1d1d22', '#1d1916', [-6, 0, 2.6], 0.6, 'clerk');
     club.eye.copy(world(g, [0, 2.9, 4.6]));
     club.look.copy(world(g, [0, 1.0, -2]));
   }
@@ -482,7 +487,7 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
       drum(g, '#8a6f52', [x, 0.3, -3.5], 0.3, 0.6);
       put(g, new THREE.DodecahedronGeometry(0.55, 0), mat('#5f9a55'), [x, 1.0, -3.5], [1, 1.3, 1]);
     }
-    spa.clerk = person(spa, '#8fbfae', '#1d1916', [1.0, 0, -3.0]);
+    person(spa, '#8fbfae', '#1d1916', [1.0, 0, -3.0], 0, 'clerk');
     spa.eye.copy(world(g, [0, 2.1, 3.6]));
     spa.look.copy(world(g, [0, 1.0, -2.4]));
   }
@@ -514,7 +519,7 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     product(motel, 'night', window_, [-3.9, 1.7, -0.3], [-1.4, 1.9, 1.4], service('motel', 'night'), [-3.6, 2.6, -0.6], { tagScale: 0.36 });
     put(g, cyl, mat('#f2f2ee'), [0, 2.95, 0.5], [0.08, 0.1, 0.08]);
     for (let i = 0; i < 3; i++) cube(g, '#f2f2ee', [0, 2.88, 0.5], [1.1, 0.02, 0.14], [0, (i * PI) / 3, 0]);
-    motel.clerk = person(motel, '#c95a5a', '#1d1916', [2.6, 0, 1.2], -2.2);
+    person(motel, '#c95a5a', '#1d1916', [2.6, 0, 1.2], -2.2, 'clerk');
     motel.eye.copy(world(g, [0.4, 2.0, 3.2]));
     motel.look.copy(world(g, [0, 0.9, -1.8]));
   }
@@ -523,8 +528,8 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
   // Price tags get their text now that every product exists.
   // The customer: the player, seen from behind just inside the door.
   const visitor = make.person('#e77641');
-  scene.add(visitor);
-  visitor.visible = false;
+  scene.add(visitor.group);
+  visitor.group.visible = false;
   let current: InteriorKind | null = null;
   let hovered: string | null = null;
   const tmp = new THREE.Vector3();
@@ -540,11 +545,11 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
     show(kind: InteriorKind | null) {
       current = kind;
       for (const [k, r] of Object.entries(rooms)) r.group.visible = k === kind;
-      visitor.visible = kind !== null;
+      visitor.group.visible = kind !== null;
       if (kind) {
         const r = rooms[kind];
-        visitor.position.copy(r.eye).setY(0).add(tmp.set(-1.9, 0, -2.9));
-        visitor.rotation.y = PI;
+        visitor.group.position.copy(r.eye).setY(0).add(tmp.set(-1.9, 0, -2.9));
+        visitor.group.rotation.y = PI;
       }
     },
     /** Who owns what, for the price tags. */
@@ -581,19 +586,19 @@ export function createInteriors(scene: THREE.Scene, make: InteriorFactories) {
         if (p.spin) p.object.rotation.y += dt * p.spin * (on ? 2.2 : 1);
         else p.object.rotation.y = on ? p.object.rotation.y + dt * 0.9 : THREE.MathUtils.damp(p.object.rotation.y, 0, 6, dt);
       }
-      // The clerk shifts their weight now and then.
-      if (r.clerk) r.clerk.rotation.z = Math.sin(time * 0.8) * 0.02;
-      // Dancers bounce and sway to the beat; the dance floor and beams cycle colour.
+      // People breathe, shift their weight, look round, talk and dance (feet kept on the floor) and the player
+      // waits by the door; dancers also turn about. The dance floor and beams cycle colour.
+      for (const o of r.people) o.figure.group.position.y = o.floor + o.figure.pose(time, o.act);
+      visitor.group.position.y = visitor.pose(time, 'idle');
       r.dancers?.forEach((d, i) => {
-        d.position.y = Math.abs(Math.sin(time * 4.2 + i * 1.7)) * 0.12;
-        d.rotation.z = Math.sin(time * 2.1 + i) * 0.08;
+        d.rotation.z = Math.sin(time * 2.1 + i) * 0.03;
         d.rotation.y = d.userData.yaw + Math.sin(time * 1.3 + i * 2.1) * 0.6;
       });
       r.lights?.forEach((m, i) => m.color.setHSL((time * 0.12 + i * 0.25) % 1, 0.9, 0.58));
     },
     dispose() {
       for (const r of Object.values(rooms)) scene.remove(r.group);
-      scene.remove(visitor);
+      scene.remove(visitor.group);
       geometries.forEach((g) => g.dispose());
       materials.forEach((m) => m.dispose());
       textures.forEach((t) => t.dispose());

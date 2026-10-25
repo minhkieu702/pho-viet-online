@@ -3,7 +3,7 @@ import { BUILDINGS, COLLIDERS, LAMPS, LAND, PLOTS, RIVER, RIVER_BED, ROADS_X, RO
 import { buildSkyline } from './skyline';
 import { APPROACHES, lightFor, type Light } from './signals';
 
-export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number };
+export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number; top?: number };
 
 /** Sidewalks stand this much above the carriageway, behind a stone curb. */
 export const CURB_HEIGHT = 0.14;
@@ -50,6 +50,13 @@ export function groundHeight(x: number, z: number) {
   if (x > 14.5 && x < 43.5 && z > 29.5 && z < 46.5) return 0.27;
   return onSidewalk(x, z) ? 0.1 + CURB_HEIGHT : 0.1;
 }
+
+/** Seat tops of the street furniture above its base (the base is world y 0 on the road, sunk 0.08 below the asphalt). */
+export const SEAT_TOP = { bench: 0.46, stool: 0.42 } as const;
+/** How far furniture at (x, z) is raised: it stands on the walkable surface there (sidewalk, lawn, plaza). */
+export const furnitureLift = (x: number, z: number) => groundHeight(x, z) - 0.1;
+/** Height of a seat above the ground a sitter at (x, z) stands on (groundHeight there): what npcs sit at. */
+export const seatHeight = (seat: keyof typeof SEAT_TOP, x: number, z: number) => SEAT_TOP[seat] + furnitureLift(x, z) - groundHeight(x, z);
 
 type Kind = 'box' | 'cylinder' | 'cone' | 'ball' | 'bead' | 'gable' | 'hip' | 'pyramid' | 'puff' | 'trunk' | 'frond';
 /** Material families: each is one shared material, so colour variety costs no extra draw calls. */
@@ -134,7 +141,10 @@ export function buildWorld(scene: THREE.Scene) {
   const root = new THREE.Group();
   root.name = 'Pho Viet neighbourhood';
   scene.add(root);
-  const colliders: Collider[] = COLLIDERS.map((c) => ({ ...c }));
+  // Props on a sidewalk are drawn on the raised pavement: their tops are that much higher too.
+  const colliders: Collider[] = COLLIDERS.map((c) => (c.top === undefined ? { ...c } : { ...c, top: c.top + (onSidewalk((c.minX + c.maxX) / 2, (c.minZ + c.maxZ) / 2) ? CURB_HEIGHT : 0) }));
+  /** Bench seats, stools and café tables as low boxes with a top, for ragdolls only (people walk round them anyway). */
+  const seats: Collider[] = [];
   const textures: THREE.Texture[] = [];
   const materials: THREE.Material[] = [];
   const geometries: THREE.BufferGeometry[] = [];
@@ -293,20 +303,32 @@ export function buildWorld(scene: THREE.Scene) {
     }
   }
 
-  // ---- Small furniture shared by many places. ----
+  // ---- Small furniture shared by many places (drawn with `lift` = furnitureLift where it stands). ----
+  /** A low box with a top (axis-aligned footprint w x d turned by yaw) that a falling body can land on. */
+  const seatBox = (x: number, z: number, w: number, d: number, yaw: number, top: number) => {
+    const across = Math.abs(Math.sin(yaw)) > 0.5, hw = (across ? d : w) / 2, hd = (across ? w : d) / 2;
+    seats.push({ minX: x - hw, maxX: x + hw, minZ: z - hd, maxZ: z + hd, top: top + lift });
+  };
+  // Seat top SEAT_TOP.bench (npcs.ts sits people on it), so a seated adult's feet rest on the ground.
   function bench(x: number, z: number, yaw = 0) {
     const c = Math.cos(yaw), s = Math.sin(yaw);
     const part = (lx: number, ly: number, lz: number, w: number, h: number, d: number, color: string) => box(color, x + lx * c + lz * s, ly, z - lx * s + lz * c, w, h, d, yaw);
-    part(0, 0.7, 0, 2.7, 0.22, 0.8, '#b58255');
-    part(0, 1.3, -0.35, 2.7, 0.85, 0.15, '#b58255');
-    part(-1, 0.35, 0, 0.12, 0.7, 0.65, '#51645d');
-    part(1, 0.35, 0, 0.12, 0.7, 0.65, '#51645d');
+    part(0, SEAT_TOP.bench - 0.06, 0, 2.7, 0.12, 0.6, '#b58255');
+    part(0, 0.86, -0.27, 2.7, 0.56, 0.1, '#b58255');
+    part(-1, 0.2, 0, 0.12, 0.4, 0.5, '#51645d');
+    part(1, 0.2, 0, 0.12, 0.4, 0.5, '#51645d');
+    seatBox(x, z, 2.7, 0.6, yaw, SEAT_TOP.bench);
   }
+  /** A small plastic café stool (ghế nhựa), as on every Vietnamese sidewalk: a square seat on splayed legs. */
   function stool(x: number, z: number, color = '#cf6251') {
-    box(color, x, 0.5, z, 0.65, 0.16, 0.65);
-    for (const dx of [-0.23, 0.23]) for (const dz of [-0.23, 0.23]) box(color, x + dx, 0.24, z + dz, 0.1, 0.48, 0.1);
+    const top = SEAT_TOP.stool;
+    box(color, x, top - 0.025, z, 0.36, 0.05, 0.36);
+    box(color, x, top - 0.075, z, 0.33, 0.05, 0.33);
+    for (const dx of [-0.13, 0.13]) for (const dz of [-0.13, 0.13]) box(color, x + dx * 1.08, (top - 0.08) / 2, z + dz * 1.08, 0.05, top - 0.08, 0.05);
+    seatBox(x, z, 0.36, 0.36, 0, top);
   }
   function table(x: number, z: number) {
+    seatBox(x, z, 1.5, 1.5, 0, 0.96);
     shape('cylinder', '#dfd3ba', x, 0.9, z, 0.85, 0.12, 0.85);
     shape('cylinder', '#65766c', x, 0.48, z, 0.09, 0.85, 0.09);
     shape('cylinder', '#65766c', x, 0.1, z, 0.45, 0.12, 0.45);
@@ -962,13 +984,14 @@ export function buildWorld(scene: THREE.Scene) {
   for (let i = 0; i < 4; i++) box('#c3bca6', 29, 0.28, 30 + i * 5.2, 28.8, 0.015, 0.055, 0, false, 'ground');
   // Café furniture, kept away from the mission pickup at (-32, 7).
   for (const t of SCENERY.tables) {
-    lift = onPavement(t.x, t.z);
+    lift = furnitureLift(t.x, t.z);
     table(t.x, t.z);
     stool(t.x - 1.25, t.z);
     stool(t.x + 1.25, t.z, '#698b81');
   }
+  // Benches stand on whatever is under them: the sidewalk, the park lawn, the plaza tiles.
   for (const b of SCENERY.benches) {
-    lift = onPavement(b.x, b.z);
+    lift = furnitureLift(b.x, b.z);
     bench(b.x, b.z, b.yaw);
   }
   lift = 0;
@@ -1761,6 +1784,8 @@ export function buildWorld(scene: THREE.Scene) {
   const sky = new THREE.Color('#bcd2dc');
   return {
     colliders,
+    /** Seats and tables a ragdoll can land on (not obstacles for walking, shooting or the camera). */
+    seats,
     update(time: number) {
       skyline.update(time);
       updateSignals(time);

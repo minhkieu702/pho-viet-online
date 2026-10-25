@@ -1,8 +1,11 @@
 import * as THREE from 'three';
 import { BUILDINGS, LAND, ROADS_X, ROADS_Z, SIDEWALK, inRect } from './city';
-import type { RagdollBody, RagdollLook } from './ragdoll';
+import type { FallMode, HitKind, RagdollBody, RagdollLook } from './ragdoll';
 import type { createRagdolls } from './ragdoll';
-import { FIGURE, FigureBatch, PART, armGeometry, bodyGeometry, deriveStyle, figureMaterial, legGeometry, palette, setStyle, styleOf } from './figures';
+import {
+  FIGURE, FigureBatch, HAND, HEAD, chestMatrix, deriveStyle, figureGeometry, figureMaterial, gait, limbMatrix, newGait, palettesOf, setBits, setStyle, sideX, swingCode, zombify,
+  type ArmPose, type Detail,
+} from './figures';
 
 /**
  * Zombie mode's undead: the neighbourhood's residents, turned. They shamble about, notice the player by
@@ -23,6 +26,8 @@ export type Zombie = {
   waypoints: Point[]; routeAt: number; stuck: number; sniffAt: number;
   windup: number; attackAt: number; timer: number;
   body: RagdollBody | null; look: number;
+  /** Where the head is turned (animation only). */
+  headYaw: number;
 };
 export type ZombieWorld = {
   clear: (x: number, z: number, radius: number) => boolean;
@@ -40,47 +45,56 @@ const KINDS: Record<ZombieKind, { health: number; wander: number; chase: number;
   runner: { health: 55, wander: 0.85, chase: 4.1, damage: 5, reach: 1.1, cooldown: 0.8, windup: 0.25, scale: 0.8, width: 0.92, sight: 30 },
   brute: { health: 320, wander: 0.5, chase: 1.7, damage: 20, reach: 1.55, cooldown: 1.7, windup: 0.55, scale: 1.14, width: 1.3, sight: 20 },
 };
-const HEIGHT = 1.85;
+/** Hit height in figure units: the top of a hunched head (the figure is 2.08 u tall standing straight). */
+const HEIGHT = 2.0;
 const RADIUS = 0.38;
-const RAGDOLL_SCALE = 0.7;
 const GROANS = ['Grừ…', 'Ưưư…', 'Grràoo!', 'Hừ… hừ…', 'Ááá…', 'Khhh…'];
 // Grey-green skin, dirty and faded clothes.
 const SKINS = ['#9aa88a', '#8e9c80', '#a7ad92', '#87937a', '#b0b39a', '#99a17f'];
 const SHIRTS = ['#6f5a52', '#5f6d73', '#7a6a4c', '#4f5a4c', '#8a5a4f', '#5b5168', '#6d6a63', '#7d4a40', '#4d5f6a', '#8f8576', '#6b3a32', '#9a8f7a'];
 const PANTS = ['#3a3f45', '#4a4238', '#2f3540', '#504a40', '#3d4a4a', '#5a4a3c'];
 const ROLES = ['worker', 'student', 'vendor', 'retiree', 'owl'];
+const clamp = THREE.MathUtils.clamp;
+const wrap = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
+// Arm poses ([swing, abduct, roll, elbow, twist, flex, hand], mirrored for the left arm).
+/** The classic reach: arms out in front, palms down, clawed fingers raised at the wrist. */
+const REACH: ArmPose = [-1.45, 0.12, 0, -0.25, 0.9, -0.5, HAND.CLAW];
+/** Wandering: forearms half raised, the hands hanging limp from the wrists. */
+const DROOP: ArmPose = [-0.75, 0.1, 0, -0.85, 1.1, 0.95, HAND.RELAXED];
+/** Knocked back by a hit: arms thrown out. */
+const FLINCH: ArmPose = [-0.45, 0.5, 0, -0.45, 0.2, -0.3, HAND.OPEN];
+
 
 export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof createRagdolls>, world: ZombieWorld, say: (zombie: Zombie, text: string) => void = () => {}) {
   let seed = 9001;
   const random = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
   const pick = <T,>(list: readonly T[]) => list[Math.floor(random() * list.length)];
 
-  // A wardrobe of turned residents; each zombie wears one.
-  const looks: RagdollLook[] = Array.from({ length: 28 }, (_, i) => {
+  // A wardrobe of turned residents (their everyday outfits, faded and dirtied, some barefoot); each zombie wears
+  // one. Trouser legs and sleeves are often torn off. The style is remembered so ragdolls dress the same.
+  const dress = Array.from({ length: 28 }, (_, i) => {
     const look: RagdollLook = { shirt: pick(SHIRTS), pants: pick(PANTS), skin: pick(SKINS) };
-    const style = deriveStyle(look, i, ROLES[i % ROLES.length]);
-    setStyle(look, { ...style, forearm: 'skin', shin: random() < 0.35 ? 'skin' : 'pants', shoes: random() < 0.3 ? look.skin : style.shoes });
-    return look;
-  });
-  const dress = looks.map((look) => {
-    const style = styleOf(look);
-    return {
-      body: palette([look.shirt, look.pants, look.skin, style.hair, style.accent], style.mask),
-      legs: palette([look.pants, style.shin === 'skin' ? look.skin : look.pants, style.shoes], PART.STRAIGHT),
-      arms: palette([look.shirt, look.skin, look.skin]),
-    };
+    const style = zombify(deriveStyle(look, i, ROLES[i % ROLES.length]), i);
+    if (random() < 0.35) style.colors.shin = look.skin;
+    if (random() < 0.5) style.colors.lower = look.skin;
+    setStyle(look, style);
+    return { look, style, palettes: palettesOf(style) };
   });
 
-  const material = figureMaterial();
-  const bodies = new FigureBatch(bodyGeometry('civil'), material, MAX);
-  const legs = new FigureBatch(legGeometry(), material, MAX * 2);
-  const arms = new FigureBatch(armGeometry(false), material, MAX * 2);
-  for (const batch of [bodies, legs, arms]) { batch.mesh.receiveShadow = true; scene.add(batch.mesh); }
+  // Four articulated figure meshes (body, left arm, right arm, legs) for the whole horde.
+  const materials = { body: figureMaterial('body'), arm: figureMaterial('arm'), leg: figureMaterial('leg') };
+  let detail: Detail = 'hi';
+  const bodies = new FigureBatch(figureGeometry('body', detail), materials.body, MAX);
+  const armsL = new FigureBatch(figureGeometry('armL', detail), materials.arm, MAX);
+  const armsR = new FigureBatch(figureGeometry('armR', detail), materials.arm, MAX);
+  const legs = new FigureBatch(figureGeometry('leg', detail), materials.leg, MAX * 2);
+  const batches = [bodies, armsL, armsR, legs];
+  for (const batch of batches) { batch.mesh.receiveShadow = true; scene.add(batch.mesh); }
 
   const zombies: Zombie[] = Array.from({ length: MAX }, (_, index) => ({
     index, kind: 'walker', state: 'off', x: 0, z: 0, yaw: 0, pace: 0, stride: 0, lean: 0.25, tilt: 0,
     health: 0, maxHealth: 1, hitAt: -99, rise: 1, goalX: 0, goalZ: 0, lastSeen: -99, investigateUntil: 0, thinkAt: 0,
-    waypoints: [], routeAt: 0, stuck: 0, sniffAt: 0, windup: 0, attackAt: 0, timer: 0, body: null, look: 0,
+    waypoints: [], routeAt: 0, stuck: 0, sniffAt: 0, windup: 0, attackAt: 0, timer: 0, body: null, look: 0, headYaw: 0,
   }));
   const corpses: { body: RagdollBody; until: number }[] = [];
   const doors = BUILDINGS.map((b) => ({ x: b.door.x, z: b.door.z, curb: b.curb }));
@@ -90,6 +104,10 @@ export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof cr
   const events = { strikes: [] as ZombieStrike[], waveStarted: 0, waveCleared: 0, risen: [] as Point[] };
 
   const standing = (z: Zombie) => z.state !== 'off' && z.state !== 'down';
+  /** Vertical world scale of a zombie's figure (its kind's size times the build of what it wears). */
+  const scaleY = (z: Zombie) => KINDS[z.kind].scale * dress[z.look].style.height;
+  /** How far the torso is bent forward at the hips (back when staggering from a hit, further while clawing out of the ground). */
+  const pitchOf = (z: Zombie) => z.lean + (z.state === 'stagger' ? -0.45 : 0) + (z.state === 'rise' ? 0.4 * (1 - z.rise) : 0);
   const alive = () => zombies.reduce((n, z) => n + (z.state !== 'off' ? 1 : 0), 0);
   const groan = (z: Zombie, time: number, chance: number) => {
     if (time < groanAt || random() > chance) return;
@@ -135,17 +153,22 @@ export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof cr
       lean: kind === 'runner' ? 0.38 : kind === 'brute' ? 0.18 : 0.22 + random() * 0.12, tilt: (random() - 0.5) * 0.24,
       health: k.health * (1 + wave * 0.05), maxHealth: k.health * (1 + wave * 0.05), hitAt: -99, rise: spot.rise ? 0 : 1,
       goalX: px, goalZ: pz, lastSeen: -99, investigateUntil: time + 30, thinkAt: time + random() * 0.3, waypoints: [], routeAt: 0, stuck: 0, sniffAt: time + 20 + random() * 10,
-      windup: 0, attackAt: 0, timer: 0, body: null, look: Math.floor(random() * looks.length),
+      windup: 0, attackAt: 0, timer: 0, body: null, look: Math.floor(random() * dress.length), headYaw: 0,
     });
     if (spot.rise) events.risen.push({ x: spot.x, z: spot.z });
     return true;
   }
 
-  function knock(z: Zombie, vx: number, vy: number, vz: number, time: number) {
+  function knock(z: Zombie, vx: number, vy: number, vz: number, time: number, hit?: { x: number; y: number; z: number } | null, mode?: FallMode, kind?: HitKind) {
     const k = KINDS[z.kind];
+    const d = dress[z.look];
     z.state = 'down';
     z.timer = time + 3 + random() * 1.5;
-    z.body = ragdolls.spawn({ x: z.x, y: world.ground(z.x, z.z), z: z.z, yaw: z.yaw, scale: RAGDOLL_SCALE * k.scale / 0.84, look: looks[z.look], velocity: { x: vx, y: vy, z: vz } });
+    // The ragdoll has the standing zombie's scale and build (a brute stays broad); the blow lands where it hit.
+    z.body = ragdolls.spawn({
+      x: z.x, y: world.ground(z.x, z.z), z: z.z, yaw: z.yaw, scale: k.scale, look: d.look, velocity: { x: vx, y: vy, z: vz },
+      build: { width: d.style.width * k.width, height: d.style.height }, hit, mode, kind,
+    });
     return z.body;
   }
 
@@ -271,57 +294,104 @@ export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof cr
     walk(z, tx, tz, speed, dt);
   }
 
-  const base = new THREE.Matrix4(), local = new THREE.Matrix4(), out = new THREE.Matrix4();
-  const quat = new THREE.Quaternion(), pos = new THREE.Vector3(), size = new THREE.Vector3(), euler = new THREE.Euler();
+  const base = new THREE.Matrix4(), hips = new THREE.Matrix4(), chest = new THREE.Matrix4(), limbM = new THREE.Matrix4();
+  const quat = new THREE.Quaternion(), turn = new THREE.Quaternion(), pos = new THREE.Vector3(), size = new THREE.Vector3(), euler = new THREE.Euler();
+  const pivot = new THREE.Vector3(), up = new THREE.Vector3(0, 1, 0);
   const tmp = new THREE.Vector3();
-  const limb = (batch: FigureBatch, px: number, py: number, angle: number, look: Float32Array, twist = 0) => {
-    local.compose(pos.set(px, py, 0), quat.setFromEuler(euler.set(angle, 0, twist)), size.set(1, 1, 1));
-    batch.push(out.multiplyMatrices(base, local), look);
+  const walkCycle = newGait();
+  const bodyPose = [0, 0, 0, 0], limbPose = [0, 0, 0, 0];
+  const face = new Float32Array(8);
+  const armL: number[] = [], armR: number[] = [];
+  let frameDt = 0;
+  // An arm from the chest matrix: [swing, abduct, roll, elbow, twist, flex, hand], abduct and roll mirrored on the left.
+  const arm = (side: 1 | -1, a: ArmPose, look: Float32Array, shoulderX: number) => {
+    const sx = sideX(side);
+    limbMatrix(chest, sx * shoulderX, FIGURE.shoulderY, a[0], sx * a[1], sx * a[2], limbM);
+    limbPose[0] = a[3]; limbPose[1] = a[4]; limbPose[2] = a[5]; limbPose[3] = a[6];
+    (side > 0 ? armsR : armsL).push(limbM, look, limbPose);
+  };
+  const leg = (side: 1 | -1, thigh: number, knee: number, ankle: number, toe: number, look: Float32Array) => {
+    limbMatrix(hips, sideX(side) * FIGURE.hipX, FIGURE.hipY, thigh, 0, 0, limbM);
+    limbPose[0] = knee; limbPose[1] = ankle; limbPose[2] = toe; limbPose[3] = 0;
+    legs.push(limbM, look, limbPose);
+  };
+  const tuple = (out: number[], swing: number, abduct: number, roll: number, elbow: number, twist: number, flex: number, hand: number): ArmPose => {
+    out[0] = swing; out[1] = abduct; out[2] = roll; out[3] = elbow; out[4] = twist; out[5] = flex; out[6] = hand;
+    return out as unknown as ArmPose;
   };
 
-  function draw(z: Zombie, time: number) {
+  function draw(z: Zombie, time: number, prey: Prey) {
     if (!standing(z)) return;
     const k = KINDS[z.kind];
-    const d = dress[z.look];
-    const sink = (1 - z.rise) * HEIGHT * k.scale;
-    // Hunched forward and tilted to one side; the body lurches with each step.
+    const d = dress[z.look], p = d.palettes;
+    const sx = k.scale * k.width * d.style.width, sy = k.scale * d.style.height, sh = d.style.shoulderX;
+    const sink = (1 - z.rise) * HEIGHT * sy;
+    const runner = z.kind === 'runner', brute = z.kind === 'brute';
+    // Walkers shuffle with short steps; runners sprint.
+    const go = clamp(z.pace / (runner ? 2.5 : 1.2), 0, 1) * (runner || brute ? 1 : 0.8);
+    const g = gait(z.stride, runner ? 1 : brute ? 0.3 : 0, go, walkCycle);
+    // Hunched forward at the hips and tilted to one side over upright legs; the body lurches with each step.
     const swing = Math.sin(z.stride);
-    const stagger = z.state === 'stagger' ? -0.45 : 0;
-    euler.set(z.lean + stagger + (z.state === 'rise' ? 0.4 * (1 - z.rise) : 0), z.yaw, z.tilt + swing * 0.07 * Math.min(1, z.pace), 'YXZ');
-    base.compose(pos.set(z.x, world.ground(z.x, z.z) - sink, z.z), quat.setFromEuler(euler), size.set(k.scale * k.width, k.scale, k.scale * k.width));
-    bodies.push(base, d.body);
-    const stride = swing * Math.min(0.7, z.pace * 0.28);
-    // A limp: one leg drags behind the other.
-    limb(legs, -FIGURE.hipX, FIGURE.hipY, stride * 0.55 + 0.08, d.legs);
-    limb(legs, FIGURE.hipX, FIGURE.hipY, -stride, d.legs);
-    let left: number, right: number, spread = 0.12;
+    const chasing = z.state === 'chase';
+    const feet = world.ground(z.x, z.z) - sink + g.bob * sy, hip = FIGURE.hipY * sy;
+    hips.compose(pos.set(z.x, feet, z.z), turn.setFromAxisAngle(up, z.yaw), size.set(sx, sy, sx));
+    euler.set(pitchOf(z), z.yaw, z.tilt + swing * 0.07 * Math.min(1, z.pace), 'YXZ');
+    quat.setFromEuler(euler);
+    pivot.set(0, hip, 0).applyQuaternion(quat);
+    base.compose(pos.set(z.x, feet + hip, z.z).sub(pivot), quat, size);
+    // The head lolls and sways; a chasing zombie lifts it and turns it toward the prey.
+    const twist = runner ? g.chest : g.chest * 0.5;
+    const toward = chasing && !prey.down ? clamp(wrap(Math.atan2(prey.x - z.x, prey.z - z.z) - z.yaw) - twist, -1, 1) : 0;
+    z.headYaw = THREE.MathUtils.damp(z.headYaw, toward + 0.4 * Math.sin(time * 0.9 + z.index * 1.3) * (chasing ? 0.35 : 1), 4, frameDt);
+    bodyPose[0] = z.headYaw;
+    bodyPose[1] = z.windup ? -0.2 : chasing ? 0.05 - z.lean * 0.9 : 0.3 + 0.08 * Math.sin(time * 0.7 + z.index);
+    bodyPose[2] = twist;
+    // Skirts and áo dài panels swing open with the stride so the knees stay inside; hair swings half as much.
+    const flare = Math.abs(g.thighL) + 0.1 * go;
+    bodyPose[3] = swingCode(flare, flare * 0.5);
+    // The jaw hangs open while clawing, rising, and in bursts of groaning.
+    face.set(p.body);
+    setBits(face, 0, HEAD.MOUTH, !!z.windup || z.state === 'rise' || Math.sin(time * 2.3 + z.index * 1.7) > 0.55);
+    bodies.push(base, face, bodyPose);
+    chestMatrix(base, twist, chest);
+    // A limp: one leg (the same one for each zombie) drags along behind, toes scraping the ground.
+    const lame = z.index % 2 ? -1 : 1;
+    const dragL = lame < 0 && !runner, dragR = lame > 0 && !runner;
+    leg(-1, dragL ? g.thighL * 0.55 + 0.08 : g.thighL, dragL ? g.kneeL * 0.25 + 0.03 : g.kneeL, dragL ? g.ankleL + 0.45 : g.ankleL, dragL ? 0 : g.toeL, p.legs);
+    leg(1, dragR ? g.thighR * 0.55 + 0.08 : g.thighR, dragR ? g.kneeR * 0.25 + 0.03 : g.kneeR, dragR ? g.ankleR + 0.45 : g.ankleR, dragR ? 0 : g.toeR, p.legs);
+    let left: ArmPose, right: ArmPose;
     if (z.windup) {
       // Wind-up to claw: both arms raised high, then brought down.
       const t = 1 - Math.max(0, z.windup - time) / k.windup;
-      left = right = -2.7 + t * 1.6;
-      spread = 0.25;
+      left = right = tuple(armL, -2.7 + t * 1.6, 0.25, 0, -0.4, 0.9, -0.4, HAND.CLAW);
     } else if (z.state === 'rise') {
-      left = -2.6 + Math.sin(time * 9) * 0.3;
-      right = -2.4 + Math.cos(time * 8) * 0.3;
-    } else if (z.kind === 'runner') {
-      left = -0.5 + swing * 1.4;
-      right = -0.5 - swing * 1.4;
-      spread = 0.3;
-    } else if (z.kind === 'brute') {
-      left = 0.1 + swing * 0.35;
-      right = 0.1 - swing * 0.35;
-      spread = 0.35;
+      // Clawing up out of the ground, one arm after the other.
+      left = tuple(armL, -2.6 + Math.sin(time * 9) * 0.3, 0.2, 0, -0.3 - 0.3 * Math.max(0, Math.sin(time * 9)), 0.6, -0.3, HAND.CLAW);
+      right = tuple(armR, -2.4 + Math.cos(time * 8) * 0.3, 0.2, 0, -0.3 - 0.3 * Math.max(0, Math.cos(time * 8)), 0.6, -0.3, HAND.CLAW);
+    } else if (z.state === 'stagger') {
+      left = right = FLINCH;
+    } else if (runner) {
+      // Sprinting with the elbows bent and the fingers hooked.
+      left = tuple(armL, -0.35 + g.armL * 1.3, 0.3, 0, -1.3, 0.5, -0.3, HAND.CLAW);
+      right = tuple(armR, -0.35 + g.armR * 1.3, 0.3, 0, -1.3, 0.5, -0.3, HAND.CLAW);
+    } else if (brute) {
+      // Heavy fists swinging wide.
+      left = tuple(armL, 0.1 + swing * 0.35, 0.35, 0, -0.6, 0, 0, HAND.FIST);
+      right = tuple(armR, 0.1 - swing * 0.35, 0.35, 0, -0.6, 0, 0, HAND.FIST);
     } else {
-      // The classic reach: arms out in front, swaying.
-      left = -1.45 + Math.sin(time * 2.1 + z.index) * 0.14;
-      right = -1.35 + Math.cos(time * 1.9 + z.index) * 0.14;
+      // The classic reach when it has prey, arms dangling when it wanders; swaying either way.
+      const reach = chasing ? REACH : DROOP;
+      left = tuple(armL, reach[0] + Math.sin(time * 2.1 + z.index) * 0.14, reach[1], reach[2], reach[3], reach[4], reach[5] + Math.sin(time * 3.1 + z.index) * 0.15, reach[6]);
+      right = tuple(armR, reach[0] + 0.1 + Math.cos(time * 1.9 + z.index) * 0.14, reach[1], reach[2], reach[3], reach[4], reach[5] + Math.cos(time * 2.7 + z.index) * 0.15, reach[6]);
+      // Wanderers' arms swing a little with the shuffle.
+      if (!chasing) { armL[0] += g.armL * 0.3; armR[0] += g.armR * 0.3; }
     }
-    limb(arms, -FIGURE.shoulderX, FIGURE.shoulderY, left, d.arms, spread);
-    limb(arms, FIGURE.shoulderX, FIGURE.shoulderY, right, d.arms, -spread);
+    arm(-1, left, p.armL, sh);
+    arm(1, right, p.armR, sh);
   }
 
   function hide() {
-    for (const batch of [bodies, legs, arms]) { batch.begin(); batch.end(); }
+    for (const batch of batches) { batch.begin(); batch.end(); }
   }
   hide();
 
@@ -358,8 +428,11 @@ export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof cr
         zb.thinkAt = time;
       }
     },
-    /** Applies damage; returns the body when the zombie falls (killed, or knocked over by a big hit). */
-    damage(zb: Zombie, amount: number, vx: number, vy: number, vz: number, time: number, force = false) {
+    /**
+     * Applies damage; returns the body when the zombie falls (killed: limp, or knocked over by a big hit).
+     * `at` is the world point that was hit and `kind` what hit it, if known.
+     */
+    damage(zb: Zombie, amount: number, vx: number, vy: number, vz: number, time: number, force = false, at?: { x: number; y: number; z: number } | null, kind?: HitKind) {
       if (!standing(zb) || zb.state === 'rise' && zb.rise < 0.5) return null;
       zb.health -= amount;
       zb.hitAt = time;
@@ -368,14 +441,14 @@ export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof cr
       zb.windup = 0;
       const killed = zb.health <= 0;
       if (killed) {
-        const body = knock(zb, vx, vy, vz, time);
+        const body = knock(zb, vx, vy, vz, time, at, 'limp', kind);
         zb.state = 'off';
         zb.body = null;
         corpses.push({ body, until: time + 14 });
         kills++;
         return { body, killed: true };
       }
-      if (force && zb.kind !== 'brute') return { body: knock(zb, vx, vy, vz, time), killed: false };
+      if (force && zb.kind !== 'brute') return { body: knock(zb, vx, vy, vz, time, at, undefined, kind), killed: false };
       if (zb.state !== 'rise') {
         zb.state = 'stagger';
         zb.timer = time + (zb.kind === 'brute' ? 0.12 : 0.32);
@@ -384,9 +457,12 @@ export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof cr
       }
       return { body: null, killed: false };
     },
-    /** Nearest standing zombie crossed by a ray (`dir` normalised), with the hit height above its feet. */
+    /**
+     * Nearest standing zombie crossed by a ray (`dir` normalised): `height` is the hit height above its feet in
+     * figure units (compare with FIGURE.neckY), `head` is true above the neck of the hunched figure.
+     */
     raycast(origin: THREE.Vector3, dir: THREE.Vector3, maxT: number) {
-      let best: { zombie: Zombie; t: number; height: number } | null = null;
+      let best: { zombie: Zombie; t: number; height: number; head: boolean } | null = null;
       for (const zb of zombies) {
         if (!standing(zb)) continue;
         const k = KINDS[zb.kind];
@@ -400,9 +476,12 @@ export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof cr
         let t = (-b - Math.sqrt(disc)) / (2 * a);
         if (t < 0) t = (-b + Math.sqrt(disc)) / (2 * a);
         if (t <= 0 || t >= maxT || (best && t >= best.t)) continue;
-        const feet = world.ground(zb.x, zb.z) - (1 - zb.rise) * HEIGHT * k.scale;
+        const sy = scaleY(zb);
+        const feet = world.ground(zb.x, zb.z) - (1 - zb.rise) * HEIGHT * sy;
         const y = origin.y + dir.y * t - feet;
-        if (y > 0 && y < HEIGHT * k.scale) best = { zombie: zb, t, height: y / k.scale };
+        // The neck of a figure bent at the hips sits lower than a standing one's.
+        const neck = (FIGURE.hipY + (FIGURE.neckY - FIGURE.hipY) * Math.cos(pitchOf(zb))) * sy;
+        if (y > 0 && y < HEIGHT * sy) best = { zombie: zb, t, height: y / sy, head: y > neck };
       }
       return best;
     },
@@ -413,18 +492,19 @@ export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof cr
     forEachStanding(callback: (x: number, z: number, y0: number, y1: number, radius: number, zombie: Zombie) => void) {
       for (const zb of zombies) {
         if (!standing(zb)) continue;
-        const k = KINDS[zb.kind];
-        const feet = world.ground(zb.x, zb.z) - (1 - zb.rise) * HEIGHT * k.scale;
-        callback(zb.x, zb.z, feet, feet + HEIGHT * k.scale, RADIUS * k.scale * k.width, zb);
+        const k = KINDS[zb.kind], sy = scaleY(zb);
+        const feet = world.ground(zb.x, zb.z) - (1 - zb.rise) * HEIGHT * sy;
+        callback(zb.x, zb.z, feet, feet + HEIGHT * sy, RADIUS * k.scale * k.width, zb);
       }
     },
     forEachHurt(time: number, callback: (x: number, y: number, z: number, fraction: number) => void) {
       for (const zb of zombies) {
         if (!standing(zb) || time - zb.hitAt > 3) continue;
-        callback(zb.x, world.ground(zb.x, zb.z) + HEIGHT * KINDS[zb.kind].scale + 0.3, zb.z, Math.max(0, zb.health) / zb.maxHealth);
+        callback(zb.x, world.ground(zb.x, zb.z) + HEIGHT * scaleY(zb) + 0.3, zb.z, Math.max(0, zb.health) / zb.maxHealth);
       }
     },
     update(dt: number, time: number, prey: Prey) {
+      frameDt = dt;
       events.strikes.length = 0;
       events.risen.length = 0;
       events.waveStarted = 0;
@@ -454,15 +534,28 @@ export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof cr
       for (let i = corpses.length - 1; i >= 0; i--) {
         if (time > corpses[i].until || corpses[i].body.removed) { ragdolls.remove(corpses[i].body); corpses.splice(i, 1); }
       }
-      bodies.begin(); legs.begin(); arms.begin();
-      for (const z of zombies) draw(z, time);
-      bodies.end(); legs.end(); arms.end();
+      for (const batch of batches) batch.begin();
+      for (const z of zombies) draw(z, time, prey);
+      for (const batch of batches) batch.end();
       return events;
+    },
+    /**
+     * Figure level of detail ('hi' at quality levels 0-2, 'lo' at 3-5). With up to 64 on screen, zombies already
+     * switch to 'lo' from quality level 2: pass the level to apply that.
+     */
+    setDetail(next: Detail, level = 0) {
+      const d: Detail = level >= 2 ? 'lo' : next;
+      if (d === detail) return;
+      detail = d;
+      bodies.setGeometry(figureGeometry('body', detail));
+      armsL.setGeometry(figureGeometry('armL', detail));
+      armsR.setGeometry(figureGeometry('armR', detail));
+      legs.setGeometry(figureGeometry('leg', detail));
     },
     dispose() {
       this.stop();
-      for (const batch of [bodies, legs, arms]) { scene.remove(batch.mesh); batch.mesh.geometry.dispose(); batch.dispose(); }
-      material.dispose();
+      for (const batch of batches) { scene.remove(batch.mesh); batch.dispose(); }
+      for (const m of Object.values(materials)) m.dispose();
     },
   };
 }

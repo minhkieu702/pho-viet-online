@@ -1,341 +1,243 @@
 import * as THREE from 'three';
-import type { RagdollLook } from './ragdoll';
+import { figureGeometry, type Detail, type FigurePiece } from './anatomy.ts';
+import { FIGURE, REST, applyRig, rigGLSL, sideX, swingCode, type FigureKind } from './pose.ts';
+import { palettesOf, type FigurePalettes, type FigureStyle } from './wardrobe.ts';
+
+export * from './pose.ts';
+export * from './anatomy.ts';
+export * from './wardrobe.ts';
 
 /**
- * Stylised low-poly people for the instanced crowds (residents, police, ragdolls).
+ * Articulated people for every crowd (residents, police, zombies, vehicle occupants, ragdolls) and the hero
+ * figures of the player, peers and interior people.
  *
- * Every body part is one merged geometry whose vertices name a palette slot (shirt, pants, skin, hair,
- * accent, or a fixed colour) and optionally an extra part (hair styles, hats, police kit, weapons).
- * Each instance carries its own five-colour palette and a bit mask of the extra parts it shows, so a
- * whole crowd with varied clothes, hair and hats is still one draw call per body part.
+ * A person is five instances of four shared meshes: body (torso, head, face, hair, hats, clothing), left
+ * arm, right arm (with held items) and two legs. Elbows, wrists, fingers, knees, ankles, toes, the head,
+ * the chest, skirts and ponytails bend in the vertex shader (pose.ts), so a whole crowd is still one draw
+ * call per mesh. Each instance carries a packed look (six 24-bit colours and two part masks, wardrobe.ts)
+ * and a pose vec4. Never add instanceColor, morph targets or uv to these meshes: they use 12 of the 16
+ * guaranteed vertex attribute slots.
  */
 
-/** Palette slots. Body meshes use shirt/pants/skin/hair/accent; limb meshes reuse the first slots for their own colours. */
-export const SLOT = { SHIRT: 0, PANTS: 1, SKIN: 2, HAIR: 3, ACCENT: 4, FIXED: 5 } as const;
+// ---- Material -------------------------------------------------------------------------------------------
 
-/** Optional parts, one bit each; an instance shows the parts whose bits are set in its mask. */
-export const PART = {
-  DOME: 1 << 0, FRINGE: 1 << 1, LONG: 1 << 2, BUN: 1 << 3, TAIL: 1 << 4,
-  CONE: 1 << 5, BANDANA: 1 << 6, CAP: 1 << 7, SWAT: 1 << 8, HELMET: 1 << 9,
-  KIT: 1 << 10, VEST: 1 << 11,
-  STRAIGHT: 1 << 12, BENT: 1 << 13,
-  BATON: 1 << 14, PISTOL: 1 << 15, TASER: 1 << 16, RIFLE: 1 << 17,
-  THIN: 1 << 18,
-  /** Motorbike riders: long sleeves (sun jacket) and a cloth face mask, light or dark. */
-  SLEEVE: 1 << 19, MASK: 1 << 20, MASK_DARK: 1 << 21,
-  /** Things a passer-by holds while standing about: a phone, a paper fan, a broom. */
-  PHONE: 1 << 22, FAN: 1 << 23, BROOM: 1 << 24,
-} as const;
-
-/** Skeleton of the crowd model (feet at y = 0, facing +z). */
-export const FIGURE = { hipX: 0.135, hipY: 0.76, shoulderX: 0.33, shoulderY: 1.47, headY: 1.87, headR: 0.27, sitDrop: 0.14 } as const;
-
-export type FigureStyle = {
-  /** Head and torso parts (hair style, hat, police kit...). */
-  mask: number;
-  hair: string;
-  accent: string;
-  forearm: 'skin' | 'shirt';
-  shin: 'pants' | 'skin';
-  shoes: string;
-  /** Per-person build: horizontal and vertical scale. */
-  width: number;
-  height: number;
-};
-
-const HAIR = ['#1d1916', '#2a2220', '#33261f', '#3d2b20', '#1a1a1c'];
-const GREY = ['#cfcac2', '#a9a49c', '#bdb7ad'];
-const SHOES = ['#2b2622', '#3b2f28', '#e9e4da', '#6b4a35', '#26303a', '#8a3f2f'];
-const styles = new WeakMap<RagdollLook, FigureStyle>();
-
-function hashOf(text: string) {
-  let h = 2166136261;
-  for (let i = 0; i < text.length; i++) h = Math.imul(h ^ text.charCodeAt(i), 16777619);
-  return (h >>> 0) / 4294967296;
+/** Palette unpacking and part masks (vertex shader). */
+const PALETTE_GLSL = /* glsl */`
+attribute vec3 tag;
+attribute vec4 look0;
+attribute vec4 look1;
+varying float vFigGloss;
+vec3 figColor(float slot) {
+  float v = slot < 0.5 ? look0.x : slot < 1.5 ? look0.y : slot < 2.5 ? look0.z : slot < 3.5 ? look0.w : slot < 4.5 ? look1.x : slot < 5.5 ? look1.y : 16777215.0;
+  float r = floor(v / 65536.0), g = floor(mod(v, 65536.0) / 256.0), b = mod(v, 256.0);
+  vec3 c = vec3(r, g, b) / 255.0;
+  return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c));
 }
-
-/** Deterministic style for a look; `seed` adds per-person variety on top of the look's own colours. */
-export function deriveStyle(look: RagdollLook, seed = 0, role = ''): FigureStyle {
-  const r = (k: number) => hashOf(`${look.shirt}${look.pants}${look.skin}${look.hat ?? ''}${look.helmet ?? ''}${seed}:${k}`);
-  const older = role === 'retiree';
-  const roll = r(1);
-  let mask: number = PART.DOME;
-  if (role === 'vendor') mask |= roll < 0.6 ? PART.BUN : PART.LONG;
-  else if (role === 'student') mask |= roll < 0.45 ? PART.TAIL : PART.FRINGE;
-  else if (older) mask = roll < 0.35 ? PART.DOME | PART.BUN : roll < 0.75 ? PART.THIN : PART.DOME;
-  else mask |= roll < 0.42 ? PART.FRINGE : roll < 0.66 ? PART.LONG : roll < 0.8 ? PART.TAIL : roll < 0.88 ? PART.BUN : 0;
-  if (look.hat) mask |= PART.CONE;
-  if (look.helmet) mask = PART.HELMET;
-  const sleeves = role === 'vendor' ? 0.7 : role === 'student' ? 0 : 0.22;
-  return {
-    mask,
-    hair: (older ? GREY : HAIR)[Math.floor(r(2) * (older ? GREY.length : HAIR.length))],
-    accent: look.helmet ?? look.hat ?? '#e5cf92',
-    forearm: r(3) < sleeves ? 'shirt' : 'skin',
-    shin: role === 'student' || role === 'vendor' || older ? 'pants' : r(4) < 0.14 ? 'skin' : 'pants',
-    shoes: role === 'student' ? '#e9e4da' : SHOES[Math.floor(r(5) * SHOES.length)],
-    width: (role === 'student' ? 0.92 : 0.94) + r(6) * 0.14,
-    height: (role === 'student' ? 0.9 : older ? 0.93 : 0.96) + r(7) * 0.08,
-  };
+bool figBit(int part) {
+  if (part == 0) return true;
+  int word = part > 24 ? int(look1.w + 0.5) : int(look1.z + 0.5);
+  return ((word >> ((part - 1) % 24)) & 1) == 1;
 }
-
-/** Remembers how a look is dressed so its ragdoll matches the standing person. */
-export function setStyle(look: RagdollLook, style: FigureStyle) { styles.set(look, style); }
-export function styleOf(look: RagdollLook) {
-  let style = styles.get(look);
-  if (!style) { style = deriveStyle(look); styles.set(look, style); }
-  return style;
-}
-
-const tmp = new THREE.Color();
-/** Packs five slot colours and a part mask into the 16 floats one instance needs. */
-export function palette(colors: (THREE.ColorRepresentation | undefined)[], mask = 0, out = new Float32Array(16)) {
-  for (let k = 0; k < 5; k++) {
-    tmp.set(colors[k] ?? '#ffffff');
-    out[k * 3] = tmp.r; out[k * 3 + 1] = tmp.g; out[k * 3 + 2] = tmp.b;
-  }
-  out[15] = mask;
-  return out;
-}
-
-// ---- Geometry assembly ----------------------------------------------------------------------------
-
-type AddOptions = {
-  at?: [number, number, number];
-  scale?: number | [number, number, number];
-  rot?: [number, number, number];
-  slot?: number;
-  part?: number;
-  /** Colour multiplier (number = grey level); for SLOT.FIXED this is the colour itself. */
-  shade?: THREE.ColorRepresentation;
-  smooth?: boolean;
-};
-
-const matrix = new THREE.Matrix4(), position = new THREE.Vector3(), quaternion = new THREE.Quaternion(), scaling = new THREE.Vector3(), euler = new THREE.Euler();
-
-/** Collects primitives into one non-indexed geometry with colour and palette-tag attributes. */
-export class FigureParts {
-  private positions: number[] = [];
-  private normals: number[] = [];
-  private colors: number[] = [];
-  private tags: number[] = [];
-  /** Extra transform applied to everything added (e.g. to place a head on a body). */
-  base = new THREE.Matrix4();
-
-  add(source: THREE.BufferGeometry, o: AddOptions = {}) {
-    const g = source.index ? source.toNonIndexed() : source.clone();
-    source.dispose();
-    if (!o.smooth) { g.deleteAttribute('normal'); g.computeVertexNormals(); }
-    const s = o.scale ?? 1;
-    euler.set(...(o.rot ?? [0, 0, 0]));
-    matrix.compose(position.set(...(o.at ?? [0, 0, 0])), quaternion.setFromEuler(euler), typeof s === 'number' ? scaling.setScalar(s) : scaling.set(...s));
-    g.applyMatrix4(matrix.premultiply(this.base));
-    const p = g.getAttribute('position'), n = g.getAttribute('normal');
-    const shade = typeof o.shade === 'number' ? tmp.setRGB(o.shade, o.shade, o.shade) : tmp.set(o.shade ?? '#ffffff');
-    const part = o.part ? Math.log2(o.part) + 1 : 0;
-    for (let i = 0; i < p.count; i++) {
-      this.positions.push(p.getX(i), p.getY(i), p.getZ(i));
-      this.normals.push(n.getX(i), n.getY(i), n.getZ(i));
-      this.colors.push(shade.r, shade.g, shade.b);
-      this.tags.push(o.slot ?? SLOT.FIXED, part);
-    }
-    g.dispose();
-    return this;
-  }
-
-  build() {
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(this.positions, 3));
-    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.normals, 3));
-    g.setAttribute('color', new THREE.Float32BufferAttribute(this.colors, 3));
-    g.setAttribute('tag', new THREE.Float32BufferAttribute(this.tags, 2));
-    return g;
-  }
-}
-
-const sphere = (r: number, w = 8, h = 6, thetaLength = Math.PI) => new THREE.SphereGeometry(r, w, h, 0, Math.PI * 2, 0, thetaLength);
-const cyl = (top: number, bottom: number, height: number, seg = 8) => new THREE.CylinderGeometry(top, bottom, height, seg);
-/** A tube without end caps, for segments whose ends are hidden inside joints. */
-const tube = (top: number, bottom: number, height: number, seg = 8) => new THREE.CylinderGeometry(top, bottom, height, seg, 1, true);
-const box = (w: number, h: number, d: number) => new THREE.BoxGeometry(w, h, d);
-const lathe = (profile: number[], seg = 10) => {
-  const points: THREE.Vector2[] = [];
-  for (let i = 0; i < profile.length; i += 2) points.push(new THREE.Vector2(profile[i], profile[i + 1]));
-  return new THREE.LatheGeometry(points, seg, Math.PI / seg);
-};
-/** Front half of a flat disc (cap visors and helmet peaks). */
-const halfDisc = (r: number, h: number) => new THREE.CylinderGeometry(r, r, h, 10, 1, false, -Math.PI / 2, Math.PI);
+bool figHidden() { int t = int(tag.y + 0.5); return !figBit(t % 64) || !figBit(t / 64); }
+`;
 
 /**
- * Head of radius 1 centred on the origin: face, then every hair style and hat the `set` allows.
- * 'rider' is a motorbike rider: the face, a half helmet and optional face masks, no loose hair.
+ * The shared look of every figure mesh of one kind ('body', 'arm', 'leg' or 'rigid' for umbrellas and
+ * props). All materials of a kind compile to one program (pre-warm with renderer.compile).
  */
-export function addHead(parts: FigureParts, set: 'civil' | 'police' | 'all' | 'rider') {
-  const { SKIN, HAIR, ACCENT, SHIRT } = SLOT;
-  const rider = set === 'rider';
-  parts.add(sphere(1, 12, 8), { scale: [1, 1.07, 0.97], slot: SKIN, smooth: true });
-  for (const side of [-1, 1]) {
-    parts.add(sphere(0.2, 5, 3), { at: [side * 0.97, -0.04, 0.02], scale: [0.6, 1, 0.75], slot: SKIN, shade: 0.93 });
-    parts.add(sphere(0.13, 7, 4), { at: [side * 0.36, 0.03, 0.885], scale: [0.95, 1.3, 0.5], shade: '#2a201b' });
-    parts.add(box(0.32, 0.075, 0.09), { at: [side * 0.37, 0.33, 0.855], rot: [-0.25, 0, side * -0.1], slot: HAIR, shade: 0.85 });
-  }
-  parts.add(sphere(0.13, 5, 3), { at: [0, -0.14, 0.95], scale: [1, 0.85, 0.85], slot: SKIN, shade: 0.97 });
-  parts.add(box(0.24, 0.05, 0.06), { at: [0, -0.43, 0.875], rot: [0.35, 0, 0], slot: SKIN, shade: 0.55 });
+export function figureMaterial(kind: FigureKind = 'rigid', params: THREE.MeshStandardMaterialParameters = {}) {
+  const material = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, metalness: 0.02, ...params });
+  material.userData.figureKind = kind;
+  const rigged = kind !== 'rigid';
+  material.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', `#include <common>\n${rigGLSL(kind)}\n${PALETTE_GLSL}`)
+      .replace('#include <color_vertex>', 'vColor = color * figColor(tag.x);\n\tvFigGloss = tag.z;')
+      .replace('#include <beginnormal_vertex>', rigged
+        ? `#include <beginnormal_vertex>\n\tvec3 figP = position;\n\tfloat figSide = ${kind === 'arm' ? '(rig.z < 0.0 ? -1.0 : 1.0)' : '1.0'};\n\tfigP.x *= figSide;\n\tfigPose(figP);\n\tobjectNormal.x *= figSide; objectNormal = figRig * objectNormal; objectNormal.x *= figSide;`
+        : '#include <beginnormal_vertex>')
+      .replace('#include <begin_vertex>', rigged
+        ? 'vec3 transformed = figRig * figP + figShift;\n\ttransformed.x *= figSide;\n\tif (figHidden()) transformed = vec3(0.0);'
+        : 'vec3 transformed = vec3(position);\n\tif (figHidden()) transformed = vec3(0.0);');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying float vFigGloss;')
+      .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = roughness * mix(1.0, 0.45, vFigGloss);');
+  };
+  material.customProgramCacheKey = () => `figure-${kind}`;
+  return material;
+}
 
-  if (!rider) {
-    // Hair: a chunky dome tilted back so the forehead stays clear, with sideburns, plus a style-specific extra.
-    parts.add(sphere(1.07, 12, 6, Math.PI * 0.56), { scale: [1, 1.07, 0.99], rot: [-0.5, 0, 0], slot: HAIR, part: PART.DOME });
-    for (const side of [-1, 1]) parts.add(box(0.14, 0.4, 0.3), { at: [side * 0.93, -0.06, 0.22], rot: [0, side * 0.35, 0], slot: HAIR, part: PART.DOME });
-    // Thinning hair for older people: only the back and sides.
-    parts.add(sphere(1.07, 12, 5, Math.PI * 0.5), { scale: [1, 1.07, 0.99], rot: [-1.0, 0, 0], at: [0, -0.04, 0], slot: HAIR, part: PART.THIN });
+// ---- Instanced batches ------------------------------------------------------------------------------------
+
+/** Per-instance attributes a figure mesh owns; everything else on its geometry is shared with the cached build. */
+const INSTANCED = ['look0', 'look1', 'pose'];
+
+/**
+ * A geometry that draws a source build's vertex buffers and index (shared, never copied), so every crowd and
+ * hero mesh can hang its own instance attributes on it. Free it with releaseView().
+ */
+export function shareGeometry(source: THREE.BufferGeometry) {
+  const view = new THREE.BufferGeometry();
+  for (const [name, attribute] of Object.entries(source.attributes)) if (!INSTANCED.includes(name)) view.setAttribute(name, attribute);
+  view.setIndex(source.index);
+  view.boundingSphere = source.boundingSphere;
+  view.boundingBox = source.boundingBox;
+  view.userData.sharedGeometry = true;
+  return view;
+}
+
+/** Frees a view's own buffers (its instance attributes), never the shared ones. */
+export function releaseView(view: THREE.BufferGeometry) {
+  for (const name of Object.keys(view.attributes)) if (!INSTANCED.includes(name)) view.deleteAttribute(name);
+  view.setIndex(null);
+  view.dispose();
+}
+
+/**
+ * An instanced figure mesh with per-instance look (look0/look1) and pose attributes. `push` packs visible
+ * instances so hidden ones cost nothing; looks and poses are only re-uploaded when an instance changed, and
+ * then only the range of instances that did (matrices: the used range). An empty batch is hidden.
+ * The batch draws its own view of the geometry it is given, so any number of batches can share the cached
+ * figureGeometry() builds; the instance data follows it across setGeometry() (levels of detail).
+ */
+export class FigureBatch {
+  readonly mesh: THREE.InstancedMesh;
+  readonly look0: THREE.InstancedBufferAttribute;
+  readonly look1: THREE.InstancedBufferAttribute;
+  readonly pose: THREE.InstancedBufferAttribute;
+  readonly kind: FigureKind;
+  private readonly rest: readonly number[];
+  private readonly views = new Map<THREE.BufferGeometry, THREE.BufferGeometry>();
+  private n = 0;
+  /** Dirty instance ranges [min, max] of the colours (look0), masks and accents (look1) and poses (min > max: clean). */
+  private lookMin = 0; private lookMax: number;
+  private maskMin = 0; private maskMax: number;
+  private poseMin = 0; private poseMax: number;
+
+  constructor(geometry: THREE.BufferGeometry, material: THREE.Material, readonly capacity: number, kind?: FigureKind) {
+    this.kind = kind ?? (material.userData.figureKind as FigureKind | undefined) ?? 'rigid';
+    this.rest = REST[this.kind];
+    const attribute = (fill: (i: number, k: number) => number) => {
+      const a = new THREE.InstancedBufferAttribute(new Float32Array(capacity * 4), 4);
+      for (let i = 0; i < capacity; i++) for (let k = 0; k < 4; k++) a.array[i * 4 + k] = fill(i, k);
+      a.setUsage(THREE.DynamicDrawUsage);
+      return a;
+    };
+    this.look0 = attribute(() => 16777215);
+    this.look1 = attribute((_, k) => (k < 2 ? 16777215 : 0));
+    this.pose = attribute((_, k) => this.rest[k]);
+    this.mesh = new THREE.InstancedMesh(this.view(geometry), material, capacity);
+    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.mesh.frustumCulled = false;
+    this.mesh.count = 0;
+    this.mesh.visible = false;
+    this.lookMax = this.maskMax = this.poseMax = capacity - 1;
   }
-  if (set === 'civil' || set === 'all') {
-    parts.add(sphere(0.5, 6, 4), { at: [0.22, 0.6, 0.66], scale: [1.4, 0.5, 0.75], rot: [-0.55, 0, -0.3], slot: HAIR, part: PART.FRINGE });
-    parts.add(sphere(1, 8, 6), { at: [0, -0.5, -0.36], scale: [1.08, 1.0, 0.74], slot: HAIR, part: PART.LONG });
-    for (const side of [-1, 1]) parts.add(sphere(0.5, 5, 4), { at: [side * 0.84, -0.42, 0.14], scale: [0.62, 1.4, 0.95], slot: HAIR, part: PART.LONG });
-    parts.add(sphere(0.42, 7, 5), { at: [0, 0.55, -0.95], slot: HAIR, part: PART.BUN });
-    parts.add(sphere(0.3, 6, 4), { at: [0, -0.32, -1.18], scale: [1, 2.2, 1], rot: [0.35, 0, 0], slot: HAIR, part: PART.TAIL });
-    parts.add(sphere(0.2, 5, 3), { at: [0, 0.32, -1.06], slot: HAIR, shade: 0.7, part: PART.TAIL });
-    // Nón lá: a wide straw cone.
-    parts.add(new THREE.ConeGeometry(2.05, 1.15, 14), { at: [0, 1.1, 0], slot: ACCENT, part: PART.CONE });
-    parts.add(new THREE.CylinderGeometry(1.12, 1.15, 0.32, 12), { at: [0, 0.3, 0], rot: [-0.12, 0, 0], slot: ACCENT, part: PART.BANDANA });
-    for (const side of [-1, 1]) parts.add(box(0.16, 0.5, 0.08), { at: [side * 0.14, 0.02, -1.12], rot: [0.35, 0, side * 0.35], slot: ACCENT, part: PART.BANDANA });
+
+  private view(source: THREE.BufferGeometry) {
+    let view = this.views.get(source);
+    if (!view) {
+      view = shareGeometry(source);
+      view.setAttribute('look0', this.look0);
+      view.setAttribute('look1', this.look1);
+      view.setAttribute('pose', this.pose);
+      this.views.set(source, view);
+    }
+    return view;
   }
-  if (set === 'police' || set === 'all') {
-    // Peaked police cap: flared crown, red band, dark visor and a gold badge.
-    parts.add(cyl(1.24, 1.08, 0.5, 14), { at: [0, 0.68, -0.02], rot: [-0.08, 0, 0], slot: ACCENT, part: PART.CAP });
-    parts.add(cyl(1.1, 1.1, 0.16, 14), { at: [0, 0.48, -0.01], rot: [-0.08, 0, 0], shade: '#9c3a32', part: PART.CAP });
-    parts.add(halfDisc(0.95, 0.07), { at: [0, 0.42, 0.62], scale: [1, 1, 0.78], rot: [0.28, 0, 0], shade: '#151a22', part: PART.CAP });
-    parts.add(sphere(0.17, 6, 4), { at: [0, 0.74, 1.08], scale: [1, 1, 0.45], shade: '#d9b44a', part: PART.CAP });
-    // SWAT helmet with ear guards and a short peak.
-    parts.add(sphere(1.2, 12, 6, Math.PI * 0.54), { at: [0, 0.1, -0.04], scale: [1, 0.95, 1.04], rot: [-0.32, 0, 0], slot: ACCENT, part: PART.SWAT });
-    parts.add(halfDisc(1.0, 0.08), { at: [0, 0.4, 0.68], scale: [1, 1, 0.55], rot: [0.15, 0, 0], slot: ACCENT, shade: 0.8, part: PART.SWAT });
-    for (const side of [-1, 1]) parts.add(box(0.2, 0.62, 0.62), { at: [side * 1.08, -0.08, -0.02], slot: ACCENT, shade: 0.85, part: PART.SWAT });
+
+  /** Switches to another level of detail (each view is built once, so switching back and forth allocates nothing). */
+  setGeometry(geometry: THREE.BufferGeometry) {
+    this.mesh.geometry = this.view(geometry);
   }
-  if (set === 'all' || rider) {
-    // Motorbike half helmet with a peak and a stripe in the shirt colour.
-    parts.add(sphere(1.15, 12, 6, Math.PI * 0.52), { at: [0, 0.06, -0.02], scale: [1, 1.0, 1.02], rot: [-0.3, 0, 0], slot: ACCENT, part: PART.HELMET });
-    parts.add(sphere(1.17, 12, 6, Math.PI * 0.5), { at: [0, 0.06, -0.02], scale: [0.2, 1.0, 1.03], rot: [-0.3, 0, 0], slot: SHIRT, part: PART.HELMET });
-    parts.add(halfDisc(0.85, 0.07), { at: [0, 0.36, 0.86], scale: [1, 1, 0.6], rot: [0.15, 0, 0], slot: ACCENT, shade: 0.9, part: PART.HELMET });
+
+  begin() { this.n = 0; }
+
+  /** Writes one instance: a transform, a packed look from `palette()` and a pose (REST when omitted). */
+  set(index: number, transform: THREE.Matrix4, look: ArrayLike<number>, pose?: ArrayLike<number>) {
+    this.mesh.setMatrixAt(index, transform);
+    this.setLook(index, look);
+    this.setPose(index, pose ?? this.rest);
   }
-  if (rider) {
-    // A cloth face mask (khẩu trang) over nose and mouth: light surgical blue or dark cloth.
-    for (const [part, shade] of [[PART.MASK, '#b4cfdc'], [PART.MASK_DARK, '#2c3036']] as const) {
-      parts.add(new THREE.SphereGeometry(1.04, 12, 4, Math.PI * 0.12, Math.PI * 0.76, Math.PI * 0.53, Math.PI * 0.28), { scale: [1, 1.07, 0.97], shade, part });
-      parts.add(sphere(0.2, 6, 4), { at: [0, -0.17, 0.93], scale: [1, 0.9, 0.75], shade, part });
-      for (const side of [-1, 1]) parts.add(box(0.05, 0.05, 0.5), { at: [side * 0.97, -0.12, 0.2], rot: [0.3, side * 0.2, 0], shade, part });
+
+  setLook(index: number, look: ArrayLike<number>) {
+    const a = this.look0.array as Float32Array, b = this.look1.array as Float32Array, o = index * 4;
+    // A blink, a mouth or a held item only changes the masks (look1): the colours stay put.
+    if (a[o] !== look[0] || a[o + 1] !== look[1] || a[o + 2] !== look[2] || a[o + 3] !== look[3]) {
+      a[o] = look[0]; a[o + 1] = look[1]; a[o + 2] = look[2]; a[o + 3] = look[3];
+      if (index < this.lookMin) this.lookMin = index;
+      if (index > this.lookMax) this.lookMax = index;
+    }
+    if (b[o] !== look[4] || b[o + 1] !== look[5] || b[o + 2] !== look[6] || b[o + 3] !== look[7]) {
+      b[o] = look[4]; b[o + 1] = look[5]; b[o + 2] = look[6]; b[o + 3] = look[7];
+      if (index < this.maskMin) this.maskMin = index;
+      if (index > this.maskMax) this.maskMax = index;
     }
   }
-  return parts;
+
+  setPose(index: number, pose: ArrayLike<number>) {
+    const p = this.pose.array as Float32Array, o = index * 4;
+    // Float32 storage: compare after rounding so an unchanged pose stays clean.
+    const x = Math.fround(pose[0]), y = Math.fround(pose[1]), z = Math.fround(pose[2]), w = Math.fround(pose[3]);
+    if (p[o] !== x || p[o + 1] !== y || p[o + 2] !== z || p[o + 3] !== w) {
+      p[o] = x; p[o + 1] = y; p[o + 2] = z; p[o + 3] = w;
+      if (index < this.poseMin) this.poseMin = index;
+      if (index > this.poseMax) this.poseMax = index;
+    }
+  }
+
+  push(transform: THREE.Matrix4, look: ArrayLike<number>, pose?: ArrayLike<number>) {
+    if (this.n < this.capacity) this.set(this.n++, transform, look, pose);
+  }
+
+  /** Finishes a frame; `count` overrides the packed count when slots are fixed. */
+  end(count = this.n) {
+    const was = this.mesh.count;
+    this.mesh.count = count;
+    this.mesh.visible = count > 0;
+    // Ranges add up until the renderer uploads them (it clears them then), so a frame the mesh is not drawn in
+    // loses nothing; a long backlog becomes one whole upload.
+    const range = (attribute: THREE.BufferAttribute, start: number, length: number) => {
+      if (attribute.updateRanges.length > 6) { attribute.clearUpdateRanges(); start = 0; length = attribute.array.length; }
+      attribute.addUpdateRange(start, length);
+      attribute.needsUpdate = true;
+    };
+    if (count > 0) range(this.mesh.instanceMatrix, 0, count * 16);
+    else if (was === 0) return;
+    if (this.lookMin <= this.lookMax) {
+      range(this.look0, this.lookMin * 4, (this.lookMax - this.lookMin + 1) * 4);
+      this.lookMin = this.capacity; this.lookMax = -1;
+    }
+    if (this.maskMin <= this.maskMax) {
+      range(this.look1, this.maskMin * 4, (this.maskMax - this.maskMin + 1) * 4);
+      this.maskMin = this.capacity; this.maskMax = -1;
+    }
+    if (this.poseMin <= this.poseMax) {
+      range(this.pose, this.poseMin * 4, (this.poseMax - this.poseMin + 1) * 4);
+      this.poseMin = this.capacity; this.poseMax = -1;
+    }
+  }
+
+  /** Marks looks and poses for upload after writing their arrays directly. */
+  touch() { this.lookMin = this.maskMin = this.poseMin = 0; this.lookMax = this.maskMax = this.poseMax = this.capacity - 1; }
+
+  /** Frees the batch's views and instance buffers; a source geometry is freed too unless it is a shared build. */
+  dispose() {
+    for (const [source, view] of this.views) {
+      releaseView(view);
+      if (!source.userData.sharedGeometry) source.dispose();
+    }
+    this.views.clear();
+    this.mesh.dispose();
+  }
 }
 
-/** Torso of the crowd model in model units (pelvis, shirt, neck), plus police kit and SWAT vest. */
-export function addTorso(parts: FigureParts, police: boolean) {
-  const { SHIRT, PANTS, SKIN } = SLOT;
-  parts.add(lathe([0, 0.67, 0.2, 0.67, 0.245, 0.73, 0.25, 0.88, 0, 0.88], 10), { scale: [1, 1, 0.66], slot: PANTS });
-  parts.add(lathe([0, 0.83, 0.262, 0.83, 0.262, 0.9, 0.245, 1.03, 0.258, 1.2, 0.287, 1.36, 0.287, 1.45, 0.235, 1.525, 0.11, 1.565, 0, 1.565], 10), { scale: [1, 1, 0.64], slot: SHIRT });
-  parts.add(cyl(0.11, 0.125, 0.05, 10), { at: [0, 1.55, 0], scale: [1, 1, 0.8], slot: SHIRT, shade: 0.86 });
-  parts.add(tube(0.072, 0.08, 0.16, 8), { at: [0, 1.62, 0], slot: SKIN });
-  if (!police) return parts;
-  parts.add(cyl(0.258, 0.258, 0.07, 10), { at: [0, 0.87, 0], scale: [1, 1, 0.68], shade: '#1c1f24', part: PART.KIT });
-  parts.add(box(0.08, 0.06, 0.03), { at: [0, 0.87, 0.172], shade: '#d9b44a', part: PART.KIT });
-  parts.add(box(0.07, 0.08, 0.02), { at: [-0.13, 1.33, 0.172], rot: [-0.12, 0, 0], shade: '#d9b44a', part: PART.KIT });
-  for (const side of [-1, 1]) parts.add(box(0.14, 0.03, 0.17), { at: [side * 0.2, 1.505, 0], rot: [0, 0, side * -0.45], slot: SHIRT, shade: 0.7, part: PART.KIT });
-  parts.add(lathe([0, 0.95, 0.29, 0.95, 0.3, 1.2, 0.31, 1.42, 0.24, 1.5, 0, 1.5], 10), { scale: [1, 1, 0.7], slot: SHIRT, shade: 0.62, part: PART.VEST });
-  for (const x of [-0.15, 0, 0.15]) parts.add(box(0.11, 0.13, 0.06), { at: [x, 1.08, 0.215], slot: SHIRT, shade: 0.45, part: PART.VEST });
-  parts.add(box(0.06, 0.14, 0.05), { at: [0.17, 1.38, 0.21], shade: '#2a2d31', part: PART.VEST });
-  return parts;
-}
-
-/** Crowd body: torso and head in one piece (it never bends at the neck). */
-export function bodyGeometry(set: 'civil' | 'police') {
-  const parts = new FigureParts();
-  addTorso(parts, set === 'police');
-  parts.base.compose(position.set(0, FIGURE.headY, 0.015), quaternion.identity(), scaling.setScalar(FIGURE.headR));
-  addHead(parts, set);
-  return parts.build();
-}
+// ---- Seated poses -------------------------------------------------------------------------------------------
 
 /**
- * Leg hanging from the hip pivot: slot 0 thigh, 1 shin, 2 shoe. Two variants share the hip joint:
- * STRAIGHT for standing and walking, BENT (thigh forward, shin down) for sitting.
- */
-export function legGeometry() {
-  const parts = new FigureParts();
-  parts.add(sphere(0.118, 7, 5), { at: [0, -0.02, 0], slot: 0 });
-  const shoe = (y: number, z: number, part: number) => {
-    parts.add(box(0.15, 0.1, 0.25), { at: [0, y + 0.05, z + 0.04], slot: 2, part });
-    parts.add(sphere(0.075, 6, 3), { at: [0, y + 0.045, z + 0.165], scale: [1, 0.7, 1.1], slot: 2, part });
-    parts.add(box(0.16, 0.03, 0.29), { at: [0, y + 0.012, z + 0.06], slot: 2, shade: 0.55, part });
-  };
-  parts.add(tube(0.116, 0.1, 0.36, 8), { at: [0, -0.18, 0], slot: 0, part: PART.STRAIGHT });
-  parts.add(tube(0.098, 0.082, 0.33, 8), { at: [0, -0.495, 0], slot: 1, part: PART.STRAIGHT });
-  shoe(-0.755, 0, PART.STRAIGHT);
-  parts.add(tube(0.104, 0.116, 0.38, 8), { at: [0, -0.01, 0.17], rot: [Math.PI / 2, 0, 0], slot: 0, part: PART.BENT });
-  parts.add(sphere(0.104, 6, 4), { at: [0, -0.01, 0.36], slot: 0, part: PART.BENT });
-  parts.add(tube(0.096, 0.082, 0.5, 8), { at: [0, -0.28, 0.37], slot: 1, part: PART.BENT });
-  shoe(-0.61, 0.36, PART.BENT);
-  return parts.build();
-}
-
-/**
- * Arm hanging from the shoulder pivot: slot 0 sleeve, 1 forearm, 2 hand; police arms can hold a weapon,
- * and crowd arms (`props`) a phone, a paper fan or a broom that reaches down to the ground.
- */
-export function armGeometry(weapons: boolean, props = false) {
-  const parts = new FigureParts();
-  parts.add(sphere(0.092, 7, 5), { at: [0, -0.02, 0], slot: 0 });
-  parts.add(tube(0.092, 0.08, 0.3, 7), { at: [0, -0.15, 0], slot: 0 });
-  parts.add(cyl(0.09, 0.09, 0.05, 7), { at: [0, -0.28, 0], slot: 0, shade: 0.88 });
-  parts.add(tube(0.072, 0.061, 0.28, 7), { at: [0, -0.43, 0], slot: 1 });
-  parts.add(sphere(0.078, 6, 4), { at: [0, -0.6, 0.005], scale: [0.85, 1.12, 0.95], slot: 2 });
-  if (weapons) {
-    parts.add(cyl(0.024, 0.024, 0.56, 6), { at: [0, -0.86, 0.03], shade: '#1d1f22', part: PART.BATON });
-    parts.add(box(0.05, 0.26, 0.085), { at: [0, -0.72, 0.03], shade: '#2b2f33', part: PART.PISTOL });
-    parts.add(box(0.052, 0.2, 0.09), { at: [0, -0.7, 0.03], shade: '#e0b92e', part: PART.TASER });
-    parts.add(box(0.054, 0.08, 0.092), { at: [0, -0.84, 0.03], shade: '#24272b', part: PART.TASER });
-    parts.add(box(0.065, 0.66, 0.1), { at: [0, -0.88, 0.035], shade: '#24282c', part: PART.RIFLE });
-    parts.add(box(0.05, 0.16, 0.12), { at: [0, -0.84, 0.1], shade: '#2f3337', part: PART.RIFLE });
-  }
-  if (props) {
-    parts.add(box(0.075, 0.15, 0.018), { at: [0, -0.68, 0.075], shade: '#1d2024', part: PART.PHONE });
-    parts.add(box(0.062, 0.12, 0.004), { at: [0, -0.68, 0.064], shade: '#7fa6d6', part: PART.PHONE });
-    // A folding paper fan pivots in the hand and spreads out past the fingers.
-    parts.add(halfDisc(0.22, 0.012), { at: [0, -0.64, 0.05], rot: [Math.PI / 2, 0, 0], shade: '#e9d6a6', part: PART.FAN });
-    parts.add(cyl(0.024, 0.024, 0.02, 8), { at: [0, -0.64, 0.05], rot: [Math.PI / 2, 0, 0], shade: '#b8463a', part: PART.FAN });
-    parts.add(cyl(0.02, 0.02, 1.0, 5), { at: [0, -1.1, 0], shade: '#9a7a4e', part: PART.BROOM });
-    parts.add(cyl(0.035, 0.12, 0.34, 7), { at: [0, -1.74, 0], shade: '#c9a85e', part: PART.BROOM });
-    parts.add(cyl(0.03, 0.03, 0.05, 6), { at: [0, -1.58, 0], shade: '#b8463a', part: PART.BROOM });
-  }
-  return parts.build();
-}
-
-/** Umbrella in crowd model units: handle at the origin, shaft up +y, canopy on top (`length` is handle to tip). */
-export const UMBRELLA = { length: 1.64, radius: 0.84, drop: 0.36 } as const;
-
-/** An open umbrella: J handle, shaft, eight faceted canopy panels alternating palette slots 0 and 1, a darker underside. */
-export function umbrellaGeometry(panels = 8) {
-  const parts = new FigureParts();
-  const top = UMBRELLA.length, r = UMBRELLA.radius, rim = top - UMBRELLA.drop;
-  parts.add(cyl(0.034, 0.034, 0.22, 6), { at: [0, -0.01, 0], shade: '#4a3324' });
-  parts.add(new THREE.TorusGeometry(0.06, 0.026, 4, 8, Math.PI), { at: [-0.06, -0.12, 0], rot: [0, 0, Math.PI], shade: '#4a3324' });
-  parts.add(cyl(0.017, 0.017, top + 0.1, 5), { at: [0, (top + 0.1) / 2, 0], shade: '#2c2c2e' });
-  // Profile from the rim up to the tip (outer surface), and the same points reversed for the underside.
-  const outside = [new THREE.Vector2(r, rim), new THREE.Vector2(r * 0.7, rim + 0.21), new THREE.Vector2(r * 0.36, top - 0.05), new THREE.Vector2(0.001, top)];
-  const inside = [...outside].reverse().map((p) => new THREE.Vector2(p.x, p.y - 0.015));
-  const step = (Math.PI * 2) / panels;
-  for (let k = 0; k < panels; k++) {
-    parts.add(new THREE.LatheGeometry(outside, 1, k * step, step), { slot: k % 2 });
-    parts.add(new THREE.LatheGeometry(inside, 1, k * step, step), { slot: k % 2, shade: 0.6 });
-    parts.add(sphere(0.028, 4, 3), { at: [Math.sin(k * step) * r, rim - 0.01, Math.cos(k * step) * r], shade: '#2c2c2e' });
-  }
-  parts.add(cyl(0.024, 0.012, 0.14, 5), { at: [0, top + 0.06, 0], shade: '#2c2c2e' });
-  return parts.build();
-}
-
-/**
- * Where a traffic rider sits on the scooter model, in moto-local metres (the model is real-world size:
- * seat top 0.82 m, floorboard 0.65 m, handlebar 1.12 m high at z 0.52, grips about 0.36 m out).
+ * How a rider sits a scooter, in moto-local metres (the model is real-world size: seat top 0.82 m, floorboard
+ * 0.65 m, handlebar 1.12 m high at z 0.52, grips about 0.36 m out): figure scale, forward lean, and the grip,
+ * foot, knee and elbow directions. vehicles.ts SEATS and game.ts seatOn build their IK targets on these.
  */
 export type RiderPose = {
   scale: number; hipY: number; hipZ: number; lean: number;
@@ -350,170 +252,217 @@ export const RIDER: RiderPose = {
   knee: [0.9, 0.55, 0.25],
   elbow: [0.9, -0.45, -0.2],
 };
-/** The same rider on a manual bike: feet on the footpegs beside the engine instead of a floorboard. */
-export const PEG_RIDER: RiderPose = { ...RIDER, foot: [0.2, 0.37, -0.03], knee: [0.9, 0.35, 0.6] };
 /**
  * A car driver relative to their hip (the seat position is added by the caller): leaning back a little,
- * hands on the wheel, feet on the pedals. Smaller, so the stylised head clears a sedan roof.
+ * hands on the wheel, feet on the pedals. Hip .5 m + 1.04 u x .8 = 1.33 m stays under a 1.44 m roof.
  */
 export const CAR_DRIVER: RiderPose = {
-  scale: 0.62, hipY: 0, hipZ: 0, lean: -0.12,
+  scale: 0.8, hipY: 0, hipZ: 0, lean: -0.12,
   grip: [0.17, 0.4, 0.3],
   foot: [0.14, -0.36, 0.26],
   knee: [0.3, 0.7, 0.6],
   elbow: [0.9, -0.45, -0.2],
 };
 
-/** Two-bone joint (elbow or knee) between `a` and `b` for segment lengths l1, l2, bent toward `hint`. */
-function joint(a: THREE.Vector3, b: THREE.Vector3, l1: number, l2: number, hint: THREE.Vector3) {
-  const d = new THREE.Vector3().subVectors(b, a);
-  const dist = d.length();
-  d.divideScalar(dist);
-  if (dist >= l1 + l2) return a.clone().addScaledVector(d, dist * l1 / (l1 + l2));
-  const p = (l1 * l1 - l2 * l2 + dist * dist) / (2 * dist);
-  const h = Math.sqrt(Math.max(0, l1 * l1 - p * p));
-  const n = hint.clone().addScaledVector(d, -hint.dot(d)).normalize();
-  return a.clone().addScaledVector(d, p).addScaledVector(n, h);
+// ---- Hero figures (player, peers, interior people) ----------------------------------------------------------
+
+const PIECE_KIND: Record<FigurePiece, FigureKind> = { body: 'body', armL: 'arm', armR: 'arm', leg: 'leg' };
+
+/** One instance of a shared hero geometry: the attributes are the cache's, only look/pose are its own. */
+function heroMesh(piece: FigurePiece, detail: Detail, material: THREE.Material) {
+  const g = shareGeometry(figureGeometry(piece, detail));
+  const own = (values: readonly number[]) => new THREE.InstancedBufferAttribute(new Float32Array(values), 4);
+  g.setAttribute('look0', own([16777215, 16777215, 16777215, 16777215]));
+  g.setAttribute('look1', own([16777215, 16777215, 0, 0]));
+  g.setAttribute('pose', own(REST[PIECE_KIND[piece]]));
+  const mesh = new THREE.InstancedMesh(g, material, 1);
+  // Culled like any mesh (a shopkeeper down the street costs nothing), against the rest pose's sphere grown to
+  // hold every bend the shader can give it.
+  const rest = figureGeometry(piece, detail).boundingSphere;
+  if (rest) mesh.boundingSphere = new THREE.Sphere(rest.center.clone(), rest.radius * 1.3 + 0.1);
+  else mesh.frustumCulled = false;
+  mesh.castShadow = false;
+  mesh.userData.sharedGeometry = true;
+  return mesh;
 }
 
-/** Points `parts.base` along a limb segment: model y = `from` lands on `a` and y = `from - length` on `b` (limbs hang along -y). */
-function alongSegment(parts: FigureParts, a: THREE.Vector3, b: THREE.Vector3, scale: number, from: number, length: number) {
-  const dir = new THREE.Vector3().subVectors(b, a);
-  const len = dir.length();
-  const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, -1, 0), dir.divideScalar(len));
-  parts.base.compose(a, q, new THREE.Vector3(scale, len / length, scale)).multiply(new THREE.Matrix4().makeTranslation(0, -from, 0));
-}
+export type HeroFigure = ReturnType<typeof createHeroFigure>;
 
 /**
- * A seated motorbike rider in one piece, posed on the traffic scooter: torso leaning toward the bars,
- * head up looking down the road under a half helmet, elbows bent to the grips, knees up and feet on the
- * floorboard. Built in moto-local metres so the scooter's own instance matrix (with its lean) places it.
- * Palette: shirt, pants, skin, hair (brows), helmet; parts SLEEVE, MASK, MASK_DARK and HELMET.
+ * A single detailed person built from the shared hero geometry, with a joint hierarchy to animate:
+ * group > body (hip) > chest (waist twist) > head (yaw 'YXZ' pitch) and armLeft/armRight (shoulders,
+ * 'XZY': swing, abduct, roll) > elbowLeft/Right (x) > handLeft/Right (wrist, 'YZX': twist then flex);
+ * group > limbLeft/limbRight (hips) > kneeLeft/Right > ankleLeft/Right. Units are FIGURE units (scale the
+ * group). Set rotations, `grip` hand codes, `toe`, `secondary` and `hair`, then call sync() once per frame.
+ * The right side hangs at -x (people face +z). Hand rotations are mirrored: handLeft.rotation.y = -twist,
+ * .z = -flex; handRight (the mirrored build) uses +twist, +flex.
  */
-export function riderGeometry(pose: RiderPose = RIDER, head: 'rider' | 'all' = 'rider') {
-  const parts = new FigureParts();
-  const { SHIRT, PANTS, SKIN } = SLOT;
-  const S = pose.scale;
-  const xAxis = new THREE.Vector3(1, 0, 0);
-  const body = new THREE.Matrix4()
-    .compose(new THREE.Vector3(0, pose.hipY, pose.hipZ), new THREE.Quaternion().setFromAxisAngle(xAxis, pose.lean), new THREE.Vector3(S, S, S))
-    .multiply(new THREE.Matrix4().makeTranslation(0, -FIGURE.hipY, 0));
-  parts.base.copy(body);
-  addTorso(parts, false);
-  // The head tips back up so the rider looks down the road rather than at the handlebar.
-  parts.base.copy(body).multiply(new THREE.Matrix4().compose(
-    new THREE.Vector3(0, FIGURE.headY, 0.015), new THREE.Quaternion().setFromAxisAngle(xAxis, -pose.lean * 0.85), new THREE.Vector3(FIGURE.headR, FIGURE.headR, FIGURE.headR)));
-  addHead(parts, head);
-  for (const side of [-1, 1]) {
-    // Arm: shoulder to grip, elbow bent outward and down.
-    const shoulder = new THREE.Vector3(side * FIGURE.shoulderX, FIGURE.shoulderY, 0).applyMatrix4(body);
-    const grip = new THREE.Vector3(side * pose.grip[0], pose.grip[1], pose.grip[2]);
-    const elbow = joint(shoulder, grip, 0.29 * S * 1.08, 0.31 * S * 1.08, new THREE.Vector3(side * pose.elbow[0], pose.elbow[1], pose.elbow[2]));
-    alongSegment(parts, shoulder, elbow, S, 0, 0.29);
-    parts.add(sphere(0.092, 7, 5), { at: [0, -0.02, 0], slot: SHIRT });
-    parts.add(tube(0.092, 0.08, 0.3, 7), { at: [0, -0.15, 0], slot: SHIRT });
-    parts.add(cyl(0.09, 0.09, 0.05, 7), { at: [0, -0.28, 0], slot: SHIRT, shade: 0.88 });
-    alongSegment(parts, elbow, grip, S, -0.29, 0.31);
-    parts.add(sphere(0.07, 6, 4), { at: [0, -0.29, 0], slot: SKIN });
-    parts.add(sphere(0.083, 6, 4), { at: [0, -0.29, 0], slot: SHIRT, part: PART.SLEEVE });
-    parts.add(tube(0.072, 0.061, 0.29, 7), { at: [0, -0.435, 0], slot: SKIN });
-    parts.add(tube(0.082, 0.07, 0.27, 7), { at: [0, -0.425, 0], slot: SHIRT, part: PART.SLEEVE });
-    parts.add(sphere(0.078, 6, 4), { at: [0, -0.6, 0.005], scale: [0.85, 1.12, 0.95], slot: SKIN });
-    // Leg: hip to ankle with the knee up and out, the foot flat on the floorboard.
-    const hip = new THREE.Vector3(side * FIGURE.hipX, FIGURE.hipY, 0).applyMatrix4(body);
-    const ankle = new THREE.Vector3(side * pose.foot[0], pose.foot[1] + 0.098 * S, pose.foot[2] - 0.05 * S);
-    const knee = joint(hip, ankle, 0.345 * S, 0.315 * S, new THREE.Vector3(side * pose.knee[0], pose.knee[1], pose.knee[2]));
-    alongSegment(parts, hip, knee, S, 0, 0.345);
-    parts.add(sphere(0.118, 7, 5), { at: [0, -0.02, 0], slot: PANTS });
-    parts.add(tube(0.116, 0.104, 0.36, 8), { at: [0, -0.18, 0], slot: PANTS });
-    alongSegment(parts, knee, ankle, S, -0.345, 0.315);
-    parts.add(sphere(0.106, 6, 4), { at: [0, -0.345, 0], slot: PANTS });
-    parts.add(tube(0.098, 0.082, 0.33, 8), { at: [0, -0.495, 0], slot: PANTS });
-    parts.base.compose(ankle, new THREE.Quaternion(), new THREE.Vector3(S, S, S));
-    parts.add(box(0.15, 0.1, 0.25), { at: [0, -0.048, 0.05], shade: '#2b2622' });
-    parts.add(sphere(0.075, 6, 3), { at: [0, -0.053, 0.175], scale: [1, 0.7, 1.1], shade: '#2b2622' });
-    parts.add(box(0.16, 0.03, 0.29), { at: [0, -0.086, 0.07], shade: '#1b1816' });
-  }
-  return parts.build();
-}
-
-/** Ragdoll torso: the crowd torso re-centred between hip and shoulder joints, which sit at y = ±0.5. */
-export function ragdollTorsoGeometry() {
-  const parts = new FigureParts();
-  const span = FIGURE.shoulderY - FIGURE.hipY, mid = (FIGURE.shoulderY + FIGURE.hipY) / 2;
-  parts.base.compose(position.set(0, -mid / span, 0), quaternion.identity(), scaling.set(1, 1 / span, 1));
-  addTorso(parts, true);
-  return parts.build();
-}
-
-/** Ragdoll limb segment along +y from -0.5 to 0.5, radius 0.5; slot 1 colours the far end (hand or shoe). */
-export function ragdollLimbGeometry() {
-  const parts = new FigureParts();
-  parts.add(cyl(0.44, 0.5, 0.82, 7), { at: [0, -0.09, 0], slot: 0 });
-  parts.add(cyl(0.4, 0.46, 0.2, 7), { at: [0, 0.4, 0], slot: 1 });
-  return parts.build();
-}
-
-export function ragdollHeadGeometry() {
-  return addHead(new FigureParts(), 'all').build();
-}
-
-/** Shared look for every figure mesh: vertex colours pick a slot from the instance palette; parts are masked. */
-export function figureMaterial() {
-  const material = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.8, metalness: 0.02 });
-  material.onBeforeCompile = (shader) => {
-    shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\nattribute vec2 tag;\nattribute vec3 c0;\nattribute vec3 c1;\nattribute vec3 c2;\nattribute vec3 c3;\nattribute vec4 c4;')
-      .replace('#include <color_vertex>', 'vColor = color * ( tag.x < 0.5 ? c0 : tag.x < 1.5 ? c1 : tag.x < 2.5 ? c2 : tag.x < 3.5 ? c3 : tag.x < 4.5 ? c4.rgb : vec3( 1.0 ) );')
-      .replace('#include <begin_vertex>', '#include <begin_vertex>\n\tint figurePart = int( tag.y + 0.5 );\n\tif ( figurePart > 0 && ( ( int( c4.a + 0.5 ) >> ( figurePart - 1 ) ) & 1 ) == 0 ) transformed = vec3( 0.0 );');
+export function createHeroFigure(style: FigureStyle, opts: { detail?: Detail } = {}) {
+  let detail = opts.detail ?? 'hero';
+  const materials = { body: figureMaterial('body'), arm: figureMaterial('arm'), leg: figureMaterial('leg') };
+  const group = new THREE.Group();
+  const body = new THREE.Group(), chest = new THREE.Group(), head = new THREE.Group(), pack = new THREE.Group();
+  body.position.set(0, FIGURE.hipY, 0);
+  chest.position.set(0, FIGURE.waistY - FIGURE.hipY, 0);
+  head.position.set(0, FIGURE.headPivotY - FIGURE.waistY, 0);
+  head.rotation.order = 'YXZ';
+  pack.position.set(0, FIGURE.shoulderY + 0.1 - FIGURE.waistY, -0.16);
+  group.add(body);
+  body.add(chest);
+  chest.add(head, pack);
+  const arm = (side: 1 | -1) => {
+    const shoulder = new THREE.Group(), elbow = new THREE.Group(), hand = new THREE.Group();
+    shoulder.position.set(sideX(side) * style.shoulderX, FIGURE.shoulderY - FIGURE.waistY, 0);
+    shoulder.rotation.order = 'XZY';
+    elbow.position.set(0, -FIGURE.upperArm, 0);
+    hand.position.set(0, -FIGURE.foreArm, 0);
+    hand.rotation.order = 'YZX';
+    shoulder.add(elbow);
+    elbow.add(hand);
+    chest.add(shoulder);
+    return { shoulder, elbow, hand };
   };
-  material.customProgramCacheKey = () => 'figure-palette';
-  return material;
+  const leg = (side: 1 | -1) => {
+    const hip = new THREE.Group(), knee = new THREE.Group(), ankle = new THREE.Group();
+    hip.position.set(sideX(side) * FIGURE.hipX, FIGURE.hipY, 0);
+    knee.position.set(0, -FIGURE.thigh, 0);
+    ankle.position.set(0, -FIGURE.shin, 0);
+    hip.add(knee);
+    knee.add(ankle);
+    group.add(hip);
+    return { hip, knee, ankle };
+  };
+  const L = arm(-1), Rt = arm(1), LL = leg(-1), RL = leg(1);
+  const meshes = { body: heroMesh('body', detail, materials.body), armL: heroMesh('armL', detail, materials.arm), armR: heroMesh('armR', detail, materials.arm), legL: heroMesh('leg', detail, materials.leg), legR: heroMesh('leg', detail, materials.leg) };
+  meshes.body.position.y = -FIGURE.hipY;
+  const mount = () => {
+    body.add(meshes.body); L.shoulder.add(meshes.armL); Rt.shoulder.add(meshes.armR); LL.hip.add(meshes.legL); RL.hip.add(meshes.legR);
+  };
+  mount();
+  let looks: FigurePalettes = palettesOf(style);
+  const writeLook = (mesh: THREE.InstancedMesh, look: Float32Array) => {
+    const a = mesh.geometry.getAttribute('look0') as THREE.InstancedBufferAttribute, b = mesh.geometry.getAttribute('look1') as THREE.InstancedBufferAttribute;
+    const A = a.array as Float32Array, B = b.array as Float32Array;
+    if (A[0] !== look[0] || A[1] !== look[1] || A[2] !== look[2] || A[3] !== look[3] || B[0] !== look[4] || B[1] !== look[5] || B[2] !== look[6] || B[3] !== look[7]) {
+      A.set(look.subarray(0, 4)); B.set(look.subarray(4, 8));
+      a.needsUpdate = true; b.needsUpdate = true;
+    }
+  };
+  const writePose = (mesh: THREE.InstancedMesh, x: number, y: number, z: number, w: number) => {
+    const p = mesh.geometry.getAttribute('pose') as THREE.InstancedBufferAttribute, P = p.array as Float32Array;
+    const fx = Math.fround(x), fy = Math.fround(y), fz = Math.fround(z), fw = Math.fround(w);
+    if (P[0] !== fx || P[1] !== fy || P[2] !== fz || P[3] !== fw) { P[0] = fx; P[1] = fy; P[2] = fz; P[3] = fw; p.needsUpdate = true; }
+  };
+  const hero = {
+    group, body, chest, head, pack,
+    limbLeft: LL.hip, limbRight: RL.hip, kneeLeft: LL.knee, kneeRight: RL.knee, ankleLeft: LL.ankle, ankleRight: RL.ankle,
+    armLeft: L.shoulder, armRight: Rt.shoulder, elbowLeft: L.elbow, elbowRight: Rt.elbow, handLeft: L.hand, handRight: Rt.hand,
+    /** Hand codes (HAND.*) of each hand. */
+    grip: { left: REST.arm[3] as number, right: REST.arm[3] as number },
+    /** Toe bend at the ball of each foot (+ = toes up). */
+    toe: { left: 0, right: 0 },
+    /** Skirt / áo dài tà / apron swing angle (+ flares the front forward). */
+    secondary: 0,
+    /** Ponytail / long hair swing angle (+ lifts it backward). */
+    hair: 0,
+    style,
+    /** The packed looks; edit masks with setBits() and call sync(). */
+    get looks() { return looks; },
+    meshes,
+    /** Copies joint rotations, hand codes and looks into the shader attributes. */
+    sync() {
+      writePose(meshes.body, head.rotation.y, head.rotation.x, chest.rotation.y, swingCode(hero.secondary, hero.hair));
+      writePose(meshes.armL, L.elbow.rotation.x, -L.hand.rotation.y, -L.hand.rotation.z, hero.grip.left);
+      writePose(meshes.armR, Rt.elbow.rotation.x, Rt.hand.rotation.y, Rt.hand.rotation.z, hero.grip.right);
+      writePose(meshes.legL, LL.knee.rotation.x, LL.ankle.rotation.x, hero.toe.left, 0);
+      writePose(meshes.legR, RL.knee.rotation.x, RL.ankle.rotation.x, hero.toe.right, 0);
+      writeLook(meshes.body, looks.body); writeLook(meshes.armL, looks.armL); writeLook(meshes.armR, looks.armR);
+      writeLook(meshes.legL, looks.legs); writeLook(meshes.legR, looks.legs);
+    },
+    /** Dresses the figure anew (keeps joints). */
+    restyle(next: FigureStyle) {
+      hero.style = next;
+      looks = palettesOf(next);
+      L.shoulder.position.x = sideX(-1) * next.shoulderX; Rt.shoulder.position.x = sideX(1) * next.shoulderX;
+      hero.sync();
+    },
+    setDetail(next: Detail) {
+      if (next === detail) return;
+      detail = next;
+      for (const [key, mesh] of Object.entries(meshes) as [keyof typeof meshes, THREE.InstancedMesh][]) {
+        const piece: FigurePiece = key === 'legL' || key === 'legR' ? 'leg' : key;
+        const fresh = heroMesh(piece, detail, mesh.material as THREE.Material);
+        for (const name of ['look0', 'look1', 'pose']) fresh.geometry.setAttribute(name, mesh.geometry.getAttribute(name));
+        fresh.position.copy(mesh.position);
+        mesh.parent?.remove(mesh);
+        // The look and pose buffers moved to the fresh mesh: free only the old view itself.
+        for (const name of ['look0', 'look1', 'pose']) mesh.geometry.deleteAttribute(name);
+        releaseView(mesh.geometry);
+        mesh.dispose();
+        meshes[key] = fresh;
+      }
+      mount();
+    },
+    /** Frees this figure's own buffers and materials (never the shared geometry attributes). */
+    dispose() {
+      for (const mesh of Object.values(meshes)) { releaseView(mesh.geometry); mesh.dispose(); }
+      for (const m of Object.values(materials)) m.dispose();
+    },
+  };
+  hero.sync();
+  return hero;
 }
 
-/** An instanced figure part with per-instance palettes; `push` packs visible instances so hidden ones cost nothing. */
-export class FigureBatch {
-  readonly mesh: THREE.InstancedMesh;
-  private readonly slots: THREE.InstancedBufferAttribute[];
-  private n = 0;
+// ---- Baked figures -------------------------------------------------------------------------------------------
 
-  constructor(geometry: THREE.BufferGeometry, material: THREE.Material, readonly capacity: number) {
-    this.slots = [0, 1, 2, 3, 4].map((k) => {
-      const size = k === 4 ? 4 : 3;
-      const attribute = new THREE.InstancedBufferAttribute(new Float32Array(capacity * size).fill(1), size);
-      attribute.setUsage(THREE.DynamicDrawUsage);
-      geometry.setAttribute(`c${k}`, attribute);
-      return attribute;
-    });
-    this.mesh = new THREE.InstancedMesh(geometry, material, capacity);
-    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-    this.mesh.frustumCulled = false;
-    this.mesh.count = 0;
+export type BakePart = { piece: FigurePiece; detail?: Detail; matrix: THREE.Matrix4; look: ArrayLike<number>; pose?: ArrayLike<number> };
+
+/**
+ * Bakes posed pieces into one plain vertex-coloured geometry (for a MeshStandardMaterial with
+ * vertexColors): hidden parts are dropped, the rig and palette are applied on the CPU. For static people
+ * such as boat rowers.
+ */
+export function bakeFigure(parts: BakePart[]) {
+  const pos: number[] = [], col: number[] = [], idx: number[] = [];
+  const p = new THREE.Vector3(), color = new THREE.Color();
+  for (const part of parts) {
+    const g = figureGeometry(part.piece, part.detail ?? 'lo');
+    const kind = PIECE_KIND[part.piece];
+    const pose = part.pose ?? REST[kind];
+    const P = g.getAttribute('position'), C = g.getAttribute('color'), T = g.getAttribute('tag'), Rg = g.getAttribute('rig');
+    const look = part.look;
+    const bit = (index: number) => {
+      if (index === 0) return true;
+      const word = index > 24 ? look[7] : look[6];
+      return ((word >> ((index - 1) % 24)) & 1) === 1;
+    };
+    const slotColor = (slot: number) => {
+      if (slot > 5.5) return color.setRGB(1, 1, 1);
+      const v = look[Math.round(slot)];
+      return color.setRGB(Math.floor(v / 65536) / 255, Math.floor((v % 65536) / 256) / 255, (v % 256) / 255, THREE.SRGBColorSpace);
+    };
+    const map = new Int32Array(P.count).fill(-1);
+    const rig = [0, 0, 0, 0];
+    for (let i = 0; i < P.count; i++) {
+      const t = Math.round(T.getY(i));
+      if (!bit(t % 64) || !bit(Math.floor(t / 64))) continue;
+      rig[0] = Rg.getX(i); rig[1] = Rg.getY(i); rig[2] = Rg.getZ(i); rig[3] = Rg.getW(i);
+      applyRig(kind, rig, pose, p.set(P.getX(i), P.getY(i), P.getZ(i)), p).applyMatrix4(part.matrix);
+      map[i] = pos.length / 3;
+      pos.push(p.x, p.y, p.z);
+      const c = slotColor(T.getX(i));
+      col.push(c.r * C.getX(i), c.g * C.getY(i), c.b * C.getZ(i));
+    }
+    const index = g.index!.array;
+    for (let i = 0; i < index.length; i += 3) {
+      const a = map[index[i]], b = map[index[i + 1]], c = map[index[i + 2]];
+      if (a >= 0 && b >= 0 && c >= 0) idx.push(a, b, c);
+    }
   }
-
-  begin() { this.n = 0; }
-
-  /** Writes one instance at `index`; `look` is a packed palette from `palette()`. */
-  set(index: number, transform: THREE.Matrix4, look: Float32Array) {
-    this.mesh.setMatrixAt(index, transform);
-    const s = this.slots;
-    for (let k = 0; k < 4; k++) (s[k].array as Float32Array).set(look.subarray(k * 3, k * 3 + 3), index * 3);
-    (s[4].array as Float32Array).set(look.subarray(12, 16), index * 4);
-  }
-
-  push(transform: THREE.Matrix4, look: Float32Array) {
-    if (this.n < this.capacity) this.set(this.n++, transform, look);
-  }
-
-  /** Finishes a frame; `count` overrides the packed count when slots are fixed. */
-  end(count = this.n) {
-    this.mesh.count = count;
-    this.mesh.instanceMatrix.needsUpdate = true;
-    for (const attribute of this.slots) attribute.needsUpdate = true;
-  }
-
-  dispose() {
-    this.mesh.geometry.dispose();
-    this.mesh.dispose();
-  }
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  out.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+  out.setIndex(idx);
+  out.computeVertexNormals();
+  return out;
 }

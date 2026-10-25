@@ -1,15 +1,19 @@
 /** Graphics presets and the frame-pacing monitor that drives automatic quality. */
 export type QualityMode = 'auto' | 'high' | 'medium' | 'low';
-export type QualityLevel = { label: string; shadows: boolean; shadowSize: number; maxDpr: number; scale: number };
+export type QualityLevel = {
+  label: string; shadows: boolean; shadowSize: number; maxDpr: number; scale: number;
+  /** Detail of the crowd's figures (figures.ts): 'lo' has mitten hands, six-sided limbs and a coarser head. */
+  figures: 'hi' | 'lo';
+};
 
 // Ordered from best looking to fastest; automatic mode steps one level at a time.
 export const QUALITY_LEVELS: QualityLevel[] = [
-  { label: 'Cao', shadows: true, shadowSize: 2048, maxDpr: 1.75, scale: 1 },
-  { label: 'Cân bằng', shadows: true, shadowSize: 1024, maxDpr: 1.25, scale: 1 },
-  { label: 'Cân bằng', shadows: true, shadowSize: 1024, maxDpr: 1.25, scale: 0.85 },
-  { label: 'Hiệu năng', shadows: false, shadowSize: 0, maxDpr: 1, scale: 0.9 },
-  { label: 'Hiệu năng', shadows: false, shadowSize: 0, maxDpr: 1, scale: 0.75 },
-  { label: 'Tối thiểu', shadows: false, shadowSize: 0, maxDpr: 1, scale: 0.6 },
+  { label: 'Cao', shadows: true, shadowSize: 2048, maxDpr: 1.75, scale: 1, figures: 'hi' },
+  { label: 'Cân bằng', shadows: true, shadowSize: 1024, maxDpr: 1.25, scale: 1, figures: 'hi' },
+  { label: 'Cân bằng', shadows: true, shadowSize: 1024, maxDpr: 1.25, scale: 0.85, figures: 'hi' },
+  { label: 'Hiệu năng', shadows: false, shadowSize: 0, maxDpr: 1, scale: 0.9, figures: 'lo' },
+  { label: 'Hiệu năng', shadows: false, shadowSize: 0, maxDpr: 1, scale: 0.75, figures: 'lo' },
+  { label: 'Tối thiểu', shadows: false, shadowSize: 0, maxDpr: 1, scale: 0.6, figures: 'lo' },
 ];
 
 export const MODE_LEVEL: Record<Exclude<QualityMode, 'auto'>, number> = { high: 0, medium: 1, low: 4 };
