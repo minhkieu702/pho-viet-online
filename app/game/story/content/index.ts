@@ -51,6 +51,9 @@ type Loader = () => Promise<{ chapter: ChapterModule } | ChapterModule>;
 const LOADERS: Record<number, Loader> = {
   1: () => import('./ch01.ts'),
   2: () => import('./ch02.ts'),
+  3: () => import('./ch03.ts'),
+  4: () => import('./ch04.ts'),
+  5: () => import('./ch05.ts'),
 };
 const cache = new Map<number, Promise<ChapterModule | null>>();
 

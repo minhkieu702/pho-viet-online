@@ -263,10 +263,10 @@ export const SITES: Record<string, Site> = {
   'mai-pho-dem': {
     name: 'MÁI DÃY PHỐ ĐÊM', district: 'D1', phase: 'P0', kind: 'roof', building: 100, x: 90.3, z: 36, y: 7.11,
     spots: {
-      transformer: { x: 94.6, z: 33.2, y: 7.11, solid: true, note: 'c10-m1: the transformer box feeding the strip (hold E at 22:00)' },
-      plank: { x: 83.3, z: 39.5, y: 7.4, solid: true, note: 'plank over the 2.55 m gap to the spa\'s water-tank stand, then a 3 m ladder' },
-      spa: { x: 77, z: 41, y: 10.2, solid: true, note: 'spa roof (building 53)' },
-      moonlight: { x: 66, z: 42, y: 7.2, solid: true, note: 'Moonlight roof (building 52)' },
+      transformer: { x: 94.6, z: 33.2, y: 7.11, solid: true, level: 'roof', note: 'c10-m1: the transformer box feeding the strip (hold E at 22:00)' },
+      plank: { x: 83.3, z: 39.5, y: 7.4, solid: true, level: 'roof', note: 'plank over the 2.55 m gap to the spa\'s water-tank stand, then a 3 m ladder' },
+      spa: { x: 77, z: 41, y: 10.2, solid: true, level: 'roof', note: 'spa roof (building 53)' },
+      moonlight: { x: 66, z: 42, y: 7.2, solid: true, level: 'roof', note: 'Moonlight roof (building 52)' },
     },
     notes: 'Walkable roofs of the strip\'s north row (c5-m2, c10-m1): bia hơi 7.11 m, spa 10.2 m, Moonlight 7.2 m; the timing beat of c10-m1 rides the lion-dance drums.',
   },
