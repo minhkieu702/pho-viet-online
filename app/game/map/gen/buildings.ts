@@ -12,6 +12,7 @@ import { ZONE_STYLES, type DistrictLayout, type DistrictStyle, type StampSpec, t
 import type { HemPlan, Net } from './arterials.ts';
 import { streetNumber, type Lot } from './lots.ts';
 import { boxOf, hyp, polylineHit, r2, r6, type OBB } from './geom.ts';
+import { reservedSign } from '../reserved-names.ts';
 
 export type Typology = 'tube' | 'stilt' | 'shophouse' | 'market-hall' | 'warehouse' | 'apartment' | 'villa' | 'pagoda' | 'church' | 'school' | 'police' | 'hospital' | 'landmark';
 export type Facade = 'plain' | 'balcony' | 'tiled' | 'shutter' | 'cage' | 'colonial' | 'modern' | 'shed' | 'gallery' | 'temple';
@@ -108,8 +109,11 @@ function nameOn(ctx: Ctx, pick: Pick, line: string, x: number, z: number): [stri
   const seed = hashKey(ctx.layout.key, 'names', line, pick.tag);
   let step = 1 + (seed % (n - 1));
   while (gcd(step, n) !== 1) step++;
-  const k = (((seed >>> 8) % n) + slot * step) % n, [name, sub] = pick.list[k % pick.list.length], owner = Math.floor(k / pick.list.length);
-  return [owner ? `${name} ${OWNERS[owner - 1]}` : name, sub];
+  const k = (((seed >>> 8) % n) + slot * step) % n, [name, sub] = pick.list[k % pick.list.length];
+  // a story sign (reserved-names.ts) is never generated: its slot takes the next owner instead
+  let owner = Math.floor(k / pick.list.length), full = owner ? `${name} ${OWNERS[owner - 1]}` : name;
+  for (let i = 0; i < OWNERS.length && reservedSign(full); i++) { owner = (owner % OWNERS.length) + 1; full = `${name} ${OWNERS[owner - 1]}`; }
+  return [full, sub];
 }
 const gcd = (a: number, b: number): number => (b ? gcd(b, a % b) : a);
 

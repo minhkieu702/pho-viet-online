@@ -6,8 +6,9 @@
  * the Khánh Hội wharf on the river with Bến Nhà Rồng, KHO 1–9 with the story's KHO 7, the cargo-ship berth and
  * cranes; the east quay with the container yard; Bến Vân Đồn on the canal bank, Nguyễn Tất Thành round the bend,
  * Khánh Hội, Hoàng Diệu, Tôn Đản, Đoàn Văn Bơ, Vĩnh Khánh (the seafood night street), Nguyễn Khoái, Xóm Chiếu with
- * its market and night unloading bays, Tôn Thất Thuyết on Kênh Tẻ; chung cư cũ, the Xóm Chiếu church, a pagoda, a
- * school, the district police, and generated hẻm networks in the deep blocks. Data only: nothing here is wired into
+ * its market and night unloading bays, Tôn Thất Thuyết on Kênh Tẻ; chung cư cũ, the Xóm Chiếu church (a stamp), a pagoda,
+ * a school, the district police, Bến Nhà Rồng's waterbus pier (QUAN_4_EXTRA.docks), and generated hẻm networks in the
+ * deep blocks. Data only: nothing here is wired into
  * the live map (step 14 does that after the humans build merges).
  */
 import { WATERS } from '../districts.ts';
@@ -51,6 +52,11 @@ const NTT = [450, -108, 500, -60, 570, -60, 582.94, -58.3, 595, -53.3, 605.36, -
  * the gantry cranes' legs.
  */
 const BEND = { x: 620, z: -77.6 };
+/**
+ * Bến Nhà Rồng's waterbus pier (the Thủ Thiêm spur, BẠCH ĐẰNG – BẾN THỦ THIÊM – NHÀ RỒNG): between the canal mouth (x 432)
+ * and the museum (x 468), 22 m clear of the cargo ship's hull (x 479.5..574.5) so a boat berths between quay and ship.
+ */
+const NHA_RONG_PIER = 455;
 /** A fixture centred `r` m from the bend's centre at `deg` (0: east, -90: north), its w along the bend. */
 const onBend = (r: number, deg: number) => {
   const a = (deg * Math.PI) / 180;
@@ -94,6 +100,8 @@ function port(): FixtureSpec[] {
   for (const [k, [x, z]] of [[612, -90], [628, -62], [646, -46], [611, -129]].entries()) box(`drums-${k}`, 'drums', x, z, 1.3, 1.3, 0, 0.95);
   // Bollards every 15 m along the quay edge (the ship's bow and stern lines on those at x 485 and 570).
   for (const x of [485, 500, 531, 557, 570, 585, 600, 615]) box(`bollard-${x}`, 'bollard', x, -136.9, 0.5, 0.5, 0, 0.8);
+  // Bến Nhà Rồng's waterbus pier (QUAN_4_EXTRA.docks): a mooring post either side of its head on the quay edge.
+  for (const x of [NHA_RONG_PIER - 6.5, NHA_RONG_PIER + 6.5]) box(`coc-nha-rong-${x}`, 'bollard', x, -136.9, 0.5, 0.5, 0, 0.8);
   for (const deg of [-75, -60, -45, -30, -15]) { const p = onBend(59.2, deg); box(`bollard-b${-deg}`, 'bollard', p.x, p.z, 0.5, 0.5, 0, 0.8); }
   for (let z = -60; z <= 195; z += 15) if (![53, 67, 143, 157].some((c) => Math.abs(c - z) < 2)) box(`bollard-e${z}`, 'bollard', 679.2, z, 0.5, 0.5, 0, 0.8);
   // The guard booth at KHO 7's gate.
@@ -169,6 +177,9 @@ export const QUAN_4: DistrictLayout = {
     stampSpec('kho7'),
     // The container yard behind its gate office: the apron keeps every lot off the quay at z 20..200 (stacks: QUAN_4_EXTRA).
     { id: 'cang-khanh-hoi', kind: 'warehouse', name: 'CẢNG KHÁNH HỘI', subtitle: 'BÃI CONTAINER • CỔNG SỐ 3', x: 641.5, z: 110, w: 14, d: 8, yaw: -H, h: 4.2, storeys: 1, building: 'office', color: '#3d6f9e', yard: 83 },
+    // The Xóm Chiếu church (the block's institution lot never found room among the rows, so it is authored): it faces
+    // Bến Vân Đồn across a 6.5 m forecourt, its bell tower over the doors (QUAN_4_EXTRA.towers).
+    { id: 'nha-tho-xom-chieu', kind: 'church', name: 'NHÀ THỜ XÓM CHIẾU', subtitle: 'GIÁO XỨ XÓM CHIẾU • THÁNH LỄ 5:00 • 17:30', x: 485, z: 339, w: 22, d: 32, yaw: -H, h: 16, storeys: 2, color: '#efe4cf', yard: 1.5 },
     { id: 'cong-an-q4', kind: 'police', name: 'CÔNG AN QUẬN 4', subtitle: 'TRỰC BAN 24/7 • BÃI GIỮ XE VI PHẠM', x: 542.5, z: 233, w: 26, d: 18, yaw: -H, h: 12, storeys: 3, color: '#e9c46a', yard: 1 },
     stampSpec('factory-p1'),
   ],
@@ -182,7 +193,6 @@ export const QUAN_4: DistrictLayout = {
     { zone: 'night', at: [595, 27] },
     { zone: 'pagoda', at: [485, 150], name: 'CHÙA AN PHƯỚC' },
     { zone: 'apartment', at: [485, 230], name: 'KHÁNH HỘI' },
-    { zone: 'church', at: [485, 340], name: 'NHÀ THỜ XÓM CHIẾU' },
     { zone: 'school', at: [485, 400], name: 'TRƯỜNG TIỂU HỌC XÓM CHIẾU' },
     { zone: 'market', at: [570, 400], name: 'CHỢ XÓM CHIẾU' },
   ],
@@ -209,4 +219,14 @@ export const QUAN_4_EXTRA = {
   cranes: CRANES,
   /** The cargo ship's berth, lines, fenders and pilot ladder (stamps.ts 'cargo-ship'). */
   ship: STORY_STAMP['cargo-ship'],
+  /**
+   * Waterbus piers on this bank (consts.ts Dock shape: deck from 3 m inland out over the water, steps on its east side,
+   * the boarding ring near its end): Bến Nhà Rồng on the Thủ Thiêm spur (WIRING-PLAN step 14 adds it to WATER_NET).
+   */
+  docks: [{
+    id: 'ben-nha-rong', name: 'BẾN NHÀ RỒNG', bank: 'S' as const, x: NHA_RONG_PIER,
+    pier: { minX: NHA_RONG_PIER - 2, maxX: NHA_RONG_PIER + 2, minZ: -152, maxZ: -134.6 }, steps: { minX: NHA_RONG_PIER + 2.6, maxX: NHA_RONG_PIER + 5, minZ: -140.5, maxZ: -134.6 }, ring: { x: NHA_RONG_PIER, z: -149.5 },
+  }],
+  /** The Xóm Chiếu church's bell tower over its doors (inside its footprint), for the church renderer (WIRING-PLAN §2). */
+  towers: [{ stamp: 'nha-tho-xom-chieu', kind: 'bell tower', x: 472.5, z: 339, w: 6, d: 6, h: 30 }],
 };

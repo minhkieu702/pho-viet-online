@@ -68,7 +68,7 @@ export const STORY_STAMPS: StoryStamp[] = [
   },
   {
     // P1 fallback on the Thủ Thiêm riverside strip, the same shape, with its pier.
-    id: 'villa-p1', kind: 'story', anchor: 'villa-p1', district: 'D9', phase: 'P1', form: 'building', layout: null, fallbackFor: 'villa',
+    id: 'villa-p1', kind: 'story', anchor: 'villa-p1', district: 'D9', phase: 'P1', form: 'building', layout: 'thu-thiem', fallbackFor: 'villa',
     name: 'BIỆT THỰ VEN SÔNG', subtitle: 'NHÀ RIÊNG • CÓ CAMERA', x: -380, z: -226.5, w: 50, d: 37, yaw: Math.PI, h: 10, storeys: 3, building: 'home', color: '#f2e6c9', yard: 4,
     entrance: { x: -380, z: -245.8 }, at: { x: -380, z: -228, yaw: 0 }, pier: { x: -380, z0: -203.6, z1: -188 },
     story: { role: 'P1 stand-in for the Thảo Điền villa (Thủ Thiêm riverside, step 18 builds it)', set: 'phuong-penthouse', owner: 'Lý Kim Phượng (Bà Phượng Sen Vàng)' },
