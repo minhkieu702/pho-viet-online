@@ -58,6 +58,19 @@ export type Cue = { t?: number; if?: Cond } & (
   | { k: 'sfx'; id: string; at?: Mark } | { k: 'music'; id: string | null; fade?: number } | { k: 'ambience'; id: string }
   | { k: 'fx'; kind: string; at?: Mark } | { k: 'grade'; id: string } | { k: 'slowmo'; scale: number; seconds: number }
   | { k: 'letterbox'; on: boolean } | { k: 'fade'; to: 'black' | 'clear'; ms: number }
+  /**
+   * A scene QTE (escort-boss-qte.md §3, context 'scene'): the director's Wait (story-system-cinematics.md §2 "Wait = …
+   * | Qte") at the cue's time. The scene clock stops until it resolves; the window counts real seconds whatever the
+   * scene's slow motion; 'loop' rewinds to the shot labelled `loop` (default: the shot holding the cue) and replays from
+   * there, so a 'loop' QTE always ends passed; a skip passes it. Owned by the ui lane (ops.qte, context 'scene').
+   */
+  | { k: 'qte'; id: string; kind: 'press' | 'hold' | 'mash' | 'band' | 'alternate'; keys: string[]; label: TextRef; window: number; target?: number; count?: TextRef[]; anchor?: { actor: string; joint?: string }; onFail: 'loop' | 'continue'; loop?: string; lethal?: false }
+  /**
+   * World power region during a scene (festival-blackout-heli.md §2.3–2.4, world.setPower): `sweep` steps the dark edge
+   * from `from` to `to` every `step` seconds (the CS09 sign-by-sign blackout) and leaves the whole rect at `level`;
+   * without it the region switches at once. rect is a map/consts.ts Rect. Interiors never use it (§2.6).
+   */
+  | { k: 'power'; region: { id: string; rect: { minX: number; maxX: number; minZ: number; maxZ: number }; level: number }; sweep?: { axis: 'x' | 'z'; dark: 1 | -1; from: number; to: number; step: number } }
 );
 export type Shot = { dur: number; label?: string; cam: Cam; cues?: Cue[]; note?: string };
 /** Background people drawn as an instanced batch (dignified pose presets only for captives). */
@@ -94,7 +107,8 @@ export const POSES_DIGNIFIED = ['sit-hug-knees', 'sit', 'stand-head-down', 'walk
 
 /**
  * Every engine id a scene names, as [contract kind, id, where]: the cutscene half of the engine contract
- * (story/contract.ts). Extras templates and 'tpl:' cast count as templates, ride models as rideModels or models.
+ * (story/contract.ts). Extras templates and 'tpl:' cast count as templates, ride models as rideModels or models; a
+ * scene QTE counts as ops 'qte', a power cue as ops 'power' (ops 'powerSweep' with a sweep).
  */
 export function sceneVocab(s: Scene): [ContractKind | 'rides', string, string][] {
   const out: [ContractKind | 'rides', string, string][] = [];
@@ -117,6 +131,8 @@ export function sceneVocab(s: Scene): [ContractKind | 'rides', string, string][]
         case 'hide': out.push(['meshes', c.mesh, at]); break;
         case 'ambience': out.push(['ambience', c.id, at]); break;
         case 'music': if (c.id) out.push(['music', c.id, at]); break;
+        case 'qte': out.push(['ops', 'qte', at]); break;
+        case 'power': out.push(['ops', c.sweep ? 'powerSweep' : 'power', at]); break;
       }
     }
   });

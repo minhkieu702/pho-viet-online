@@ -54,6 +54,12 @@ const LOADERS: Record<number, Loader> = {
   3: () => import('./ch03.ts'),
   4: () => import('./ch04.ts'),
   5: () => import('./ch05.ts'),
+  6: () => import('./ch06.ts'),
+  7: () => import('./ch07.ts'),
+  8: () => import('./ch08.ts'),
+  9: () => import('./ch09.ts'),
+  10: () => import('./ch10.ts'),
+  11: () => import('./ch11.ts'),
 };
 const cache = new Map<number, Promise<ChapterModule | null>>();
 
