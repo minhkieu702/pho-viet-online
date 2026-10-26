@@ -12,6 +12,7 @@
  *
  * Pure and allocation-free in the hot path; runs under `node --experimental-transform-types` for the tests.
  */
+import { createCollisionIndex, type CollisionIndex } from './map/collision.ts';
 
 export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number; top?: number };
 export type Ground = (x: number, z: number) => number;
@@ -333,53 +334,38 @@ function dist(p: Float32Array, a: number, b: number) {
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Collider broadphase: a uniform grid of collider indices (colliders are static after the world is built).
+// Collider broadphase: the shared spatial index (map/collision.ts) over the colliders, and optionally the game's own
+// index of static solids (whose references are colliders too), queried together.
 // ---------------------------------------------------------------------------------------------------------
 
 export type ColliderGrid = {
-  readonly colliders: readonly Collider[]; readonly cell: number; readonly minX: number; readonly minZ: number;
-  readonly cols: number; readonly rows: number; readonly start: Int32Array; readonly items: Int32Array;
-  stamp: Uint32Array; tick: number;
+  readonly colliders: readonly Collider[];
+  /** The colliders handed in, and (when given) the game's shared index of solids. */
+  readonly index: CollisionIndex; readonly shared: CollisionIndex | null;
+  /** Query scratch. */
+  readonly ids: number[];
 };
 
-export function createColliderGrid(colliders: readonly Collider[], cell = 8): ColliderGrid {
-  let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
-  for (const c of colliders) { minX = Math.min(minX, c.minX); minZ = Math.min(minZ, c.minZ); maxX = Math.max(maxX, c.maxX); maxZ = Math.max(maxZ, c.maxZ); }
-  if (!colliders.length) { minX = minZ = 0; maxX = maxZ = cell; }
-  const cols = Math.max(1, Math.ceil((maxX - minX) / cell)), rows = Math.max(1, Math.ceil((maxZ - minZ) / cell));
-  const cellOf = (v: number, lo: number, count: number) => Math.min(count - 1, Math.max(0, Math.floor((v - lo) / cell)));
-  const start = new Int32Array(cols * rows + 1);
-  const each = (fn: (cellIndex: number, id: number) => void) => colliders.forEach((c, id) => {
-    for (let gz = cellOf(c.minZ, minZ, rows); gz <= cellOf(c.maxZ, minZ, rows); gz++) {
-      for (let gx = cellOf(c.minX, minX, cols); gx <= cellOf(c.maxX, minX, cols); gx++) fn(gz * cols + gx, id);
-    }
-  });
-  each((ci) => { start[ci + 1]++; });
-  for (let i = 0; i < cols * rows; i++) start[i + 1] += start[i];
-  const items = new Int32Array(start[cols * rows]), fill = start.slice(0, cols * rows);
-  each((ci, id) => { items[fill[ci]++] = id; });
-  return { colliders, cell, minX, minZ, cols, rows, start, items, stamp: new Uint32Array(colliders.length), tick: 0 };
+/** Files colliders in a collision index (16 m cells); `shared` is queried as well (its refs must be colliders). */
+export function createColliderGrid(colliders: readonly Collider[], cell = 16, shared: CollisionIndex | null = null): ColliderGrid {
+  const index = createCollisionIndex(cell);
+  for (const c of colliders) index.add(c.minX, c.minZ, c.maxX, c.maxZ, -Infinity, Infinity, 0, c);
+  return { colliders, index, shared, ids: [] };
 }
 
+function gather(index: CollisionIndex, ids: number[], minX: number, minZ: number, maxX: number, maxZ: number, out: Collider[]) {
+  const n = index.query(minX, minZ, maxX, maxZ, ids);
+  for (let i = 0; i < n; i++) {
+    const c = index.ref(ids[i]) as Collider | null;
+    // Only boxes that are colliders (another owner's solid may carry some other reference).
+    if (c && typeof c.minX === 'number' && c.maxX > minX && c.minX < maxX && c.maxZ > minZ && c.minZ < maxZ) out.push(c);
+  }
+}
 /** Colliders overlapping a box on the ground plane, written into `out`. */
 export function queryColliders(grid: ColliderGrid, minX: number, minZ: number, maxX: number, maxZ: number, out: Collider[]) {
   out.length = 0;
-  if (++grid.tick > 0xfffffff0) { grid.stamp.fill(0); grid.tick = 1; }
-  const tick = grid.tick, cell = grid.cell;
-  const gx0 = Math.max(0, Math.floor((minX - grid.minX) / cell)), gx1 = Math.min(grid.cols - 1, Math.floor((maxX - grid.minX) / cell));
-  const gz0 = Math.max(0, Math.floor((minZ - grid.minZ) / cell)), gz1 = Math.min(grid.rows - 1, Math.floor((maxZ - grid.minZ) / cell));
-  for (let gz = gz0; gz <= gz1; gz++) {
-    for (let gx = gx0; gx <= gx1; gx++) {
-      const ci = gz * grid.cols + gx;
-      for (let j = grid.start[ci]; j < grid.start[ci + 1]; j++) {
-        const id = grid.items[j];
-        if (grid.stamp[id] === tick) continue;
-        grid.stamp[id] = tick;
-        const c = grid.colliders[id];
-        if (c.maxX > minX && c.minX < maxX && c.maxZ > minZ && c.minZ < maxZ) out.push(c);
-      }
-    }
-  }
+  gather(grid.index, grid.ids, minX, minZ, maxX, maxZ, out);
+  if (grid.shared) gather(grid.shared, grid.ids, minX, minZ, maxX, maxZ, out);
   return out;
 }
 
@@ -628,7 +614,7 @@ export type RagdollWorld = {
   grid?: ColliderGrid | null;
   /** River surface: parts below it float (city.ts WATER_LEVEL). */
   water?: number;
-  /** Fence: particles never leave this box (LAND x RIVER..LAND z). */
+  /** Fence: particles never leave this box (the terrain bounds, map/terrain.ts). */
   bounds?: Bounds;
   /** Moving vehicles this frame (see Mover); they push parts out of their boxes inside the solver iterations. */
   movers?: readonly Mover[];

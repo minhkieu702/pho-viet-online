@@ -243,12 +243,13 @@ export function deriveStyle(look: FigureLook, seed: number | string = 0, role: W
       break;
     default:
       if (fem) femHair(); else maleHair();
-      if (look.hat) { head |= HEAD.CONE; c.accent = look.hat; }
+      if (look.hat && fem) { head |= HEAD.CONE; c.accent = look.hat; }
       if (look.helmet) { head |= HEAD.HELMET; c.accent = look.helmet; }
       break;
   }
-  if (look.hat && role !== 'student' && role !== 'gang' && role !== 'police' && !(head & (HEAD.PITH | HEAD.BUCKET | HEAD.BASEBALL | HEAD.HELMET))) {
-    head |= HEAD.CONE; c.accent = look.hat;
+  // A hat from the look: the nón lá is a woman's sun hat; a man given one wears a bucket hat instead.
+  if (look.hat && role !== 'student' && role !== 'gang' && role !== 'police' && !(head & (HEAD.PITH | HEAD.BUCKET | HEAD.BASEBALL | HEAD.HELMET | HEAD.CONE))) {
+    if (fem) { head |= HEAD.CONE; c.accent = look.hat; } else { head |= HEAD.BUCKET; c.accent = '#7a7458'; }
   }
   // Ears show unless long hair or a bob falls over them.
   if (!(head & (HEAD.LONG | HEAD.BOB))) head |= HEAD.EARS;

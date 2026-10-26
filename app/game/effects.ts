@@ -83,8 +83,8 @@ export function createEffects(scene: THREE.Scene, ground: (x: number, z: number)
   textures.push(flashTexture, puffTexture);
   materials.push(flashMaterial);
 
-  // Moving characters use soft blob shadows so the sun's shadow map can stay static.
-  const MAX_BLOBS = 96;
+  // Moving characters use soft blob shadows so the sun's shadow map can stay static (the street-life crowd needs room).
+  const MAX_BLOBS = 160;
   const blobTexture = radialTexture('rgba(28,40,34,0.45)', 'rgba(28,40,34,0)');
   const blobGeometry = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
   const blobMaterial = new THREE.MeshBasicMaterial({ map: blobTexture, transparent: true, depthWrite: false });

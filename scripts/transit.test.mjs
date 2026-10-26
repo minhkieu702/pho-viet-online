@@ -123,8 +123,10 @@ test('bus routes are closed, connected loops on traffic edges with no U-turns', 
 
 test('every line calls at all four shelters in loop order, heading the way that serves them; each has its own terminus', () => {
   for (const id of BUS_LINES) {
-    const line = net.lines.find((l) => l.id === id), ids = line.visits.map((v) => v.stop.id), k = ids.indexOf('ben-do');
+    // The four An Hòa shelters in loop order; 08 and 15 also call at Bến Bạch Đằng downtown, between the hospital and the đò.
+    const line = net.lines.find((l) => l.id === id), all = line.visits.map((v) => v.stop.id), ids = all.filter((s) => SHELTERS.includes(s)), k = ids.indexOf('ben-do');
     assert.deepEqual([...ids.slice(k), ...ids.slice(0, k)], SHELTERS, id);
+    if (id !== '03') assert.equal(all[(all.indexOf('ben-do') + all.length - 1) % all.length], 'bach-dang', `${id} calls at Bến Bạch Đằng before the đò`);
     let prev = -1;
     for (const v of line.visits) {
       assert.ok(v.s > prev, `${id}: stops in path order`);

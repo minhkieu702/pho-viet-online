@@ -336,6 +336,27 @@ export function createSigns() {
         ],
       });
     },
+    /**
+     * Small street signs, `w` x `h` m facing `yaw`; lines split at '|'. 'box' a light box (one bold line, framed),
+     * 'vertical' a tall light box with the words stacked, 'plate' a street-name plate, 'banner' a cloth banner across
+     * the road, all readable from both faces; 'paint' an ad painted on a wall (no board, one face).
+     */
+    tag(style: 'box' | 'vertical' | 'plate' | 'banner' | 'paint', text: string, color: string, background: string, x: number, y: number, z: number, w: number, h: number, yaw = 0, glow = 0) {
+      const vertical = style === 'vertical';
+      const lines = vertical ? text.split(/[ |]+/) : text.split('|');
+      const cellW = vertical ? 128 : Math.max(128, Math.round((128 * w) / h)), cellH = vertical ? Math.max(128, Math.round((128 * h) / w)) : 128;
+      const pad = style === 'paint' ? 4 : 10, inner = cellH - pad * 2;
+      const step = inner / lines.length, size = Math.min(step * 0.78, vertical ? cellW * 0.5 : 84);
+      boards.push({
+        x, y, z, yaw, w, h, depth: style === 'paint' ? 0.004 : style === 'banner' ? 0.01 : 0.04, cellW, cellH, background, border: style === 'paint' ? background : color,
+        frame: [pad / 2, pad / 2, cellW - pad, cellH - pad], line: style === 'paint' ? 0 : 4, glow, twoSided: style !== 'paint',
+        // A stacked word shrinks to fit the box's width rather than being squeezed; other second lines are smaller.
+        runs: lines.map((t, i) => ({
+          text: t, face: '900' as const, cx: cellW / 2, cy: pad + step * (i + 0.5), maxWidth: cellW - pad * 3, color,
+          size: vertical ? Math.min(size, (cellW - pad * 3) / (0.7 * Array.from(t).length)) : i > 0 && style !== 'banner' ? size * 0.7 : size,
+        })),
+      });
+    },
     /** A blue house-number plate (0.5 x 0.25 m) facing `yaw`. */
     plate(n: number, x: number, y: number, z: number, yaw: number) {
       boards.push({

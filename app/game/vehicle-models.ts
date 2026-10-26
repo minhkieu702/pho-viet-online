@@ -77,7 +77,8 @@ export class ModelParts {
 
   /** A cylinder of radius `r` from point `a` to point `b`. */
   rod(a: Vec3, b: Vec3, r: number, o: PartOptions = {}, segments = 6) {
-    return this.add(new THREE.CylinderGeometry(r, r, 1, segments), { ...o, matrix: between(a, b, r, r) });
+    // A unit cylinder: between() scales it to radius r (a radius-r cylinder scaled by r came out r² thin).
+    return this.add(new THREE.CylinderGeometry(1, 1, 1, segments), { ...o, matrix: between(a, b, r, r) });
   }
 
   /** A box `w` wide and `d` deep stretched from point `a` to point `b` (pillars, struts). */
@@ -433,19 +434,19 @@ type CarSpec = {
   noseTop: number; hoodFront: number; screenBase: [number, number]; backBase: [number, number];
   /** Height of the trunk lid, and the cabin: rear and front ends of the roof and its height. */
   trunk: number; roofBack: number; roofFront: number; roof: number;
-  /** Driver's hip position (left-hand seat). */
+  /** Driver's hip position: Vietnamese cars are left-hand drive, so the seat (and the wheel) is on the car's left, +x. */
   seat: Vec3;
   /** B-pillar position along the car. */
   pillar: number;
 };
 
 const CAR_SPECS: Record<CarStyle, CarSpec> = {
-  sedan: { length: 4.42, width: 1.74, wheel: 0.31, clearance: 0.22, front: 1.36, rear: -1.32, noseTop: 0.74, hoodFront: 0.83, screenBase: [0.78, 0.98], backBase: [-1.3, 1.0], trunk: 1.0, roofBack: -0.82, roofFront: 0.12, roof: 1.44, seat: [-0.38, 0.5, -0.22], pillar: -0.32 },
-  hatch: { length: 3.66, width: 1.62, wheel: 0.29, clearance: 0.2, front: 1.2, rear: -1.18, noseTop: 0.72, hoodFront: 0.8, screenBase: [0.62, 0.95], backBase: [-1.72, 0.98], trunk: 0.98, roofBack: -1.55, roofFront: 0.0, roof: 1.48, seat: [-0.36, 0.5, -0.3], pillar: -0.45 },
-  suv: { length: 4.62, width: 1.86, wheel: 0.37, clearance: 0.3, front: 1.44, rear: -1.4, noseTop: 0.95, hoodFront: 1.04, screenBase: [0.82, 1.15], backBase: [-2.18, 1.18], trunk: 1.18, roofBack: -2.08, roofFront: 0.02, roof: 1.76, seat: [-0.4, 0.68, -0.25], pillar: -0.3 },
-  taxi: { length: 4.42, width: 1.74, wheel: 0.31, clearance: 0.22, front: 1.36, rear: -1.32, noseTop: 0.74, hoodFront: 0.83, screenBase: [0.78, 0.98], backBase: [-1.3, 1.0], trunk: 1.0, roofBack: -0.82, roofFront: 0.12, roof: 1.44, seat: [-0.38, 0.5, -0.22], pillar: -0.32 },
-  pickup: { length: 4.7, width: 1.82, wheel: 0.36, clearance: 0.32, front: 1.52, rear: -1.5, noseTop: 0.98, hoodFront: 1.06, screenBase: [0.86, 1.18], backBase: [-0.72, 1.18], trunk: 1.16, roofBack: -0.62, roofFront: 0.12, roof: 1.8, seat: [-0.4, 0.7, -0.02], pillar: -0.18 },
-  police: { length: 4.42, width: 1.76, wheel: 0.31, clearance: 0.22, front: 1.36, rear: -1.32, noseTop: 0.74, hoodFront: 0.83, screenBase: [0.78, 0.98], backBase: [-1.3, 1.0], trunk: 1.0, roofBack: -0.82, roofFront: 0.12, roof: 1.44, seat: [-0.38, 0.5, -0.22], pillar: -0.32 },
+  sedan: { length: 4.42, width: 1.74, wheel: 0.31, clearance: 0.22, front: 1.36, rear: -1.32, noseTop: 0.74, hoodFront: 0.83, screenBase: [0.78, 0.98], backBase: [-1.3, 1.0], trunk: 1.0, roofBack: -0.82, roofFront: 0.12, roof: 1.44, seat: [0.38, 0.5, -0.22], pillar: -0.32 },
+  hatch: { length: 3.66, width: 1.62, wheel: 0.29, clearance: 0.2, front: 1.2, rear: -1.18, noseTop: 0.72, hoodFront: 0.8, screenBase: [0.62, 0.95], backBase: [-1.72, 0.98], trunk: 0.98, roofBack: -1.55, roofFront: 0.0, roof: 1.48, seat: [0.36, 0.5, -0.3], pillar: -0.45 },
+  suv: { length: 4.62, width: 1.86, wheel: 0.37, clearance: 0.3, front: 1.44, rear: -1.4, noseTop: 0.95, hoodFront: 1.04, screenBase: [0.82, 1.15], backBase: [-2.18, 1.18], trunk: 1.18, roofBack: -2.08, roofFront: 0.02, roof: 1.76, seat: [0.4, 0.68, -0.25], pillar: -0.3 },
+  taxi: { length: 4.42, width: 1.74, wheel: 0.31, clearance: 0.22, front: 1.36, rear: -1.32, noseTop: 0.74, hoodFront: 0.83, screenBase: [0.78, 0.98], backBase: [-1.3, 1.0], trunk: 1.0, roofBack: -0.82, roofFront: 0.12, roof: 1.44, seat: [0.38, 0.5, -0.22], pillar: -0.32 },
+  pickup: { length: 4.7, width: 1.82, wheel: 0.36, clearance: 0.32, front: 1.52, rear: -1.5, noseTop: 0.98, hoodFront: 1.06, screenBase: [0.86, 1.18], backBase: [-0.72, 1.18], trunk: 1.16, roofBack: -0.62, roofFront: 0.12, roof: 1.8, seat: [0.4, 0.7, -0.02], pillar: -0.18 },
+  police: { length: 4.42, width: 1.76, wheel: 0.31, clearance: 0.22, front: 1.36, rear: -1.32, noseTop: 0.74, hoodFront: 0.83, screenBase: [0.78, 0.98], backBase: [-1.3, 1.0], trunk: 1.0, roofBack: -0.82, roofFront: 0.12, roof: 1.44, seat: [0.38, 0.5, -0.22], pillar: -0.32 },
 };
 
 /** Driver's hip, roof height and the middle of the roof (for light bars) of each car body. */
