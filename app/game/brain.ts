@@ -94,6 +94,8 @@ export type Mind = {
   lineAt: number;
   stage: number;
   cooldown: number;
+  /** What a chat is about: small talk, or buying from a hawker or a vé số seller (the partner). */
+  topic: 'talk' | 'buy';
   /** Seconds since the rain stopped (0 while it rains). */
   dryFor: number;
   /** Seconds spent waiting for the rain to pass (under a shelter or indoors). */
@@ -164,7 +166,7 @@ export function createMind(random: () => number, role: string, hour = 12): Mind 
     traits,
     needs: { wet: 0, hunger: 0.1 + random() * 0.35, fatigue: late ? 0.5 : 0.1 + random() * 0.25, social: random() * 0.6, fear: 0, interest: 0 },
     intent: 'routine', since: -99, score: BRAIN.ROUTINE, umbrella: 0, incident: null,
-    partner: -1, until: 0, lineAt: 0, stage: 0, cooldown: 20 + random() * 60,
+    partner: -1, until: 0, lineAt: 0, stage: 0, cooldown: 20 + random() * 60, topic: 'talk',
     dryFor: 999, waited: 0, dash: false, last: 0,
   };
 }
@@ -172,7 +174,8 @@ export function createMind(random: () => number, role: string, hour = 12): Mind 
 /** Late-evening sleepiness on top of fatigue; owls and gangs stay up much later. */
 function lateness(hour: number, role: string) {
   const start = role === 'retiree' ? 18 : role === 'owl' ? 23 : role === 'gang' ? 30 : 20;
-  const h = hour < 6 ? hour + 24 : hour;
+  // Retirees are up before five for the morning exercise; for everyone else the night lasts until six.
+  const h = hour < (role === 'retiree' ? 4.5 : 6) ? hour + 24 : hour;
   return h <= start ? 0 : Math.min(0.45, (h - start) * 0.1);
 }
 export function tiredness(mind: Mind, hour: number, role: string) {

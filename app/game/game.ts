@@ -1,8 +1,18 @@
 import * as THREE from 'three';
 import { buildWorld, dockAt, groundHeight, onSidewalk } from './world';
-import { LANDMARKS, PLOTS, ROADS_X, ROADS_Z, SCENERY, VENUES, WATER_LEVEL, inRect, type Dock } from './city';
+import { BUILDINGS, LANDMARKS, LIFE, PLOTS, ROADS_X, ROADS_Z, SCENERY, WATER_LEVEL, inRect, type Dock } from './city';
+import { LIFE_LINES } from './street-life';
+import { BASE, OWN_VEHICLE, createRegistry, type Ctx, type Entry, type Focus, type MenuItem, type MenuView, type PromptView } from './interact';
+import { ATM_SPOTS, COUNTERS, FORTUNES, PLACES, VENDING_SPOTS, counterAt, hourLabel, hoursLabel, isOpen, lunarDay, opensAt, type CounterDef, type Hours, type Place } from './counters';
+import {
+  DRAW_HOUR, HAGGLE_OFF, MAX_TICKETS, applyEffect, drawDay, drawNumber, footSpeed, haggle, prizeFor, regenRate, ticketNumber,
+  type BuffId, type EffectHost, type Ticket,
+} from './services';
+import { SECONDS_PER_HOUR } from './clock';
 import { SWIM_DEPTH, TERRAIN, bankNear, bounds, deep as deepWater, inBounds, inWater, navigable, pierNear, walkable, waterLevel } from './map/terrain';
 import { createBoats, makeBoatMesh, type Boat } from './boats';
+import { createBuses } from './buses';
+import { LOTS, SPOTS } from './parking';
 import { createNav } from './nav';
 import { createCollisionIndex, OWNER } from './map/collision';
 import { createRagdolls, type BodyPart, type HitKind, type RagdollBody, type RagdollLook } from './ragdoll';
@@ -17,11 +27,11 @@ import { createSideMissions, type SideMissionView } from './side-missions';
 import { playBoom, playCrash, playHorn, playShot, playThud, setRain, unlockAudio } from './audio';
 import { STOP_LINE, lightFor, nearest } from './signals';
 import { WEAPONS, weaponById, type WeaponId } from './weapons';
-import { createMissions, type MissionEvent, type MissionId, type MissionView } from './missions';
+import { MISSION_DEFS, createMissions, type MissionEvent, type MissionId, type MissionView } from './missions';
 import { createPeerInterpolator, createSnapshotClock } from './peer-interpolation';
 import type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
 import { BIKES, CAR_STATS, MOTO_STATS, POLICE_CAR_STATS, bikeById, repairCost, type BikeId } from './bikes';
-import { createVehicles, makeCarMesh, seatOf, vehicleStyle, CAR_HEALTH, MASS, MOTO_HEALTH, POLICE_CAR_HEALTH, type Body, type Car, type Crash } from './vehicles';
+import { createVehicles, makeCarMesh, seatOf, vehicleLabel, vehicleStyle, CAR_HEALTH, MASS, MOTO_HEALTH, POLICE_CAR_HEALTH, type Body, type Car, type Crash } from './vehicles';
 import { MOTO_RIDER, motoParts, vehicleMaterial, type MotoStyle } from './vehicle-models';
 import {
   ARM_POSES, BODY_SCALE, CAR_DRIVER, FIGURE, HAND, HAND_SOCKET, HEAD, TORSO, armFK, createHeroFigure, deriveStyle, gait, handCode, mixHand, newGait,
@@ -41,6 +51,8 @@ export type Hud = {
   cash: number; deliveries: number; weapon: WeaponId; owned: WeaponId[]; down: boolean; fps: number; quality: string; qualityMode: QualityMode;
   gpu: string; softwareGpu: boolean;
   health: number; wanted: number; banner: string; vehicle: VehicleKind; vehicleHealth: number;
+  /** What the vehicle being driven is ("Xe số màu kem", "Taxi"), when it is not the player's own bike. */
+  vehicleName: string;
   bike: BikeId; bikeHealth: number; bikeBroken: boolean; bikeX: number; bikeZ: number;
   targetX: number; targetZ: number; targetName: string; police: { x: number; z: number }[];
   clock: string; ammo: { mag: number; reserve: number; reloading: boolean } | null; side: SideMissionView; offers: { x: number; z: number }[];
@@ -51,10 +63,61 @@ export type Hud = {
   policeIn: number;
   /** Zombie mode: wave, zombies left in it, kills, seconds of rest left, best wave reached. */
   zombie: { wave: number; left: number; kills: number; breakLeft: number; best: number; dots: { x: number; z: number }[] } | null;
+  /** What E does right here (interact.ts focus, a hold in progress, getting up, getting off), or null. */
+  prompt: PromptView | null;
+  /** Minimap pins: own bike and last car, the impound, bus stops, ATMs, piers. */
+  pins: MapPin[];
+  /** Riding as a passenger (bus, waterbus, xe ôm, xích lô). */
+  ride: RideView | null;
+  /** Sitting on a bench or a stool; savings in the bank; lottery tickets held. */
+  seated: boolean; bank: number; tickets: number;
+};
+export type MapPin = { kind: 'bike' | 'car' | 'impound' | 'bus' | 'atm' | 'ferry'; x: number; z: number };
+export type RideView = { title: string; next: string; hint: string; stops: { name: string; eta: number }[] };
+/**
+ * Someone carrying the player as a passenger (transit owner, xe ôm): where the player sits this frame (`y`: the
+ * seat surface), what to call the ride, and what E (or F) does: usually ring for the next stop, then call
+ * leavePassenger() there. `pose`: on a chair (default), pillion on a motorbike, or out of sight inside.
+ */
+export type PassengerProvider = {
+  seat(): { x: number; y: number; z: number; yaw: number }; label: string; onLeave(): void;
+  pose?: 'chair' | 'pillion' | 'hidden'; card?: () => RideView;
 };
 /** The normal living city, or the zombie apocalypse. */
 export type GameMode = 'city' | 'zombie';
-export type GameEvent = { type: 'store' } | { type: 'bikeshop' } | { type: 'hospital' } | { type: 'bag'; open: boolean } | { type: 'product'; id: string } | { type: 'venue'; kind: VenueRoom };
+export type GameEvent = { type: 'store' } | { type: 'bikeshop' } | { type: 'hospital' } | { type: 'bag'; open: boolean } | { type: 'product'; id: string } | { type: 'venue'; kind: VenueRoom }
+  | { type: 'menu'; menu: MenuView } | { type: 'menu-close' };
+export type { MenuView, PromptView } from './interact';
+/**
+ * What other systems may add to (vehicles.ts, npcs.ts, transit and boats code): the contract partners code against.
+ * Optional on purpose, so this file compiles before they land.
+ */
+type CurbCar = Car & { role?: 'traffic' | 'police' | 'curb' | 'owned' | 'loose' | 'wreck'; curb?: { spot: number; owner: 'resident' | 'lot' | 'player' } };
+type Impounded = { id: number; style: string; label: string; since: number; fee: number };
+type VehiclesExtra = {
+  curbNear?(x: number, z: number, r: number): Car[];
+  markOwned?(car: Car): void;
+  impound?: { list(): Impounded[]; release(id: number, x: number, z: number, yaw: number): Car | null };
+  parkedAt?(x: number, z: number, r: number): boolean;
+  /** The parked scooter nearest (x, z) is ridden off for `seconds` (a xe ôm driver on a fare). */
+  awayCurb?(x: number, z: number, seconds: number): void;
+  resetPlayer?(): void;
+  onTow?(cb: (car: Car) => void): void;
+  /** The game clock for parked-vehicle occupancy; `snap` after a fade (sleep, a ride across town). */
+  setClock?(hours: number, day?: number, snap?: boolean): void;
+};
+type SeatClaim = { id: number; x: number; z: number; yaw: number; top: number; kind: string };
+type NpcsExtra = {
+  claimSeat?(x: number, z: number, maxDist: number): SeatClaim | null;
+  releaseSeat?(id: number): void;
+  seatsNear?(x: number, z: number, r: number): { id: number; x: number; z: number; yaw: number; top?: number; kind?: string; free?: boolean; taken?: boolean }[];
+  forEachRole?(role: string, cb: (npc: Npc, onDuty: boolean) => void): void;
+  /** Someone turns to the player and serves, saying `line`. */
+  serve?(npc: Npc, x: number, z: number, line?: string): void;
+  /** Takes someone off the street for a while (a xe ôm driver out on a fare). */
+  sendAway?(npc: Npc, seconds: number): void;
+};
+type Registers = { register?(registry: ReturnType<typeof createRegistry>, passengers: { board(p: PassengerProvider): void; leave(): void }): void };
 
 // Both on the sidewalk so the player never spawns in a traffic lane.
 const START = { x: 12.6, z: 12.4 };
@@ -582,6 +645,49 @@ function poseInRoom(p: Person, time: number, act: RoomAct) {
   return lift;
 }
 
+// Toes on the ground from a high seat: the ball of the foot is FOOT_REACH from the ankle, FOOT_PHI below its line.
+const FOOT_REACH = Math.hypot(FIGURE.ankleY, FIGURE.ball), FOOT_PHI = Math.atan2(FIGURE.ankleY, FIGURE.ball);
+const _legs = { thigh: 0, knee: 0, ankle: 0, toe: 0 };
+/** Legs of someone sitting with the hips `hy` (FIGURE units) above their feet's floor, like the crowd's (npcs.ts seatLegs). */
+function seatLegs(hy: number, sway: number) {
+  const T = FIGURE.thigh, S = FIGURE.shin, A = FIGURE.ankleY;
+  let slope = THREE.MathUtils.clamp(Math.asin(THREE.MathUtils.clamp((hy - A - S * Math.cos(0.2)) / T, -1, 1)), -0.8, 0.28);
+  const ky = hy - T * Math.sin(slope);
+  let shin = 0, ankle: number, toe = 0;
+  if (ky - A <= S) { shin = Math.acos((ky - A) / S); ankle = shin; }
+  else if (ky - S <= FOOT_REACH) { ankle = Math.asin((ky - S) / FOOT_REACH) - FOOT_PHI; toe = ankle * 0.8; }
+  else { slope = 0.1; shin = -0.08 + sway; ankle = 0.45; }
+  _legs.thigh = slope - Math.PI / 2; _legs.knee = Math.PI / 2 - slope - shin; _legs.ankle = ankle; _legs.toe = toe;
+  return _legs;
+}
+const _lap: ArmTuple[] = [copyArm([], ARM_POSES.SIT), copyArm([], ARM_POSES.SIT)];
+/**
+ * Sitting on a bench or a stool whose top is `top` m above the floor under the feet: the hips just above the seat,
+ * the lower legs down to the floor, hands on the thighs, looking about. Returns how far below the seat top the
+ * figure's origin goes (place the group at seat surface minus this).
+ */
+function poseSeated(p: Person, top: number, time: number, seed = 0, sip = 0) {
+  const t = time + seed * 5.1;
+  const legs = seatLegs(top / PERSON_SCALE + FIGURE.seatClear, Math.sin(t * 1.4) * 0.1);
+  p.body.rotation.set(0.05, 0, 0);
+  p.body.scale.set(1, 1 + Math.sin(t * 2.3) * 0.008, 1);
+  p.chest.rotation.y = 0;
+  p.head.rotation.set(0.04 + Math.sin(t * 0.27) * 0.05, 0.55 * Math.sin(t * 0.31) * Math.max(0, Math.sin(t * 0.13)), 0);
+  for (const side of [-1, 1] as const) {
+    (side < 0 ? p.limbLeft : p.limbRight).rotation.set(legs.thigh, 0, sideX(side) * 0.12);
+    (side < 0 ? p.kneeLeft : p.kneeRight).rotation.x = legs.knee;
+    (side < 0 ? p.ankleLeft : p.ankleRight).rotation.x = legs.ankle;
+  }
+  p.toe.left = p.toe.right = legs.toe;
+  p.secondary = p.hair = 0;
+  setArm(p, -1, _lap[0]);
+  // A drink in the right hand comes up to the mouth now and then.
+  setArm(p, 1, sip > 0 ? arm(_lap[1], -1.05 - 0.45 * sip, 0.1, 0, -1.25 - 0.9 * sip, 0, 0, HAND.CUP) : copyArm(_lap[1], ARM_POSES.SIT));
+  blink(p, time, seed);
+  p.sync();
+  return (FIGURE.hipY - FIGURE.seatClear) * PERSON_SCALE;
+}
+
 /** A horse in bike units: legs pivot at the hip so they can gallop. */
 function makeHorse(group: THREE.Group, color: string) {
   const coat = material(color, 0.8);
@@ -795,14 +901,18 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   const bubbles = createBubbles(scene);
-  const ragdolls = createRagdolls(scene, [...world.colliders, ...world.seats], groundHeight);
+  // Bodies hit the shared index of static solids, plus the seats and tables it leaves out.
+  const ragdolls = createRagdolls(scene, world.seats, groundHeight, { solids });
   const effects = createEffects(scene, groundHeight);
   const explosives = createExplosives(scene, groundHeight);
   const pickups = createPickups(scene, groundHeight);
   const sayAt = (key: string, text: string, at: () => { x: number; y: number; z: number } | null, shout = false) => bubbles.say(key, text, performance.now(), at, shout ? 2600 : 3400, shout ? 'shout' : 'say');
   const npcs = createNpcs(scene, ragdolls, { clear: worldClear, sight: lineOfSight }, {
     onRest: (x, z) => effects.pool(x, z),
-    say: (npc, text, shout) => sayAt(`npc${npc.id}`, text, () => (npc.state === 'inside' || npc.state === 'down' || npc.state === 'away' ? null : { x: npc.x, y: npc.y + (npc.pose === 'sit' ? 1.7 : 1.95), z: npc.z }), shout),
+    // Seated on a low stool the head is lower than on a bench: the bubble follows the seat height.
+    say: (npc, text, shout) => sayAt(`npc${npc.id}`, text, () => (npc.state === 'inside' || npc.state === 'down' || npc.state === 'away' ? null : { x: npc.x, y: npc.y + (npc.pose === 'sit' ? npc.seatTop + 1.15 : 1.95), z: npc.z }), shout),
+    onFeed: (x, z) => animals.lure(x, z),
+    bikeAt: (x, z) => vehicles.parkedAt(x, z, 0.9),
   });
   const vehicles = createVehicles(scene, worldClear);
   const boats = createBoats(scene);
@@ -968,9 +1078,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   missionLabel.position.y = 4.6;
   marker.add(missionLabel);
   scene.add(marker);
+  /** Place labels: hidden behind buildings (depth tested, drawn after the city) and faded out between 25 and 45 m. */
+  const placeLabels: THREE.Sprite[] = [];
   const placeRing = (color: string, emissive: string, text: string, bg: string, at: { x: number; z: number }) => {
     const ring = makeRing(color, emissive, 2);
     const label = makeLabel(text, bg);
+    (label.material as THREE.SpriteMaterial).depthTest = true;
+    label.renderOrder = 3;
+    placeLabels.push(label);
     label.position.y = 3.4;
     ring.group.add(label);
     ring.group.position.set(at.x, 0, at.z);
@@ -981,12 +1096,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const storeRing = placeRing('#3f6f9f', '#1d3f63', 'TIỆM SÚNG', '#2f4a6b', STORE);
   const bikeShopRing = placeRing('#5e927c', '#2f5a48', 'CỬA HÀNG XE MÁY', '#2f5a48', BIKE_SHOP);
   const hospitalRing = placeRing('#e05a5a', '#8a2020', 'BỆNH VIỆN · HỒI MÁU', '#a03030', LANDMARKS.hospital);
-  // The nightlife strip's doors: walk in with E.
-  const venueDoors = VENUES.filter((v) => v.kind !== 'beer').map((v) => {
-    const f = v.building.facing;
-    const at = { x: v.door.x + Math.sin(f) * 1.6, z: v.door.z + Math.cos(f) * 1.6 };
-    return { kind: v.kind as VenueRoom, name: v.name, at, ring: placeRing(v.neon, v.neon, `${v.name} · 18+`, '#1a0b16', at) };
+  // The nightlife strip's doors (counters.ts places, 1.6 m out): walk in with E.
+  const venueDoors = PLACES.filter((p) => p.kind === 'venue').map((p) => {
+    const neon = PLOTS[p.building].signColor;
+    return { kind: p.key as VenueRoom, name: p.name, at: { x: p.x, z: p.z }, ring: placeRing(neon, neon, `${p.name} · 18+`, '#1a0b16', p) };
   });
+  const scratchLabel = new THREE.Vector3();
+  /** Opening hours of the nightlife doors (the spa by day too, the nhà nghỉ round the clock); past 24 runs over midnight. */
+  const VENUE_HOURS: Record<VenueRoom, Hours> = { bar: [[17, 27]], karaoke: [[14, 26]], club: [[20, 28]], spa: [[9, 23]], motel: [[0, 24]] };
   // Downtown and the river: speedboats for hire at two docks, the observation deck and the bank.
   const activityRings = [
     ...SCENERY.docks.filter((d) => d.rental).map((d) => placeRing('#2f86c6', '#1d4f7a', 'THUÊ CA NÔ', '#1d4f7a', d.ring)),
@@ -994,6 +1111,83 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     placeRing('#2f7a3a', '#1d4a24', 'NGÂN HÀNG PHƯƠNG NAM', '#1d4a24', LANDMARKS.bank.door),
   ];
   for (const ring of activityRings) ring.group.position.y = groundHeight(ring.group.position.x, ring.group.position.z);
+  // ATMs and drinks machines (counters.ts spots): one instanced cabinet and one lit panel, solid to walk into.
+  const kiosks = [...ATM_SPOTS.map((a) => ({ ...a, atm: true })), ...VENDING_SPOTS.map((v) => ({ ...v, atm: false }))];
+  const kioskBody = new THREE.InstancedMesh(new THREE.BoxGeometry(0.9, 1.9, 0.7), new THREE.MeshStandardMaterial({ roughness: 0.5, metalness: 0.3 }), kiosks.length);
+  const kioskFace = new THREE.InstancedMesh(new THREE.BoxGeometry(0.6, 0.66, 0.04), new THREE.MeshBasicMaterial({ toneMapped: false }), kiosks.length);
+  {
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), c = new THREE.Color();
+    kiosks.forEach((k, i) => {
+      const g = groundHeight(k.x, k.z);
+      q.setFromAxisAngle(UP, k.yaw);
+      kioskBody.setMatrixAt(i, m.compose(p.set(k.x, g + 0.95, k.z), q, ONE));
+      kioskBody.setColorAt(i, c.set(k.atm ? '#2c6a52' : '#b8372d'));
+      kioskFace.setMatrixAt(i, m.compose(p.set(k.x + Math.sin(k.yaw) * 0.36, g + 1.32, k.z + Math.cos(k.yaw) * 0.36), q, ONE));
+      kioskFace.setColorAt(i, c.set(k.atm ? '#8fd3ff' : '#ffe9b0'));
+      const side = Math.abs(Math.sin(k.yaw)) > 0.5;
+      // A collider as the reference, so bodies (ragdoll.ts reads the shared index) hit the kiosk too.
+      const box = { minX: k.x - (side ? 0.35 : 0.45), minZ: k.z - (side ? 0.45 : 0.35), maxX: k.x + (side ? 0.35 : 0.45), maxZ: k.z + (side ? 0.45 : 0.35), top: g + 1.9 };
+      solids.add(box.minX, box.minZ, box.maxX, box.maxZ, -Infinity, Infinity, OWNER.legacy, box);
+    });
+    kioskBody.castShadow = kioskBody.receiveShadow = true;
+    scene.add(kioskBody, kioskFace);
+  }
+  // Roller shutters (cửa cuốn) over the fronts of the shophouse counters: pulled down outside opening hours (and for
+  // good in zombie mode), so a closed shop reads as closed from the street (design-real C3). One instanced draw.
+  const shutterPlaces = PLACES.filter((p) => p.kind === 'counter' && p.building >= 0 && ['legacy', 'home', 'shop', 'midrise', 'kiosk'].includes(PLOTS[p.building].style));
+  const shutterTexture = (() => {
+    const c = document.createElement('canvas');
+    c.width = 8; c.height = 64;
+    const g = c.getContext('2d')!;
+    g.fillStyle = '#a7aeb0'; g.fillRect(0, 0, 8, 64);
+    for (let y = 0; y < 64; y += 8) { g.fillStyle = '#7f878a'; g.fillRect(0, y, 8, 2); g.fillStyle = '#c3c8c9'; g.fillRect(0, y + 2, 8, 1); }
+    const t = new THREE.CanvasTexture(c);
+    t.wrapS = t.wrapT = THREE.RepeatWrapping;
+    t.repeat.set(1, 6);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  })();
+  const shutterGeometry = new THREE.BoxGeometry(1, 1, 1);
+  shutterGeometry.translate(0, -0.5, 0);
+  const shutters = new THREE.InstancedMesh(shutterGeometry, new THREE.MeshStandardMaterial({ map: shutterTexture, roughness: 0.55, metalness: 0.35 }), Math.max(1, shutterPlaces.length));
+  shutters.receiveShadow = true;
+  scene.add(shutters);
+  const shutterFrames = shutterPlaces.map((p) => {
+    const b = BUILDINGS[p.building], fx = Math.sin(b.facing), fz = Math.cos(b.facing), ax = Math.cos(b.facing), az = -Math.sin(b.facing);
+    const wx = b.door.x - fx * 0.8, wz = b.door.z - fz * 0.8, along = (b.x - wx) * ax + (b.z - wz) * az;
+    const height = Math.min(3, PLOTS[p.building].h - 0.5);
+    return { key: p.key, x: wx + ax * along + fx * 0.07, z: wz + az * along + fz * 0.07, yaw: b.facing, width: Math.max(1.6, Math.min(b.w - 0.7, 9)), top: groundHeight(b.door.x, b.door.z) + height, height };
+  });
+  let shutterState = '', shutterHour = -1, shutterZombie = false;
+  function updateShutters(hour: number) {
+    if (hour === shutterHour && zombieMode === shutterZombie) return;
+    shutterHour = hour; shutterZombie = zombieMode;
+    const down = shutterFrames.map((s) => zombieMode || !isOpen(COUNTERS[s.key].hours, hour));
+    const key = down.map((d) => (d ? 1 : 0)).join('');
+    if (key === shutterState) return;
+    shutterState = key;
+    const m = new THREE.Matrix4(), q = new THREE.Quaternion(), p = new THREE.Vector3(), sc = new THREE.Vector3();
+    shutterFrames.forEach((s, i) => {
+      q.setFromAxisAngle(UP, s.yaw);
+      // Rolled up it is just the drum under the awning.
+      shutters.setMatrixAt(i, m.compose(p.set(s.x, s.top, s.z), q, sc.set(s.width, down[i] ? s.height : 0.22, down[i] ? 0.06 : 0.3)));
+    });
+    shutters.instanceMatrix.needsUpdate = true;
+    shutters.computeBoundingSphere();
+  }
+  // The focus marker: a small white diamond over whatever E would use now, and a soft ring under it (red for a crime).
+  const focusMark = new THREE.Group();
+  const focusDiamond = new THREE.Mesh(new THREE.OctahedronGeometry(0.15), new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.95, depthTest: false }));
+  focusDiamond.scale.set(1, 1.6, 1);
+  focusDiamond.renderOrder = 9;
+  const focusHalo = new THREE.Mesh(new THREE.RingGeometry(0.48, 0.6, 40), new THREE.MeshBasicMaterial({ color: '#fff6dc', transparent: true, opacity: 0.45, depthWrite: false }));
+  focusHalo.rotation.x = -Math.PI / 2;
+  focusMark.add(focusDiamond, focusHalo);
+  focusMark.visible = false;
+  scene.add(focusMark);
+  /** A takeaway drink in the player's right hand. */
+  const walkerCup = holdCup(walker.handRight);
+  walkerCup.visible = false;
   /** A tipsy spell after drinks: the camera sways and walking wanders until this time. */
   let drunkUntil = 0;
   marker.traverse((o) => { o.castShadow = false; });
@@ -1186,6 +1380,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     // Ragdolls: body cap, solver iterations and how many step at full rate; figures like the crowd's.
     ragdolls.setQuality(level);
     ragdolls.setDetail(preset.figures);
+    // Street dressing (fine layer, smoke, patterns, cables) and street-life props follow the same level.
+    world.setDetail(level);
+    npcs.setPropDetail(level);
   }
   applyLevel(level);
   renderer.shadowMap.needsUpdate = true;
@@ -1429,6 +1626,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   function damageCar(car: Car, amount: number, now: number) {
     if (wrecks.has(car)) return;
     car.health = Math.max(0, car.health - amount);
+    // A damaged parked vehicle stays a full entity (with its smoke) instead of going back to being only drawn.
+    if (car.curb) car.touched = true;
     if (car.health === 0) {
       // Wrecked vehicles burn for a moment and then blow up.
       wrecks.add(car);
@@ -1449,6 +1648,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   function leaveVehicleNow() {
+    // Knocked off a seat or out of someone else's vehicle too, and any hold-E is dropped.
+    if (seat) leaveSeat();
+    if (ride) leavePassenger();
+    hold = null;
     if (boat) { boat.speed = 0; boat = null; boatLeftAt = performance.now(); }
     if (playerCar) {
       playerCar.mode = 'parked';
@@ -1468,6 +1671,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
    * struck them. Knocked down they throw their hands out; wasted they fall limp. The body is never evicted.
    */
   function knockPlayer(vx: number, vy: number, vz: number, now: number, reason: Down = 'crash', hit?: THREE.Vector3 | null, kind?: HitKind) {
+    closeMenu(true);
     leaveVehicleNow();
     if (playerBody) ragdolls.remove(playerBody);
     playerBody = ragdolls.spawn({
@@ -1525,6 +1729,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   function teleport(at: { x: number; z: number }) {
+    closeMenu(true);
+    if (seat) { if (seat.claim !== null) nx.releaseSeat?.(seat.claim); seat = null; }
+    ride = null;
+    hold = null;
     const spot = reachable(at);
     Object.assign(state, { x: spot.x, z: spot.z, riding: false, speed: 0 });
     boat = null;
@@ -1558,6 +1766,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   function busted(now: number) {
     if (down === 'wasted' || down === 'busted') return;
     interruptRace('Bạn đã bị bắt. Nhấn M để thử lại vòng đua.');
+    closeMenu(true);
     leaveVehicleNow();
     // A player pinned on the ground is hauled up where they lie.
     if (playerBody) {
@@ -1585,27 +1794,17 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     notify(fine ? `Được thả khỏi đồn · Nộp phạt ${formatThousands(fine)}` : 'Được thả, lần sau cẩn thận!', 3500);
   }
 
-  function nearestCar(maxDistance: number) {
-    let best: Car | null = null, bestDistance = maxDistance;
-    for (const car of vehicles.cars) {
-      if (car.mode === 'off' || car.mode === 'player' || car.mode === 'chase' || car.mode === 'leave') continue;
-      const d = Math.hypot(car.x - state.x, car.z - state.z) - (car.kind === 'moto' ? 1 : 0);
-      if (d < bestDistance) { best = car; bestDistance = d; }
-    }
-    return best;
-  }
-
   function enterCar(car: Car, now: number) {
     const time = now / 1000;
     if (car.mode === 'lane' && car.driver) {
-      // Carjacking: the driver is dragged out of the left side.
+      // Carjacking: the driver is dragged out of the left side (+x, where the seat is: traffic keeps right).
       const rx = Math.cos(car.yaw), rz = -Math.sin(car.yaw);
       const side = car.kind === 'moto' ? 0.8 : 1.4;
       // Pulled off the seat at the size they sat at (car drivers are drawn a little smaller to clear the roof).
       const scale = car.kind === 'moto' ? RAGDOLL_SCALE : CAR_DRIVER.scale;
       const body = ragdolls.spawn({
-        x: car.x - rx * side, y: groundHeight(car.x, car.z) + seatOf(car)[1] - FIGURE.seatClear * scale, z: car.z - rz * side, yaw: car.yaw,
-        scale, look: car.driver, from: 'sit', velocity: { x: -rx * 4.5, y: 2.5, z: -rz * 4.5 },
+        x: car.x + rx * side, y: groundHeight(car.x, car.z) + seatOf(car)[1] - FIGURE.seatClear * scale, z: car.z + rz * side, yaw: car.yaw,
+        scale, look: car.driver, from: 'sit', velocity: { x: rx * 4.5, y: 2.5, z: rz * 4.5 },
       });
       looseBodies.push({ body, until: time + 10 });
       npcs.alarm(car.x, car.z, 20, time);
@@ -1638,7 +1837,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const big = inCar();
     const sideways = big ? 2.3 : 1.3;
     const lengthwise = big ? 3.2 : 1.8;
-    const offsets = [new THREE.Vector3(-sideways, 0, 0), new THREE.Vector3(sideways, 0, 0), new THREE.Vector3(0, 0, -lengthwise), new THREE.Vector3(0, 0, lengthwise)];
+    // The driver's door first: the seat is on the left (+x), and a bike's side stand is on its left too.
+    const offsets = [new THREE.Vector3(sideways, 0, 0), new THREE.Vector3(-sideways, 0, 0), new THREE.Vector3(0, 0, -lengthwise), new THREE.Vector3(0, 0, lengthwise)];
     const leaving = playerCar;
     for (const offset of offsets) {
       offset.applyAxisAngle(UP, state.angle);
@@ -1674,19 +1874,908 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     };
   }
 
+  // ---- Interaction (interact.ts): counters, doors, seats, services, people, vehicles and passengers -------------
+  const registry = createRegistry();
+  const vx = vehicles as typeof vehicles & VehiclesExtra;
+  const nx = npcs as typeof npcs & NpcsExtra;
+  /** After the clock jumps behind a fade (sleeping, a ride across town): parked vehicles and the crowd are put where the new hour has them. */
+  function clockJumped() {
+    vx.setClock?.(atmosphere.hours, atmosphere.clock.day, true);
+    npcs.skipTo(atmosphere.hours);
+  }
+  /** What E would do now (computed once per frame), and a hold-E in progress. */
+  let focus: Focus | null = null;
+  let hold: { entry: Entry; view: PromptView; started: number; x: number; z: number } | null = null;
+  /** Savings (safe from hospital fees and fines), buffs (until, in seconds), lottery tickets, litter and scrap in hand. */
+  let bank = 0;
+  const buffs = new Map<BuffId, number>();
+  const tickets: Ticket[] = [];
+  let drawnDay = -1, litter = 0, scrap = 0, cupUntil = 0;
+  const carried: string[] = [];
+  /** The last car or curb bike the player drove (persists, pinned on the map), and plates reported stolen (until, s). */
+  let playerLastCar: Car | null = null;
+  const hotCars = new Map<Car, number>();
+  /** Sitting: the seat (and its reservation in npcs.ts), the eatery its stools belong to, where the player stood. */
+  let seat: { claim: number | null; x: number; z: number; yaw: number; top: number; kind: string; eatery: Place | null; from: { x: number; z: number }; at: number } | null = null;
+  let blendFor = 0;
+  /** Riding as a passenger (boardPassenger). */
+  let ride: PassengerProvider | null = null;
+  // Buses, the river bus and the moored đò and ghe (buses.ts): fares, getting off, fast travel by đò, and the ride.
+  const buses = createBuses(scene, {
+    vehicles, boats,
+    pay: (k) => { if (cash < k) return false; cash -= k; return true; },
+    notify: (text, ms) => notify(text, ms),
+    place: (x, z, yaw) => { Object.assign(state, { x, z, angle: yaw }); bodyY = groundHeight(x, z); swimming = false; cameraTarget.set(x, 1, z); },
+    fade: () => dip(),
+    skip: (h) => { atmosphere.setHours(atmosphere.hours + h); clockJumped(); },
+    riding: () => ride,
+    say: (key, text, at) => sayAt(key, text, at),
+  });
+  /** The counter menu open on the panel (page.tsx CounterPanel). */
+  type OpenMenu = {
+    id: string; place: string | null; view: MenuView; build: () => MenuView; choose: (itemId: string) => { message: string; ok: boolean; close?: boolean };
+    anchor: { x: number; z: number; yaw: number } | null; haggled: boolean; onHaggle?: (off: number) => void;
+  };
+  let menu: OpenMenu | null = null;
+  let menuSeq = 0;
+  const refusedUntil = new Map<string, number>();
+  const rummagedAt = new Map<string, number>();
+  /** The game day incense was last lit at each pagoda, and the night the player last sang at each karaoke. */
+  const incenseDay = new Map<string, number>(), sangNight = new Map<string, number>();
+  /** The giữ-xe attendant holding the player's bike, and where it stands in the lot. */
+  let parkedWith: Npc | null = null;
+  const buffOn = (id: BuffId) => (buffs.get(id) ?? 0) > performance.now() / 1000;
+  /** "PHỞ CÔ BA" → "Phở Cô Ba" (ATM and "24H" stay as they are). */
+  const titleCase = (name: string) => name.split(' ').map((w) => (w === 'ATM' || /\d/.test(w) ? w : w.charAt(0) + w.slice(1).toLocaleLowerCase('vi'))).join(' ');
+  /** The price on the prompt: the house dish (the first item that costs something). */
+  const headline = (def: CounterDef) => def.items.find((i) => i.price > 0)?.price;
+
+  const ctx: Ctx = {
+    x: 0, z: 0, heading: 0, onFoot: true, riding: false, inCar: false, swimming: false, hour: 0, day: 0, zombie: false, wanted: 0, cash: 0, bank: 0,
+    armed: false, time: 0,
+    witnesses: (x, z, r) => witnesses(x, z, r),
+    notify: (text, ms) => notify(text, ms),
+    menu: (view, choose) => openMenu({ build: () => view, choose: (id) => { const m = choose?.(id); return { message: typeof m === 'string' ? m : '', ok: true }; }, anchor: null }),
+  };
+  function refreshCtx(now: number) {
+    Object.assign(ctx, {
+      x: state.x, z: state.z, heading: state.angle, onFoot: !state.riding && !swimming && !boat && !glide, riding: state.riding, inCar: inCar(), swimming,
+      hour: atmosphere.hours, day: atmosphere.clock.day, zombie: zombieMode, wanted: police.wanted, cash, bank, armed: weapon !== 'fists', time: now / 1000,
+    });
+    return ctx;
+  }
+  /** People who would see something at (x, z): residents within r with a clear line, giữ-xe attendants within 25 m (awake), officers within 40 m. */
+  function witnesses(x: number, z: number, r: number) {
+    let n = 0;
+    if (!zombieMode) npcs.near(x, z, r, (npc) => { if (npc.state !== 'fleeing' && npc.role !== 'thief' && lineOfSight(npc.x, npc.z, x, z)) n++; });
+    const hour = atmosphere.hours;
+    if (hour < 12 || hour > 13.5) nx.forEachRole?.('giu-xe', (npc, onDuty) => { if (onDuty && Math.hypot(npc.x - x, npc.z - z) < 25 && lineOfSight(npc.x, npc.z, x, z)) n++; });
+    return n + policeSeeing(x, z, 40);
+  }
+  function policeSeeing(x: number, z: number, r: number) {
+    let n = 0;
+    police.forEachUnit((px, pz) => { if (Math.hypot(px - x, pz - z) < r && lineOfSight(px, pz, x, z)) n++; });
+    // The officer on duty at the ward station watches its front: the visitors' bikes and the confiscation row.
+    if (!zombieMode && Math.hypot(LANDMARKS.police.x - x, LANDMARKS.police.z - z) < 22) n++;
+    return n;
+  }
+  const dimView = (id: string, verb: string, label = ''): PromptView => ({ id, key: '', verb, label, dim: true });
+
+  // -- Counters and the doors of public places (C3: closed ones answer with their hours) --
+  function closedText(def: CounterDef, hour: number) {
+    const at = hourLabel(opensAt(def.hours, hour));
+    switch (def.kind) {
+      case 'school': return hour > 6.5 && hour < 17.5 ? ['Trường đang giờ học', 'quà vặt bán lúc tan trường'] : ['Trường đã đóng cổng', `mở lại ${at}`];
+      case 'theatre': return ['Phòng vé chưa mở', 'mở 18:00 · suất 19:30 và 21:00'];
+      case 'office': return ['Tòa nhà đóng cửa', `mở lại ${at}`];
+      case 'bank': return ['Ngân hàng đóng cửa', `mở lại ${at} · ATM bên hông 24/7`];
+      default: return ['Đóng cửa', `mở lại ${at}`];
+    }
+  }
+  function counterEntry(place: Place): Entry {
+    const def = COUNTERS[place.key];
+    return {
+      id: place.id, kind: def.kind === 'atm' || def.kind === 'vending' ? 'atm' : 'counter', x: place.x, z: place.z, r: place.r,
+      prompt(c) {
+        if (c.zombie) return dimView(place.id, def.kind === 'atm' || def.kind === 'vending' ? 'Mất điện' : 'Bỏ hoang từ khi dịch bùng phát', titleCase(place.name));
+        // Walking into the bank with a gun out is the bank job (the 'heist' entry), not a deposit.
+        if (def.kind === 'bank' && c.armed) return null;
+        if ((refusedUntil.get(place.id) ?? 0) > c.time) return dimView(place.id, 'Không bán nữa!', 'quay lại sau');
+        if (!isOpen(def.hours, c.hour)) { const [verb, label] = closedText(def, c.hour); return dimView(place.id, verb, label); }
+        const away = AWAY[def.kind];
+        if (away && !sellerAt(place.anchor.x, place.anchor.z, away.r)) return dimView(place.id, away.text[0], away.text[1]);
+        return { id: place.id, key: 'E', verb: def.verb, label: def.kind === 'atm' ? `số dư ${formatThousands(bank)}` : titleCase(place.name), price: def.kind === 'atm' || def.kind === 'bank' || def.kind === 'police' || def.kind === 'pagoda' ? undefined : headline(def) };
+      },
+      use(c) {
+        if (c.zombie || (refusedUntil.get(place.id) ?? 0) > c.time || !isOpen(def.hours, c.hour)) return;
+        const away = AWAY[def.kind];
+        if (away && !sellerAt(place.anchor.x, place.anchor.z, away.r)) return;
+        openCounter(place);
+      },
+    };
+  }
+  /** Counters that are only someone selling there (a sạp, a vé số case, the school-gate cart): how near, and what is said when nobody is. */
+  const AWAY: Partial<Record<CounterDef['kind'], { r: number; text: [string, string] }>> = {
+    stall: { r: 3.4, text: ['Cô bán hàng đi vắng', 'quay lại sau'] }, lottery: { r: 2.2, text: ['Cô bán vé số đi vắng', 'quay lại sau'] },
+    school: { r: 5, text: ['Hàng quà chưa dọn ra', 'bán lúc tan trường'] },
+  };
+  /** Whether a vendor, hawker or vé số seller is at their post within r of (x, z). */
+  function sellerAt(x: number, z: number, r: number) {
+    let found = false;
+    npcs.near(x, z, r, (npc) => { if (npc.state === 'at' && npc.gang < 0 && (npc.role === 'vendor' || npc.role === 'lottery' || npc.role === 'hawker')) found = true; });
+    return found;
+  }
+  const SERVE_LINES: Partial<Record<CounterDef['kind'], string>> = {
+    cafe: 'Uống gì em?', kiosk: 'Uống gì em?', food: 'Ăn gì em?', cart: 'Ăn gì em?', stall: 'Mua gì em ơi?', beer: 'Mấy ly em ơi?', hotel: 'Dạ, thuê phòng hả em?',
+    post: 'Dạ, em cần gửi gì?', police: 'Có việc gì đó cháu?', bank: 'Dạ, em giao dịch gì ạ?', lottery: 'Mua giùm cô tờ vé số đi con!', school: 'Mua gì con?',
+  };
+  /** The person who serves at a counter: whoever is at work nearest its door (npcs.ts serve turns them to the player). */
+  function serveAt(x: number, z: number, line?: string, who?: Npc) {
+    let vendor = who ?? null, best = 3.5;
+    if (!vendor) npcs.near(x, z, 3.5, (npc) => { const d = Math.hypot(npc.x - x, npc.z - z); if (npc.state === 'at' && npc.gang < 0 && d < best) { best = d; vendor = npc; } });
+    if (vendor) nx.serve?.(vendor, state.x, state.z, line);
+  }
+  function openCounter(place: Place, seller?: string, who?: Npc) {
+    const def = COUNTERS[place.key];
+    const state0 = { off: 1 };
+    serveAt(place.anchor.x, place.anchor.z, SERVE_LINES[def.kind], who);
+    openMenu({
+      build: () => counterMenu(place, def, state0.off, seller),
+      choose: (itemId) => buyAt(place, def, itemId, state0.off),
+      anchor: { x: place.anchor.x, z: place.anchor.z, yaw: place.yaw },
+      onHaggle: def.haggle ? (off) => { state0.off = off; } : undefined,
+      id: place.id,
+    });
+  }
+  function counterMenu(place: Place, def: CounterDef, off: number, seller?: string): MenuView {
+    const items: MenuItem[] = [];
+    const bikeNear = Math.hypot(bikeX - place.x, bikeZ - place.z) < 25;
+    if (def.kind === 'atm' || def.kind === 'bank') {
+      const atm = def.kind === 'atm', fee = atm ? 1.1 : 0;
+      for (const [id, amount] of [['rut100', 100], ['rut500', 500]] as const) items.push({ id, name: `Rút ${formatThousands(amount)}`, price: amount, desc: atm ? 'Phí 1.100đ mỗi lần rút.' : 'Rút tại quầy, không mất phí.', disabled: bank < amount + fee });
+      const all = Math.floor(bank - fee);
+      items.push({ id: 'rutall', name: 'Rút hết', price: Math.max(0, all), desc: 'Toàn bộ số dư thành tiền mặt.', disabled: all < 1, tag: all < 1 && bank > 0 ? 'Số dư dưới mức rút' : undefined });
+      if (!atm) for (const [id, amount] of [['gui100', 100], ['gui500', 500]] as const) items.push({ id, name: `Gửi ${formatThousands(amount)}`, price: amount, desc: 'Tiền gửi không mất khi bị hạ gục hay bị bắt.', disabled: cash < amount });
+      items.push({ id: 'guiall', name: 'Gửi hết tiền mặt', price: cash, desc: atm ? 'Nộp tiền qua máy, không mất phí.' : 'Giữ an toàn toàn bộ tiền mặt.', disabled: cash <= 0 });
+    } else if (def.kind === 'police') {
+      if (police.wanted > 0) items.push({ id: 'dauthu', name: 'Ra đầu thú', price: 100 * police.wanted, desc: `Nộp phạt 100.000đ mỗi sao · xóa truy nã ${police.wanted}★.`, disabled: cash < 100 * police.wanted });
+      for (const v of vx.impound?.list() ?? []) items.push({ id: `xe:${v.id}`, name: `Nộp phạt, lấy xe: ${v.label}`, price: v.fee, desc: `Bị cẩu về đồn lúc ${hourLabel(v.since)}.`, disabled: cash < v.fee });
+      if (!items.length) items.push({ id: 'none', name: 'Không có việc gì cần giải quyết', price: 0, desc: vx.impound ? 'Không có xe nào của bạn bị tạm giữ, cũng không bị truy nã.' : 'Bạn không bị truy nã.', disabled: true });
+    } else {
+      for (const it of def.items) {
+        let price = Math.round(it.price * off), disabled = cash < price, tag: string | undefined;
+        if (it.effect.fix === 'repair') { price = repairCost(bikeId, bikeHealth); disabled = !price || cash < price; tag = price ? undefined : 'Xe còn tốt'; }
+        if (it.effect.fix && !bikeNear) { disabled = true; tag = 'Dắt xe tới gần tiệm'; }
+        if (it.effect.lottery && tickets.length >= MAX_TICKETS) { disabled = true; tag = 'Đã giữ 10 tờ'; }
+        if (def.kind === 'pagoda' && it.id === 'huong' && incenseDay.get(place.id) === atmosphere.clock.day) { disabled = true; tag = 'Hôm nay đã thắp'; }
+        items.push({ id: it.id, name: it.name, price, desc: it.description, disabled, tag });
+      }
+      if (def.kind === 'taphoa' || def.kind === 'lottery') {
+        const due = tickets.filter((t) => drawn(t.day)).length;
+        if (due) items.push({ id: 'do', name: `Dò ${due} tờ vé số`, price: 0, desc: `Kết quả hôm nay: ${drawnToday() ? drawNumber(atmosphere.clock.day) : drawNumber(atmosphere.clock.day - 1)}.` });
+        if (scrap && def.kind === 'taphoa') items.push({ id: 'vechai', name: `Bán ${scrap} ve chai`, price: scrap, desc: 'Vỏ lon nhặt ở thùng rác, 1.000đ một cái.' });
+      }
+    }
+    const eatIn = !!seat && seat.eatery?.id === place.id;
+    const lunar = lunarDay(atmosphere.clock.day);
+    const intro = def.kind === 'pagoda' && (lunar === 1 || lunar === 15) ? `Hôm nay ${lunar === 1 ? 'mùng một' : 'ngày rằm'}, chùa đông khách thập phương. ${def.intro}` : def.kind === 'atm' || def.kind === 'bank' ? `${def.intro} Số dư: ${formatThousands(bank)}.` : def.intro;
+    return {
+      id: '', kind: def.kind, icon: def.icon, eyebrow: `${seller ?? place.name} · ${hoursLabel(def.hours)}`, title: def.title, intro, items,
+      foot: def.foot ?? (def.kind === 'police' ? 'Xe bỏ giữa đường quá lâu sẽ bị cẩu về đây. Tiền gửi ngân hàng không bị trừ khi bị bắt.' : hoursLabel(def.hours).startsWith('Mở') ? `${hoursLabel(def.hours)}.` : `Giờ mở cửa: ${hoursLabel(def.hours)}.`),
+      wallet: { cash, bank: def.kind === 'atm' || def.kind === 'bank' ? bank : undefined }, haggle: def.haggle && off === 1, seated: eatIn,
+      tickets: def.kind === 'taphoa' || def.kind === 'lottery' ? tickets.map((t) => t.number) : undefined,
+    };
+  }
+  /** Whether a draw day's numbers are out. */
+  const drawn = (day: number) => day < atmosphere.clock.day || (day === atmosphere.clock.day && atmosphere.hours >= DRAW_HOUR);
+  const drawnToday = () => atmosphere.hours >= DRAW_HOUR;
+  function buyAt(place: Place, def: CounterDef, itemId: string, off: number): { message: string; ok: boolean; close?: boolean } {
+    const now = performance.now();
+    // Money in and out of the bank.
+    if (def.kind === 'atm' || def.kind === 'bank') {
+      const fee = def.kind === 'atm' ? 1.1 : 0;
+      const take = itemId === 'rut100' ? 100 : itemId === 'rut500' ? 500 : itemId === 'rutall' ? Math.floor(bank - fee) : 0;
+      if (itemId.startsWith('rut') && take < 1) return { message: 'Số dư không đủ để rút.', ok: false };
+      if (take > 0) {
+        if (bank < take + fee) return { message: 'Số dư không đủ.', ok: false };
+        bank = Math.round((bank - take - fee) * 10) / 10; cash += take;
+        return { message: `Đã rút ${formatThousands(take)}${fee ? ' · phí 1.100đ' : ''}. Số dư còn ${formatThousands(bank)}.`, ok: true };
+      }
+      const put = itemId === 'gui100' ? 100 : itemId === 'gui500' ? 500 : itemId === 'guiall' ? cash : 0;
+      if (put <= 0 || cash < put) return { message: 'Không đủ tiền mặt.', ok: false };
+      cash -= put; bank += put;
+      return { message: `Đã gửi ${formatThousands(put)}. Số dư ${formatThousands(bank)}.`, ok: true };
+    }
+    if (def.kind === 'police') {
+      if (itemId === 'dauthu') {
+        const fine = 100 * police.wanted;
+        if (!police.wanted) return { message: 'Bạn không bị truy nã.', ok: false };
+        if (cash < fine) return { message: `Cần ${formatThousands(fine)} để nộp phạt.`, ok: false };
+        cash -= fine; police.reset();
+        return { message: `Đã nộp phạt ${formatThousands(fine)} · hết bị truy nã. Lần sau cẩn thận!`, ok: true };
+      }
+      if (itemId.startsWith('xe:')) {
+        const id = Number(itemId.slice(3)), v = vx.impound?.list().find((i) => i.id === id);
+        if (!v) return { message: 'Xe này không còn trong bãi.', ok: false };
+        if (cash < v.fee) return { message: `Cần ${formatThousands(v.fee)} tiền phạt.`, ok: false };
+        const exit = impoundExit(MOTO_STYLES.has(v.style));
+        const car = vx.impound!.release(id, exit.x, exit.z, exit.yaw);
+        if (!car) return { message: 'Chưa dắt xe ra được, thử lại sau.', ok: false };
+        cash -= v.fee;
+        playerLastCar = car;
+        vx.markOwned?.(car);
+        return { message: `Đã nộp ${formatThousands(v.fee)} · ${v.label} đang chờ trước cổng đồn.`, ok: true };
+      }
+      return { message: '', ok: false };
+    }
+    if (itemId === 'do') {
+      let won = 0;
+      const lines: string[] = [];
+      for (let i = tickets.length - 1; i >= 0; i--) {
+        const t = tickets[i];
+        if (!drawn(t.day)) continue;
+        const prize = prizeFor(t.number, drawNumber(t.day));
+        if (prize) { won += prize; lines.push(`${t.number} trúng ${formatThousands(prize)}`); }
+        tickets.splice(i, 1);
+      }
+      cash += won;
+      return { message: won ? `Trúng rồi! ${lines.join(', ')}.` : 'Không trúng tờ nào. Mai thử lại nhé!', ok: true };
+    }
+    if (itemId === 'vechai') { cash += scrap; const n = scrap; scrap = 0; return { message: `Bán ${n} ve chai được ${formatThousands(n)}.`, ok: true }; }
+    const item = def.items.find((i) => i.id === itemId);
+    if (!item) return { message: 'Món này đã hết.', ok: false };
+    let price = Math.round(item.price * off);
+    if (item.effect.fix === 'repair') price = repairCost(bikeId, bikeHealth);
+    if (item.effect.fix && Math.hypot(bikeX - place.x, bikeZ - place.z) > 25) return { message: 'Dắt hoặc chạy xe tới gần tiệm đã.', ok: false };
+    if (item.effect.fix === 'repair' && !price) return { message: 'Xe của bạn vẫn còn tốt.', ok: false };
+    if (item.effect.lottery && tickets.length >= MAX_TICKETS) return { message: 'Bạn đã giữ 10 tờ vé số rồi.', ok: false };
+    if (cash < price) return { message: `Không đủ tiền: cần ${formatThousands(price)}.`, ok: false };
+    cash -= price;
+    // The post office is the delivery hub: the job is the post mission.
+    if (def.kind === 'post' && item.id === 'viec') {
+      missions.select('post');
+      setMissionLabel();
+      notify(missions.view().objective, 4500);
+      return { message: 'Đã nhận việc giao bưu phẩm.', ok: true, close: true };
+    }
+    if (def.kind === 'pagoda' && item.id === 'xam') return { message: FORTUNES[Math.floor(Math.random() * FORTUNES.length)], ok: true };
+    // Incense once a day at each pagoda: a calm mind, not a free heal.
+    if (def.kind === 'pagoda' && item.id === 'huong') {
+      if (incenseDay.get(place.id) === atmosphere.clock.day) return { message: 'Hôm nay bạn đã thắp hương ở đây rồi · mai quay lại nhé.', ok: false };
+      incenseDay.set(place.id, atmosphere.clock.day);
+    }
+    const eatIn = !!seat && seat.eatery?.id === place.id && !!def.eatIn;
+    const parts = applyEffect(item.effect, effectHost, eatIn);
+    if (item.effect.hours || item.effect.wakeAt !== undefined) { dip(); clockJumped(); }
+    if (item.effect.litter && !eatIn) {
+      // A takeaway: a cup in the hand for a while (drinks), the wrapper for the next bin.
+      if (/^(Cà phê|Bạc xỉu|Trà|Nước|Sữa|Dừa|Kem)/.test(item.name)) cupUntil = now + 45000;
+    }
+    if (def.kind === 'books' && item.id === 'bao') parts.push(`xổ số hôm qua: ${drawNumber(atmosphere.clock.day - 1)}`);
+    emitHud(now);
+    return { message: `${item.name}${parts.length ? ` · ${parts.join(', ')}` : ''}`, ok: true, close: !!(item.effect.hours || item.effect.wakeAt !== undefined) };
+  }
+  /**
+   * Where a released vehicle waits: a motorbike in a free spot of the station's XE TẠM GIỮ row (nose to the building),
+   * a car at the far curb of road x = -108 across from the station, facing the way that lane runs (the near lane is
+   * the buses' approach to the CÔNG AN shelter).
+   */
+  const IMPOUND_EXIT = { x: -102.6, z: -27, yaw: Math.PI };
+  const MOTO_STYLES = new Set(['cub', 'scooter', 'vespa', 'sport']);
+  function impoundExit(moto: boolean) {
+    if (moto) {
+      const door = LANDMARKS.police;
+      const row = SPOTS.filter((s) => s.vehicle === 'moto' && s.lot >= 0 && LOTS[s.lot]?.kind === 'impound').sort((a, b) => Math.hypot(a.x - door.x, a.z - door.z) - Math.hypot(b.x - door.x, b.z - door.z));
+      for (const s of row) if (!vehicles.blocked(s.x, s.z, 0.5) && !vx.parkedAt?.(s.x, s.z, 0.6)) return { x: s.x, z: s.z, yaw: s.yaw };
+    }
+    return IMPOUND_EXIT;
+  }
+  const effectHost: EffectHost = {
+    get now() { return performance.now() / 1000; },
+    get health() { return health; }, maxHealth: MAX_HEALTH,
+    setHealth(v) { health = v; },
+    drunk(seconds) { drunkUntil = Math.max(drunkUntil, performance.now()) + seconds * 1000; },
+    sober() { drunkUntil = 0; },
+    score(points) { state.score += points; },
+    get hours() { return atmosphere.hours; },
+    setHours(h) { atmosphere.setHours(h); },
+    get wanted() { return police.wanted; },
+    loseTail(watched) { if (watched && policeSeeing(state.x, state.z, 45)) return false; police.reset(); return true; },
+    buff(id, seconds) { buffs.set(id, Math.max(buffs.get(id) ?? 0, performance.now() / 1000) + seconds); },
+    fix(kind) {
+      const max = bikeById(bikeId).health;
+      if (kind === 'repair') { bikeHealth = max; return 'xe đã sửa như mới'; }
+      if (kind === 'oil') { bikeHealth = Math.min(max, bikeHealth + max * 0.15); return 'máy êm hơn'; }
+      if (playerLastCar && flatCars.has(playerLastCar)) { flatCars.delete(playerLastCar); return 'đã vá lốp ô tô'; }
+      bikeHealth = Math.min(max, bikeHealth + max * 0.05);
+      return 'bánh xe căng lại';
+    },
+    look(kind) { if (kind === 'shirt') restyleShirt(); },
+    lottery(count) { for (let i = 0; i < count; i++) tickets.push({ number: ticketNumber(Math.random), day: drawDay(atmosphere.clock.day, atmosphere.hours) }); },
+    litter(count) { if (!seat) litter += count; },
+    item(name) { carried.push(name); },
+  };
+  const SHIRTS = ['#e77641', '#3f6f9f', '#5e927c', '#c9493b', '#f0f0ea', '#2f3a48', '#d4b164', '#a57fb0', '#86b8a0'];
+  let shirtIndex = 0;
+  /** New clothes: the player is drawn (and falls) in a new shirt. */
+  function restyleShirt(color?: string) {
+    shirtIndex = color ? Math.max(0, SHIRTS.indexOf(color)) : (shirtIndex + 1 + Math.floor(Math.random() * (SHIRTS.length - 2))) % SHIRTS.length;
+    PLAYER_LOOK.shirt = SHIRTS[shirtIndex];
+    const style = deriveStyle(PLAYER_LOOK, 0, 'player');
+    style.torso &= ~TORSO.GANH;
+    setStyle(PLAYER_LOOK, style);
+    for (const p of [walker, rider, seated, helm]) { p.look.shirt = PLAYER_LOOK.shirt; p.restyle(style); }
+  }
+
+  // -- The panel --
+  function openMenu(m: { build: () => MenuView; choose: OpenMenu['choose']; anchor: OpenMenu['anchor']; onHaggle?: (off: number) => void; id?: string }) {
+    if (hold) { hold.entry.cancel?.(ctx); hold = null; }
+    const id = `${m.id ?? 'menu'}#${++menuSeq}`;
+    const self: OpenMenu = {
+      id, place: m.id ?? null, haggled: false, anchor: m.anchor, choose: m.choose, onHaggle: m.onHaggle,
+      build: () => ({ ...m.build(), id, haggle: !!m.onHaggle && !self.haggled }),
+      view: { id, kind: '', icon: '', eyebrow: '', title: '', intro: '', items: [], foot: '', wallet: { cash: 0 } },
+    };
+    self.view = self.build();
+    menu = self;
+    velocity = 0;
+    if (m.anchor && !seat) state.angle = Math.atan2(m.anchor.x - state.x, m.anchor.z - state.z);
+    onEvent({ type: 'menu', menu: self.view });
+  }
+  function closeMenu(tell = false) {
+    if (!menu) return;
+    menu = null;
+    if (tell) onEvent({ type: 'menu-close' });
+  }
+  function chooseItem(menuId: string, itemId: string): { message: string; ok: boolean; menu?: MenuView } {
+    if (!menu || menu.id !== menuId) return { message: 'Quầy này đã đóng.', ok: false };
+    const m = menu;
+    // Knocked down, arrested, or carried away from the counter: nothing more is sold.
+    if (down || (m.anchor && Math.hypot(m.anchor.x - state.x, m.anchor.z - state.z) > 8)) { closeMenu(true); return { message: 'Quầy này đã đóng.', ok: false }; }
+    if (itemId === '__haggle') {
+      if (!m.onHaggle || m.haggled) return { message: '', ok: false, menu: m.view };
+      m.haggled = true;
+      const outcome = haggle(Math.random);
+      if (outcome === 'refused') {
+        if (m.place) refusedUntil.set(m.place, performance.now() / 1000 + 60);
+        closeMenu(true);
+        notify('“Trả giá gì kỳ vậy! Không bán nữa!” · quay lại sau một phút.', 3500);
+        return { message: 'Không bán nữa!', ok: false };
+      }
+      if (outcome === 'cheaper') m.onHaggle(HAGGLE_OFF);
+      m.view = m.build();
+      return { message: outcome === 'cheaper' ? '“Thôi được, bớt cho em 20%.”' : '“Giá này là rẻ lắm rồi em ơi.”', ok: outcome === 'cheaper', menu: m.view };
+    }
+    const result = m.choose(itemId);
+    if (result.close) { closeMenu(true); return { message: result.message, ok: result.ok }; }
+    if (menu === m) m.view = m.build();
+    if (result.message) notify(result.message, 3000);
+    return { message: result.message, ok: result.ok, menu: menu === m ? m.view : undefined };
+  }
+
+  // -- Seats (npcs.ts claimSeat/releaseSeat reserve them, so no one sits on the player) --
+  function seatTaken(x: number, z: number, r = 0.45) {
+    let taken = false;
+    npcs.near(x, z, r, (npc) => { if (npc.pose === 'sit') taken = true; });
+    return taken;
+  }
+  function seatEntry(place: Place): Entry {
+    // A quán's stools belong to its own counter (street-life groups and café tables name the building); a stool with
+    // no eat-in counter of its own (a karaoke or doorstep stool) is just a seat.
+    const eatery = place.key === 'cafe-seat' || place.key === 'stool'
+      ? PLACES.find((p) => p.kind === 'counter' && place.building >= 0 && p.building === place.building && COUNTERS[p.key]?.eatIn) ?? null : null;
+    const label = eatery ? 'Ghế quán' : place.key === 'cafe-seat' || place.key === 'stool' ? 'Ghế nhựa' : place.key === 'chess' ? 'Ghế đánh cờ' : place.key === 'bus-stop' ? 'Ghế chờ xe buýt' : 'Ghế đá';
+    return {
+      id: place.id, kind: 'seat', x: place.x, z: place.z, r: place.r, arc: 1.2,
+      prompt(c) {
+        if (c.zombie || seat || place.poi === undefined) return null;
+        // Stools of a quán that has packed up for the night are stacked away: nothing to sit on (C4).
+        const s = seatsHere.get(place.poi);
+        if (!s) return null;
+        if (s.taken || seatTaken(place.x, place.z)) return dimView(place.id, 'Ghế có người ngồi', label);
+        return { id: place.id, key: 'E', verb: 'Ngồi nghỉ', label };
+      },
+      use() { if (!seatTaken(place.x, place.z)) sitDown(place.x, place.z, eatery); },
+    };
+  }
+  function sitDown(x: number, z: number, eatery: Place | null) {
+    if (state.riding) return;
+    // npcs.ts reserves it, so nobody sits on the player (null: taken, or the stools are packed away for the night).
+    const claim = nx.claimSeat?.(x, z, 0.8) ?? null;
+    if (!claim) { notify('Ghế này có người ngồi rồi.', 2000); return; }
+    seat = { claim: claim.id, x: claim.x, z: claim.z, yaw: claim.yaw, top: claim.top, kind: claim.kind, eatery, from: { x: state.x, z: state.z }, at: performance.now() };
+    velocity = 0;
+    blendFor = 0;
+    registry.reset();
+    notify(seatHint(), 3500);
+  }
+  /** The seated hint, from the same test as the chip (stateView): E orders only while the quán is serving. */
+  function seatHint() {
+    const e = seat?.eatery;
+    if (e && isOpen(COUNTERS[e.key].hours, atmosphere.hours)) return `Ngồi ghế nhựa ở ${titleCase(e.name)} · E gọi món · WASD đứng dậy`;
+    return `${e ? `Ngồi ở ${titleCase(e.name)} · quán chưa bán · ` : 'Ngồi nghỉ · '}E hoặc WASD để đứng dậy · giữ Space cho thời gian trôi nhanh`;
+  }
+  function leaveSeat() {
+    if (!seat) return;
+    const s = seat;
+    seat = null;
+    if (s.claim !== null) nx.releaseSeat?.(s.claim);
+    // Up and a step forward off the seat, or back where the player stood.
+    const fx = s.x + Math.sin(s.yaw) * 0.7, fz = s.z + Math.cos(s.yaw) * 0.7;
+    const spot = clearAt(fx, fz, 0.35) ? { x: fx, z: fz } : s.from;
+    state.x = spot.x; state.z = spot.z;
+    bodyY = groundHeight(spot.x, spot.z);
+    registry.reset();
+  }
+  /** Seats out and usable near the player this frame (npcs.ts seatsNear: stools come out with their quán), by POI id. */
+  const seatsHere = new Map<number, { taken: boolean }>();
+  function refreshSeats() {
+    seatsHere.clear();
+    if (nx.seatsNear) { for (const s of nx.seatsNear(state.x, state.z, 6)) seatsHere.set(s.id, { taken: !!s.taken }); return; }
+    for (const p of PLACES) if (p.kind === 'seat' && p.poi !== undefined && Math.abs(p.x - state.x) < 6 && Math.abs(p.z - state.z) < 6) seatsHere.set(p.poi, { taken: false });
+  }
+
+  // -- Legacy shops and landmarks (their rings stay; the registry answers them) --
+  function legacyEntry(place: Place): Entry {
+    const base = { id: place.id, kind: 'door' as const, x: place.x, z: place.z, r: place.r };
+    switch (place.kind) {
+      case 'gunstore': return { ...base, prompt: () => ({ id: place.id, key: 'E', verb: 'Vào Tiệm súng', label: deliveries ? '' : 'mở khóa sau 1 đơn giao hàng' }), use: () => onEvent({ type: 'store' }) };
+      case 'bikeshop': return { ...base, prompt: () => ({ id: place.id, key: 'E', verb: 'Vào Cửa hàng xe máy', label: 'mua, sửa xe' }), use: () => onEvent({ type: 'bikeshop' }) };
+      case 'hospital': return { ...base, prompt: () => ({ id: place.id, key: 'E', verb: 'Khám và hồi máu', label: 'Bệnh viện An Hòa', price: health < MAX_HEALTH ? Math.ceil((MAX_HEALTH - health) * 1.2) : undefined }), use: () => onEvent({ type: 'hospital' }) };
+      case 'venue': {
+        const hours = VENUE_HOURS[place.key as VenueRoom];
+        return {
+          ...base, kind: 'counter',
+          prompt: (c) => (c.zombie ? dimView(place.id, 'Đã đóng cửa từ khi dịch bùng phát', titleCase(place.name))
+            : !isOpen(hours, c.hour) ? dimView(place.id, `${titleCase(place.name)} đóng cửa`, `mở lúc ${hourLabel(opensAt(hours, c.hour))}`)
+            : { id: place.id, key: 'E', verb: `Vào ${place.name}`, label: '18+' }),
+          use: (c) => { if (!c.zombie && isOpen(hours, c.hour)) onEvent({ type: 'venue', kind: place.key as VenueRoom }); },
+        };
+      }
+      case 'deck': return { ...base, prompt: () => ({ id: place.id, key: 'E', verb: 'Lên đài quan sát tầng 68', label: 'nhảy dù', price: DECK_PRICE }), use: () => enterDeck() };
+      case 'heist': return {
+        ...base, hold: 1.2, crime: 3,
+        prompt: (c) => {
+          if (c.zombie || !c.armed || heist) return null;
+          if (performance.now() < bankReadyAt) return dimView(place.id, 'Ngân hàng đang bị phong tỏa', `quay lại sau ${Math.ceil((bankReadyAt - performance.now()) / 60000)} phút`);
+          return { id: place.id, key: 'Giữ E', verb: 'Cướp ngân hàng', label: 'truy nã gắt', crime: 3, seen: true };
+        },
+        use: () => startHeist(performance.now()),
+      };
+      case 'boat': {
+        const dock = SCENERY.docks.find((d) => d.ring.x === place.x && d.ring.z === place.z)!;
+        return {
+          ...base, kind: 'transit',
+          prompt: (c) => (c.zombie ? dimView(place.id, 'Không ai cho thuê ca nô', 'bến bỏ hoang')
+            : boats.rental.mode === 'player' && Math.hypot(boats.rental.x - state.x, boats.rental.z - state.z) < 40 ? dimView(place.id, 'Ca nô của bạn neo gần đây', 'lại gần rồi nhấn E')
+            : { id: place.id, key: 'E', verb: 'Thuê ca nô', label: titleCase(dock.name.split(' • ')[0]), price: BOAT_PRICE }),
+          use: () => hireBoat(dock),
+        };
+      }
+      default: return { ...base, prompt: () => null, use: () => undefined };
+    }
+  }
+  // -- Bins (the streets owner places them as 'bin' props) --
+  function binEntry(place: Place): Entry {
+    return {
+      id: place.id, kind: 'bin', x: place.x, z: place.z, r: place.r,
+      prompt: (c) => (c.zombie ? null : litter > 0 ? { id: place.id, key: 'E', verb: 'Bỏ rác', label: `${litter} món` } : { id: place.id, key: 'E', verb: 'Lục thùng rác', label: 'tìm ve chai' }),
+      use(c) {
+        if (litter > 0) { state.score += litter * 2; notify(`Bỏ ${litter} món rác đúng chỗ · +${litter * 2} điểm. Phố sạch hơn rồi!`, 2500); litter = 0; return; }
+        if ((rummagedAt.get(place.id) ?? -1e9) > c.time - 90) { notify('Thùng này vừa lục rồi, chẳng còn gì.', 2000); return; }
+        rummagedAt.set(place.id, c.time);
+        if (Math.random() < 0.2) { scrap++; notify(`Nhặt được một vỏ lon · ${scrap} ve chai (bán ở tạp hóa)`, 2500); }
+        else notify('Toàn rác ướt, chẳng có gì…', 2000);
+      },
+    };
+  }
+  for (const place of PLACES) {
+    registry.add(place.kind === 'counter' ? counterEntry(place) : place.kind === 'seat' ? seatEntry(place) : place.kind === 'bin' ? binEntry(place) : legacyEntry(place));
+  }
+  // The sidewalk karaoke (street life, LIFE.groups): in its hours the neighbours hand the player the mic for a song;
+  // otherwise the loudspeaker just says when it starts.
+  LIFE.groups.forEach((g, gi) => {
+    if (g.kind !== 'karaoke' || !g.hours) return;
+    const id = `karaoke${gi}`, hours = g.hours;
+    let songUntil = 0;
+    registry.add({
+      id, kind: 'counter', x: g.x, z: g.z, r: 3,
+      prompt: (c) => (c.zombie ? null : !isOpen(hours, c.hour) ? dimView(id, 'Karaoke vỉa hè', `hát từ ${hoursLabel(hours)}`)
+        : c.time < songUntil ? dimView(id, 'Đang hát…', 'karaoke vỉa hè') : { id, key: 'E', verb: 'Hát một bài', label: 'karaoke vỉa hè' }),
+      use(c) {
+        if (c.zombie || !isOpen(hours, c.hour) || c.time < songUntil) return;
+        songUntil = c.time + 14;
+        const at = () => ({ x: state.x, y: groundHeight(state.x, state.z) + 2.1, z: state.z });
+        for (let k = 0; k < 3; k++) setTimeout(() => bubbles.say('player', LIFE_LINES.sing[(k + gi) % LIFE_LINES.sing.length], performance.now(), at, 3800), k * 4200);
+        let n = 0;
+        npcs.near(g.x, g.z, 7, (npc) => {
+          if (n >= 3 || npc.state === 'down') return;
+          const line = LIFE_LINES.audience[(n + gi) % LIFE_LINES.audience.length], delay = 4000 + n++ * 3000;
+          setTimeout(() => sayAt(`npc${npc.id}`, line, () => ({ x: npc.x, y: npc.y + (npc.pose === 'sit' ? npc.seatTop + 1.15 : 1.95), z: npc.z })), delay);
+        });
+        effectHost.buff('mat', 90);
+        // Points for the first song of the night only (the night runs on past midnight).
+        const night = atmosphere.clock.day - (c.hour < 12 ? 1 : 0), first = sangNight.get(id) !== night;
+        sangNight.set(id, night);
+        if (first) state.score += 5;
+        notify(first ? 'Cầm mic hát một bài · hàng xóm vỗ tay rần rần! +5 điểm' : 'Thêm một bài nữa · hàng xóm vẫn vỗ tay!', 3500);
+      },
+    });
+  });
+
+  // -- Vehicles: the player's bike, cars in reach (enter, or carjack moving traffic with a tap as before), curb bikes --
+  const carEntries = new Map<Car, Entry>();
+  /** Whether the attendant holding the player's bike is at his chair now (on duty, up, by the lot). */
+  function keeperOnDuty(npc: Npc) {
+    let on = false;
+    nx.forEachRole?.('giu-xe', (n, onDuty) => { if (n === npc && onDuty && Math.hypot(n.x - bikeX, n.z - bikeZ) < 15) on = true; });
+    return on;
+  }
+  const ownBike: Entry = {
+    id: 'own-bike', kind: 'vehicle', priority: OWN_VEHICLE, x: 0, z: 0, r: 2.6,
+    prompt() {
+      const horse = bikeId === 'horse';
+      // With the attendant at his chair the ticket goes to him; with nobody minding the lot the ticket is enough.
+      if (parkedWith && keeperOnDuty(parkedWith)) return dimView('own-bike', 'Xe đang gửi ở bãi', 'đưa vé cho anh giữ xe');
+      if (parkedWith && bikeHealth > 0) return { id: 'own-bike', key: 'E', verb: 'Lấy xe', label: 'bãi không người · cầm vé dắt ra' };
+      if (bikeHealth <= 0) return dimView('own-bike', horse ? 'Ngựa đã kiệt sức' : 'Xe máy đã hỏng', horse ? 'chữa ở Cửa hàng xe máy' : 'sửa ở tiệm sửa xe');
+      return { id: 'own-bike', key: 'E', verb: horse ? 'Cưỡi ngựa' : 'Lên xe máy', label: 'xe của bạn' };
+    },
+    use() {
+      if ((parkedWith && keeperOnDuty(parkedWith)) || bikeHealth <= 0) return;
+      parkedWith = null;
+      state.riding = true;
+      state.x = bikeX; state.z = bikeZ; state.angle = bikeAngle;
+      velocity = 0;
+    },
+  };
+  function carEntry(car: Car): Entry {
+    let e = carEntries.get(car);
+    if (!e) {
+      e = {
+        id: `car${car.kind}${car.index}`, kind: 'vehicle', x: 0, z: 0, r: 3.4,
+        prompt() {
+          const curb = car as CurbCar;
+          const moto = car.kind === 'moto';
+          if (car.health <= 0) return dimView(e!.id, 'Xe này đã hỏng');
+          if (curb.role === 'curb' && curb.curb?.owner !== 'player') {
+            // A xe ôm driver or a couple sitting on it: not a bike to steal.
+            if (seatTaken(car.x, car.z, 0.9)) return null;
+            // A confiscated bike in the ward police's row is evidence, chained up in front of the duty desk.
+            if (curb.curb && IMPOUNDED_SPOTS.has(curb.curb.spot)) return dimView(e!.id, 'Xe tạm giữ', 'công an phường đang giữ');
+            const seen = seenAround(car.x, car.z) > 0;
+            return { id: e!.id, key: 'Giữ E', verb: moto ? 'Bẻ khóa xe máy' : 'Phá khóa ô tô', label: curb.curb?.owner === 'lot' ? 'xe trong bãi giữ xe' : 'xe người ta', crime: 1, seen };
+          }
+          if (car.mode === 'lane' && car.driver) return { id: e!.id, key: 'E', verb: moto ? 'Cướp xe máy' : 'Cướp xe', label: 'bị truy nã', crime: 2, seen: true };
+          if (car.kind === 'police') return { id: e!.id, key: 'Giữ E', verb: 'Lấy xe cảnh sát', label: 'bị truy nã gắt', crime: 3, seen: true };
+          return { id: e!.id, key: 'E', verb: 'Lên xe', label: car === playerLastCar ? 'xe của bạn' : moto ? 'xe máy' : 'ô tô' };
+        },
+        use() {
+          const curb = car as CurbCar;
+          if (car.health <= 0) { notify('Xe này đã hỏng, không chạy được.'); return; }
+          if (curb.role === 'curb' && curb.curb && IMPOUNDED_SPOTS.has(curb.curb.spot)) return;
+          if (curb.role === 'curb' && curb.curb?.owner !== 'player') stealCurb(car);
+          else takeCar(car);
+        },
+      };
+      carEntries.set(car, e);
+    }
+    const curb = car as CurbCar;
+    e.x = car.x; e.z = car.z;
+    e.r = car.kind === 'moto' ? 4.4 : 3.4;
+    const own = car === playerLastCar || curb.role === 'owned' || curb.curb?.owner === 'player';
+    const thief = curb.role === 'curb' && !own;
+    e.priority = own ? OWN_VEHICLE : thief ? BASE.vehicle : car.mode === 'lane' && car.driver ? BASE.vehicle : car.kind === 'police' ? BASE.vehicle : 60;
+    e.crime = thief ? 1 : car.mode === 'lane' && car.driver ? 2 : car.kind === 'police' ? 3 : 0;
+    // C2: taking an idle vehicle that is not yours is a hold (a parked cruiser too); carjacking moving traffic stays a tap.
+    e.hold = thief ? (car.kind !== 'moto' ? 4.5 : ({ cub: 2, scooter: 3, vespa: 3.5, sport: 4 } as Record<string, number>)[vehicleStyle(car)] ?? 3) : car.kind === 'police' ? 2 : undefined;
+    return e;
+  }
+  /** The confiscated half of the ward police's row (parking.ts 'impound' spots): never a bike to take. */
+  const IMPOUNDED_SPOTS = new Set(SPOTS.filter((s) => s.kind === 'impound').map((s) => s.id));
+  /** Witnesses around a spot, recounted at most four times a second (prompts ask every frame). */
+  const seenCache = { x: 1e9, z: 1e9, at: -1, n: 0 };
+  function seenAround(x: number, z: number) {
+    const t = performance.now();
+    if (Math.hypot(x - seenCache.x, z - seenCache.z) > 1 || t - seenCache.at > 250) Object.assign(seenCache, { x, z, at: t, n: witnesses(x, z, 15) });
+    return seenCache.n;
+  }
+  function takeCar(car: Car) {
+    enterCar(car, performance.now());
+    if (car.kind !== 'police') { playerLastCar = car; vx.markOwned?.(car); }
+  }
+  /** Hot-wiring a parked bike or car (design-real 4.5): witnesses counted again at the end; the plate is reported. */
+  function stealCurb(car: Car) {
+    const now = performance.now(), time = now / 1000;
+    const seen = witnesses(car.x, car.z, 15), cops = policeSeeing(car.x, car.z, 40);
+    if (car.kind !== 'moto' && Math.random() < 0.5) { playHorn(true); npcs.notice(car.x, car.z, 'crash', time); notify('Còi báo động ô tô hú inh ỏi!', 2500); }
+    if (seen > 0) {
+      let shouter: Npc | null = null, best = 1e9;
+      npcs.near(car.x, car.z, 15, (npc) => { const d = Math.hypot(npc.x - car.x, npc.z - car.z); if (d < best && npc.state !== 'fleeing') { best = d; shouter = npc; } });
+      const who = shouter as Npc | null;
+      if (who) sayAt(`npc${who.id}`, 'Trộm xe! Trộm xe!', () => ({ x: who.x, y: who.y + 1.95, z: who.z }), true);
+      npcs.notice(car.x, car.z, 'fight', time);
+      police.crime(cops ? 2 : 1, time);
+      hotCars.set(car, time + 3 * SECONDS_PER_HOUR);
+      notify(cops ? 'Bị công an thấy bẻ khóa xe! Chạy mau!' : 'Có người thấy bạn trộm xe! Họ đang báo công an.', 3500);
+    } else notify('Nổ máy rồi · không ai thấy. Đi thôi!', 2500);
+    takeCar(car);
+  }
+  registry.addProvider((x, z, _r, out) => {
+    if (state.riding || swimming || boat || glide) return;
+    if (!seat && Math.hypot(bikeX - x, bikeZ - z) < 2.6) { ownBike.x = bikeX; ownBike.z = bikeZ; out.push(ownBike); }
+    for (const car of vehicles.cars) {
+      if (car.mode === 'off' || car.mode === 'player' || car.mode === 'chase' || car.mode === 'leave') continue;
+      if (Math.abs(car.x - x) > 6 || Math.abs(car.z - z) > 6) continue;
+      out.push(carEntry(car));
+    }
+    for (const car of vx.curbNear?.(x, z, 6) ?? []) if (!vehicles.cars.includes(car) && car.mode !== 'player') out.push(carEntry(car));
+  });
+  vx.onTow?.((car) => {
+    if (car !== playerLastCar) return;
+    playerLastCar = null;
+    notify('Xe của bạn bị cẩu về Công an phường. Nộp phạt ở quầy trực ban để lấy lại.', 5000);
+  });
+
+  // -- People: giữ-xe attendants, xe ôm drivers and lottery sellers (npcs.ts roles, placed by the street-life owner) --
+  const personEntries = new Map<Npc, Entry>();
+  function personEntry(npc: Npc, role: string): Entry {
+    let e = personEntries.get(npc);
+    if (!e) {
+      const id = `npc${npc.id}`;
+      // Walking up to the attendant with the bike beside you is to leave it (over getting back on it).
+      e = role === 'giu-xe' ? {
+        id, kind: 'person', x: 0, z: 0, r: 2.4, priority: OWN_VEHICLE + 10,
+        prompt(c) {
+          if (parkedWith === npc) return { id, key: 'E', verb: 'Lấy xe', label: 'đưa vé xe' };
+          if (parkedWith || bikeHealth <= 0 || Math.hypot(bikeX - c.x, bikeZ - c.z) > 6) return null;
+          // No new bikes in the last half hour of his shift: the lot closes and nobody would mind it.
+          const end = closingOf(npc);
+          if (end !== null && (end - c.hour + 24) % 24 < 0.5) return dimView(id, `Bãi đóng lúc ${hourLabel(end)}`, 'không nhận gửi thêm');
+          return { id, key: 'E', verb: 'Gửi xe', label: 'anh giữ xe', price: 5 };
+        },
+        use(c) {
+          if (parkedWith === npc) {
+            parkedWith = null;
+            const a = c.heading + Math.PI / 2;
+            const px = state.x + Math.sin(a) * 1.4, pz = state.z + Math.cos(a) * 1.4;
+            if (clearAt(px, pz, 0.5)) { bikeX = px; bikeZ = pz; } else { bikeX = state.x + Math.sin(c.heading) * 1.6; bikeZ = state.z + Math.cos(c.heading) * 1.6; }
+            bikeAngle = c.heading;
+            sayAt(id, 'Xe đây em, đi cẩn thận nha!', () => ({ x: npc.x, y: npc.y + 1.95, z: npc.z }));
+            return;
+          }
+          const end = closingOf(npc);
+          if (end !== null && (end - c.hour + 24) % 24 < 0.5) return;
+          if (cash < 5) { notify('Gửi xe 5.000đ, bạn không đủ tiền.', 2000); return; }
+          cash -= 5;
+          parkedWith = npc;
+          // Rolled into the lot beside the attendant's chair.
+          bikeX = npc.x + Math.sin(npc.yaw + Math.PI / 2) * 1.6; bikeZ = npc.z + Math.cos(npc.yaw + Math.PI / 2) * 1.6; bikeAngle = npc.yaw;
+          sayAt(id, 'Vé xe đây, giữ kỹ nha em!', () => ({ x: npc.x, y: npc.y + 1.95, z: npc.z }));
+          notify('Đã gửi xe · 5.000đ · giữ vé để lấy xe ở đây.', 3000);
+        },
+      } : role === 'xe-om' ? {
+        id, kind: 'person', x: 0, z: 0, r: 2.6,
+        // Nobody gives a ride to someone the police are after (the ride is a fade across town).
+        prompt: (c) => (c.wanted > 0 ? dimView(id, 'Chú không chở người đang bị công an truy', 'chú xe ôm') : { id, key: 'E', verb: 'Đi xe ôm', label: 'chú xe ôm' }),
+        use: (c) => { if (c.wanted === 0) openXeOm(npc); },
+      } : role === 'hawker' ? {
+        id, kind: 'person', x: 0, z: 0, r: 2.4,
+        prompt: () => {
+          const def = COUNTERS[`ganh-${goodsOf(npc)}`];
+          return def ? { id, key: 'E', verb: def.verb, label: 'hàng rong', price: headline(def) } : null;
+        },
+        use: () => {
+          const key = `ganh-${goodsOf(npc)}`;
+          if (COUNTERS[key]) openCounter({ id, kind: 'counter', key, name: COUNTERS[key].title.toLocaleUpperCase('vi'), x: npc.x, z: npc.z, r: 2.4, yaw: npc.yaw, anchor: { x: npc.x, z: npc.z }, covers: [], building: -1 }, undefined, npc);
+        },
+      } : {
+        id, kind: 'person', x: 0, z: 0, r: 2.4,
+        prompt: () => ({ id, key: 'E', verb: 'Mua vé số', label: 'cô bán vé số', price: 10 }),
+        use: () => openCounter({ id, kind: 'counter', key: 'veso', name: 'CÔ BÁN VÉ SỐ', x: npc.x, z: npc.z, r: 2.4, yaw: npc.yaw, anchor: { x: npc.x, z: npc.z }, covers: [], building: -1 }, 'Cô bán vé số', npc),
+      };
+      personEntries.set(npc, e);
+    }
+    e.x = npc.x; e.z = npc.z;
+    return e;
+  }
+  registry.addProvider((x, z, _r, out) => {
+    if (!nx.forEachRole || zombieMode || state.riding) return;
+    for (const role of ['giu-xe', 'xe-om', 've-so', 'hawker']) nx.forEachRole(role, (npc, onDuty) => {
+      if (onDuty && Math.abs(npc.x - x) < 6 && Math.abs(npc.z - z) < 6 && (role !== 'hawker' || COUNTERS[`ganh-${goodsOf(npc)}`])) out.push(personEntry(npc, role));
+    });
+  });
+  /** When an attendant's shift ends (his guard slice), or null. */
+  const closingOf = (npc: Npc) => { const a = npc.current as { life?: string; end?: number } | null; return a?.life === 'guard' && a.end !== undefined ? a.end : null; };
+  /** What a roaming hawker sells right now (street-life slices carry their goods). */
+  const goodsOf = (npc: Npc) => (npc.current as { goods?: string } | null)?.goods ?? '';
+  /** Xe ôm: a destination menu priced 10.000đ + 2.000đ per 100 m (haggling allowed); the ride is a fade across town. */
+  function openXeOm(npc: Npc) {
+    serveAt(npc.x, npc.z, 'Đi đâu con? Lên xe chú chở!', npc);
+    const places = [
+      { id: 'cho', name: 'Chợ An Hòa', at: { x: -31, z: 27 } }, { id: 'benhvien', name: 'Bệnh viện An Hòa', at: LANDMARKS.hospital },
+      { id: 'congan', name: 'Công an phường', at: LANDMARKS.police }, { id: 'chua', name: 'Chùa An Hòa', at: { x: -25.4, z: 116.4 } },
+      { id: 'bachdang', name: 'Bến Bạch Đằng', at: { x: 190, z: -128 } }, { id: 'nhahat', name: 'Nhà hát Thành phố', at: { x: 243, z: -8.4 } },
+    ];
+    const target = missions.view().target;
+    if (target) places.push({ id: 'nhiemvu', name: `Điểm nhiệm vụ: ${missions.view().label}`, at: target });
+    const fare = (p: { x: number; z: number }) => 10 + Math.round((2 * Math.hypot(p.x - state.x, p.z - state.z)) / 100);
+    const off = { v: 1 };
+    openMenu({
+      id: `xeom${npc.id}`, anchor: { x: npc.x, z: npc.z, yaw: npc.yaw }, onHaggle: (v) => { off.v = v; },
+      build: () => ({
+        id: '', kind: 'xeom', icon: 'bike', eyebrow: 'XE ÔM · CHÚ TƯ', title: 'Đi đâu con?', intro: 'Xe ôm đầu ngõ, chạy quen đường, có nón bảo hiểm cho khách. Giá thì trả giá được.',
+        items: places.filter((p) => Math.hypot(p.at.x - state.x, p.at.z - state.z) > 30).map((p) => {
+          const price = Math.round(fare(p.at) * off.v);
+          return { id: p.id, name: p.name, price, desc: `${Math.round(Math.hypot(p.at.x - state.x, p.at.z - state.z))} m`, disabled: cash < price };
+        }),
+        foot: 'Ngồi sau xe ôm nhớ đội nón bảo hiểm. Chuyến đi trôi qua trong chớp mắt.', wallet: { cash },
+      }),
+      choose: (itemId) => {
+        const p = places.find((q) => q.id === itemId);
+        if (!p) return { message: '', ok: false };
+        if (police.wanted > 0) return { message: 'Chú không chở người đang bị công an truy.', ok: false, close: true };
+        const price = Math.round(fare(p.at) * off.v);
+        if (cash < price) return { message: `Cần ${formatThousands(price)}.`, ok: false };
+        cash -= price;
+        const meters = Math.hypot(p.at.x - state.x, p.at.z - state.z);
+        // The driver is gone on the fare (and his scooter with him) for as long as the ride takes, and a bit to come back.
+        const perch = (npc.current?.place as { poi?: { x: number; z: number } } | undefined)?.poi;
+        nx.sendAway?.(npc, meters / 7 + 40);
+        if (perch) vx.awayCurb?.(perch.x, perch.z, meters / 7 + 40);
+        dip();
+        teleport(p.at);
+        atmosphere.setHours(atmosphere.hours + meters / 7 / SECONDS_PER_HOUR);
+        clockJumped();
+        return { message: `Đã tới ${p.name} · ${formatThousands(price)}`, ok: true, close: true };
+      },
+    });
+  }
+
+  // -- Passengers (bus, waterbus, xe ôm, xích lô: the transit owner calls these) --
+  function boardPassenger(p: PassengerProvider) {
+    if (seat) leaveSeat();
+    if (state.riding) leaveVehicleNow();
+    if (hold) { hold.entry.cancel?.(ctx); hold = null; }
+    closeMenu(true);
+    ride = p;
+    velocity = 0;
+    registry.reset();
+  }
+  function leavePassenger() {
+    if (!ride) return;
+    const s = ride.seat();
+    ride = null;
+    for (let r = 1.2; r <= 4.8; r += 0.6) for (let k = 0; k < 12; k++) {
+      const a = s.yaw + Math.PI / 2 + (k / 12) * Math.PI * 2, x = s.x + Math.sin(a) * r, z = s.z + Math.cos(a) * r;
+      if (clearAt(x, z, 0.4)) { state.x = x; state.z = z; bodyY = groundHeight(x, z); return; }
+    }
+    const spot = reachable(s);
+    state.x = spot.x; state.z = spot.z; bodyY = groundHeight(spot.x, spot.z);
+  }
+  const passengers = { board: boardPassenger, leave: leavePassenger };
+  for (const partner of [vehicles, npcs, boats] as Registers[]) partner.register?.(registry, passengers);
+  buses.register(registry, passengers);
+
+  /** Busy with something Space must not jump out of (sitting, riding along, holding E, a menu). */
+  const activityBusy = () => !!(seat || ride || hold || menu);
+  /** E on the current focus: a tap acts now, a hold entry starts its hold (it acts when the hold completes). */
+  function actOnFocus(now: number) {
+    const f = focus;
+    if (!f || f.view.dim) return false;
+    if (f.entry.hold) { hold = { entry: f.entry, view: f.view, started: now, x: state.x, z: state.z }; return true; }
+    f.entry.use(refreshCtx(now));
+    registry.reset();
+    return true;
+  }
+  /** What E means while seated or riding along, for the prompt chip. */
+  function rideVerb() {
+    const hint = ride?.card?.().hint;
+    return hint ? hint[0].toLocaleUpperCase('vi') + hint.slice(1) : 'Xin xuống ở trạm tới';
+  }
+  function stateView(): PromptView | null {
+    // The ride's card says what E does now (ring for the next stop, get off at this pier, stand up in a moored đò).
+    if (ride) return { id: 'ride', key: 'E', verb: rideVerb(), label: ride.label };
+    if (seat) return seat.eatery && isOpen(COUNTERS[seat.eatery.key].hours, atmosphere.hours)
+      ? { id: 'seat', key: 'E', verb: COUNTERS[seat.eatery.key].verb, label: titleCase(seat.eatery.name) }
+      : { id: 'seat', key: 'E', verb: 'Đứng dậy', label: seat.kind === 'bus-stop' ? 'Ghế chờ xe buýt' : seat.kind === 'bench' ? 'Ghế đá' : 'Ghế' };
+    return null;
+  }
+  /** The prompt as one line of text (the hint line, and screen readers). */
+  function promptText(v: PromptView) {
+    return [v.key ? `${v.key} · ${v.verb}` : v.verb, v.label, v.price ? formatThousands(v.price) : ''].filter(Boolean).join(' · ');
+  }
+  /**
+   * Once a frame: a hold-E in progress (cancelled on release, moving off, aiming, falling, a menu; done when it
+   * completes), the focus for the prompt, the 16:15 lottery draw, sitting (time passes faster on held Space, at 1★ the
+   * police lose a player who sits unseen for 10 s), stolen plates, and the marker over the focus.
+   */
+  function updateInteraction(dt: number, now: number, time: number) {
+    refreshCtx(now);
+    updateShutters(Math.floor(atmosphere.hours * 6) / 6);
+    if (!state.riding) refreshSeats();
+    if (hold) {
+      const aimingNow = mouseHeld || keys.has('f') || now < aimUntil;
+      if (!keys.has('e') || !active || down || menu || state.riding || aimingNow || Math.hypot(state.x - hold.x, state.z - hold.z) > 1.2) {
+        hold.entry.cancel?.(ctx);
+        hold = null;
+      } else if (now - hold.started >= (hold.entry.hold ?? 0) * 1000) {
+        const done = hold.entry;
+        hold = null;
+        done.use(ctx);
+        registry.reset();
+      }
+    }
+    // Nothing to use at speed: the registry is only asked on foot, or riding slowly (a stop, a parking lot).
+    const canFocus = active && !down && !playerBody && !glide && !boat && !heist && !menu && !hold && !ride && !seat && !interior && !surrendered && (!state.riding || Math.abs(velocity) < 2);
+    focus = canFocus ? registry.best(ctx) : null;
+    // The day's lottery draw at 16:15 (numbers from services.ts, so everyone in a room gets the same).
+    const day = atmosphere.clock.day;
+    if (atmosphere.hours >= DRAW_HOUR && drawnDay !== day) {
+      drawnDay = day;
+      if (started && !zombieMode) {
+        const win = drawNumber(day), lucky = tickets.some((t) => t.day === day && prizeFor(t.number, win) > 0);
+        notify(`Xổ số kiến thiết 16:15 · giải đặc biệt ${win}${lucky ? ' · Bạn có vé trúng! Dò vé ở tạp hóa hoặc cô bán vé số.' : tickets.length ? ' · Dò vé ở tạp hóa.' : ''}`, 6000);
+      }
+    }
+    // The quán packed up its stools (closing time, rain): the player gets up too.
+    if (seat && seat.claim !== null && !state.riding && !seatsHere.has(seat.claim)) { leaveSeat(); notify('Quán dọn hàng rồi · đứng dậy thôi.', 2500); }
+    if (seat) {
+      const info = missions.view(), timed = info.status === 'active' && info.remainingSeconds !== null && info.started;
+      if ((keys.has(' ') || keys.has('space')) && police.wanted === 0 && !timed && !sideMissions.active) atmosphere.setHours(atmosphere.hours + (dt * 5) / SECONDS_PER_HOUR);
+      if (police.wanted === 1 && !policeSeeing(state.x, state.z, 45)) {
+        blendFor += dt;
+        if (blendFor > 10) { police.reset(); blendFor = 0; notify('Ngồi lẫn vào đám đông · cảnh sát đã mất dấu bạn.', 3500); }
+      } else blendFor = 0;
+    }
+    // A plate reported stolen: an officer close by who sees it calls it in.
+    if (playerCar && hotCars.has(playerCar)) {
+      if (time > hotCars.get(playerCar)!) hotCars.delete(playerCar);
+      else if (police.wanted === 0 && policeSeeing(state.x, state.z, 25)) { police.crime(1, time); notify('Công an nhận ra biển số xe bị báo mất!', 3000); }
+    }
+    const f = focus && !focus.view.dim && !zombieMode ? focus : null;
+    focusMark.visible = !!f && !hold;
+    if (f) {
+      const e = f.entry, g = groundHeight(e.x, e.z);
+      focusMark.position.set(e.x, g + 0.04, e.z);
+      focusDiamond.position.y = (e.kind === 'seat' ? 1.3 : e.kind === 'vehicle' ? 2.0 : e.kind === 'person' ? 2.4 : 2.9) + Math.sin(time * 3) * 0.08;
+      focusDiamond.rotation.y = time * 1.6;
+      const red = !!f.view.crime;
+      (focusDiamond.material as THREE.MeshBasicMaterial).color.set(red ? '#ff6a55' : '#ffffff');
+      (focusHalo.material as THREE.MeshBasicMaterial).color.set(red ? '#ff6a55' : '#fff6dc');
+      focusHalo.scale.setScalar(e.kind === 'vehicle' ? 1.6 : e.kind === 'seat' ? 0.9 : 1.2);
+    }
+  }
+  function mapPins(): MapPin[] {
+    const pins = STATIC_PINS.slice();
+    if (playerLastCar && playerLastCar !== playerCar && playerLastCar.mode !== 'off') pins.push({ kind: 'car', x: Math.round(playerLastCar.x), z: Math.round(playerLastCar.z) });
+    if (vx.impound?.list().length) pins.push({ kind: 'impound', x: Math.round(LANDMARKS.police.x), z: Math.round(LANDMARKS.police.z) });
+    if (!state.riding || playerCar) pins.push({ kind: 'bike', x: Math.round(bikeX), z: Math.round(bikeZ) });
+    return pins;
+  }
+  /** Map pins that never move: bus stops, ATMs and piers. */
+  const STATIC_PINS: MapPin[] = [
+    ...SCENERY.busStops.map((b) => ({ kind: 'bus' as const, x: Math.round(b.x), z: Math.round(b.z) })),
+    ...ATM_SPOTS.map((a) => ({ kind: 'atm' as const, x: Math.round(a.x), z: Math.round(a.z) })),
+    ...SCENERY.docks.filter((d) => !d.rental).map((d) => ({ kind: 'ferry' as const, x: Math.round(d.ring.x), z: Math.round(d.ring.z) })),
+  ];
+
   function action() {
     if (!active || down) return;
     const now = performance.now();
     const time = now / 1000;
     if (glide) { if (glide.phase === 'deck') leaveDeck(); return; }
     if (boat) { leaveBoat(now); return; }
-    if (!state.riding && boats.rental.mode === 'player' && (swimming || dockAt(state.x, state.z)) && Math.hypot(boats.rental.x - state.x, boats.rental.z - state.z) < 4.2) { boardBoat(); return; }
-    if (!state.riding && !swimming) {
-      const dock = SCENERY.docks.find((d) => d.rental && distance(d.ring) < 3);
-      if (dock) { hireBoat(dock); return; }
-      if (distance(LANDMARKS.tower.door) < 3.2) { enterDeck(); return; }
-      if (distance(LANDMARKS.bank.door) < 3.2 && !heist) { startHeist(now); return; }
+    // A hold already running is finished by holding, not by pressing again.
+    if (hold) return;
+    if (ride) { ride.onLeave(); return; }
+    if (seat) {
+      // At a café or stall stool E orders; anywhere else it gets up (moving also gets up).
+      if (seat.eatery && !zombieMode && isOpen(COUNTERS[seat.eatery.key].hours, atmosphere.hours)) openCounter(seat.eatery);
+      else leaveSeat();
+      return;
     }
+    if (!state.riding && boats.rental.mode === 'player' && (swimming || dockAt(state.x, state.z)) && Math.hypot(boats.rental.x - state.x, boats.rental.z - state.z) < 4.2) { boardBoat(); return; }
     const info = missions.view();
     const needsVehicleChange = (info.requiresOnFoot && state.riding) || (info.requiresBike && !isMotorbike());
     const missionEvent = missions.interact(missionPlayer());
@@ -1705,31 +2794,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       notify(`Nhận việc: ${offer.def.title} · ${offer.def.intro}`, 4500);
       return;
     }
-    if (!state.riding && distance(STORE) < 3.5) { onEvent({ type: 'store' }); return; }
-    if (!state.riding && distance(BIKE_SHOP) < 3.5) { onEvent({ type: 'bikeshop' }); return; }
-    if (!state.riding && distance(LANDMARKS.hospital) < 3.5) { onEvent({ type: 'hospital' }); return; }
-    const venue = !state.riding ? venueDoors.find((door) => distance(door.at) < 2.6) : undefined;
-    if (venue) {
-      if (zombieMode) notify(`${venue.name} đã đóng cửa từ khi dịch bùng phát.`, 2500);
-      else onEvent({ type: 'venue', kind: venue.kind });
-      return;
-    }
-    if (state.riding) { exitVehicle(); return; }
-    const car = nearestCar(3.4);
-    const bikeDistance = Math.hypot(state.x - bikeX, state.z - bikeZ);
-    if (car && (bikeDistance > 2.6 || Math.hypot(car.x - state.x, car.z - state.z) < bikeDistance)) {
-      if (car.health <= 0) { notify('Xe này đã hỏng, không chạy được.'); return; }
-      enterCar(car, now);
-      return;
-    }
-    if (bikeDistance < 2.6) {
-      if (bikeHealth <= 0) { notify(bikeId === 'horse' ? 'Ngựa đã kiệt sức. Chữa ở Cửa hàng xe máy.' : 'Xe máy đã hỏng. Mua xe mới hoặc sửa ở Cửa hàng xe máy.', 3500); return; }
-      state.riding = true;
-      state.x = bikeX;
-      state.z = bikeZ;
-      state.angle = bikeAngle;
-      velocity = 0;
-    }
+    // Everything else E can do here is the registry's focus (shops, counters, seats, vehicles, people...).
+    if (actOnFocus(now)) return;
+    if (state.riding) exitVehicle();
   }
 
   function spaceAction() {
@@ -2068,7 +3135,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const normalized = key.toLowerCase();
     if (pressed && !keys.has(normalized)) {
       if (normalized === 'e' || normalized === 'key e') action();
-      if (normalized === 'f') { triggerQueued = true; unlockAudio(); }
+      // Riding along, F (the fire key) also asks to get off.
+      if (normalized === 'f' && ride && active) ride.onLeave();
+      else if (normalized === 'f') { triggerQueued = true; unlockAudio(); }
       if (normalized === 'q') cycleWeapon();
       if (normalized === 'r') startReload(performance.now());
       if (normalized === 'v') Object.assign(view, CAMERA_DEFAULT);
@@ -2080,8 +3149,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         else if (!police.wanted) notify('Không có ai đang truy bắt bạn.', 1500);
       }
       // Space jumps on foot (vaults the river railing, climbs out of the water, jumps off the deck, opens the
-      // parachute); on a vehicle it stays the brake.
-      if ((normalized === ' ' || normalized === 'space') && !down && performance.now() > stunUntil) spaceAction();
+      // parachute); on a vehicle it stays the brake. Sitting, riding along, holding E or in a menu it belongs to
+      // that activity (held while seated, it makes time pass faster).
+      if ((normalized === ' ' || normalized === 'space') && !down && performance.now() > stunUntil && !activityBusy()) spaceAction();
       const slot = Number(normalized);
       if (slot >= 1 && slot <= WEAPONS.length && !equip(WEAPONS[slot - 1].id)) notify(`Chưa có ${WEAPONS[slot - 1].name}. Mua ở Tiệm súng.`);
     }
@@ -2515,6 +3585,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const d = Math.hypot(peer.group.position.x - b.x, peer.group.position.z - b.z);
       if (d < b.radius && byPlayer) hitPeer(id, peer, Math.min(100, b.damage * (1 - d / b.radius) + 10), (peer.group.position.x - b.x) / (d || 1), (peer.group.position.z - b.z) / (d || 1), now);
     }
+    // Parked vehicles that are only drawn wake up first, so the blast reaches them too.
+    vx.curbNear?.(b.x, b.z, b.radius + 2);
     for (const car of vehicles.cars) {
       if (car.mode === 'off') continue;
       const d = Math.hypot(car.x - b.x, car.z - b.z);
@@ -2779,14 +3851,15 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const missionInfo = missions.view();
     const target = missionInfo.target;
     const nearMission = target !== null && distance(target) <= 6.5;
-    const nearBike = !state.riding && Math.hypot(state.x - bikeX, state.z - bikeZ) < 2.6;
-    const nearStore = !state.riding && distance(STORE) < 3.5;
-    const nearBikeShop = !state.riding && distance(BIKE_SHOP) < 3.5;
-    const nearHospital = !state.riding && distance(LANDMARKS.hospital) < 3.5;
-    const nearVenue = !state.riding ? venueDoors.find((door) => distance(door.at) < 2.6) : undefined;
     const offer = sideMissions.nearOffer(state.x, state.z);
-    const car = !state.riding ? nearestCar(3.4) : null;
     const rounds = ammo.get(weapon);
+    // The prompt chip (C1): a hold in progress, getting up or off, else the registry's focus, unless the mission ring
+    // or a side-job offer has E here (C5) or the player is busy being down, gliding, boating or robbing the bank.
+    const missionHasE = nearMission && missionInfo.status === 'active' && MISSION_DEFS.find((d) => d.id === missionInfo.id)?.steps[missionInfo.step]?.mode === 'interact';
+    const busy = down || playerBody || surrendered || glide || heist || boat || interior;
+    const prompt: PromptView | null = hold ? { ...hold.view, progress: Math.min(1, (now - hold.started) / ((hold.entry.hold ?? 1) * 1000)) }
+      : busy || menu ? null : stateView() ?? (missionHasE || offer ? null : focus?.view ?? null);
+    const focusText = prompt ? promptText(prompt) : '';
     const hint = now < notificationUntil ? notification
       : down === 'wasted' ? 'Đang được đưa đi cấp cứu…'
       : down === 'busted' ? 'Đang bị còng tay, áp giải về đồn…'
@@ -2798,23 +3871,18 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       : heist ? `Đang mở két… ${Math.min(100, Math.round(((now - heist.started) / HEIST_MS) * 100))}% · ở yên gần quầy, đừng đi xa`
       : boat ? 'Ca nô · W ga · S lùi · A/D bẻ lái · Space thắng · E cập bến hoặc nhảy xuống sông'
       : swimming ? (boats.rental.mode === 'player' && Math.hypot(boats.rental.x - state.x, boats.rental.z - state.z) < 4.2 ? 'Nhấn E để lên ca nô' : 'Đang bơi · Shift bơi nhanh · sát bờ kè hoặc cầu tàu nhấn Space để leo lên')
-      : !state.riding && SCENERY.docks.some((d) => d.rental && distance(d.ring) < 3) ? `Nhấn E để thuê ca nô (${formatThousands(BOAT_PRICE)})`
-      : !state.riding && distance(LANDMARKS.tower.door) < 3.2 ? `Nhấn E: lên đài quan sát tầng 68 (${formatThousands(DECK_PRICE)}) và nhảy dù`
-      : !state.riding && distance(LANDMARKS.bank.door) < 3.2 ? (weapon === 'fists' ? 'Ngân hàng Phương Nam · phải có súng mới cướp được' : 'Nhấn E để cướp ngân hàng (bị truy nã gắt)')
+      : hold ? 'Giữ phím E tới khi xong · thả ra hoặc đi chỗ khác là bỏ dở'
+      : ride ? `${ride.label} · ${rideVerb()} (E hoặc F)`
+      : seat ? (seat.eatery && isOpen(COUNTERS[seat.eatery.key].hours, atmosphere.hours) ? 'Ngồi ghế nhựa ăn tại chỗ · E gọi món · WASD đứng dậy' : `Đang ngồi nghỉ · E hoặc WASD đứng dậy${police.wanted ? '' : ' · giữ Space cho thời gian trôi nhanh'}`)
       : !state.riding && vaultSpot() ? 'Space để nhảy qua lan can xuống sông'
-      : zombieMode && !nearStore && !nearHospital && !state.riding && !(car && !nearBike) ? (rounds && rounds.mag === 0 && rounds.reserve === 0 ? 'Hết đạn · Đổi súng (1–6) hoặc mua đạn ở Tiệm súng' : 'Click/F bắn · bắn vào đầu · R nạp đạn · lên xe để chạy thoát')
+      : zombieMode && !prompt && !state.riding ? (rounds && rounds.mag === 0 && rounds.reserve === 0 ? 'Hết đạn · Đổi súng (1–6) hoặc mua đạn ở Tiệm súng' : 'Click/F bắn · bắn vào đầu · R nạp đạn · lên xe để chạy thoát')
       : nearMission && missionInfo.requiresOnFoot && state.riding ? 'Giảm tốc rồi nhấn E xuống xe để dọn rác'
       : nearMission && missionInfo.requiresBike && !isMotorbike() ? 'Hãy dùng xe máy để tham gia vòng đua'
       : nearMission ? missionInfo.objective
       : offer ? `Nhấn E để nhận việc: ${offer.def.title} (+${formatThousands(offer.def.reward)})`
-      : nearStore ? (deliveries ? 'Nhấn E để vào Tiệm súng' : 'Tiệm súng: hoàn thành 1 nhiệm vụ giao hàng để mở khóa')
-      : nearBikeShop ? 'Nhấn E để vào Cửa hàng xe máy'
-      : nearHospital ? 'Nhấn E để khám và hồi máu'
-      : nearVenue ? `Nhấn E để vào ${nearVenue.name} (18+)`
+      : prompt ? focusText
       : missionInfo.status !== 'active' ? 'Nhấn M để chọn nhiệm vụ mới hoặc chơi lại'
       : state.riding ? (weapon !== 'fists' ? 'W ga · S phanh/lùi · A/D lái · Space phanh tay · Click bắn' : 'W ga · S phanh/lùi · A/D lái · Space phanh tay · E xuống xe')
-      : car && !nearBike ? (car.mode === 'lane' ? (car.kind === 'moto' ? 'Nhấn E để cướp xe máy (bị truy nã)' : 'Nhấn E để cướp xe (bị truy nã)') : car.health <= 0 ? 'Xe này đã hỏng' : 'Nhấn E để lên xe')
-      : nearBike ? (bikeHealth > 0 ? (bikeId === 'horse' ? 'Nhấn E để cưỡi ngựa' : 'Nhấn E để lên xe máy') : bikeId === 'horse' ? 'Ngựa đã kiệt sức · Chữa ở Cửa hàng xe máy' : 'Xe máy đã hỏng · Mua xe mới ở Cửa hàng xe máy')
       : police.wanted ? 'Đang bị truy nã · Trốn khỏi tầm mắt cảnh sát, hoặc nhấn H để đầu hàng'
       : rounds && rounds.mag === 0 && rounds.reserve === 0 ? 'Hết đạn · Mua thêm ở Tiệm súng'
       : weapon !== 'fists' ? 'Chĩa súng vào người để cướp · Click/F bắn · R nạp đạn · Giữ Tab túi súng'
@@ -2825,11 +3893,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const vehicleHealth = playerCar ? playerCar.health / carMax(playerCar) : state.riding ? bikeHealth / bikeById(bikeId).health : -1;
     const hud: Hud = {
       speed: Math.round(velocity * 10) / 10, riding: state.riding, score: state.score,
-      mission: missionInfo.objective, missionStep: missionInfo.step, missionInfo, hint,
+      mission: missionInfo.objective, missionStep: missionInfo.step, missionInfo, hint: hint === focusText ? '' : hint,
+      prompt, pins: mapPins(), ride: ride ? ride.card?.() ?? { title: ride.label, next: '', hint: 'E hoặc F · xin xuống ở trạm tới', stops: [] } : null,
+      seated: !!seat, bank: Math.floor(bank), tickets: tickets.length,
       x: Math.round(state.x * 2) / 2, z: Math.round(state.z * 2) / 2,
       cash, deliveries, weapon, owned: WEAPONS.filter((w) => owned.has(w.id)).map((w) => w.id), down: down !== null,
       fps: monitor.fps, quality: QUALITY_LEVELS[level].label, qualityMode, gpu, softwareGpu,
       health: Math.ceil(health), wanted: police.wanted, banner: now < bannerUntil ? banner : '', vehicle, vehicleHealth: Math.round(vehicleHealth * 100) / 100,
+      vehicleName: playerCar && playerCar.kind !== 'police' ? vehicleLabel(playerCar, vehicles.paintOf(playerCar)).split(' · ')[0] : '',
       bike: bikeId, bikeHealth: Math.round(bikeHealth / bikeById(bikeId).health * 100) / 100, bikeBroken: bikeHealth <= 0,
       bikeX: Math.round(bikeX), bikeZ: Math.round(bikeZ), targetX: Math.round(target?.x ?? state.x), targetZ: Math.round(target?.z ?? state.z), targetName: missionInfo.label, police: policePoints,
       clock: atmosphere.label(), ammo: rounds ? { mag: rounds.mag, reserve: rounds.reserve, reloading: reloadWeapon === weapon } : null,
@@ -3185,7 +4256,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const aiming = now < aimUntil;
     if (moving && !aiming) state.angle = angleLerp(state.angle, Math.atan2(dirX, dirZ), 1 - Math.exp(-dt * 12));
     // Tear gas makes it hard to run; swimming is slow (Shift for a faster crawl).
-    const topSpeed = swimming ? (keys.has('shift') ? 2.9 : 1.8) : (keys.has('shift') ? 6.8 : aiming ? 3.4 : 4.2) * (performance.now() < gassedUntil ? 0.55 : 1);
+    const topSpeed = swimming ? (keys.has('shift') ? 2.9 : 1.8) : (keys.has('shift') ? 6.8 : aiming ? 3.4 : 4.2) * (performance.now() < gassedUntil ? 0.55 : 1) * footSpeed(buffOn('mat'));
     velocity = THREE.MathUtils.damp(velocity, moving ? topSpeed : 0, 9, dt);
     if (velocity < 0.025) velocity = 0;
     // While aiming the player strafes in the input direction instead of turning.
@@ -3350,7 +4421,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         if (keys.has('c')) { view.yaw -= dt * 1.9; manualCameraAt = now; }
       }
       const braking = keys.has(' ') || keys.has('space');
-      if (state.riding) {
+      if (ride || seat) {
+        // Riding along or sitting: no walking; a step (or the trigger) gets the player up off a seat.
+        velocity = 0;
+        if (seat && (vertical || horizontal || triggerQueued) && now - seat.at > 400) leaveSeat();
+        triggerQueued = false;
+      } else if (state.riding) {
         driveVehicle(dt, now, time, vertical, horizontal, braking);
         moving = velocity !== 0;
       } else if (boat) {
@@ -3359,13 +4435,17 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       } else if (glide) moving = glideMove(dt, now, vertical, horizontal);
       else moving = walk(dt, now, vertical, horizontal);
       const wantsShot = triggerQueued || (def.auto && (mouseHeld || keys.has('f')));
-      if (wantsShot && !bagOpen && now - lastShot >= 1000 / def.fireRate) {
+      if (wantsShot && !bagOpen && !ride && !seat && now - lastShot >= 1000 / def.fireRate) {
         triggerQueued = false;
         fire(now, time);
       }
       state.speed = velocity;
-      if (time - lastDamage > 6 && health < MAX_HEALTH && police.wanted === 0) health = Math.min(MAX_HEALTH, health + dt * 2);
-      unstick(dt);
+      // Natural healing (services.ts): to 60 in the city (70 seated), a full stomach to 100; zombie mode as before.
+      if (time - lastDamage > 6 && police.wanted === 0) {
+        const rate = regenRate(health, { zombie: zombieMode, full: buffOn('no'), seated: !!seat });
+        if (rate) health = Math.min(MAX_HEALTH, health + dt * rate);
+      }
+      if (!seat && !ride) unstick(dt);
     } else {
       if (!state.riding) velocity = 0;
       state.speed = velocity;
@@ -3373,7 +4453,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
 
     // Deep water under someone on foot means swimming (weapons away); back in the shallows they walk.
-    const deep = !state.riding && !boat && !glide && !playerBody && deepWater(state.x, state.z, bodyY);
+    const deep = !state.riding && !boat && !glide && !playerBody && !ride && deepWater(state.x, state.z, bodyY);
     if (deep && !swimming) {
       swimming = true;
       jumpY = jumpV = 0;
@@ -3397,8 +4477,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       interiors.update(dt, time);
     }
     applyShadows();
-    world.setAtmosphere?.({ night: atmosphere.night, wet: atmosphere.rain, sky: (scene.fog as THREE.Fog).color });
+    // The hour switches each shop's light pool off while its shutter is down.
+    world.setAtmosphere({ night: atmosphere.night, wet: atmosphere.rain, sky: (scene.fog as THREE.Fog).color, hours: atmosphere.hours });
     vehicles.setNight(atmosphere.night);
+    vehicles.setWet(atmosphere.rain);
     setRain(street ? atmosphere.rain : 0);
     crossing.length = 0;
     npcs.forEachCrossing((x, z) => crossing.push({ x, z }));
@@ -3412,7 +4494,15 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     viewFrustum.setFromProjectionMatrix(viewMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
     vehicles.setView(viewFrustum);
     npcs.setView(viewFrustum);
-    for (const crash of vehicles.update(dt, time, { x: state.x, z: state.z, car: playerCar }, crossing)) handleCrash(crash, now, time, false);
+    // Parked vehicles come and go with the hour (vehicles.ts occupancy); the tow is quicker for a wanted player.
+    vx.setClock?.(atmosphere.hours, atmosphere.clock.day);
+    // The player's own bike standing somewhere is in the way like any parked vehicle: traffic eases past it, people go round.
+    if (state.riding && !playerCar) vehicles.clearObstacle('own-bike');
+    else if (bikeId === 'horse') vehicles.registerObstacle('own-bike', bikeX, bikeZ, 0.45, 1.2, bikeAngle);
+    else vehicles.registerObstacle('own-bike', bikeX, bikeZ, 0.4, 1, bikeAngle);
+    for (const crash of vehicles.update(dt, time, { x: state.x, z: state.z, car: playerCar, wanted: police.wanted }, crossing)) handleCrash(crash, now, time, false);
+    buses.update(dt, time, { x: state.x, z: state.z, car: playerCar, riding: state.riding, zombie: zombieMode, hours: atmosphere.hours, day: atmosphere.clock.day }, crossing, viewFrustum);
+    buses.setNight(atmosphere.night);
     checkRedLight(time);
     vehicleImpacts(now);
     const policeResult = police.update(dt, time, {
@@ -3429,7 +4519,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     if (policeResult.pulledOut && state.riding && !down) {
       const side = inCar() ? 2.2 : 1.2;
-      const ox = Math.cos(state.angle) * -side, oz = -Math.sin(state.angle) * -side;
+      // Out of the driver's door, on the left (+x).
+      const ox = Math.cos(state.angle) * side, oz = -Math.sin(state.angle) * side;
       leaveVehicleNow();
       if (clearAt(state.x + ox, state.z + oz, 0.4)) { state.x += ox; state.z += oz; }
       knockPlayer(ox * 1.5, 1.5, oz * 1.5, now);
@@ -3514,9 +4605,22 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (zombieMode) updateZombies(dt, now, time);
     const npcEvents = zombieMode ? NO_NPC_EVENTS : npcs.update(dt, time, atmosphere.hours, atmosphere.rain > 0.4, { x: state.x, z: state.z, aimYaw, armed: armed && !inCar(), aiming, inVehicle: state.riding, down: down !== null }, state.x, state.z, groundHeight);
     for (const robbery of npcEvents.robbed) {
-      pickups.drop(robbery.npc.x - Math.sin(robbery.npc.yaw) * -0.6, robbery.npc.z - Math.cos(robbery.npc.yaw) * -0.6, robbery.amount, now);
-      police.crime(robbery.shop ? 2 : 1, time);
-      notify(robbery.shop ? `Cướp tiệm! Nhặt ${formatThousands(robbery.amount)} rơi trước mặt` : `Cướp được ${formatThousands(robbery.amount)}, nhặt tiền đi!`, 2500);
+      // A hold-up at a counter costs that counter's stars (a mini mart's camera calls it in, a gold shop's alarm
+      // rings); street vendors and lottery sellers are protected: they run, and there is nothing to take.
+      const at = robbery.shop ? counterAt(robbery.npc.x, robbery.npc.z) : null;
+      if ((robbery.npc as Npc & { protected?: boolean }).protected || at?.def.robbable === 0) {
+        police.crime(1, time);
+        notify('Người bán hàng rong chỉ có mấy đồng lẻ · họ bỏ chạy, còn bạn thì bị báo công an.', 3000);
+        continue;
+      }
+      const stars = at ? at.def.robbable : robbery.shop ? 2 : 1;
+      const amount = Math.round(robbery.amount * (stars >= 3 ? 4 : stars === 2 ? 1.5 : 1));
+      pickups.drop(robbery.npc.x - Math.sin(robbery.npc.yaw) * -0.6, robbery.npc.z - Math.cos(robbery.npc.yaw) * -0.6, amount, now);
+      police.crime(stars, time);
+      if (at?.def.kind === 'gold') { npcs.alarm(robbery.npc.x, robbery.npc.z, 30, time); playHorn(true); }
+      notify(at?.def.kind === 'gold' ? `Cướp tiệm vàng! Chuông báo động réo · nhặt ${formatThousands(amount)} rồi chạy!`
+        : at?.def.kind === 'mart' ? `Cướp mini mart! Camera đã ghi hình · nhặt ${formatThousands(amount)}`
+        : robbery.shop ? `Cướp tiệm! Nhặt ${formatThousands(amount)} rơi trước mặt` : `Cướp được ${formatThousands(amount)}, nhặt tiền đi!`, 2500);
     }
     for (let i = 0; i < npcEvents.strikes; i++) { damagePlayer(6, now, undefined, 'Băng đảng'); playThud(); }
     if (npcEvents.shots.length) npcs.notice(state.x, state.z, 'shots', time);
@@ -3563,10 +4667,11 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       notify(`Hoàn thành "${missionResult.completed.title}" · +${formatThousands(missionResult.completed.reward)}`, 4500);
     }
     if (missionResult.failed) notify(missionResult.failed, 4000);
+    updateInteraction(dt, now, time);
 
     // Player, bike and props. In the water the body floats (head and shoulders out when treading, flat when
     // swimming); stepping off a pier or over the railing it first drops into the river.
-    walker.group.visible = !state.riding && !playerBody && !boat;
+    walker.group.visible = !state.riding && !playerBody && !boat && !(ride && ride.pose && ride.pose !== 'chair');
     const swimPace = swimming ? Math.min(1, velocity / 1.6) : 0;
     const surface = glide ? glide.y : swimming ? WATER_LEVEL - 1.25 + swimPace * 0.44 : groundHeight(state.x, state.z) - 0.02;
     if (!glide && bodyY > surface + 0.08) {
@@ -3590,15 +4695,51 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const handsUp = surrendered || (arrestTime >= 0 && !kneeling);
     // The head follows the aim (the pointer, or the last shot) while a gun is out.
     const aimTurn = armed && aiming && !down ? Math.atan2(Math.sin(aimYaw - state.angle), Math.cos(aimYaw - state.angle)) : null;
-    animateWalker(dt, now, time, moving && active && !state.riding, {
-      gun: weapon === 'fists' ? null : weapon, kneeling, handsUp, armed: armed && now < aimUntil + 600 && !swimming && !glide,
-      swim: swimming ? 0.25 + swimPace * 0.75 : 0, sky: glide ? glide.phase : null, look: aimTurn,
-    });
+    // A takeaway drink: in the right hand for a while, sipped every few seconds.
+    const cupOn = now < cupUntil && !state.riding && !playerBody && !boat && !swimming && !glide && !down && weapon === 'fists' && !ride;
+    const sip = cupOn ? Math.max(0, Math.sin((now - cupUntil) / 1300)) ** 6 : 0;
+    walkerCup.visible = cupOn;
+    if (seat) {
+      // On the seat: slide onto it over 0.35 s, face the way it faces, sit down.
+      const k = Math.min(1, (now - seat.at) / 350);
+      state.x += (seat.x - state.x) * k; state.z += (seat.z - state.z) * k;
+      state.angle = angleLerp(state.angle, seat.yaw, k);
+      const drop = poseSeated(walker, seat.top, time, 0, sip);
+      walker.group.position.set(state.x, groundHeight(seat.x, seat.z) + seat.top - drop * Math.min(1, k * 1.5), state.z);
+      walker.group.rotation.y = state.angle;
+    } else if (ride) {
+      const s = ride.seat();
+      state.x = s.x; state.z = s.z; state.angle = s.yaw;
+      bodyY = s.y;
+      if (!ride.pose || ride.pose === 'chair') {
+        const drop = poseSeated(walker, 0.45, time);
+        walker.group.position.set(s.x, s.y - drop, s.z);
+        walker.group.rotation.y = s.yaw;
+      }
+    } else {
+      animateWalker(dt, now, time, moving && active && !state.riding, {
+        gun: weapon === 'fists' ? null : weapon, kneeling, handsUp, armed: armed && now < aimUntil + 600 && !swimming && !glide,
+        swim: swimming ? 0.25 + swimPace * 0.75 : 0, sky: glide ? glide.phase : null, look: aimTurn,
+      });
+      if (cupOn && now >= punchUntil) {
+        setArm(walker, 1, sip > 0.02 ? arm(handPose, -1.05 - 0.45 * sip, 0.1, 0, -1.25 - 0.9 * sip, 0, 0, HAND.CUP) : HOLD_CUP);
+        walker.sync();
+      }
+    }
     for (const cuff of cuffs) cuff.visible = kneeling;
-    for (const [id, gun] of guns) gun.group.visible = id === weapon && !kneeling && !handsUp && !swimming && !glide;
+    for (const [id, gun] of guns) gun.group.visible = id === weapon && !kneeling && !handsUp && !swimming && !glide && !seat && !ride;
     const onBike = state.riding && !playerCar;
     rider.group.visible = onBike;
-    seatHolder.visible = !!playerCar && state.riding;
+    seatHolder.visible = (!!playerCar && state.riding) || ride?.pose === 'pillion';
+    if (ride?.pose === 'pillion') {
+      // Pillion on someone else's motorbike (a xe ôm): the hips just above its saddle.
+      if (seatedKind !== 'pillion') { seatOn(seated, 'pillion'); seatedKind = 'pillion'; }
+      const s = ride.seat();
+      seatHolder.position.set(s.x, s.y + FIGURE.seatClear * PERSON_SCALE, s.z);
+      seatHolder.rotation.set(0, s.yaw, 0, 'YXZ');
+      blink(seated, time);
+      holdSeat(seated, 0, 0, false);
+    }
     // Two wheels bank into the corner by the angle that balances it (tan = speed x turn rate / g);
     // the rider hangs a little further inside. A positive roll tips the top towards a right turn.
     const twoWheelsNow = state.riding && (!playerCar || playerCar.kind === 'moto');
@@ -3613,8 +4754,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       // seat (a car driver is drawn smaller so the head clears the roof). Vehicle models stand 0.04 m into the ground.
       const kind: SeatKind = moto ? vehicleStyle(playerCar) as MotoStyle : 'car';
       if (seatedKind !== kind) { seatOn(seated, kind); seatedKind = kind; }
-      const seat = moto ? MOTO_HIP : seatOf(playerCar);
-      const lx = seat[0], ly = seat[1] - 0.04, lz = seat[2];
+      const hip = moto ? MOTO_HIP : seatOf(playerCar);
+      const lx = hip[0], ly = hip[1] - 0.04, lz = hip[2];
       const c = Math.cos(playerCar.yaw), s = Math.sin(playerCar.yaw);
       seatHolder.position.set(playerCar.x + lx * c + lz * s, groundHeight(playerCar.x, playerCar.z) + ly, playerCar.z - lx * s + lz * c);
       seatHolder.rotation.set(0, playerCar.yaw, moto ? lean : 0, 'YXZ');
@@ -3645,14 +4786,24 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (playerBody) ragdolls.center(playerBody, scratch);
     else scratch.set(state.x, 0, state.z);
     youLabel.position.set(scratch.x, glide ? glide.y + 2.3 : swimming ? WATER_LEVEL + 1.2 : boat ? WATER_LEVEL + 2.4 : inCar() ? 3.1 : state.riding ? 2.6 : 2.3, scratch.z);
-    youLabel.visible = street;
+    youLabel.visible = street && !menu;
 
     // Mission marker, shopkeeper and receiver.
     pin.position.y = 2.7 + Math.sin(time * 2.5) * 0.2;
     pin.rotation.y = time * 0.35;
     missionRing.ring.scale.setScalar(1 + Math.sin(time * 2.5) * 0.045);
     for (const [ring, phase] of [[storeRing, 1.5], [bikeShopRing, 3], [hospitalRing, 4.5]] as const) ring.ring.scale.setScalar(1 + Math.sin(time * 2.5 + phase) * 0.045);
-    venueDoors.forEach((door, i) => door.ring.ring.scale.setScalar(1 + Math.sin(time * 2.5 + i) * 0.045));
+    venueDoors.forEach((door, i) => {
+      door.ring.ring.scale.setScalar(1 + Math.sin(time * 2.5 + i) * 0.045);
+      // A nightlife door's ring and sign only while it is open.
+      door.ring.group.visible = !zombieMode && isOpen(VENUE_HOURS[door.kind], atmosphere.hours);
+    });
+    for (const label of placeLabels) {
+      const d = camera.position.distanceTo(label.getWorldPosition(scratchLabel));
+      const fadeTo = THREE.MathUtils.clamp((45 - d) / 20, 0, 1);
+      (label.material as THREE.SpriteMaterial).opacity = fadeTo;
+      label.visible = fadeTo > 0.02;
+    }
     activityRings.forEach((ring, i) => ring.ring.scale.setScalar(1 + Math.sin(time * 2.5 + i * 0.7) * 0.045));
     const mission = missions.view();
     const coffeePickup = mission.id === 'coffee' && mission.status === 'active' && mission.step === 0;
@@ -3698,13 +4849,17 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const [hw, hl] = vehicles.halfSize(car.kind);
       ragdolls.sweep(car.x, car.z, car.yaw, hw, hl, moto ? 1.1 : 1.45, Math.sin(car.yaw) * car.speed, Math.cos(car.yaw) * car.speed);
     }
+    buses.forEachShadow((x, z, w, l, yaw) => effects.blob(x, groundHeight(x, z) + 0.02, z, w, l, yaw));
+    buses.forEachBody((x, z, yaw, hw, hl, h, bvx, bvz) => ragdolls.sweep(x, z, yaw, hw, hl, h, bvx, bvz));
     // The player's own bike (cars the player drives are in the list above).
     if (state.riding && !playerCar && !boat) {
       const horse = bikeId === 'horse';
       ragdolls.sweep(state.x, state.z, state.angle, horse ? 0.45 : 0.4, horse ? 1.2 : 1, horse ? 1.6 : 1.1, Math.sin(state.angle) * velocity, Math.cos(state.angle) * velocity);
     }
     updatePeers(now, time, dt);
-    npcs.forEachStanding((x, z, npc) => effects.blob(x, npc.y + 0.02, z, 0.85));
+    // Only people near the camera get a blob: far off it is too small to see, and the crowd would use them all up.
+    const eyeX = camera.position.x, eyeZ = camera.position.z;
+    npcs.forEachStanding((x, z, npc) => { if ((x - eyeX) ** 2 + (z - eyeZ) ** 2 < 5600) effects.blob(x, npc.y + 0.02, z, 0.85); });
     police.forEachUnit((x, z, onFoot) => { if (onFoot) effects.blob(x, groundHeight(x, z) + 0.02, z, 0.85); });
     animals.forEachShadow((x, z, size) => effects.blob(x, groundHeight(x, z) + 0.02, z, size, size * 1.6));
     // Bodies on the street last (when the blobs run out, standing people keep theirs): along the body, smaller in the air.
@@ -3740,12 +4895,22 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (down === 'busted') view.dist = Math.min(view.dist, 14);
     smoothView.yaw += (view.yaw - smoothView.yaw) * viewBlend;
     smoothView.pitch += (view.pitch - smoothView.pitch) * viewBlend;
-    smoothView.dist += (view.dist - smoothView.dist) * viewBlend;
+    // Sitting down the camera comes in closer.
+    smoothView.dist += ((seat ? Math.min(view.dist, 12) : view.dist) - smoothView.dist) * viewBlend;
+    const counterShot = !interior && street && menu?.anchor ? menu.anchor : null;
     if (interior) {
       const shot = interiors.view(interior, productFocus);
       const glide = 1 - Math.exp(-dt * 4);
       camera.position.lerp(shot.eye, glide);
       interiorLook.lerp(shot.look, glide);
+    } else if (counterShot) {
+      // The counter shot: in front of the shop, a little to the right, at eye height, so the panel on the right
+      // leaves the shopfront and the player at the counter in view.
+      const a = counterShot, fx = Math.sin(a.yaw), fz = Math.cos(a.yaw), rx = Math.cos(a.yaw), rz = -Math.sin(a.yaw);
+      const g = groundHeight(a.x, a.z), blend = 1 - Math.exp(-dt * 4);
+      camDesired.set(a.x + fx * 7.6 + rx * 3.2, g + 3.6, a.z + fz * 7.6 + rz * 3.2);
+      camera.position.lerp(camDesired, blend);
+      interiorLook.lerp(scratch.set(a.x + fx * 1.2 + rx * 2.4, g + 1.0, a.z + fz * 1.2 + rz * 2.4), blend);
     } else if (street) {
       camDesired.copy(cameraTarget).add(offsetFor(smoothView.yaw, smoothView.pitch, smoothView.dist, cameraOffset));
       camera.position.lerp(camDesired, 1 - Math.exp(-dt * 10));
@@ -3756,7 +4921,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       camDesired.z += 12;
       camera.position.lerp(camDesired, cameraBlend);
     }
-    camera.lookAt(interior ? interiorLook : cameraTarget);
+    camera.lookAt(interior || counterShot ? interiorLook : cameraTarget);
+    if (!counterShot && !interior) interiorLook.copy(cameraTarget);
     const sway = !interior && now < drunkUntil ? Math.min(1, (drunkUntil - now) / 20000) : 0;
     if (sway > 0) camera.rotateZ(Math.sin(now / 900) * 0.06 * sway);
     const fov = interior ? 52 : 42 + (state.riding ? Math.min(1, Math.abs(velocity) / 26) * 10 : 0);
@@ -3861,21 +5027,36 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   if (typeof location !== 'undefined' && /^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
     (window as unknown as Record<string, unknown>).__pvo = {
       tp: (x: number, z: number, angle = 0) => { Object.assign(state, { x, z, angle, riding: false }); bodyY = groundHeight(x, z); cameraTarget.set(x, 1, z); },
-      ride: (x: number, z: number, angle: number) => { bikeX = x; bikeZ = z; bikeAngle = angle; Object.assign(state, { x, z, angle, riding: true }); velocity = 0; cameraTarget.set(x, 1, z); },
+      ride: (x: number, z: number, angle: number) => { parkedWith = null; bikeX = x; bikeZ = z; bikeAngle = angle; Object.assign(state, { x, z, angle, riding: true }); velocity = 0; cameraTarget.set(x, 1, z); },
       view: (yaw: number, pitch: number, dist: number) => { Object.assign(view, { yaw, pitch, dist }); manualCameraAt = performance.now() + 1e9; },
       hours: (h: number) => atmosphere.setHours(h),
+      // A clock jump as after a fade: parked vehicles and the crowd are put where the new hour has them.
+      jump: (h: number) => { atmosphere.setHours(h); clockJumped(); },
       weather: (w: Weather) => atmosphere.setWeather(w),
       cash: (c: number) => { cash = c; },
       weapon: (id: WeaponId) => { owned.add(id); ammo.set(id, { mag: 30, reserve: 90 }); equip(id); },
       stats: () => ({ calls: renderer.info.render.calls, triangles: renderer.info.render.triangles, geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures, fps: monitor.fps }),
       info: () => ({ x: state.x, z: state.z, riding: state.riding, swimming, boat: !!boat, glide: glide ? { ...glide } : null, down, wanted: police.wanted, cash, hint: notification }),
-      scene, camera, renderer, npcs, vehicles, police, ragdolls, zombies,
+      scene, camera, renderer, npcs, vehicles, police, ragdolls, zombies, buses, boats,
       /** How a look is dressed (wardrobe bits and colours), to find people in a given outfit. */
       style: (look: FigureLook) => styleOf(look),
       people: { walker, rider, passenger, seated, helm, shopkeeper, receiver },
       /** Other players to draw (as the room would send them), and a bike to ride, for checking peers and bikes. */
       peers: (list: PeerState[]) => setPeers(list, performance.now()),
       bike: (id: BikeId) => rebuildBike(id),
+      /** The interaction registry: what E would do now, use it, the open counter menu, buy from it, savings. */
+      registry,
+      focus: () => (focus ? { id: focus.entry.id, kind: focus.entry.kind, score: Math.round(focus.score), view: focus.view } : null),
+      use: () => { refreshCtx(performance.now()); focus = registry.best(ctx); return actOnFocus(performance.now()); },
+      place: (id: string) => PLACES.find((p) => p.id === id) ?? null,
+      places: (key: string) => PLACES.filter((p) => p.key === key || p.kind === key).map((p) => ({ id: p.id, name: p.name, x: p.x, z: p.z, yaw: p.yaw })),
+      menu: () => menu?.view ?? null,
+      choose: (itemId: string) => (menu ? chooseItem(menu.id, itemId) : null),
+      bank: (n: number) => { bank = n; },
+      sitting: () => (seat ? { x: seat.x, z: seat.z, top: seat.top, kind: seat.kind, eatery: seat.eatery?.name ?? null } : null),
+      passenger: (p: PassengerProvider | null) => (p ? boardPassenger(p) : leavePassenger()),
+      /** Running and taking input even if the page has not said so (a hot-reloaded game instance in development). */
+      activate: () => { active = true; started = true; previousTime = performance.now(); },
       /** Opens a shop or venue the way walking into its door does. */
       enter: (kind: InteriorKind) => onEvent(kind === 'gun' ? { type: 'store' } : kind === 'bike' ? { type: 'bikeshop' } : kind === 'hospital' ? { type: 'hospital' } : { type: 'venue', kind }),
       /** Poses to check: hands up to the police, an arrest (kneeling in cuffs), a pillion passenger. */
@@ -3924,22 +5105,26 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (!def) return 'Dịch vụ không tồn tại.';
       if (cash < def.price) return `Không đủ tiền: cần ${formatThousands(def.price)}.`;
       cash -= def.price;
-      const e = def.effect;
       const now = performance.now();
-      if (e.full) health = MAX_HEALTH;
-      else if (e.heal) health = Math.min(MAX_HEALTH, health + e.heal);
-      if (e.drunk) drunkUntil = Math.max(drunkUntil, now) + e.drunk * 1000;
-      if (e.score) state.score += e.score;
-      if (e.hours) atmosphere.setHours(atmosphere.hours + e.hours);
-      if (e.wakeAt !== undefined) atmosphere.setHours(e.wakeAt);
-      let hidden = false;
-      if (e.hide !== undefined && police.wanted > 0 && police.wanted <= e.hide) { police.reset(); hidden = true; }
+      const parts = applyEffect(def.effect, effectHost);
       dip();
-      const parts = [e.full ? 'hồi đầy máu' : e.heal ? `+${e.heal} máu` : '', e.score ? `+${e.score} điểm` : '', e.drunk ? 'hơi say' : '', hidden ? 'cảnh sát đã mất dấu bạn' : ''].filter(Boolean);
       notify(`${def.name} · ${VENUE_SERVICES[venue].title.toLowerCase()} xong${parts.length ? ` · ${parts.join(', ')}` : ''}`, 3500);
       emitHud(now);
       return null;
     },
+    /** Buys an item from the open counter menu (or haggles: itemId '__haggle'); returns what happened and the menu now. */
+    choose(menuId: string, itemId: string) {
+      const result = chooseItem(menuId, itemId);
+      emitHud(performance.now());
+      return result;
+    },
+    /** The counter panel was closed (Esc, the close button). */
+    closeMenu() { closeMenu(); },
+    /** Seats the player as a passenger of a bus, waterbus, xe ôm or xích lô (see PassengerProvider). */
+    boardPassenger,
+    leavePassenger,
+    /** The interaction registry, for systems that add their own entries (registry.add / remove / addProvider). */
+    registry,
     /** Points the shop camera at one product (an item hovered in the shop panel), or back at the shop. */
     focusProduct(id: string | null) {
       productFocus = id;
@@ -4020,6 +5205,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (state.riding && !playerCar) return 'Hãy xuống xe trước khi mua xe mới.';
       cash -= def.price;
       rebuildBike(id);
+      parkedWith = null;
       bikeX = BIKE_SHOP.x + 2.5;
       bikeZ = BIKE_SHOP.z + 0.6;
       bikeAngle = Math.PI / 2;
@@ -4048,6 +5234,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     },
     reset(mode: GameMode = 'city') {
       if (playerCar) { playerCar.mode = 'parked'; playerCar = null; }
+      if (seat?.claim != null) nx.releaseSeat?.(seat.claim);
+      seat = null; ride = null; hold = null; focus = null; menu = null; parkedWith = null; playerLastCar = null;
+      vx.resetPlayer?.();
+      incenseDay.clear(); sangNight.clear();
+      bank = 0; litter = 0; scrap = 0; cupUntil = 0; drawnDay = -1;
+      buffs.clear(); tickets.length = 0; carried.length = 0; hotCars.clear(); refusedUntil.clear();
+      registry.reset();
+      if (PLAYER_LOOK.shirt !== SHIRTS[0]) restyleShirt(SHIRTS[0]);
       boat = null;
       boats.dock();
       swimming = false;
@@ -4116,6 +5310,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       world.dispose();
       npcs.dispose();
       police.dispose();
+      buses.dispose();
       vehicles.dispose();
       ragdolls.dispose();
       effects.dispose();

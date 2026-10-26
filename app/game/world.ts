@@ -1,9 +1,17 @@
 import * as THREE from 'three';
-import { BUILDINGS, COLLIDERS, LAMPS, LAND, PLOTS, RIVER, RIVER_BED, ROADS_X, ROADS_Z, SCENERY, VENUES, inRect, pathClearance, pointClear, type Building, type Plot, type Prop, type Rect, type Tree } from './city';
+import { BUILDINGS, COLLIDERS, DOWNTOWN_X, LAMPS, LAND, PLOTS, RIVER, RIVER_BED, ROADS_X, ROADS_Z, SCENERY, VENUES, inRect, pathClearance, pointClear, type Building, type Plot, type Pole, type Prop, type Rect, type Tree } from './city';
 import { buildSkyline } from './skyline';
 import { APPROACHES, lightFor, type Light } from './signals';
 import { createSigns } from './map/signs';
+import { STREETS_H, STREETS_V } from './map/consts';
 import { ASPHALT_HALF, CURB_HEIGHT, PIER_DECK, SIDEWALK_EDGE, STEPS_DROP, STEPS_TOP, groundHeight, onSidewalk } from './map/terrain';
+import { COUNTERS, PLACES, counterKeyOf, isOpen, type Hours } from './counters';
+import { LOTS, SPOTS } from './parking';
+import { MODE_LEVEL, detectStartLevel } from './quality';
+import { CLOTH, DECAL, type ClothCell, type ClothOpts, type ColorLike, type DecalCell, type DecalOpts, type Frame, type Kind, type Role, type SmokeKind, type TagStyle } from './kit';
+import { patchGlow, patchRoofTiles, patchTiles, patchWall, surfaceDetail, surfaceNoise } from './surfaces';
+import { buildCables, buildCloth, buildDecals, buildSmoke, cableUniforms, clothAtlas, clothMaterial, decalAtlas, type Cable, type ClothItem, type DecalQuad, type Emitter } from './street-dressing';
+import { FRONT_OF, IRON, LAUNDRY, LED_COLORS, LIGHT_BOXES, ROOF_TILES, TON, acUnit, cage, grille, houseFlag, laundry, ledBorder, maiThai, openFront, pillarWidth, railing, rooftop, thoThien, verticalSign, type FrontKind } from './facades';
 
 export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number; top?: number };
 
@@ -18,11 +26,6 @@ export const furnitureLift = (x: number, z: number) => groundHeight(x, z) - 0.1;
 /** Height of a seat above the ground a sitter at (x, z) stands on (groundHeight there): what npcs sit at. */
 export const seatHeight = (seat: keyof typeof SEAT_TOP, x: number, z: number) => SEAT_TOP[seat] + furnitureLift(x, z) - groundHeight(x, z);
 
-type Kind = 'box' | 'cylinder' | 'cone' | 'ball' | 'bead' | 'gable' | 'hip' | 'pyramid' | 'puff' | 'trunk' | 'frond';
-/** Material families: each is one shared material, so colour variety costs no extra draw calls. */
-type Role = 'solid' | 'ground' | 'glass' | 'glassLit' | 'lamp' | 'lantern' | 'water' | 'neon';
-type ColorLike = string | THREE.Color;
-
 const PI = Math.PI;
 const HALF_PI = PI / 2;
 const AWNINGS = ['#cf795d', '#5e927c', '#d9a441', '#4f7fa8', '#b8574f', '#7d9a52'];
@@ -30,6 +33,27 @@ const DOORS = ['#7a5a3f', '#5d7f86', '#8a6b4a', '#6c7a5a', '#4f6577', '#9b5b46']
 const SHUTTERS = ['#5f8f7a', '#7aa0b8', '#b0774f', '#6f8f5a', '#4f7a8a'];
 const FLOWERS = ['#ef8fb0', '#e5484d', '#f5c84a', '#f4f1e8', '#a07cc5', '#f08c3a', '#ff6f91'];
 const LEAVES = ['#689b6b', '#87b477', '#4f875c', '#5e9a5a', '#76a86a'];
+const BAY_COLORS = ['#e9cf8f', '#f0dcae', '#cfe0c8', '#e3b9a3', '#c9d7e3', '#efe6d2', '#d9a6a0', '#bcd0b5', '#f2c47a', '#d7c4dd', '#a9c9c2', '#e6c3a0'];
+/** Buildings with a counter: game.ts pulls a roller shutter over their front outside opening hours (with its drum). */
+const COUNTERED = new Set(PLACES.filter((p) => p.kind === 'counter' && p.building >= 0).map((p) => p.building));
+/** Each counter building's opening hours (its light pool goes dark when it is closed). */
+const HOURS = new Map<number, Hours>(PLACES.filter((p) => p.kind === 'counter' && p.building >= 0 && COUNTERS[p.key]).map((p) => [p.building, COUNTERS[p.key].hours]));
+const VENUE_OF = new Map(VENUES.map((v) => [v.building.id, v]));
+/** Decals that light up after dark: what is inside a lit shop front, and the vé số board in its glass case. */
+const GLOWING = new Set<DecalCell>([DECAL.goods, DECAL.snacks, DECAL.menu, DECAL.fridge, DECAL.familyAltar, DECAL.poster, DECAL.lottery, DECAL.thanTai]);
+
+/**
+ * Where a shophouse's sign board hangs, in its local frame (lz is the sign's face). An original shophouse with
+ * balconies hangs it on the first balcony's front, where it used to be half hidden behind the balcony; the others
+ * over the door. A tube house's sign sits over its open front.
+ */
+export function signSpot(p: Plot) {
+  const sideways = Math.abs(Math.sin(p.facing)) > 0.5;
+  const w = sideways ? p.full.maxZ - p.full.minZ : p.full.maxX - p.full.minX, front = (sideways ? p.full.maxX - p.full.minX : p.full.maxZ - p.full.minZ) / 2;
+  if (p.style !== 'legacy') return { balcony: false, y: 4.05, lz: front + 0.25, w: w - 0.6, h: 1.1 };
+  if (p.legacy % 3 !== 1 && p.h - 0.8 > 5.2) return { balcony: true, y: 4.45, lz: front + 1.36, w: w - 1.1, h: 1.0 };
+  return { balcony: false, y: Math.min(p.h - 0.65, 3.8), lz: front + 0.36, w: w - 0.65, h: 1.1 };
+}
 
 /**
  * A palm frond along +x (length 1, rooted at the origin): it rises a little, then arches down, folds along
@@ -97,11 +121,19 @@ const CUT_RADIUS = 3.6;
 
 /** The An Hòa neighbourhood, drawn from the layout in city.ts. All artwork is generated locally. */
 export function buildWorld(scene: THREE.Scene) {
+  const buildStart = performance.now();
   const root = new THREE.Group();
   root.name = 'Pho Viet neighbourhood';
   scene.add(root);
+  /** Small detail (washing, antennas, coils, service drops, stickers) that lower quality levels hide. */
+  const fineRoot = new THREE.Group();
+  fineRoot.name = 'Fine detail';
+  root.add(fineRoot);
   // Props on a sidewalk are drawn on the raised pavement: their tops are that much higher too.
-  const colliders: Collider[] = COLLIDERS.map((c) => (c.top === undefined ? { ...c } : { ...c, top: c.top + (onSidewalk((c.minX + c.maxX) / 2, (c.minZ + c.maxZ) / 2) ? CURB_HEIGHT : 0) }));
+  // The parked scooters are vehicles now (vehicles.ts curb spots): they are neither drawn nor solid here.
+  const parked = SCENERY.props.filter((p) => p.kind === 'scooter');
+  const isParked = (c: Rect) => c.top !== undefined && parked.some((p) => Math.abs((c.minX + c.maxX) / 2 - p.x) < 1e-6 && Math.abs((c.minZ + c.maxZ) / 2 - p.z) < 1e-6 && Math.abs(c.maxX - c.minX - p.sx) < 1e-6 && Math.abs(c.maxZ - c.minZ - p.sz) < 1e-6);
+  const colliders: Collider[] = COLLIDERS.filter((c) => !isParked(c)).map((c) => (c.top === undefined ? { ...c } : { ...c, top: c.top + (onSidewalk((c.minX + c.maxX) / 2, (c.minZ + c.maxZ) / 2) ? CURB_HEIGHT : 0) }));
   /** Bench seats, stools and café tables as low boxes with a top, for ragdolls only (people walk round them anyway). */
   const seats: Collider[] = [];
   const textures: THREE.Texture[] = [];
@@ -132,14 +164,33 @@ export function buildWorld(scene: THREE.Scene) {
     water: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.22, metalness: 0.08 }),
     // Neon tubes glow in their own (instance) colour, brighter at night.
     neon: new THREE.MeshStandardMaterial({ color: '#3a3a3a', roughness: 0.4, emissive: '#ffffff', emissiveIntensity: 0.5 }),
+    // Weathered render, sidewalk paving (never cut away), tiled roof decks and cladding, barrel roof tiles.
+    wall: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.93 }),
+    paving: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.88 }),
+    tiles: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.88 }),
+    roofTile: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.8 }),
+    // Shop fluorescent tubes and blinking LED borders, lit in their instance colour after dark.
+    tube: new THREE.MeshStandardMaterial({ color: '#d8dde0', roughness: 0.5, emissive: '#e8f4ff', emissiveIntensity: 0 }),
+    led: new THREE.MeshStandardMaterial({ color: '#3a3a3a', roughness: 0.4, emissive: '#ffffff', emissiveIntensity: 0 }),
   };
   roles.neon.onBeforeCompile = (shader) => {
     shader.fragmentShader = shader.fragmentShader.replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\n\ttotalEmissiveRadiance *= vColor;');
   };
   roles.neon.customProgramCacheKey = () => 'neon-tubes';
+  const surfNoise = surfaceNoise();
+  textures.push(surfNoise);
+  patchWall(roles.wall, surfNoise);
+  patchTiles(roles.paving, surfNoise, 'surf-paving', false);
+  patchTiles(roles.tiles, surfNoise, 'surf-tiles', true);
+  patchRoofTiles(roles.roofTile, surfNoise);
+  /** Seconds (wrapped) for everything that moves in a shader: LEDs, cloth, cables, smoke. */
+  const shaderTime = { value: 0 };
+  patchGlow(roles.tube, 'tube-glow');
+  patchGlow(roles.led, 'led-glow', shaderTime);
+  for (const [name, material] of Object.entries(roles)) material.name = name;
   materials.push(...Object.values(roles));
 
-  const batches = new Map<string, { kind: Kind; role: Role; shadow: boolean; m: number[]; c: number[]; big: boolean[] }>();
+  const batches = new Map<string, { kind: Kind; role: Role; shadow: boolean; fine: boolean; m: number[]; c: number[]; big: boolean[] }>();
   const colorCache = new Map<string, THREE.Color>();
   const matrix = new THREE.Matrix4();
   const quaternion = new THREE.Quaternion();
@@ -158,11 +209,14 @@ export function buildWorld(scene: THREE.Scene) {
 
   // Street furniture drawn while `lift` is set stands on the raised sidewalk.
   let lift = 0;
+  // Small detail drawn while `fine` is set goes into the layer lower quality levels hide (setDetail).
+  let fine = false;
+  const setFine = (on: boolean) => { fine = on; };
   const onPavement = (x: number, z: number) => (onSidewalk(x, z) ? CURB_HEIGHT : 0);
   function shape(kind: Kind, color: ColorLike, x: number, y: number, z: number, sx: number, sy: number, sz: number, yaw = 0, tilt = 0, shadow = true, role: Role = 'solid') {
-    const key = `${kind}|${role}|${shadow ? 1 : 0}`;
+    const key = `${kind}|${role}|${shadow ? 1 : 0}|${fine ? 1 : 0}`;
     let batch = batches.get(key);
-    if (!batch) { batch = { kind, role, shadow, m: [], c: [], big: [] }; batches.set(key, batch); }
+    if (!batch) { batch = { kind, role, shadow, fine, m: [], c: [], big: [] }; batches.set(key, batch); }
     rotation.set(0, yaw, tilt);
     quaternion.setFromEuler(rotation);
     matrix.compose(position.set(x, y + lift, z), quaternion, scale.set(sx, sy, sz));
@@ -174,16 +228,42 @@ export function buildWorld(scene: THREE.Scene) {
   function box(color: ColorLike, x: number, y: number, z: number, w: number, h: number, d: number, yaw = 0, shadow = true, role: Role = 'solid') {
     shape('box', color, x, y, z, w, h, d, yaw, 0, shadow, role);
   }
+  // ---- Street dressing collected while the city is drawn (built after the batches; see street-dressing.ts). ----
+  const WHITE = new THREE.Color('#ffffff');
+  const decals: { base: DecalQuad[]; fine: DecalQuad[] } = { base: [], fine: [] };
+  const cloths: { base: ClothItem[]; fine: ClothItem[] } = { base: [], fine: [] };
+  const cables: { base: Cable[]; fine: Cable[] } = { base: [], fine: [] };
+  const emitters: Emitter[] = [];
+  /** Shop light pools on the pavement: where, how big, and the building whose hours switch it (-1: always). */
+  const shopPools: { x: number; z: number; size: number; shop: number }[] = [];
+  function decal(cell: DecalCell, x: number, y: number, z: number, w: number, h: number, yaw: number, opts: DecalOpts = {}) {
+    (opts.fine ?? fine ? decals.fine : decals.base).push({ cell, x, y: y + lift, z, w, h, yaw, pitch: opts.pitch ?? 0, color: opts.tint ? toColor(opts.tint) : WHITE, glow: GLOWING.has(cell) ? 1 : 0 });
+  }
+  function cloth(cell: ClothCell, x: number, y: number, z: number, w: number, h: number, yaw: number, opts: ClothOpts) {
+    (opts.fine ?? fine ? cloths.fine : cloths.base).push({ x, y: y + lift, z, w, h, yaw, cell, mode: opts.mode, amp: opts.amp ?? 0.05, color: opts.tint ? toColor(opts.tint) : WHITE });
+  }
+  const smoke = (kind: SmokeKind, x: number, y: number, z: number) => { emitters.push({ kind, x, y: y + lift, z }); };
+  const pool = (x: number, z: number, size: number, shop: number) => { shopPools.push({ x, z, size, shop }); };
+  function tag(style: TagStyle, text: string, fg: string, bg: string, x: number, y: number, z: number, w: number, h: number, yaw: number, glow = 0) {
+    signs.tag(style, text, fg, bg, x, y + lift, z, w, h, yaw, glow);
+  }
   /** Local frame of a building or prop: lx along its front, lz towards its front. */
-  function frame(x: number, z: number, facing: number) {
+  function frame(x: number, z: number, facing: number): Frame {
     const c = Math.cos(facing), s = Math.sin(facing);
+    const wx = (lx: number, lz: number) => x + lx * c + lz * s, wz = (lx: number, lz: number) => z - lx * s + lz * c;
     return {
-      at: (lx: number, lz: number) => ({ x: x + lx * c + lz * s, z: z - lx * s + lz * c }),
-      local: (wx: number, wz: number) => ({ x: (wx - x) * c - (wz - z) * s, z: (wx - x) * s + (wz - z) * c }),
+      facing,
+      at: (lx: number, lz: number) => ({ x: wx(lx, lz), z: wz(lx, lz) }),
+      local: (px: number, pz: number) => ({ x: (px - x) * c - (pz - z) * s, z: (px - x) * s + (pz - z) * c }),
       part: (lx: number, ly: number, lz: number, w: number, h: number, d: number, color: ColorLike, role: Role = 'solid', shadow = true) =>
-        box(color, x + lx * c + lz * s, ly, z - lx * s + lz * c, w, h, d, facing, shadow, role),
-      solid: (kind: Kind, lx: number, ly: number, lz: number, sx: number, sy: number, sz: number, color: ColorLike, tilt = 0, shadow = true, yaw = 0) =>
-        shape(kind, color, x + lx * c + lz * s, ly, z - lx * s + lz * c, sx, sy, sz, facing + yaw, tilt, shadow),
+        box(color, wx(lx, lz), ly, wz(lx, lz), w, h, d, facing, shadow, role),
+      solid: (kind: Kind, lx: number, ly: number, lz: number, sx: number, sy: number, sz: number, color: ColorLike, tilt = 0, shadow = true, yaw = 0, role: Role = 'solid') =>
+        shape(kind, color, wx(lx, lz), ly, wz(lx, lz), sx, sy, sz, facing + yaw, tilt, shadow, role),
+      decal: (cell, lx, ly, lz, w, h, opts = {}) => decal(cell, wx(lx, lz), ly, wz(lx, lz), w, h, facing + (opts.yaw ?? 0), opts),
+      cloth: (cell, lx, ly, lz, w, h, opts) => cloth(cell, wx(lx, lz), ly, wz(lx, lz), w, h, facing + (opts.yaw ?? 0), opts),
+      smoke: (kind, lx, ly, lz) => smoke(kind, wx(lx, lz), ly, wz(lx, lz)),
+      tag: (style, text, fg, bg, lx, ly, lz, w, h, opts = {}) => tag(style, text, fg, bg, wx(lx, lz), ly, wz(lx, lz), w, h, facing + (opts.yaw ?? 0), opts.glow ?? 0),
+      pool: (lx, lz, size, shop) => pool(wx(lx, lz), wz(lx, lz), size, shop),
     };
   }
   const glassRole = (x: number, y: number, z: number): Role => (hash(x, y, z) < 0.55 ? 'glassLit' : 'glass');
@@ -268,7 +348,14 @@ export function buildWorld(scene: THREE.Scene) {
       const p = off(dx * s, dz * s);
       shape('puff', leaf(dark, light, f, (tint + jitter(i) * 0.6) % 1), p.x, y * s, p.z, r * s, h * s, r * s * (0.9 + jitter(i + 9) * 0.2), spin + i * 1.7, 0, shadow);
     };
-    if (street && t.species !== 'palm' && t.species !== 'bamboo') streetPit(t);
+    if (street && t.species !== 'palm' && t.species !== 'bamboo') {
+      streetPit(t);
+      // Street trees have their trunks whitewashed (quét vôi) to a metre or so.
+      const R = t.species === 'flame' ? 0.3 : t.species === 'round' ? 0.23 : t.species === 'layered' ? 0.2 : 0.19;
+      setFine(true);
+      shape('trunk', '#f1eee4', x, 0.62, z, R * s * 1.06, 1.1, R * s * 1.06, spin, 0, false);
+      setFine(false);
+    }
     if (t.species === 'round') {
       // Sấu / me: a tapered trunk forking into a cloud of leaf clumps; some trees grow a little taller.
       const k = 0.92 + tint * 0.16;
@@ -386,16 +473,19 @@ export function buildWorld(scene: THREE.Scene) {
     const color = b.color;
     const front = d / 2;
     const c = Math.cos(facing), s = Math.sin(facing);
-    const { part, at } = frame(x, z, facing);
+    const F = frame(x, z, facing);
+    const { part, at } = F;
+    const q = seeded(index * 131 + 17);
     const g = localRect(p.ground, x, z, facing);
     const AH = 3.2;
     const cuts = { front: g.z1 < front - 0.05, back: g.z0 > -front + 0.05, left: g.x0 > -w / 2 + 0.05, right: g.x1 < w / 2 - 0.05 };
     const cut = cuts.front || cuts.back || cuts.left || cuts.right;
     const gw = g.x1 - g.x0, gd = g.z1 - g.z0, gx = (g.x0 + g.x1) / 2, gz = (g.z0 + g.z1) / 2;
-    if (!cut) part(0, h / 2, 0, w, h, d, color);
+    const iron = pickOf(q, IRON);
+    if (!cut) part(0, h / 2, 0, w, h, d, color, 'wall');
     else {
-      part(gx, AH / 2, gz, gw, AH, gd, color);
-      part(0, AH + (h - AH) / 2, 0, w, h - AH, d, color);
+      part(gx, AH / 2, gz, gw, AH, gd, color, 'wall');
+      part(0, AH + (h - AH) / 2, 0, w, h - AH, d, color, 'wall');
       // Beams under the overhang and a warm light for the covered walkway.
       if (cuts.front) {
         for (let k = -w / 2 + 0.4; k <= w / 2 - 0.3; k += 2.4) part(k, AH - 0.2, (g.z1 + front) / 2, 0.16, 0.4, front - g.z1, '#e7d9bd');
@@ -411,6 +501,7 @@ export function buildWorld(scene: THREE.Scene) {
     }
     part(gx, 0.25, gz, gw + 0.12, 0.5, gd + 0.1, '#d1bea5');
     part(0, h + 0.18, 0, w + 0.45, 0.35, d + 0.5, '#e7d9bd');
+    part(0, h + 0.365, 0, w + 0.25, 0.02, d + 0.3, '#b47a62', 'tiles', false);
     part(0, h + 0.45, -d / 2 + 0.13, w, 0.55, 0.27, color);
     const pilasterBase = cuts.front ? AH : 0;
     for (const side of [-1, 1]) part(side * (w / 2 - 0.12), (pilasterBase + h) / 2, front + 0.06, 0.27, h - pilasterBase, 0.19, '#eadfc9');
@@ -421,28 +512,43 @@ export function buildWorld(scene: THREE.Scene) {
     part(gx + gw * 0.16, 1.8, gf + 0.13, gw * 0.32, 2.8, 0.06, '#90b5a8');
     part(gx, 1.8, gf + 0.2, 0.12, 3.1, 0.08, '#e7d9bd');
     part(gx - gw * 0.09, 1.6, gf + 0.26, 0.08, 0.45, 0.08, '#e7d9bd');
+    // A fluorescent tube over the entrance and its light on the pavement after dark.
+    part(gx, 3.05, gf + 0.3, 1.2, 0.05, 0.1, '#eef8ff', 'tube', false);
+    { const pp = at(gx, gf + 2.4); pool(pp.x, pp.z, 4.6, b.id); }
+    const balconies = index % 3 !== 1;
+    const spot = signSpot(p);
     for (let floor = 5.2; floor < h - 0.8; floor += 3.2) {
+      const first = floor === 5.2;
       for (const dx of [-w * 0.24, w * 0.24]) {
         const wp = at(dx, front);
         part(dx, floor, front + 0.1, w * 0.29, 2.3, 0.15, '#e8ddc4');
         part(dx, floor, front + 0.2, w * 0.24, 1.95, 0.12, '#527a73', glassRole(wp.x, floor, wp.z), false);
         part(dx, floor, front + 0.29, 0.08, 2, 0.1, '#d4c9ae');
         part(dx, floor, front + 0.29, w * 0.24, 0.08, 0.1, '#d4c9ae');
+        // Window cages and grilles where no balcony stands in front.
+        const roll = q();
+        if (!balconies && roll < 0.3) cage(F, dx, floor - 1.45, front + 0.17, w * 0.3, iron, pickOf(q, TON));
+        else if (roll < 0.6) grille(F, dx, floor, front + 0.37, w * 0.25, 2.0, iron, q() < 0.4);
       }
-      if (index % 3 !== 1) {
+      if (balconies) {
         part(0, floor - 1.2, front + 0.55, w - 0.9, 0.18, 1.5, '#e7d9bd');
-        part(0, floor - 0.5, front + 1.2, w - 1.05, 0.08, 0.08, '#516e62');
-        for (let k = -w / 2 + 0.75; k < w / 2 - 0.5; k += 0.6) part(k, floor - 0.85, front + 1.2, 0.055, 0.7, 0.055, '#516e62');
-        part(w * 0.25, floor - 0.95, front + 0.75, 0.55, 0.4, 0.5, '#bd7956');
-        shape('ball', '#659671', x + w * 0.25 * c + (front + 0.75) * s, floor - 0.55, z - w * 0.25 * s + (front + 0.75) * c, 0.45, 0.5, 0.45);
-        const fb = at(-w * 0.22, front + 1.0);
-        part(-w * 0.22, floor - 0.98, front + 1.0, 1.2, 0.3, 0.3, '#a8664a');
-        flowers(fb.x, floor - 0.78, fb.z, 5, 1.0, 0.25, index * 31 + floor);
+        railing(F, -(w - 1.05) / 2, (w - 1.05) / 2, floor - 1.24, front, 1.2, '#516e62', index % 2 === 0);
+        // The first balcony carries the shop sign (legacySignSpot), so it keeps no flowers.
+        if (!first) {
+          part(w * 0.25, floor - 0.95, front + 0.75, 0.55, 0.4, 0.5, '#bd7956');
+          shape('ball', '#659671', x + w * 0.25 * c + (front + 0.75) * s, floor - 0.55, z - w * 0.25 * s + (front + 0.75) * c, 0.45, 0.5, 0.45);
+          const fb = at(-w * 0.22, front + 1.0);
+          part(-w * 0.22, floor - 0.98, front + 1.0, 1.2, 0.3, 0.3, '#a8664a');
+          flowers(fb.x, floor - 0.78, fb.z, 5, 1.0, 0.25, index * 31 + floor);
+        } else if (q() < 0.45) thoThien(F, (q() < 0.5 ? -1 : 1) * (w / 2 - 0.55), floor - 0.35, front + 0.17);
+        if (q() < 0.3) { setFine(true); laundry(F, q, 0, floor + 0.75, front + 0.9, w - 2); setFine(false); }
       }
+      if (q() < 0.4) acUnit(F, (q() < 0.5 ? -1 : 1) * (w / 2 - 0.75), floor + 1.45, front + 0.02);
     }
-    const sy = Math.min(h - 0.65, 3.8);
-    part(0, sy, front + 0.23, w - 0.45, 1.25, 0.22, '#e7d9bd');
-    sign(b.name, b.subtitle, p.signColor, x + (front + 0.36) * s, sy, z + (front + 0.36) * c, w - 0.65, 1.1, facing);
+    if (!spot.balcony) part(0, spot.y, front + 0.23, w - 0.45, 1.25, 0.22, '#e7d9bd');
+    else part(0, spot.y, spot.lz - 0.13, spot.w + 0.2, spot.h + 0.15, 0.06, '#e7d9bd');
+    { const sp = at(0, spot.lz); sign(b.name, b.subtitle, p.signColor, sp.x, spot.y, sp.z, spot.w, spot.h, facing); }
+    if (!VENUE_OF.has(b.id) && q() < 0.3) ledBorder(F, 0, spot.y, spot.lz + 0.02, spot.w + 0.2, spot.h + 0.15, pickOf(q, LED_COLORS));
     if (!cuts.front) {
       // Segmented striped shop canopy.
       for (let aw = 0; aw < 8; aw++) {
@@ -451,11 +557,13 @@ export function buildWorld(scene: THREE.Scene) {
         part(-w / 2 + 0.35 + (aw + 0.5) * (w - 0.7) / 8, 2.78, front + 2.12, (w - 0.7) / 8, 0.35, 0.1, stripe);
       }
     }
-    if (index % 2 === 0) {
-      shape('cylinder', '#a8bcb9', x - w * 0.22, h + 0.95, z - 1, 0.85, 1.5, 0.85);
-      box('#758e86', x - w * 0.22, h + 0.24, z - 1, 2, 0.16, 2);
-      part(w * 0.23, h + 0.45, -1, 2.2, 0.4, 1.4, '#c5b99f');
-    }
+    // A light box beside the shop sign, the national flag, and the roof: tiles, a stair hut, the inox tank.
+    const look = FRONT_OF[counterKeyOf(b) ?? ''];
+    const flagSide = q() < 0.5 ? -1 : 1;
+    if (look) verticalSign(F, look[1], -flagSide * (w / 2 - 0.35), Math.min(h - 1.0, spot.balcony ? 6.0 : 5.6), front, ...pickOf(q, LIGHT_BOXES));
+    if (q() < 0.6) houseFlag(F, flagSide * (w / 2 - 0.7), front + 0.15, balconies ? 5.6 : 4.9);
+    rooftop(F, q, { lx: 0, w: w - 0.3, d: d - 0.6, front: front - 0.3, floor: h + 0.37, wall: color, trim: '#e7d9bd' }, setFine);
+    if (q() < 0.25) maiThai(F, 0, w + 0.2, h + 0.2, front + 0.1, pickOf(q, ROOF_TILES));
     // A door on another side (the post office opens onto the post-office road).
     if (Math.abs(Math.sin(b.facing - facing)) > 0.5) {
       const e = { x: Math.round(Math.sin(b.facing)), z: Math.round(Math.cos(b.facing)) };
@@ -465,6 +573,7 @@ export function buildWorld(scene: THREE.Scene) {
       side.part(0, 1.6, 0.04, 3.4, 3.0, 0.12, '#365d57');
       side.part(-0.8, 1.4, 0.1, 1.4, 2.5, 0.06, '#527a73', 'glassLit', false);
       side.part(0.8, 1.4, 0.1, 1.4, 2.5, 0.06, '#527a73', 'glassLit', false);
+      const sy = Math.min(h - 0.65, 3.8);
       const fx = e.x < 0 ? p.full.minX : e.x > 0 ? p.full.maxX : b.door.x;
       const fz = e.z < 0 ? p.full.minZ : e.z > 0 ? p.full.maxZ : b.door.z;
       const signAt = frame(e.x ? fx : x, e.z ? fz : z, b.facing);
@@ -474,114 +583,180 @@ export function buildWorld(scene: THREE.Scene) {
     }
   }
 
-  /** A narrow Vietnamese tube house: home, shop or street-food front, with balconies, plants and a roof garden or tank. */
+  /**
+   * A narrow Vietnamese tube house: home, shop or street-food front. A wide home splits into two tube-house bays
+   * (each its own colour, height and floors); the ground floor is an open front lit by a tube (shops always, homes
+   * often, behind a folding gate), or a door and window, or a roller shutter; upper floors have balconies with iron
+   * railings, washing, cages or grilles and AC units; flat roofs carry a stair hut, the inox tank and the rest.
+   */
   function newHouse(p: Plot, b: Building) {
     const { x, z, w, d } = dims(p);
     const h = p.h, front = d / 2;
-    const r = seeded(p.seed);
-    const { part, at, local, solid } = frame(x, z, p.facing);
+    const r = seeded(p.seed), q = seeded(p.seed * 7 + 3);
+    const F = frame(x, z, p.facing);
+    const { part, at, local, solid } = F;
     const trim = pickOf(r, ['#efe5cf', '#f4ecdc', '#e2d6bd', '#fbf6ea']);
     const wall = vary(b.color, r(), 0.6);
-    part(0, h / 2, 0, w, h, d, wall);
-    part(0, 0.25, 0, w + 0.1, 0.5, d + 0.08, '#cdbda4');
-    for (const side of [-1, 1]) part(side * (w / 2 - 0.1), h / 2 + 0.1, front + 0.05, 0.22, h - 0.2, 0.14, trim);
     const doorX = THREE.MathUtils.clamp(local(b.door.x, b.door.z).x, -w / 2 + 1, w / 2 - 1);
-    const shopFront = p.style === 'shop' || b.kind === 'food';
-    if (shopFront) {
-      part(0, 1.75, front + 0.03, w - 0.7, 3.2, 0.1, '#3f5853');
-      part(0, 1.3, front + 0.08, w - 1.1, 2.2, 0.05, '#2b3533');
-      part(0, 2.85, front + 0.1, w - 1.0, 0.9, 0.06, pickOf(r, ['#9fb7ae', '#b9c2c4', '#a7b9c9']));
-      part(-w * 0.22, 0.55, front + 0.3, w * 0.34, 0.95, 0.55, '#d9c9a8');
-      const awning = pickOf(r, AWNINGS);
-      for (let k = 0; k < 6; k++) {
-        const ax = -w / 2 + 0.35 + (k + 0.5) * (w - 0.7) / 6;
-        part(ax, 3.05, front + 0.9, (w - 0.7) / 6, 0.14, 1.6, k % 2 ? '#f3e6ca' : awning);
-        part(ax, 2.88, front + 1.68, (w - 0.7) / 6, 0.3, 0.08, k % 2 ? '#f3e6ca' : awning);
-      }
-      if (p.sign) {
-        const pos = at(0, front + 0.25);
-        part(0, 3.95, front + 0.12, w - 0.4, 1.2, 0.2, '#e7d9bd');
-        sign(b.name, b.subtitle, p.signColor, pos.x, 3.95, pos.z, w - 0.6, 1.0, p.facing);
-      }
-    } else {
-      part(doorX, 1.4, front + 0.04, 1.8, 2.8, 0.1, '#46524f');
-      part(doorX, 1.35, front + 0.09, 1.5, 2.6, 0.05, pickOf(r, DOORS));
-      part(doorX, 0.14, front + 0.45, 2.0, 0.18, 0.8, '#cbbfae');
-      part(doorX, 3.0, front + 0.55, 2.3, 0.1, 1.1, trim);
-      const wx = doorX > 0 ? doorX - 2.4 : doorX + 2.4;
-      if (Math.abs(wx) < w / 2 - 0.9) {
-        const wp = at(wx, front);
-        part(wx, 1.7, front + 0.05, 1.7, 1.5, 0.1, trim);
-        part(wx, 1.7, front + 0.09, 1.4, 1.2, 0.05, '#4f6f6c', glassRole(wp.x, 1.7, wp.z), false);
-        for (let k = -0.5; k <= 0.51; k += 0.25) part(wx + k, 1.7, front + 0.13, 0.04, 1.2, 0.04, '#3d4a48');
-      }
-    }
-    if (p.number > 0) {
-      const lx = doorX + (doorX > 0 ? -1.25 : 1.25);
-      const pos = at(lx, front + 0.08);
-      plate(p.number, pos.x, 2.25, pos.z, p.facing);
-    }
-    part(0, 3.42, front + 0.07, w, 0.16, 0.14, trim);
+    const venue = VENUE_OF.get(b.id);
+    const shopFront = p.style === 'shop' || b.kind === 'food' || !!venue;
+    const look = venue ? (venue.kind === 'beer' ? FRONT_OF.biahoi : undefined) : FRONT_OF[counterKeyOf(b) ?? ''];
     const floors = Math.max(2, Math.round((h - 0.6) / 3.2));
-    const shutter = pickOf(r, SHUTTERS);
-    for (let k = 1; k < floors; k++) {
-      const base = k * 3.2 + 0.2;
-      const balcony = r() < 0.55;
-      if (balcony) {
-        part(0, base + 0.05, front + 0.55, w - 0.3, 0.16, 1.1, trim);
-        if (r() < 0.5) part(0, base + 0.55, front + 1.07, w - 0.4, 0.85, 0.06, pickOf(r, ['#e9e1cc', '#d7e3df', '#efd9c4']));
-        else for (let bx = -w / 2 + 0.35; bx <= w / 2 - 0.3; bx += 0.55) part(bx, base + 0.55, front + 1.07, 0.05, 0.9, 0.05, '#4f5d5a');
-        part(0, base + 1.02, front + 1.07, w - 0.35, 0.07, 0.09, '#4f5d5a');
-        const gp = at(0, front);
-        part(0, base + 1.25, front + 0.05, Math.min(2.2, w * 0.4), 2.2, 0.08, '#4f6f6c', glassRole(gp.x, base, gp.z), false);
-        const fb = at(w * 0.28, front + 0.95);
-        part(w * 0.28, base + 0.32, front + 0.95, 1.3, 0.3, 0.32, '#a8664a');
-        flowers(fb.x, base + 0.52, fb.z, 6, 1.1, 0.25, p.seed + k);
-        if (r() < 0.5) pot(at(-w * 0.32, front + 0.75).x, at(-w * 0.32, front + 0.75).z, base + 0.13, 0.9, p.seed + k * 7);
-      } else {
-        const count = w > 7.5 ? 2 : 1;
-        for (let i = 0; i < count; i++) {
-          const lx = count === 1 ? 0 : (i ? 1 : -1) * w * 0.24;
-          const wp = at(lx, front);
-          part(lx, base + 1.5, front + 0.05, 1.5, 1.9, 0.1, trim);
-          part(lx, base + 1.5, front + 0.09, 1.2, 1.6, 0.05, '#4f6f6c', glassRole(wp.x, base, wp.z), false);
-          for (const sd of [-1, 1]) part(lx + sd * 0.92, base + 1.5, front + 0.12, 0.42, 1.6, 0.05, shutter);
-          part(lx, base + 0.5, front + 0.3, 1.3, 0.22, 0.42, '#a8664a');
-          const fb = at(lx, front + 0.3);
-          flowers(fb.x, base + 0.68, fb.z, 4, 1.0, 0.2, p.seed + k * 3 + i);
-        }
-      }
-      if (r() < 0.35) part((r() < 0.5 ? -1 : 1) * (w / 2 - 0.75), base + 2.45, front + 0.22, 0.8, 0.55, 0.36, '#e3e4df');
-      part(0, base + 3.2 - 0.02, front + 0.07, w, 0.12, 0.12, trim);
-    }
-    // Roof: tiled gable, water tank with solar heater, or a little roof garden.
-    const roof = r();
-    if (roof < 0.32) {
-      solid('gable', 0, h + 0.85, 0, w + 0.5, 1.7, d + 0.4, pickOf(r, ['#b65d3d', '#a5533a', '#c06a45']));
-    } else {
-      part(0, h + 0.05, 0, w + 0.25, 0.14, d + 0.25, trim);
-      part(0, h + 0.45, front - 0.08, w, 0.7, 0.16, trim);
-      part(0, h + 0.45, -front + 0.08, w, 0.7, 0.16, trim);
-      if (roof < 0.68) {
-        solid('cylinder', -w * 0.22, h + 1.05, -d * 0.2, 0.55, 1.1, 0.55, '#d5dadb');
-        part(-w * 0.22, h + 0.3, -d * 0.2, 1.3, 0.4, 1.3, '#9aa6a3');
-        solid('box', w * 0.18, h + 0.75, -d * 0.15, 1.6, 0.08, 1.1, '#2f4f6a', 0.45);
-      } else {
-        for (let i = 0; i < 4; i++) {
-          const pp = at(-w / 2 + 1 + i * (w - 2) / 3, front - 0.9 - (i % 2) * 0.6);
-          pot(pp.x, pp.z, h + 0.1, 1.2, p.seed + i * 11);
-        }
-        for (const sx of [-1, 1]) for (const sz of [-1, 1]) part(sx * w * 0.3, h + 1.2, -d * 0.15 + sz * 1.2, 0.1, 2.2, 0.1, '#7b5a3f');
-        part(0, h + 2.3, -d * 0.15, w * 0.62, 0.08, 2.7, '#8a6a4c');
+    const iron = pickOf(q, IRON);
+    // Bays: the door bay, and on a wide home a neighbour bay (42-58 % of the width, the door well inside its own).
+    type Bay = { lx: number; w: number; h: number; wall: THREE.Color; door: boolean; open: boolean };
+    let bays: Bay[] = [{ lx: 0, w, h, wall, door: true, open: (shopFront && venue?.kind !== 'motel') || (!shopFront && q() < 0.55) }];
+    if (!shopFront && w >= 8.4 && q() < 0.7) {
+      const dw = w * (0.42 + q() * 0.16), left = doorX < 0, cut = left ? -w / 2 + dw : w / 2 - dw;
+      if (Math.abs(doorX - cut) > 1.4) {
+        const other = vary(pickOf(q, BAY_COLORS), q(), 0.6), otherH = floors >= 3 && q() < 0.4 ? h - 3.2 : h;
+        const doorBay: Bay = { lx: left ? (-w / 2 + cut) / 2 : (cut + w / 2) / 2, w: left ? cut + w / 2 : w / 2 - cut, h, wall, door: true, open: bays[0].open };
+        const next: Bay = { lx: left ? (cut + w / 2) / 2 : (-w / 2 + cut) / 2, w: left ? w / 2 - cut : cut + w / 2, h: otherH, wall: other, door: false, open: q() < 0.3 };
+        bays = [doorBay, next];
       }
     }
+    part(0, 0.25, 0, w + 0.1, 0.5, d + 0.08, '#cdbda4');
+    const signed = shopFront && (p.sign || !!venue);
+    for (const bay of bays) {
+      const { lx, w: bw, h: bh } = bay;
+      const bayTrim = bay.door ? trim : pickOf(q, ['#efe5cf', '#f4ecdc', '#e2d6bd', '#fbf6ea']);
+      for (const side of [-1, 1]) part(lx + side * (bw / 2 - 0.1), bh / 2 + 0.1, front + 0.05, 0.22, bh - 0.2, 0.14, bayTrim);
+      // ---- Ground floor ----
+      if (bay.open) {
+        const kind: FrontKind = bay.door && look ? look[0] : shopFront ? 'food' : 'home';
+        const counter = bay.door && COUNTERED.has(b.id);
+        openFront(F, q, { lx, w: bw, h: bh, d, front, wall: bay.wall, kind, shop: bay.door && look ? b.id : -1, drum: !counter, maxOpening: counter ? Math.min(b.w - 0.7, 9) - 0.1 : undefined, fine: setFine });
+      } else {
+        part(lx, bh / 2, 0, bw, bh, d, bay.wall, 'wall');
+        if (bay.door) {
+          part(doorX, 1.4, front + 0.04, 1.8, 2.8, 0.1, '#46524f');
+          if (q() < 0.5) F.decal(DECAL.door, doorX, 1.35, front + 0.1, 1.5, 2.6);
+          else part(doorX, 1.35, front + 0.09, 1.5, 2.6, 0.05, pickOf(r, DOORS));
+          part(doorX, 0.14, front + 0.45, 2.0, 0.18, 0.8, '#cbbfae');
+          part(doorX, 3.0, front + 0.55, 2.3, 0.1, 1.1, bayTrim);
+          const wx = doorX > lx ? doorX - 2.4 : doorX + 2.4;
+          if (Math.abs(wx - lx) < bw / 2 - 0.9) {
+            const wp = at(wx, front);
+            part(wx, 1.7, front + 0.05, 1.7, 1.5, 0.1, bayTrim);
+            part(wx, 1.7, front + 0.09, 1.4, 1.2, 0.05, '#4f6f6c', glassRole(wp.x, 1.7, wp.z), false);
+            grille(F, wx, 1.7, front + 0.13, 1.45, 1.25, iron, q() < 0.4);
+          }
+        } else {
+          // A garage bay behind a roller shutter (cửa cuốn), its drum on top.
+          F.decal(DECAL.shutter, lx, 1.9, front + 0.02, bw - 0.6, 2.8, { tint: pickOf(q, ['#d9dcdc', '#b9c4c8', '#c9c2b0']) });
+          part(lx, 3.38, front + 0.12, bw - 0.4, 0.28, 0.26, '#a3a9ab');
+        }
+      }
+      if (shopFront && q() < 0.65) {
+        // A canvas awning over the shop front, under the sign.
+        const awning = pickOf(r, AWNINGS), n = Math.max(3, Math.round(bw / 1.3));
+        for (let k = 0; k < n; k++) {
+          const ax = lx - bw / 2 + 0.3 + ((k + 0.5) * (bw - 0.6)) / n;
+          part(ax, 3.36, front + 0.85, (bw - 0.6) / n, 0.08, 1.6, k % 2 ? '#f3e6ca' : awning, 'solid', false);
+          part(ax, 3.2, front + 1.63, (bw - 0.6) / n, 0.26, 0.06, k % 2 ? '#f3e6ca' : awning, 'solid', false);
+        }
+      }
+      // House number on the pillar of an open front, else beside the door.
+      if (bay.door && p.number > 0) {
+        const side = doorX > lx ? -1 : 1;
+        const pillar = pillarWidth(bw, COUNTERED.has(b.id) ? Math.min(b.w - 0.7, 9) - 0.1 : undefined);
+        const pos = bay.open ? at(lx + side * (bw / 2 - pillar / 2), front + 0.015) : at(doorX + (doorX > lx ? -1.25 : 1.25), front + 0.08);
+        plate(p.number, pos.x, bay.open ? 2.35 : 2.25, pos.z, p.facing);
+      }
+      part(lx, 3.42, front + 0.07, bw, 0.16, 0.14, bayTrim);
+      if (bay.door && signed) {
+        // The shop sign over the opening; the first floor above it keeps clear (no balcony there).
+        const pos = at(0, front + 0.25);
+        part(0, 4.05, front + 0.12, w - 0.4, 1.3, 0.2, '#e7d9bd');
+        sign(b.name, b.subtitle, p.signColor, pos.x, 4.05, pos.z, w - 0.6, 1.1, p.facing);
+        if (!venue && q() < 0.3) ledBorder(F, 0, 4.05, front + 0.24, w - 0.4, 1.3, pickOf(q, LED_COLORS));
+      }
+      // ---- Upper floors ----
+      const bf = Math.max(2, Math.round((bh - 0.6) / 3.2));
+      const rr = bay.door ? r : q;
+      const shutter = pickOf(rr, SHUTTERS);
+      let altar = q() < 0.45;
+      for (let k = 1; k < bf; k++) {
+        const base = k * 3.2 + 0.2;
+        const underSign = signed && bay.door && k === 1;
+        const balcony = rr() < 0.55 && !underSign;
+        if (balcony) {
+          part(lx, base + 0.05, front + 0.55, bw - 0.3, 0.16, 1.1, bayTrim);
+          if (rr() < 0.3) part(lx, base + 0.55, front + 1.07, bw - 0.4, 0.85, 0.06, pickOf(rr, ['#e9e1cc', '#d7e3df', '#efd9c4']));
+          else railing(F, lx - bw / 2 + 0.2, lx + bw / 2 - 0.2, base, front, 1.07, iron, q() < 0.5);
+          const gp = at(lx, front);
+          part(lx, base + 1.25, front + 0.05, Math.min(2.2, bw * 0.4), 2.2, 0.08, '#4f6f6c', glassRole(gp.x, base, gp.z), false);
+          if (bw > 3.6) {
+            const fb = at(lx + bw * 0.28, front + 0.95);
+            part(lx + bw * 0.28, base + 0.32, front + 0.95, Math.min(1.3, bw * 0.3), 0.3, 0.32, '#a8664a');
+            flowers(fb.x, base + 0.52, fb.z, 5, 1.0, 0.25, p.seed + k);
+          }
+          if (rr() < 0.5) pot(at(lx - bw * 0.32, front + 0.75).x, at(lx - bw * 0.32, front + 0.75).z, base + 0.13, 0.9, p.seed + k * 7);
+          if (altar && bw > 3.4) { thoThien(F, lx - (doorX > lx ? -1 : 1) * (bw / 2 - 0.5), base + 1.55, front + 0.17); altar = false; }
+          setFine(true);
+          if (q() < 0.35 && k + 1 < bf) laundry(F, q, lx, base + 2.55, front + 0.75, bw - 1.2);
+          else if (q() < 0.12) F.cloth(CLOTH.sheet, lx + (q() - 0.5) * (bw - 2), base + 0.78, front + 1.13, 1.3, 0.75, { mode: 1, amp: 0.03, tint: pickOf(q, LAUNDRY) });
+          setFine(false);
+        } else {
+          const count = bw > 7.5 ? 2 : 1;
+          const cy = underSign ? base + 2.05 : base + 1.5, wh = underSign ? 1.3 : 1.9;
+          const caged = q() < 0.3 && !underSign;
+          for (let i = 0; i < count; i++) {
+            const wx = count === 1 ? lx : lx + (i ? 1 : -1) * bw * 0.24;
+            const wp = at(wx, front);
+            part(wx, cy, front + 0.05, 1.5, wh, 0.1, bayTrim);
+            part(wx, cy, front + 0.09, 1.2, wh - 0.3, 0.05, '#4f6f6c', glassRole(wp.x, base, wp.z), false);
+            if (caged) cage(F, wx, base, front + 0.1, 1.7, iron, pickOf(q, TON));
+            else {
+              for (const sd of [-1, 1]) part(wx + sd * 0.92, cy, front + 0.12, 0.42, wh - 0.3, 0.05, shutter);
+              if (q() < 0.45) grille(F, wx, cy, front + 0.14, 1.25, wh - 0.25, iron, q() < 0.4);
+              else if (!underSign) {
+                part(wx, base + 0.5, front + 0.3, 1.3, 0.22, 0.42, '#a8664a');
+                const fb = at(wx, front + 0.3);
+                flowers(fb.x, base + 0.68, fb.z, 4, 1.0, 0.2, p.seed + k * 3 + i);
+              }
+            }
+          }
+        }
+        if (q() < 0.5) acUnit(F, lx + (q() < 0.5 ? -1 : 1) * (bw / 2 - 0.75), base + 2.45, front + 0.02);
+        part(lx, base + 3.2 - 0.02, front + 0.07, bw, 0.12, 0.12, bayTrim);
+      }
+      // ---- Roof: a tiled gable, or a flat roof with its clutter (and sometimes a mái thái along the front) ----
+      const roof = rr();
+      if (roof < 0.32) {
+        solid('gable', lx, bh + 0.85, 0, bw + 0.5, 1.7, d + 0.4, pickOf(rr, ROOF_TILES), 0, true, 0, 'roofTile');
+      } else {
+        part(lx, bh + 0.05, 0, bw + 0.25, 0.14, d + 0.25, bayTrim);
+        part(lx, bh + 0.13, 0, bw + 0.05, 0.02, d + 0.05, '#b47a62', 'tiles', false);
+        part(lx, bh + 0.45, front - 0.08, bw, 0.7, 0.16, bayTrim);
+        part(lx, bh + 0.45, -front + 0.08, bw, 0.7, 0.16, bayTrim);
+        if (bh < h) {
+          // A low bay is a terrace under the taller neighbour's bare side wall, with a line of washing.
+          setFine(true);
+          laundry(F, q, lx, bh + 1.9, 0, Math.min(bw - 1, 3));
+          for (const k of [-1, 1]) part(lx + k * Math.min(bw - 1, 3) / 2, bh + 1.0, 0, 0.05, 1.8, 0.05, '#6b6f70', 'solid', false);
+          setFine(false);
+        } else {
+          if (roof >= 0.8) for (let i = 0; i < 3; i++) {
+            const pp = at(lx - bw / 2 + 0.9 + (i * (bw - 1.8)) / 2, front - 0.8);
+            pot(pp.x, pp.z, bh + 0.1, 1.1, p.seed + i * 11);
+          }
+          rooftop(F, q, { lx, w: bw, d, front, floor: bh + 0.14, wall: bay.wall, trim: bayTrim }, setFine);
+          if (q() < 0.25) maiThai(F, lx, bw, bh, front, pickOf(q, ROOF_TILES));
+        }
+      }
+    }
+    // The national flag from the first floor, and a light box beside the shop sign.
+    const flagSide = doorX > 0 ? -1 : 1;
+    if (q() < 0.6) houseFlag(F, flagSide * (w / 2 - 0.7), front + 0.12, signed ? 5.5 : 4.7);
+    if (shopFront && look) verticalSign(F, look[1], -flagSide * (w / 2 - 0.35), Math.min(h - 1.0, signed ? 5.75 : 4.6), front, ...pickOf(q, LIGHT_BOXES));
   }
 
   function hospitalBuilding(p: Plot, b: Building) {
     const { x, z, w, d } = dims(p);
     const h = p.h, front = d / 2;
     const { part, at } = frame(x, z, p.facing);
-    part(0, h / 2, 0, w, h, d, '#eef0e8');
+    part(0, h / 2, 0, w, h, d, '#eef0e8', 'wall');
     part(0, 0.25, 0, w + 0.2, 0.5, d + 0.2, '#cfd3cc');
     part(0, h + 0.3, 0, w + 0.4, 0.6, d + 0.4, '#dfe3dc');
     // Entrance hall, canopy and sign band.
@@ -621,7 +796,7 @@ export function buildWorld(scene: THREE.Scene) {
     const { x, z, w, d } = dims(p);
     const h = p.h, front = d / 2;
     const { part, at, solid } = frame(x, z, p.facing);
-    part(0, h / 2, 0, w, h, d, '#e9c46a');
+    part(0, h / 2, 0, w, h, d, '#e9c46a', 'wall');
     part(0, 0.3, 0, w + 0.2, 0.6, d + 0.2, '#c9b28a');
     part(0, h + 0.25, 0, w + 0.4, 0.5, d + 0.4, '#f4ecd6');
     for (const k of [-1, 1]) part(k * (w / 2 - 0.3), h / 2, front + 0.1, 0.6, h, 0.2, '#f4ecd6');
@@ -649,15 +824,14 @@ export function buildWorld(scene: THREE.Scene) {
     const pole = at(0, front - 2);
     shape('cylinder', '#d9d9d2', pole.x, h + 2.6, pole.z, 0.06, 5, 0.06);
     const flag = frame(pole.x, pole.z, p.facing + HALF_PI);
-    flag.part(0.85, h + 4.4, 0, 1.7, 1.1, 0.04, '#d62f2a');
-    flag.part(0.85, h + 4.4, 0.03, 0.4, 0.4, 0.02, '#ffd75e');
+    flag.cloth(CLOTH.flag, 0.87, h + 4.45, 0, 1.65, 1.1, { mode: 0, amp: 0.1 });
   }
 
   function schoolBuilding(p: Plot, b: Building) {
     const { x, z, w, d } = dims(p);
     const h = p.h, front = d / 2;
     const { part, at, solid } = frame(x, z, p.facing);
-    part(0, h / 2, 0, w, h, d, '#f2d58a');
+    part(0, h / 2, 0, w, h, d, '#f2d58a', 'wall');
     part(0, 0.25, 0, w + 0.2, 0.5, d + 0.2, '#d8c9a8');
     for (let k = 0; k < 3; k++) {
       const base = k * 3.4;
@@ -676,7 +850,7 @@ export function buildWorld(scene: THREE.Scene) {
         part(0, base + 1.08, front + 1.48, w, 0.08, 0.14, '#2c5d8f');
       }
     }
-    solid('hip', 0, h + 1.2, 0, w + 1.2, 2.4, d + 1.6, '#b5583a');
+    solid('hip', 0, h + 1.2, 0, w + 1.2, 2.4, d + 1.6, '#b5583a', 0, true, 0, 'roofTile');
     part(0, h - 0.7, front + 0.05, 9, 1.0, 0.1, '#2c5d8f');
     part(0, h - 0.7, front + 0.1, 8.6, 0.12, 0.04, '#ffd75e');
     // Gate arch over the yard entrance carries the school's name.
@@ -690,7 +864,7 @@ export function buildWorld(scene: THREE.Scene) {
     const front = d / 2;
     part(0, 0.45, 0, w + 1.6, 0.9, d + 1.6, '#b9a58a');
     part(0, 0.95, front + 1.0, 6, 0.3, 1.0, '#c8b597');
-    part(0, 3.2, 0, w, 4.6, d, '#e7b75f');
+    part(0, 3.2, 0, w, 4.6, d, '#e7b75f', 'wall');
     for (let i = 0; i < 6; i++) part(-w / 2 + 0.6 + i * (w - 1.2) / 5, 3.0, front + 0.6, 0.45, 4.2, 0.45, '#a8432f');
     for (const lx of [-4.4, 0, 4.4]) {
       part(lx, 2.3, front + 0.06, 2.2, 2.9, 0.1, '#7a2e22');
@@ -700,7 +874,7 @@ export function buildWorld(scene: THREE.Scene) {
     // Two curved-looking tiers: hip roofs with upturned dragon-tail corners and a ridge ornament.
     const roofs: [number, number, number, number][] = [[5.65, w + 3.2, d + 3.4, 2.2], [8.2, w * 0.62, d * 0.62, 1.9]];
     roofs.forEach(([y, rw, rd, rh], i) => {
-      solid('hip', 0, y + rh / 2, 0, rw, rh, rd, i ? '#7f3f2c' : '#8e4a33');
+      solid('hip', 0, y + rh / 2, 0, rw, rh, rd, i ? '#7f3f2c' : '#8e4a33', 0, true, 0, 'roofTile');
       if (i === 1) part(0, y - 0.6, 0, rw * 0.7, 1.2, rd * 0.7, '#e7b75f');
       for (const sx of [-1, 1]) for (const sz of [-1, 1]) {
         solid('box', sx * (rw / 2 - 0.2), y + 0.45, sz * (rd / 2 - 0.2), 0.25, 1.1, 0.25, '#8e4a33', sx * 0.6);
@@ -716,7 +890,7 @@ export function buildWorld(scene: THREE.Scene) {
       box('#d8a531', px, 4.3, 120, 1.05, 0.2, 1.05);
     }
     box('#e7b75f', -27, 4.15, 120, 9.4, 0.7, 0.6);
-    shape('hip', '#8e4a33', -27, 5.05, 120, 11.6, 1.1, 2.6);
+    shape('hip', '#8e4a33', -27, 5.05, 120, 11.6, 1.1, 2.6, 0, 0, true, 'roofTile');
     for (const sx of [-1, 1]) shape('cone', '#d8a531', -27 + sx * 5.9, 5.0, 120, 0.15, 0.5, 0.15, 0, -sx * 0.7);
     sign(b.name, b.subtitle, '#f0c75a', -27, 3.45, 119.68, 6.6, 1.0, PI, '#8e2b20');
     // Lanterns along the hall front and incense pots by the doors.
@@ -731,7 +905,7 @@ export function buildWorld(scene: THREE.Scene) {
     const { x, z, w, d } = dims(p);
     const h = p.h, front = d / 2;
     const { part, at } = frame(x, z, p.facing);
-    part(0, h / 2, 0, w, h, d, '#c9d4d6');
+    part(0, h / 2, 0, w, h, d, '#c9d4d6', 'wall');
     part(0, 2.2, front + 0.06, w - 1, 4.2, 0.1, '#5f8a8f', 'glassLit', false);
     part(0, 4.6, front + 2.0, 12, 0.35, 4.0, '#e4e9ea');
     for (const k of [-4, 0, 4]) part(k, 4.4, front + 2.0, 0.6, 0.06, 0.6, '#fff4d8', 'lamp', false);
@@ -787,7 +961,7 @@ export function buildWorld(scene: THREE.Scene) {
     else if (p.style === 'tower' || p.style === 'midrise') downtown.push({ plot: p, building: b });
     else newHouse(p, b);
   });
-  const skyline = buildSkyline({ root, materials, geometries, textures, shape, sign }, downtown);
+  const skyline = buildSkyline({ root, materials, geometries, textures, shape, sign, frame, fine: setFine }, downtown);
   {
     // The walking-street plaza: pale granite in a grid, and the city park's lawn with gravel paths.
     const { plaza, cityPark: park } = SCENERY;
@@ -853,13 +1027,16 @@ export function buildWorld(scene: THREE.Scene) {
     const inner = line + side * ASPHALT_HALF, outer = line + side * SIDEWALK_EDGE;
     const mid = (inner + outer) / 2, depth = SIDEWALK_EDGE - ASPHALT_HALF;
     const curbAt = inner + side * 0.18;
-    const place = (a: number, along: number, c: number, across: number, h: number, color: ColorLike) =>
-      alongX ? box(color, a, h / 2, c, along, h, across, 0, false, 'ground') : box(color, c, h / 2, a, across, h, along, 0, false, 'ground');
+    const place = (a: number, along: number, c: number, across: number, h: number, color: ColorLike, role: Role = 'ground') =>
+      alongX ? box(color, a, h / 2, c, along, h, across, 0, false, role) : box(color, c, h / 2, a, across, h, along, 0, false, role);
     for (const [a, b] of spansBetween(cuts, slabCut, from, to)) {
-      // Slabs about 3 m long in slightly different shades read as paving without a texture.
-      const count = Math.max(1, Math.round((b - a) / 3));
-      const step = (b - a) / count;
-      for (let i = 0; i < count; i++) place(a + step * (i + 0.5), step, mid, depth, slabTop, vary('#bea58d', slabRandom(), 0.7));
+      // One tiled box per stretch (the paving shader lays the tiles): terracotta in An Hòa, pale granite downtown.
+      const pieces = alongX ? [[a, Math.min(b, DOWNTOWN_X)], [Math.max(a, DOWNTOWN_X), b]] : [[a, b]];
+      for (const [s0, s1] of pieces) {
+        if (s1 - s0 < 0.01) continue;
+        const downtown = (alongX ? (s0 + s1) / 2 : line) > DOWNTOWN_X;
+        place((s0 + s1) / 2, s1 - s0, mid, depth, slabTop, downtown ? '#c4beb2' : vary('#c49a80', slabRandom(), 0.35), 'paving');
+      }
     }
     for (const [a, b] of spansBetween(cuts, ASPHALT_HALF, from, to)) place((a + b) / 2, b - a, curbAt, 0.36, slabTop + 0.015, '#d9d5ca');
   }
@@ -1078,21 +1255,21 @@ export function buildWorld(scene: THREE.Scene) {
       const p = at(lx, lz);
       box(v.neon, p.x, y, p.z, vertical ? 0.07 : length, vertical ? length : 0.07, 0.07, f, false, 'neon');
     };
-    // Around the shop sign (the main sign hangs at 3.8 m, 1.25 m tall).
-    const sw = b.w - 0.45, sy = Math.min(b.h - 0.65, 3.8);
-    tube(0, sy + 0.68, front + 0.42, sw + 0.1, false);
-    tube(0, sy - 0.68, front + 0.42, sw + 0.1, false);
-    tube(-sw / 2 - 0.05, sy, front + 0.42, 1.36, true);
-    tube(sw / 2 + 0.05, sy, front + 0.42, 1.36, true);
-    // Along the canopy edge and around the door.
-    tube(0, 2.58, front + 2.2, b.w - 0.7, false);
+    // Around the shop sign (signSpot: on the first balcony, or over the door).
+    const plot = PLOTS[b.id], spot = signSpot(plot), sw = spot.w + 0.25, sy = spot.y, sz = spot.lz + 0.07, half = spot.h / 2 + 0.14;
+    tube(0, sy + half, sz, sw + 0.1, false);
+    tube(0, sy - half, sz, sw + 0.1, false);
+    tube(-sw / 2 - 0.05, sy, sz, half * 2, true);
+    tube(sw / 2 + 0.05, sy, sz, half * 2, true);
+    // Along the canopy edge (the original shophouses' striped canopy) and round the door, on the wall.
+    if (plot.style === 'legacy') tube(0, 2.58, front + 2.2, b.w - 0.7, false);
     const doorLx = (v.door.x - b.x) * c - (v.door.z - b.z) * s;
-    const doorLz = (v.door.x - b.x) * s + (v.door.z - b.z) * c;
-    for (const dx of [-0.95, 0.95]) tube(doorLx + dx, 1.3, doorLz + 0.08, 2.3, true);
-    tube(doorLx, 2.48, doorLz + 0.08, 1.97, false);
+    const doorLz = (v.door.x - b.x) * s + (v.door.z - b.z) * c - 0.72;
+    for (const dx of [-0.95, 0.95]) tube(doorLx + dx, 1.3, doorLz, 2.3, true);
+    tube(doorLx, 2.48, doorLz, 1.97, false);
     if (v.kind !== 'beer' && v.kind !== 'spa') {
-      const badge = at(sw / 2 - 0.6, front + 0.45);
-      sign('18+', 'NGƯỜI LỚN', '#ffffff', badge.x, sy + 1.05, badge.z, 0.9, 0.5, f, v.neon);
+      const badge = at(sw / 2 - 0.6, sz + 0.02);
+      sign('18+', 'NGƯỜI LỚN', '#ffffff', badge.x, sy + half + 0.4, badge.z, 0.9, 0.5, f, v.neon);
     }
     const glow = at(doorLx, front + 1.6);
     neonPools.push({ x: glow.x, z: glow.z, color: v.neon, size: 5.5 });
@@ -1101,8 +1278,8 @@ export function buildWorld(scene: THREE.Scene) {
   // Banners across the road, hung between the facades at each end of the strip.
   for (const bx of [63, 94]) {
     box('#22121c', bx, 6.6, STRIP_Z + 4, 0.25, 0.9, 20.6, 0, false);
-    sign('PHỐ ĐÈN ĐỎ', 'BAR • KARAOKE • VŨ TRƯỜNG • SPA • 18+', '#ff4f8b', bx - 0.14, 6.6, STRIP_Z + 4, 9.5, 1.4, -HALF_PI, '#1a0b16');
-    sign('PHỐ ĐÈN ĐỎ', 'BAR • KARAOKE • VŨ TRƯỜNG • SPA • 18+', '#ff4f8b', bx + 0.14, 6.6, STRIP_Z + 4, 9.5, 1.4, HALF_PI, '#1a0b16');
+    sign('PHỐ ĐÊM PHƯỢNG VĨ', 'ẨM THỰC • BIA • KARAOKE • ÂM NHẠC', '#ff4f8b', bx - 0.14, 6.6, STRIP_Z + 4, 9.5, 1.4, -HALF_PI, '#1a0b16');
+    sign('PHỐ ĐÊM PHƯỢNG VĨ', 'ẨM THỰC • BIA • KARAOKE • ÂM NHẠC', '#ff4f8b', bx + 0.14, 6.6, STRIP_Z + 4, 9.5, 1.4, HALF_PI, '#1a0b16');
     for (const dy of [-0.5, 0.5]) for (const dx of [-0.16, 0.16]) box('#ff3d7f', bx + dx, 6.6 + dy, STRIP_Z + 4, 0.06, 0.06, 20.4, 0, false, 'neon');
   }
   // Strings of lanterns sagging across the road between the banners.
@@ -1129,18 +1306,29 @@ export function buildWorld(scene: THREE.Scene) {
   root.add(neonPoolMesh);
 
   // ---- Solid props from the layout. ----
-  function prop(pr: Prop) {
-    const { part, at, solid } = frame(pr.x, pr.z, pr.yaw);
-    const r = seeded(pr.x * 977 + pr.z * 131);
+  /** What each food cart sells (counters.ts places), so the cart shows that dish. */
+  const cartKeys = new Map(PLACES.filter((p) => p.id.startsWith('cart')).map((p) => [Number(p.id.slice(4)), p.key]));
+  function prop(pr: Prop, index: number) {
+    const F = frame(pr.x, pr.z, pr.yaw);
+    const { part, at, solid } = F;
+    // Seeded from the prop's own tint: a seed linear in its position gave whole rows of neighbours the same colour.
+    const r = seeded(Math.floor(pr.tint * 2147483) + 1);
     switch (pr.kind) {
       case 'fountain': break; // drawn with the park
       case 'stall': {
+        // A sạp: a low wooden platform the vendor sells over (and sits beside), goods heaped on flat nia baskets.
         const x = pr.x, z = pr.z;
-        box('#ba8b61', x, 1, z, 4.7, 1.5, 2.4);
+        box('#9c6f48', x, 0.38, z, 4.7, 0.76, 2.4);
+        box('#c49a6c', x, 0.785, z, 4.8, 0.05, 2.5);
         for (const dx of [-2.1, 2.1]) box('#8d7458', x + dx, 1.8, z, 0.12, 3.2, 0.12);
         const canopy = z < 0 ? '#4f7fa8' : '#d79555';
         for (let stripe = 0; stripe < 6; stripe++) box(stripe % 2 ? '#efdeb9' : canopy, x - 2.5 + (stripe + 0.5) * 5 / 6, 3.5, z, 5 / 6, 0.2, 3.6);
-        for (let n = 0; n < 8; n++) shape('ball', n % 3 ? (z < 0 ? '#c9d6dc' : '#e4ad58') : '#86a169', x - 1.7 + (n % 4) * 1.1, 1.93, z - 0.4 + Math.floor(n / 4) * 0.7, 0.38, 0.33, 0.38);
+        for (let n = 0; n < 8; n++) {
+          const bx = x - 1.65 + (n % 4) * 1.1, bz = z - 0.5 + Math.floor(n / 4) * 1.0;
+          shape('cylinder', '#b8925a', bx, 0.84, bz, 0.78, 0.05, 0.78);
+          const produce = n % 3 ? (z < 0 ? '#c9d6dc' : '#e4ad58') : n % 2 ? '#86a169' : '#c8553d';
+          for (let k = 0; k < 3; k++) shape('ball', produce, bx + (k - 1) * 0.17, 0.93 + (k === 1 ? 0.05 : 0), bz + (k === 1 ? 0.08 : -0.05), 0.24, 0.2, 0.24);
+        }
         break;
       }
       case 'fence': {
@@ -1166,6 +1354,7 @@ export function buildWorld(scene: THREE.Scene) {
         shape('ball', '#8a6a3c', pr.x, 1.05, pr.z, 0.55, 0.5, 0.55);
         shape('cylinder', '#6f5a3a', pr.x, 1.45, pr.z, 0.3, 0.4, 0.3);
         for (let i = 0; i < 3; i++) shape('cylinder', '#c0392b', pr.x + Math.sin(i * 2.1) * 0.15, 1.85, pr.z + Math.cos(i * 2.1) * 0.15, 0.015, 0.45, 0.015, 0, 0, false, 'lantern');
+        smoke('incense', pr.x, 2.1, pr.z);
         break;
       case 'stupa':
         for (let i = 0; i < 5; i++) {
@@ -1178,8 +1367,7 @@ export function buildWorld(scene: THREE.Scene) {
         break;
       case 'flagpole': {
         shape('cylinder', '#d9d9d2', pr.x, 4, pr.z, 0.06, 8, 0.06);
-        box('#d62f2a', pr.x + 0.85, 7.3, pr.z, 1.7, 1.1, 0.04, 0, false);
-        box('#ffd75e', pr.x + 0.85, 7.3, pr.z - 0.03, 0.4, 0.4, 0.02, 0, false);
+        cloth(CLOTH.flag, pr.x + 0.87, 7.35, pr.z, 1.65, 1.1, 0, { mode: 0, amp: 0.1 });
         shape('cylinder', '#b9ad96', pr.x, 0.2, pr.z, 0.5, 0.4, 0.5);
         break;
       }
@@ -1191,7 +1379,8 @@ export function buildWorld(scene: THREE.Scene) {
         part(0, 2.66, 0.95, 0.4, 0.05, 1.4, '#fff4d8', 'lamp', false);
         bench(at(0, 1.15).x, at(0, 1.15).z, pr.yaw);
         const sp = at(0, 2.12);
-        sign('TRẠM XE BUÝT', 'TUYẾN 03 • 08 • 15', '#ffffff', sp.x, 2.75, sp.z, 3.6, 0.6, pr.yaw, '#2c64a8');
+        // Line 03 loops An Hòa only; 08 and 15 also call at the Bạch Đằng shelter downtown (transit.ts LINE_SPECS).
+        sign('TRẠM XE BUÝT', pr.x > DOWNTOWN_X ? 'TUYẾN 08 • 15' : 'TUYẾN 03 • 08 • 15', '#ffffff', sp.x, 2.75, sp.z, 3.6, 0.6, pr.yaw, '#2c64a8');
         break;
       }
       case 'planter':
@@ -1205,18 +1394,10 @@ export function buildWorld(scene: THREE.Scene) {
           shape('ball', vary('#5f9a55', r()), f.x, 0.72, f.z, 0.32, 0.34, 0.3);
         }
         break;
-      case 'scooter': {
-        const body = pickOf(r, ['#c9493b', '#3f6f9f', '#e8d6a8', '#2f3a40', '#f0f0ea', '#8c6fae', '#5e927c', '#d98c3c']);
-        part(0, 0.55, -0.1, 0.42, 0.36, 1.1, body);
-        part(0, 0.3, 0.1, 0.36, 0.08, 0.7, '#3a3a3a');
-        part(0, 0.83, -0.25, 0.36, 0.12, 0.65, '#2c2b2a');
-        part(0, 0.75, 0.5, 0.44, 0.75, 0.12, body);
-        part(0, 1.15, 0.52, 0.62, 0.05, 0.05, '#3a3a3a');
-        part(0, 0.95, 0.6, 0.18, 0.1, 0.06, '#fff4d8');
-        for (const lz of [-0.6, 0.62]) solid('cylinder', 0, 0.26, lz, 0.26, 0.1, 0.26, '#232323', HALF_PI);
-        break;
-      }
+      case 'scooter': break; // a real vehicle (vehicles.ts curb spots)
       case 'cart': {
+        // A street-food cart: what it shows matches what its counter sells (bánh mì in a glass case, a pot of soup...).
+        const key = cartKeys.get(index) ?? 'banhmi';
         const tint = pickOf(r, ['#4f7fa8', '#c9493b', '#d9a441', '#c8ccc9']);
         part(0, 0.55, 0, 1.8, 0.75, 0.9, tint);
         part(0, 1.2, 0, 1.6, 0.55, 0.75, '#bcd3d6', 'glass', false);
@@ -1225,17 +1406,41 @@ export function buildWorld(scene: THREE.Scene) {
         part(-0.6, 1.95, 0, 0.05, 2.0, 0.05, '#6b6b6b');
         const u = at(-0.6, 0);
         shape('cone', pickOf(r, ['#e5484d', '#3f8fc9', '#f5c84a', '#5e927c']), u.x, 2.95, u.z, 1.35, 0.55, 1.35, pr.yaw, 0, true);
-        for (let i = 0; i < 4; i++) {
-          const f = at(-0.6 + i * 0.35, 0.05);
-          shape('ball', pickOf(r, ['#f5d36b', '#e88f4a', '#f1e6c8', '#9cc46b']), f.x, 1.12, f.z, 0.14, 0.1, 0.14, 0, 0, false);
+        F.tag('box', FRONT_OF[key]?.[1] ?? 'BÁNH MÌ', '#c8322a', '#fff6dc', 0, 1.2, 0.39, 1.5, 0.32, { glow: 0.6 });
+        if (key === 'banhmi') for (let i = 0; i < 5; i++) solid('ball', -0.55 + i * 0.27, 1.06, -0.05, 0.05, 0.05, 0.2, '#e3a957', 0, false, HALF_PI);
+        else if (key === 'che' || key === 'xoi') for (let i = 0; i < 4; i++) solid('cylinder', -0.5 + i * 0.33, 1.1, -0.05, 0.11, 0.18, 0.11, pickOf(r, ['#7fb04a', '#e8c04a', '#c8504a', '#f1e6c8', '#6a4fa0']), 0, false);
+        else {
+          solid('cylinder', 0.45, 1.68, 0, 0.26, 0.32, 0.26, '#c7ccce', 0, false);
+          F.smoke('steam', 0.45, 1.9, 0);
         }
+        if (key === 'banhxeo' || key === 'banhmi') { solid('cylinder', -0.35, 1.56, 0.1, 0.22, 0.05, 0.22, '#2b2b2b', 0, false); F.smoke('grill', -0.35, 1.7, 0.1); }
+        break;
+      }
+      case 'pole': break; // drawn with the cables (street dressing below)
+      case 'bin': {
+        // A 240 l wheelie bin, green (a quarter orange): body, lid, wheels.
+        const color = pr.tint < 0.25 ? '#e0782a' : '#2f7d4f';
+        part(0, 0.56, 0, 0.58, 0.96, 0.68, color);
+        part(0, 1.06, -0.03, 0.62, 0.06, 0.74, vary(color, 0.3, 0.6));
+        part(0, 0.98, -0.36, 0.5, 0.05, 0.05, '#3a3d3c', 'solid', false);
+        for (const k of [-1, 1]) solid('cylinder', k * 0.24, 0.1, -0.3, 0.1, 0.06, 0.1, '#1f2224', HALF_PI, false, HALF_PI);
+        break;
+      }
+      case 'lottery': {
+        // A vé số seller's glass case on legs, the day's tickets clipped inside, VÉ SỐ on top.
+        for (const a of [-0.22, 0.22]) for (const b of [-0.16, 0.16]) part(a, 0.42, b, 0.03, 0.84, 0.03, '#8a8f92', 'solid', false);
+        part(0, 0.9, 0, 0.56, 0.12, 0.42, '#3f6f9a');
+        part(0, 1.12, 0, 0.54, 0.32, 0.4, '#cfe0e4', 'glass', false);
+        F.decal(DECAL.lottery, 0, 1.12, 0.205, 0.5, 0.3);
+        F.decal(DECAL.lottery, 0, 1.12, -0.205, 0.5, 0.3, { yaw: PI });
+        F.tag('box', 'VÉ SỐ', '#ffffff', '#c8322a', 0, 1.42, 0, 0.56, 0.2, { glow: 0.5 });
         break;
       }
     }
   }
-  SCENERY.props.forEach((pr) => {
+  SCENERY.props.forEach((pr, i) => {
     lift = onPavement(pr.x, pr.z);
-    prop(pr);
+    prop(pr, i);
   });
   lift = 0;
 
@@ -1259,10 +1464,30 @@ export function buildWorld(scene: THREE.Scene) {
     for (let k = 0; k + 1 < list.length; k++) {
       const a = PLOTS[list[k]], b = PLOTS[list[k + 1]];
       const gap = alongX ? b.full.minX - a.full.maxX : b.full.minZ - a.full.maxZ;
-      if (gap < 1 || gap > 4.5 || hash(a.full.minX, a.full.minZ, 5) < 0.3) continue;
+      if (gap < 1 || gap > 4.5) continue;
       const fa = a.full, fb = b.full;
       const e = { x: Math.round(Math.sin(a.facing)), z: Math.round(Math.cos(a.facing)) };
       const frontCoord = alongX ? (e.z > 0 ? Math.min(fa.maxZ, fb.maxZ) : Math.max(fa.minZ, fb.minZ)) : (e.x > 0 ? Math.min(fa.maxX, fb.maxX) : Math.max(fa.minX, fb.minX));
+      if (hash(a.full.minX, a.full.minZ, 7) < 0.3 && a.number > 0) {
+        // A cổng hẻm over the alley mouth: two slim posts against the walls, a lintel with the alley's number, a lantern.
+        const lo = alongX ? fa.maxX : fa.maxZ, hi = alongX ? fb.minX : fb.minZ, mid = (lo + hi) / 2;
+        const c0 = frontCoord - (alongX ? e.z : e.x) * 0.25;
+        const at = (t: number) => (alongX ? { x: t, z: c0 } : { x: c0, z: t });
+        for (const t of [lo + 0.12, hi - 0.12]) { const pp = at(t); box('#d9cfba', pp.x, 1.9, pp.z, 0.22, 3.8, 0.22); }
+        const m = at(mid);
+        box('#d9cfba', m.x, 3.9, m.z, alongX ? gap : 0.3, 0.3, alongX ? 0.3 : gap);
+        const yaw = Math.atan2(e.x, e.z);
+        tag('box', `HẺM ${a.number}`, '#ffffff', hash(fa.minX, fa.minZ, 9) < 0.5 ? '#1d4f9c' : '#a8322a', m.x + e.x * 0.17, 3.9, m.z + e.z * 0.17, Math.min(gap - 0.3, 1.6), 0.26, yaw, 0.4);
+        shape('ball', '#d8402c', m.x, 3.45, m.z, 0.18, 0.24, 0.18, 0, 0, false, 'lantern');
+      }
+      if (hash(a.full.minX, a.full.minZ, 11) < 0.4) {
+        // A tradesman's ad painted on the side wall down the alley (made-up numbers).
+        const ads = ['KHOAN CẮT BÊ TÔNG|ĐT: 09xx.xxx.xxx', 'CHỐNG THẤM – SƠN NƯỚC|ĐT: 09xx.xxx.xxx', 'HÚT HẦM CẦU|THÔNG CỐNG NGHẸT 09xx.xxx.xxx', 'SỬA ỐNG NƯỚC – ĐIỆN|09xx.xxx.xxx'];
+        const text = ads[Math.floor(hash(fa.minX, fa.minZ, 13) * ads.length)];
+        const c0 = frontCoord - (alongX ? e.z : e.x) * 2.8, wallAt = alongX ? fa.maxX + 0.01 : fa.maxZ + 0.01;
+        tag('paint', text, hash(fa.minX, fa.minZ, 17) < 0.5 ? '#1d4f9c' : '#b3261e', '#ece8dc', alongX ? wallAt : c0, Math.min(a.h - 1, 4.3), alongX ? c0 : wallAt, 2.6, 0.8, alongX ? HALF_PI : 0);
+      }
+      if (hash(a.full.minX, a.full.minZ, 5) < 0.3) continue;
       const y = Math.max(4.4, Math.min(a.h, b.h) - 1.6);
       for (const depth of [0.8, 3.2]) {
         const c0 = frontCoord - (alongX ? e.z : e.x) * depth;
@@ -1285,6 +1510,164 @@ export function buildWorld(scene: THREE.Scene) {
   for (const bx of [-36.5, -25.5, -13.6]) {
     box('#3d3a35', bx, 5.25, 31.5, 0.03, 0.03, 10, 0, false);
     for (let i = 0; i < 14; i++) shape('cone', bunting[i % bunting.length], bx, 4.98 - Math.sin((i / 13) * PI) * 0.25, 26.9 + i * 0.7, 0.22, 0.42, 0.04, HALF_PI, PI, false);
+  }
+  // Tarps over the market alley between the stalls, and a string of bulbs along it.
+  for (const [tx, color] of [[-36.5, '#2f6fb5'], [-25.5, '#d9a441'], [-47, '#2f6fb5']] as const) {
+    box(color, tx, 4.3, 31.5, 3.4, 0.03, 4.8, 0, false);
+    decal(DECAL.ton, tx, 4.28, 31.5, 3.4, 4.8, 0, { pitch: -HALF_PI, tint: color });
+    for (const sx of [-1.6, 1.6]) for (const sz of [-2.3, 2.3]) box('#6b6f70', tx + sx, 2.15, 31.5 + sz, 0.05, 4.3, 0.05, 0, false);
+  }
+  box('#3d3a35', -31, 3.74, 31.5, 34, 0.02, 0.02, 0, false);
+  for (let lx = -47.5; lx <= -14.5; lx += 1.5) shape('ball', '#fff2c8', lx, 3.66, 31.5, 0.07, 0.09, 0.07, 0, 0, false, 'lamp');
+
+  // ---- Street dressing: concrete power poles carrying sagging bundles of cables, with service drops to the
+  // houses and bundles across the street; civic banners, street-name plates and flags on the downtown lamp posts. ----
+  {
+    const rr = seeded(8128);
+    const dark = ['#26282a', '#2e2f31', '#1f2122', '#3a3632', '#2b2d30'].map((c) => new THREE.Color(c));
+    const pale = new THREE.Color('#cfcfc6');
+    const across = (p: Pole) => ({ x: Math.sin(p.yaw), z: Math.cos(p.yaw) });
+    const base = (p: Pole) => onPavement(p.x, p.z);
+    SCENERY.poles.forEach((p) => {
+      lift = base(p);
+      const a = across(p), H = p.main ? 8.8 : 7.2;
+      shape('trunk', '#bdb9ae', p.x, H / 2, p.z, 0.15, H, 0.15, p.yaw, 0, true);
+      box('#9c978c', p.x, 0.35, p.z, 0.4, 0.7, 0.4, p.yaw);
+      const arm = (y: number, len: number) => {
+        box('#77736c', p.x, y, p.z, 0.1, 0.1, len, p.yaw, false);
+        setFine(true);
+        for (const k of [-0.42, 0, 0.42]) shape('bead', '#e8e4d8', p.x + a.x * k * len / 1.2, y + 0.1, p.z + a.z * k * len / 1.2, 0.07, 0.12, 0.07, 0, 0, false);
+        setFine(false);
+      };
+      if (p.main) { arm(8.25, 1.4); arm(7.45, 1.0); }
+      box('#4a4c4e', p.x, 5.85, p.z, 0.32, 0.22, 0.32, p.yaw, false);
+      box('#8c9096', p.x - a.x * 0.2, 2.6, p.z - a.z * 0.2, 0.36, 0.5, 0.22, p.yaw, false);
+      setFine(true);
+      // A coil of spare cable, flyers pasted on the shaft, and on some a row of electricity meters.
+      if (p.main) shape('cylinder', '#2a2b2c', p.x - a.x * 0.28, 4.6, p.z - a.z * 0.28, 0.32, 0.16, 0.32, p.yaw + 0.4, 0.2, false);
+      decal(DECAL.stickers, p.x - a.x * 0.17, 1.6 + rr() * 0.6, p.z - a.z * 0.17, 0.32, 0.9, p.yaw + PI);
+      if (rr() < 0.2) decal(DECAL.meters, p.x - a.x * 0.17, 3.3, p.z - a.z * 0.17, 0.8, 0.8, p.yaw + PI);
+      setFine(false);
+      if (p.transformer) {
+        // A pole-top transformer bank: a platform, three grey pots, a danger sign.
+        box('#6f6c66', p.x - a.x * 0.45, 6.4, p.z - a.z * 0.45, 0.5, 0.1, 1.3, p.yaw + HALF_PI, false);
+        for (const k of [-0.42, 0, 0.42]) shape('cylinder', '#8e9396', p.x - a.x * 0.45 + a.z * k, 6.85, p.z - a.z * 0.45 - a.x * k, 0.17, 0.8, 0.17, 0, 0, true);
+        decal(DECAL.danger, p.x - a.x * 0.17, 3.35, p.z - a.z * 0.17, 0.42, 0.42, p.yaw + PI);
+      }
+      lift = 0;
+    });
+    // Cables along each line of poles: three power lines and two lower ones on the main side, and on every pole the
+    // telecom bundle, six to ten loose cables of different sag, a few pale.
+    const lines = new Map<string, Pole[]>();
+    for (const p of SCENERY.poles) { let l = lines.get(p.line); if (!l) { l = []; lines.set(p.line, l); } l.push(p); }
+    for (const list of lines.values()) for (let i = 0; i + 1 < list.length; i++) {
+      const pa = list[i], pb = list[i + 1], span = Math.hypot(pb.x - pa.x, pb.z - pa.z);
+      if (span > (pa.main ? 40 : 62)) continue;
+      const aa = across(pa), ab = across(pb), ya = base(pa), yb = base(pb), sagK = span / 28;
+      const wire = (y: number, offA: number, offB: number, sag: number, width: number, color: THREE.Color, dy = 0) =>
+        cables.base.push({ ax: pa.x + aa.x * offA, ay: y + ya + dy, az: pa.z + aa.z * offA, bx: pb.x + ab.x * offB, by: y + yb - dy, bz: pb.z + ab.z * offB, sag: sag * sagK, width, color });
+      if (pa.main && pb.main) {
+        for (const k of [-0.48, 0, 0.48]) wire(8.33, (k * 1.4) / 1.2, (k * 1.4) / 1.2, 0.35 + rr() * 0.15, 0.022, dark[0]);
+        for (const k of [-0.35, 0.35]) wire(7.53, k, k, 0.45 + rr() * 0.2, 0.022, dark[1]);
+      }
+      const n = 4 + Math.floor(rr() * 4);
+      for (let k = 0; k < n; k++) {
+        const o = (rr() - 0.5) * 0.3;
+        wire(5.85, o, o + (rr() - 0.5) * 0.2, 0.45 + rr() * 0.95, 0.025 + rr() * 0.02, rr() < 0.18 ? pale : dark[Math.floor(rr() * dark.length)], (rr() - 0.5) * 0.09);
+      }
+    }
+    const anHoa = BUILDINGS.map((b, i) => ({ b, p: PLOTS[i] })).filter(({ b, p }) => (p.style === 'legacy' || p.style === 'home' || p.style === 'shop') && b.x < DOWNTOWN_X);
+    // Service drops: one to three cables from the nearest pole to each house front.
+    for (const { b, p } of anHoa) {
+      const e = { x: Math.round(Math.sin(b.facing)), z: Math.round(Math.cos(b.facing)) };
+      const wall = { x: b.door.x - e.x * 0.75, z: b.door.z - e.z * 0.75 };
+      let best: Pole | null = null, bd = 40;
+      for (const q of SCENERY.poles) { const dd = Math.hypot(q.x - wall.x, q.z - wall.z); if (dd < bd) { bd = dd; best = q; } }
+      if (!best) continue;
+      const lat = { x: Math.abs(e.z), z: Math.abs(e.x) }, n = 1 + Math.floor(rr() * 3), y0 = base(best);
+      for (let k = 0; k < n; k++) {
+        const off = (rr() - 0.5) * (b.w - 2);
+        cables.fine.push({ ax: best.x, ay: 5.8 + y0 + (rr() - 0.5) * 0.2, az: best.z, bx: wall.x + lat.x * off + e.x * 0.05, by: Math.min(p.h - 0.5, 3.7 + rr() * 1.6), bz: wall.z + lat.z * off + e.z * 0.05, sag: 0.25 + rr() * 0.45, width: 0.025, color: dark[k % dark.length] });
+      }
+    }
+    // Bundles across the street from every third main pole, to a pole or a house wall on the other side.
+    for (const list of lines.values()) list.forEach((p, k) => {
+      if (!p.main || k % 3 !== 1) return;
+      const a = across(p);
+      const far = { x: p.x + a.x * 20.05, z: p.z + a.z * 20.05 };
+      const opposite = SCENERY.poles.find((q) => q !== p && Math.hypot(q.x - p.x - a.x * 15.2, q.z - p.z - a.z * 15.2) < 10);
+      const to = opposite ? { x: opposite.x, y: 5.85 + base(opposite), z: opposite.z } : { x: far.x, y: 5.6, z: far.z };
+      const n = 2 + Math.floor(rr() * 3);
+      for (let j = 0; j < n; j++) {
+        const o = (rr() - 0.5) * 0.3;
+        cables.fine.push({ ax: p.x + a.z * o, ay: 5.85 + base(p) + (rr() - 0.5) * 0.15, az: p.z - a.x * o, bx: to.x + a.z * o, by: to.y + (rr() - 0.5) * 0.15, bz: to.z - a.x * o, sag: 0.6 + rr() * 0.4, width: 0.03, color: dark[j % dark.length] });
+      }
+    });
+    // Civic banners (khẩu hiệu) across the east-west streets, between a pole and the facade opposite.
+    const SLOGANS = ['CHÀO MỪNG NGÀY QUỐC KHÁNH 2-9', 'PHƯỜNG AN HÒA XANH – SẠCH – ĐẸP', 'AN TOÀN GIAO THÔNG LÀ HẠNH PHÚC CỦA MỌI NHÀ', 'ĐÃ UỐNG RƯỢU BIA – KHÔNG LÁI XE', 'CHÚC MỪNG NĂM MỚI', 'KHU PHỐ VĂN HÓA AN HÒA'];
+    let slogan = 0;
+    const hung = new Set<Pole>();
+    for (const road of [-54, 0, 54]) for (const bx of [-81, -27, 27, 81]) {
+      const near = SCENERY.poles.filter((p) => p.main && !hung.has(p) && p.line.startsWith(`h${road}:`) && Math.abs(p.x - bx) < 14);
+      const pole = near.sort((a, b) => Math.abs(a.x - bx) - Math.abs(b.x - bx))[0];
+      if (!pole) continue;
+      hung.add(pole);
+      const side = Math.sign(pole.z - road), x = pole.x;
+      tag('banner', SLOGANS[slogan++ % SLOGANS.length], '#ffd75e', '#c8322a', x, 6.3, road, 11, 0.85, HALF_PI, 0.3);
+      for (const dy of [0.38, -0.38]) {
+        box('#d9d4c4', x, 6.3 + dy, (road + side * 5.5 + pole.z) / 2, 0.02, 0.02, Math.abs(pole.z - road - side * 5.5), 0, false);
+        box('#d9d4c4', x, 6.3 + dy, (road - side * 5.5 + road - side * 12.45) / 2, 0.02, 0.02, 6.95, 0, false);
+      }
+    }
+    // Street-name plates on the signal poles: the name of the street each one stands on.
+    for (const ap of APPROACHES) {
+      const name = ap.axis === 'x' ? STREETS_H.get(ap.rz) : STREETS_V.get(ap.rx);
+      if (!name) continue;
+      lift = onPavement(ap.pole.x, ap.pole.z);
+      const yaw = ap.axis === 'x' ? 0 : HALF_PI, rx = Math.cos(yaw), rz = -Math.sin(yaw);
+      const out = ap.axis === 'x' ? Math.sign(ap.rx - ap.pole.x) || 1 : Math.sign(ap.rz - ap.pole.z) || 1;
+      box('#4a5458', ap.pole.x + rx * out * 0.4, 3.62, ap.pole.z + rz * out * 0.4, ap.axis === 'x' ? 0.8 : 0.04, 0.04, ap.axis === 'x' ? 0.04 : 0.8, 0, false);
+      tag('plate', name, '#ffffff', '#1d4f9c', ap.pole.x + rx * out * 0.78, 3.4, ap.pole.z + rz * out * 0.78, 1.3, 0.32, yaw, 0.25);
+      lift = 0;
+    }
+    // Downtown lamp posts fly two national flags each, out along the street.
+    for (const l of SCENERY.lamps) {
+      if (l.kind !== 'street' || l.x < DOWNTOWN_X) continue;
+      lift = onPavement(l.x, l.z);
+      const alongX = Math.abs(l.hz - l.z) > Math.abs(l.hx - l.x);
+      const dir = alongX ? 0 : -HALF_PI;
+      box('#586c65', l.x, 4.62, l.z, alongX ? 0.9 : 0.05, 0.05, alongX ? 0.05 : 0.9, 0, false);
+      for (const s of [1, -1]) {
+        const ox = alongX ? s * (0.06 + 0.375) : 0, oz = alongX ? 0 : s * (0.06 + 0.375);
+        cloth(CLOTH.flag, l.x + ox, 4.3, l.z + oz, 0.75, 0.5, dir + (s < 0 ? PI : 0), { mode: 0, amp: 0.06 });
+      }
+      lift = 0;
+    }
+    // The open car parks downtown (parking.ts lots): painted bays round every car spot and a blue P sign at the row's end.
+    for (const lot of LOTS) {
+      if (lot.kind !== 'carpark') continue;
+      const spots = lot.spots.map((id) => SPOTS[id]);
+      for (const s of spots) {
+        const rx = Math.cos(s.yaw), rz = -Math.sin(s.yaw), y = groundHeight(s.x, s.z) + 0.006;
+        for (const k of [-1.3, 1.3]) box('#e8e6dc', s.x + rx * k, y, s.z + rz * k, 0.1, 0.012, 5.0, s.yaw, false, 'ground');
+        const fx = Math.sin(s.yaw), fz = Math.cos(s.yaw);
+        box('#e8e6dc', s.x + fx * 2.5, y, s.z + fz * 2.5, 2.7, 0.012, 0.1, s.yaw, false, 'ground');
+      }
+      const first = spots.reduce((a, b) => (a.x < b.x ? a : b)), px = first.x - 2.3, pz = first.z;
+      lift = groundHeight(px, pz);
+      shape('cylinder', '#8a8f92', px, 1.2, pz, 0.05, 2.4, 0.05, 0, 0, false);
+      tag('box', 'P|BÃI ĐỖ XE', '#ffffff', '#1d4f9c', px, 2.25, pz, 1.1, 0.8, first.yaw + PI, 0.5);
+      lift = 0;
+    }
+    // Strings of small Buddhist flags across the pagoda yard.
+    for (const [x0, z0, x1, z1] of [[-31.5, 120.4, -27, 126.4], [-22.5, 120.4, -27, 126.4], [-40.5, 121, -13.5, 121]]) {
+      const len = Math.hypot(x1 - x0, z1 - z0), n = Math.floor(len / 0.55), yaw = Math.atan2(x1 - x0, z1 - z0) - HALF_PI;
+      for (let i = 1; i < n; i++) {
+        const t = i / n, sag = Math.sin(t * PI) * 0.45;
+        cloth(CLOTH.buddhist, x0 + (x1 - x0) * t, 4.55 - sag - 0.17, z0 + (z1 - z0) * t, 0.36, 0.26, yaw, { mode: 1, amp: 0.04 });
+      }
+      cables.base.push({ ax: x0, ay: 4.6, az: z0, bx: x1, by: 4.6, bz: z1, sag: 0.45, width: 0.012, color: dark[0] });
+    }
   }
 
   // ---- Riverside promenade, the river and the far bank. ----
@@ -1353,7 +1736,8 @@ export function buildWorld(scene: THREE.Scene) {
     // The gate: two posts and a lintel with the dock's name.
     for (const side of [-1, 1]) box('#7a4a2e', px + side * (pw / 2 + 0.25), 1.6, -135.4, 0.3, 3.2, 0.3);
     box('#7a4a2e', px, 3.25, -135.4, pw + 1.2, 0.35, 0.4);
-    sign(dock.name, dock.rental ? 'CA NÔ • 30.000Đ / LƯỢT' : 'TÀU BUÝT SÔNG • ĐÒ NGANG', dock.rental ? '#1f5a8a' : '#8e2b20', px, 3.9, -135.2, Math.max(pw + 1.4, 6.2), 0.9, PI, '#f6efe0');
+    // The đò is moored at An Hòa (buses.ts); Bạch Đằng only has the river bus.
+    sign(dock.name, dock.rental ? 'CA NÔ • 30.000Đ / LƯỢT' : dock.x < 0 ? 'TÀU BUÝT SÔNG • ĐÒ NGANG' : 'TÀU BUÝT SÔNG', dock.rental ? '#1f5a8a' : '#8e2b20', px, 3.9, -135.2, Math.max(pw + 1.4, 6.2), 0.9, PI, '#f6efe0');
     for (const side of [-1, 1]) {
       shape('cylinder', '#2b2f33', px + side * (pw / 2 - 0.2), PIER_DECK + 1.3, deckTo + 1, 0.06, 2.6, 0.06, 0, 0, false);
       shape('ball', '#fff2c8', px + side * (pw / 2 - 0.2), PIER_DECK + 2.7, deckTo + 1, 0.22, 0.25, 0.22, 0, 0, false, 'lamp');
@@ -1383,15 +1767,7 @@ export function buildWorld(scene: THREE.Scene) {
     box(i % 2 ? '#b9c4b6' : '#c6c6b5', x, h / 2, zz, 12 + (i % 4) * 2, h, 12, 0, false);
     for (let floor = 3; floor < h - 1; floor += 3.6) box('#a4b7af', x, floor, zz + 6.05, 9, 0.9, 0.08, 0, false, hash(x, floor) < 0.5 ? 'glassLit' : 'glass');
   }
-  // Two sampans moored on the river.
-  for (const [bx, bz, yaw] of [[-48, -146, 0.2], [74, -152, -0.3]]) {
-    const { part } = frame(bx, bz, yaw + HALF_PI);
-    part(0, -0.55, 0, 1.6, 0.5, 6, '#6e4f36');
-    part(0, -0.3, 0, 1.7, 0.1, 6.1, '#8a6a4c');
-    for (const sz of [-1, 1]) part(0, -0.25, sz * 3.2, 1.0, 0.4, 0.9, '#6e4f36');
-    part(0, 0.35, -0.6, 1.5, 0.08, 2.6, '#c9b07a');
-    shape('gable', '#a58d5c', bx, 0.65, bz, 1.6, 0.6, 2.6, yaw, 0, false);
-  }
+  // The moored sampans are boats now (boats.ts), not scenery.
   const waves: { x: number; z: number; width: number }[] = [];
   for (let i = 0; i < 80; i++) waves.push({ x: -200 + ((i * 37) % (LAND.maxX + 260)), z: -141 - ((i * 11) % 60), width: 2 + (i % 4) * 1.4 });
   const waveGeometry = new THREE.PlaneGeometry(1, 0.14).rotateX(-HALF_PI);
@@ -1455,8 +1831,8 @@ export function buildWorld(scene: THREE.Scene) {
         continue;
       }
       const w = 9 + edge() * 5, d = 9 + edge() * 5, h = 7 + edge() * 15;
-      box(pickOf(edge, BACKGROUND), x, h / 2, z, w, h, d, 0, false);
-      if (edge() < 0.4) shape('gable', '#a5533a', x, h + 0.8, z, w + 0.4, 1.6, d + 0.4, 0, 0, false);
+      box(pickOf(edge, BACKGROUND), x, h / 2, z, w, h, d, 0, false, 'wall');
+      if (edge() < 0.4) shape('gable', '#a5533a', x, h + 0.8, z, w + 0.4, 1.6, d + 0.4, 0, 0, false, 'roofTile');
       else box('#d7cfbd', x, h + 0.2, z, w + 0.3, 0.4, d + 0.3, 0, false);
       const toward = Math.abs(x) > Math.abs(z) ? { x: -Math.sign(x), z: 0 } : { x: 0, z: -Math.sign(z) };
       for (let y = 2.4; y < h - 1; y += 3.3) {
@@ -1500,20 +1876,27 @@ export function buildWorld(scene: THREE.Scene) {
   geometries.push(...signMeshes.geometries);
   for (const material of signMeshes.materials) glowMaterials.push({ material, strength: 1 });
 
-  // Instances are bucketed into 160 m tiles so off-screen parts of the city are frustum-culled.
+  // Instances are bucketed into 160 m tiles so off-screen parts of the city are frustum-culled, where a batch has
+  // enough vertices for culling to beat the extra draw calls (60k indices: 1,666 boxes, 625 cylinders, 555 puffs).
   const TILE = 160;
   for (const batch of batches.values()) {
     const count = batch.c.length / 3;
+    const whole = count * (primitives[batch.kind].index?.count ?? primitives[batch.kind].attributes.position.count) < 60000;
     const buckets = new Map<string, number[]>();
     for (let i = 0; i < count; i++) {
       const tx = batch.m[i * 16 + 12], tz = batch.m[i * 16 + 14];
-      const key = count < 600 || batch.big[i] ? 'all' : `${Math.floor((tx + 80) / TILE)}:${Math.floor((tz + 80) / TILE)}`;
+      const key = whole || batch.big[i] ? 'all' : `${Math.floor((tx + 80) / TILE)}:${Math.floor((tz + 80) / TILE)}`;
       let list = buckets.get(key);
       if (!list) { list = []; buckets.set(key, list); }
       list.push(i);
     }
     for (const list of buckets.values()) {
-      const mesh = new THREE.InstancedMesh(primitives[batch.kind], roles[batch.role], list.length);
+      // Each mesh its own copy of the (tiny) primitive: three.js caches vertex array state per geometry and program, so
+      // meshes sharing one geometry but not their instance buffers re-bind every attribute on every draw.
+      const geometry = primitives[batch.kind].clone();
+      geometries.push(geometry);
+      const mesh = new THREE.InstancedMesh(geometry, roles[batch.role], list.length);
+      mesh.name = `${batch.kind} ${batch.role}${batch.shadow ? ' shadow' : ''}${batch.fine ? ' fine' : ''}`;
       list.forEach((i, k) => {
         matrix.fromArray(batch.m, i * 16);
         mesh.setMatrixAt(k, matrix);
@@ -1524,13 +1907,66 @@ export function buildWorld(scene: THREE.Scene) {
       mesh.castShadow = batch.shadow;
       mesh.receiveShadow = batch.role !== 'lamp';
       mesh.computeBoundingSphere();
-      root.add(mesh);
+      (batch.fine ? fineRoot : root).add(mesh);
     }
   }
+  // Decals (grilles, railings, AC fronts, shutters, goods...) and cloth (flags, washing), base and fine layers.
+  const decalTexture = decalAtlas();
+  const decalMaterial = new THREE.MeshStandardMaterial({ map: decalTexture, alphaTest: 0.5, vertexColors: true, side: THREE.DoubleSide, roughness: 0.85, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2 });
+  // What hangs inside a shop front lights up with it after dark (aGlow), the iron outside does not.
+  const decalNight = { value: 0 };
+  decalMaterial.onBeforeCompile = (shader) => {
+    shader.uniforms.decalNight = decalNight;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float aGlow;\nvarying float vDecalGlow;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvDecalGlow = aGlow;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nuniform float decalNight;\nvarying float vDecalGlow;')
+      .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += diffuseColor.rgb * vDecalGlow * decalNight;');
+  };
+  decalMaterial.customProgramCacheKey = () => 'street-decals';
+  const clothTex = clothAtlas();
+  const clothMat = clothMaterial(clothTex.texture, shaderTime);
+  textures.push(decalTexture, clothTex.texture);
+  materials.push(decalMaterial, clothMat);
+  for (const [layer, quads] of [[root, decals.base], [fineRoot, decals.fine]] as const) {
+    if (!quads.length) continue;
+    const built = buildDecals(quads, decalMaterial, layer === root ? 'Decals' : 'Decals (fine)');
+    layer.add(...built.meshes);
+    geometries.push(...built.geometries);
+  }
+  const clothMeshes: THREE.InstancedMesh[] = [];
+  for (const [layer, items] of [[root, cloths.base], [fineRoot, cloths.fine]] as const) {
+    if (!items.length) continue;
+    const built = buildCloth(items, clothMat, clothTex.cells, layer === root ? 'Flags' : 'Washing');
+    layer.add(built.mesh);
+    geometries.push(built.geometry);
+    clothMeshes.push(built.mesh);
+  }
+  // Shop light pools on the pavement after dark, each switched by its shop's opening hours.
+  const shopPoolMaterial = new THREE.MeshBasicMaterial({ map: poolTexture, color: '#d9ecff', transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false, toneMapped: false });
+  materials.push(shopPoolMaterial);
+  const shopPoolMesh = new THREE.InstancedMesh(poolGeometry, shopPoolMaterial, Math.max(1, shopPools.length));
+  shopPoolMesh.name = 'Shop light';
+  const placeShopPools = (hour: number | null) => {
+    shopPools.forEach((sp, i) => {
+      const hours = sp.shop >= 0 ? HOURS.get(sp.shop) : undefined;
+      const lit = hour === null || !hours || isOpen(hours, hour);
+      const size = lit ? sp.size : 0;
+      shopPoolMesh.setMatrixAt(i, matrix.compose(position.set(sp.x, groundHeight(sp.x, sp.z) + 0.037, sp.z), quaternion.identity(), scale.set(size, 1, size)));
+    });
+    shopPoolMesh.instanceMatrix.needsUpdate = true;
+  };
+  placeShopPools(null);
+  shopPoolMesh.count = shopPools.length;
+  shopPoolMesh.computeBoundingSphere();
+  shopPoolMesh.visible = false;
+  shopPoolMesh.renderOrder = 2;
+  root.add(shopPoolMesh);
   // Cutaway: when a building stands between the camera and the player, everything in front of the player
   // inside a soft circle around them on screen is discarded (dithered at the rim), so they stay visible.
   const cut = { center: { value: new THREE.Vector2() }, depth: { value: 0 }, radius: { value: 0 }, aspect: { value: 1 } };
-  const uncut = new Set<THREE.Material>([roles.ground, poolMaterial, neonPoolMaterial, puddleMaterial, waveMaterial]);
+  const uncut = new Set<THREE.Material>([roles.ground, roles.paving, poolMaterial, neonPoolMaterial, shopPoolMaterial, puddleMaterial, waveMaterial]);
   for (const material of materials) {
     if (uncut.has(material)) continue;
     const previous = material.onBeforeCompile.bind(material);
@@ -1552,6 +1988,24 @@ export function buildWorld(scene: THREE.Scene) {
   }
   let cutStrength = 0;
   const focusPoint = new THREE.Vector3();
+  // Cables and smoke are unlit shader materials (outside the cutaway): setAtmosphere dims them at night.
+  const cableShared = cableUniforms();
+  cableShared.time = shaderTime;
+  const cableMeshes: THREE.Mesh[] = [];
+  for (const [layer, list] of [[root, cables.base], [fineRoot, cables.fine]] as const) {
+    if (!list.length) continue;
+    const built = buildCables(list, cableShared);
+    layer.add(built.mesh);
+    materials.push(built.material);
+    geometries.push(built.geometry);
+    cableMeshes.push(built.mesh);
+  }
+  const smokeTime = { value: 0 };
+  const smokeBuilt = buildSmoke(emitters, smokeTime);
+  root.add(smokeBuilt.mesh);
+  materials.push(smokeBuilt.material);
+  geometries.push(smokeBuilt.geometry);
+  let detail = 0;
 
   // Nothing in the neighbourhood moves, so skip per-frame matrix recomputation for the whole tree.
   root.traverse((object) => { object.updateMatrix(); object.matrixAutoUpdate = false; });
@@ -1559,7 +2013,7 @@ export function buildWorld(scene: THREE.Scene) {
 
   const identity = new THREE.Quaternion();
   const groundBase = new THREE.Color('#ffffff');
-  let lastNight = -1, lastWet = -1;
+  let lastNight = -1, lastWet = -1, poolHour = -1;
 
   // ---- Zombie mode: the power is out, everything is dusty, and the streets are full of debris. ----
   let apocalypse = false;
@@ -1660,13 +2114,17 @@ export function buildWorld(scene: THREE.Scene) {
     return group;
   }
   const sky = new THREE.Color('#bcd2dc');
-  return {
+  const api = {
     colliders,
     /** Seats and tables a ragdoll can land on (not obstacles for walking, shooting or the camera). */
     seats,
     update(time: number) {
       skyline.update(time);
       updateSignals(time);
+      // Flags, washing, cables and LEDs move in their shaders; the lowest levels hold them still.
+      const t = time % 3600;
+      if (detail < 4) shaderTime.value = t;
+      smokeTime.value = t;
       waves.forEach((wave, i) => {
         matrix.compose(position.set(wave.x + Math.sin(time * 0.3 + i) * 0.6, -0.78, wave.z), identity, scale.set(wave.width, 1, 1));
         waveMesh.setMatrixAt(i, matrix);
@@ -1680,7 +2138,7 @@ export function buildWorld(scene: THREE.Scene) {
     focus(camera: THREE.PerspectiveCamera, x: number, y: number, z: number, dt: number, enabled = true) {
       const { x: cx, y: cy, z: cz } = camera.position;
       let hidden = false;
-      if (enabled) for (const p of PLOTS) if (segmentHitsBlock(cx, cy, cz, x, y, z, p.full, p.h + 2.5)) { hidden = true; break; }
+      if (enabled) for (const p of PLOTS) if (segmentHitsBlock(cx, cy, cz, x, y, z, p.full, p.h + 3.8)) { hidden = true; break; }
       cutStrength += ((hidden ? 1 : 0) - cutStrength) * (1 - Math.exp(-dt * 8));
       if (cutStrength < 0.01) { cut.radius.value = 0; return; }
       const depth = -focusPoint.set(x, y, z).applyMatrix4(camera.matrixWorldInverse).z;
@@ -1698,16 +2156,41 @@ export function buildWorld(scene: THREE.Scene) {
       roles.solid.color.set(on ? '#b9af9d' : '#ffffff');
       roles.glass.color.set(on ? '#8c8b86' : '#ffffff');
       roles.glassLit.color.set(on ? '#8c8b86' : '#ffffff');
+      for (const role of [roles.wall, roles.tiles, roles.roofTile] as const) role.color.set(on ? '#b9af9d' : '#ffffff');
       groundBase.set(on ? '#aaa395' : '#ffffff');
+      smokeBuilt.mesh.visible = !on && detail <= 2;
+      lastNight = -1;
+    },
+    /**
+     * Quality level (game.ts applyLevel, 0 best .. 5): the fine layer (washing, antennas, service drops, stickers) and
+     * shop light pools show up to level 3, smoke up to 2; from level 4 flags, cables and LEDs hold still and walls,
+     * paving and roofs drop their painted patterns for plain colours; the last level hides the cables too.
+     */
+    setDetail(level: number) {
+      detail = level;
+      fineRoot.visible = level <= 3;
+      const flat = level >= 4;
+      if ((surfaceDetail.value < 0.5) !== flat) {
+        surfaceDetail.value = flat ? 0 : 1;
+        for (const m of [roles.wall, roles.paving, roles.tiles, roles.roofTile]) m.needsUpdate = true;
+      }
+      smokeBuilt.mesh.visible = level <= 2 && !apocalypse;
+      cableShared.sway.value = level >= 4 ? 0 : 1;
+      for (const mesh of cableMeshes) if (mesh.parent === root) mesh.visible = level <= 4;
       lastNight = -1;
     },
     /** Burning barrels of zombie mode (empty in the normal city). */
     get fires() { return apocalypse ? fires : []; },
     /** `night` 0..1 lights windows, lamps, signs and light pools; `wet` 0..1 darkens and glosses the paving. */
-    setAtmosphere(a: { night: number; wet: number; sky?: THREE.Color }) {
+    setAtmosphere(a: { night: number; wet: number; sky?: THREE.Color; hours?: number }) {
       if (a.sky) sky.copy(a.sky);
       const night = Math.min(1, Math.max(0, a.night || 0));
       const wet = Math.min(1, Math.max(0, a.wet || 0));
+      // Shop light pools follow their shops' hours when the clock is given (a closed shop's shutter is down).
+      if (a.hours !== undefined) {
+        const hour = Math.floor(a.hours * 4) / 4;
+        if (hour !== poolHour) { poolHour = hour; placeShopPools(hour); }
+      }
       if (Math.abs(night - lastNight) < 0.004 && Math.abs(wet - lastWet) < 0.004) return;
       lastNight = night;
       lastWet = wet;
@@ -1729,6 +2212,20 @@ export function buildWorld(scene: THREE.Scene) {
       roles.ground.metalness = 0.12 * wet;
       puddleMaterial.opacity = wet * 0.6;
       puddles.visible = wet > 0.02;
+      // Shop tubes and LED borders, the pools of shop light, and the unlit cables and smoke dimmed at night.
+      roles.tube.emissiveIntensity = (0.1 + night * 2.2) * power;
+      roles.led.emissiveIntensity = (0.25 + night * 1.8) * power;
+      shopPoolMaterial.opacity = night * 0.45;
+      decalNight.value = night * 0.75 * power;
+      shopPoolMesh.visible = night > 0.02 && !apocalypse && detail <= 3;
+      cableShared.shade.value = 1 - 0.78 * night;
+      smokeBuilt.light.value = 1 - 0.55 * night;
+      // Rain darkens and glosses the paving, the roof decks and tiles, and soaks the walls a little.
+      roles.paving.color.copy(groundBase).multiplyScalar(1 - 0.3 * wet);
+      roles.paving.roughness = 0.88 - 0.6 * wet;
+      roles.tiles.roughness = 0.88 - 0.6 * wet;
+      roles.roofTile.roughness = 0.8 - 0.5 * wet;
+      roles.wall.color.set(apocalypse ? '#b9af9d' : '#ffffff').multiplyScalar(1 - 0.12 * wet);
     },
     dispose() {
       scene.remove(root);
@@ -1738,4 +2235,17 @@ export function buildWorld(scene: THREE.Scene) {
       root.clear();
     },
   };
+  // Until game.ts passes its quality level (applyLevel -> setDetail), start at the level it will start at.
+  api.setDetail(startDetail());
+  root.userData.build = { ms: Math.round(performance.now() - buildStart), decals: decals.base.length + decals.fine.length, cloth: cloths.base.length + cloths.fine.length, cables: cables.base.length + cables.fine.length, smoke: emitters.length, pools: shopPools.length };
+  return api;
+}
+
+/** The quality level game.ts starts at: the saved preset, else what the GPU suggests (quality.ts). */
+function startDetail() {
+  try {
+    const saved = localStorage.getItem('pvo-quality');
+    if (saved === 'high' || saved === 'medium' || saved === 'low') return MODE_LEVEL[saved];
+  } catch { /* no storage: guess from the GPU */ }
+  return detectStartLevel();
 }

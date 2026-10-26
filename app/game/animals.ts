@@ -256,6 +256,21 @@ export function createAnimals(
       }
       return { x: animal.corpse!.pos[0], y: animal.corpse!.pos[1], z: animal.corpse!.pos[2] };
     },
+    /** Crumbs scattered at (x, z): the nearest pigeon flock (within 40 m) comes over and pecks round them. */
+    lure(x: number, z: number) {
+      let best = Infinity, hx = 0, hz = 0;
+      for (const a of animals) {
+        if (a.kind !== 'bird' || a.state === 'down' || a.state === 'gone') continue;
+        const d = Math.hypot(a.homeX - x, a.homeZ - z);
+        if (d < best) { best = d; hx = a.homeX; hz = a.homeZ; }
+      }
+      if (best > 40 || best < 1) return;
+      for (const a of animals) {
+        if (a.kind !== 'bird' || a.homeX !== hx || a.homeZ !== hz || a.state === 'down' || a.state === 'gone') continue;
+        a.homeX = x; a.homeZ = z; a.roam = 2.5;
+        if (best > 6) { a.state = 'fly'; a.tx = x + (Math.random() - 0.5) * 3; a.tz = z + (Math.random() - 0.5) * 3; a.timer = 0; }
+      }
+    },
     near(x: number, z: number, radius: number, callback: (index: number, ax: number, az: number) => void) {
       animals.forEach((animal, index) => {
         if (animal.state === 'gone' || animal.corpse) return;

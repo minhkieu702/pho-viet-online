@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import type { Collider } from './world';
-import { LAND, RIVER, WATER_LEVEL } from './city';
+import { WATER_LEVEL } from './city';
+import type { CollisionIndex } from './map/collision';
+import { bounds as terrainBounds } from './map/terrain';
 import {
   ARM_ITEMS, FIGURE, FigureBatch, HAND, HEAD, RAGDOLL_RADII, TORSO, figureGeometry, figureMaterial, mixHand, palettesOf, ragdollPose, setBits, styleOf, swingCode,
   type Detail, type FigureLook, type FigureStyle,
@@ -200,7 +202,13 @@ function basis(m: Float32Array, x: V, y: V, z: V, sx: number, sy: number, sz: nu
 }
 const clamp = (x: number, lo: number, hi: number) => (x < lo ? lo : x > hi ? hi : x);
 
-export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground: (x: number, z: number) => number) {
+/**
+ * `colliders` are what bodies hit (filed in a collision index on first use). `setup.solids` is the game's shared
+ * index of static solids (map/collision.ts, refs are colliders): when given, it is queried too, so `colliders` need
+ * only hold what it lacks (seats and tables). `setup.bounds` fences the bodies in (default: the terrain's bounds).
+ */
+export type RagdollOptions = { solids?: CollisionIndex | null; bounds?: { minX: number; maxX: number; minZ: number; maxZ: number } };
+export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground: (x: number, z: number) => number, setup: RagdollOptions = {}) {
   let detail: Detail = 'hi';
   const materials = { body: figureMaterial('body'), arm: figureMaterial('arm'), leg: figureMaterial('leg') };
   // Torsos first, then loose heads and fallen hats, in one body batch.
@@ -219,7 +227,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
   const movers: Mover[] = [];
   const world: RagdollWorld = {
     ground, grid: null, water: WATER_LEVEL, movers,
-    bounds: { minX: LAND.minX, maxX: LAND.maxX, minZ: RIVER.minZ, maxZ: LAND.maxZ },
+    bounds: { ...(setup.bounds ?? terrainBounds) },
   };
   let quality: { bodies: number; iterations: number; fullRate: number } = RAGDOLL_QUALITY[0];
   let options = solverOptions(quality.iterations);
@@ -577,8 +585,8 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
   }
 
   function spawn(options: SpawnOptions) {
-    // Colliders are static once the world is built (traffic-light poles are added late): grid them on first use.
-    if (!world.grid) world.grid = createColliderGrid(colliders);
+    // Colliders are static once the world is built (traffic-light poles are added late): index them on first use.
+    if (!world.grid) world.grid = createColliderGrid(colliders, 16, setup.solids ?? null);
     while (bodies.length >= quality.bodies || !freeSlots.length) if (!evict(false) && !evict(true)) break;
     const { x, y, z, yaw, scale, look, velocity: vel } = options;
     const style = styleOf(look);

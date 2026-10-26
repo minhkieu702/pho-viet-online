@@ -75,12 +75,13 @@ export type TransitNetwork = { lines: TransitLine[]; stops: Map<string, TransitS
 
 // ---- Today's stops and lines ----------------------------------------------------------------------------
 
-/** The 4 shelters city.ts builds (busStop()), bench position and facing; named after what stands beside them. */
+/** The shelters city.ts builds (busStop()), bench position and facing; named after what stands beside them. */
 const BUS_STOPS: StopSpec[] = [
   { id: 'ben-do', name: 'BẾN ĐÒ AN HÒA', mode: 'bus', wait: { x: -76, z: -117.95 }, yaw: 0 },
   { id: 'cong-an', name: 'CÔNG AN PHƯỜNG AN HÒA', mode: 'bus', wait: { x: -117.95, z: -19.5 }, yaw: Math.PI / 2 },
   { id: 'truong-hoc', name: 'TRƯỜNG TIỂU HỌC AN HÒA', mode: 'bus', wait: { x: 38, z: 117.95 }, yaw: Math.PI },
   { id: 'benh-vien', name: 'BỆNH VIỆN AN HÒA', mode: 'bus', wait: { x: 117.95, z: -36 }, yaw: -Math.PI / 2 },
+  { id: 'bach-dang', name: 'BẾN BẠCH ĐẰNG', mode: 'bus', wait: { x: 180, z: -117.95 }, yaw: 0 },
 ];
 /** The river bus berths alongside the pier end of the two docks that do not hire out speedboats. */
 export const BERTH_Z = -154.8;
@@ -101,7 +102,6 @@ const busHours = (early: number, rush: number, day: number, evening: number): He
 const BUS = { mode: 'bus' as const, cruise: 8.5, accel: 1, decel: 1.3, dwell: 10, layover: 20, turn: 2, fare: 7, capacity: 60, length: 12, hw: 1.25, door: 4.8 };
 /** The four shelters in loop order; each line starts (and lays over) at a different one. */
 const AN_HOA = ['ben-do', 'cong-an', 'truong-hoc', 'benh-vien'];
-const startAt = (k: number) => [...AN_HOA.slice(k), ...AN_HOA.slice(0, k)];
 /**
  * The river bus course, heading east at both berths: from Bạch Đằng on to a U-turn, west along the outer
  * lane, a U-turn into An Hòa, then east along the inner lane and in to Bạch Đằng again.
@@ -142,10 +142,10 @@ function ferryCourse() {
 
 export const LINE_SPECS: LineSpec[] = [
   { ...BUS, id: '03', name: 'VÒNG AN HÒA', stops: AN_HOA, headways: busHours(110, 70, 100, 120) },
-  // From the school: out along Hoa Sữa and up Tôn Đức Thắng, back along the river past Bến Bạch Đằng.
-  { ...BUS, id: '08', name: 'AN HÒA – TÔN ĐỨC THẮNG', stops: startAt(2), via: { 1: [{ x: 327, z: -81 }] }, headways: busHours(130, 90, 130, 150), offset: 25 },
-  // From the hospital: up Nguyễn Huệ to the river, then through the middle of An Hòa (Đường An Hòa, Đường Trung Tâm).
-  { ...BUS, id: '15', name: 'AN HÒA – NGUYỄN HUỆ', stops: startAt(3), via: { 0: [{ x: 219, z: -81 }], 2: [{ x: -27, z: 3 }] }, headways: busHours(120, 80, 110, 130), offset: 50 },
+  // From the school: out along Hoa Sữa and up Tôn Đức Thắng, back along the river with a stop at Bến Bạch Đằng.
+  { ...BUS, id: '08', name: 'AN HÒA – BẠCH ĐẰNG', stops: ['truong-hoc', 'benh-vien', 'bach-dang', 'ben-do', 'cong-an'], via: { 1: [{ x: 327, z: -81 }] }, headways: busHours(130, 90, 130, 150), offset: 25 },
+  // From the hospital: up Nguyễn Huệ to the river and Bến Bạch Đằng, then through the middle of An Hòa (Đường An Hòa, Đường Trung Tâm).
+  { ...BUS, id: '15', name: 'BẠCH ĐẰNG – AN HÒA', stops: ['benh-vien', 'bach-dang', 'ben-do', 'cong-an', 'truong-hoc'], via: { 0: [{ x: 219, z: -81 }], 3: [{ x: -27, z: 3 }] }, headways: busHours(120, 80, 110, 130), offset: 50 },
   {
     id: 'W1', name: 'TÀU BUÝT SÔNG BẠCH ĐẰNG – AN HÒA', mode: 'waterbus', stops: ['wb-bach-dang', 'wb-an-hoa'], course: waterbusCourse(),
     cruise: 6, accel: 0.4, decel: 0.5, dwell: 25, layover: 30, turn: 2, fare: 15, capacity: 75, length: 22, hw: 2.5, door: 0,
@@ -778,3 +778,141 @@ export function createTransit(network: TransitNetwork = buildNetwork(), opts: { 
   };
 }
 export type Transit = ReturnType<typeof createTransit>;
+
+// ---- Driving a bus line (pure helpers for buses.ts) -------------------------------------------------------
+
+/**
+ * The bus as buses.ts drives it: the rear axle runs on the line's path (so the rear wheels never slip and the
+ * body swings wide at the front through a turn, like a real 12 m bus), the centre REAR metres ahead of it and the
+ * nose NOSE metres ahead of the centre. A bus docked at visit s has its centre at s, so its rear axle at s - REAR.
+ */
+export const BUS_GEOMETRY = { REAR: 2.6, WHEELBASE: 6, NOSE: 6, HW: 1.25 } as const;
+/** Where a bus whose rear axle is at arc s (moved `lat` metres to the right of the path) stands: centre, heading, nose. */
+export function busPose(p: Path, s: number, lat = 0) {
+  const r = pathPoint(p, s), rx = r.x - r.hz * lat, rz = r.z + r.hx * lat;
+  return { x: rx + r.hx * BUS_GEOMETRY.REAR, z: rz + r.hz * BUS_GEOMETRY.REAR, hx: r.hx, hz: r.hz, yaw: Math.atan2(r.hx, r.hz), rx, rz };
+}
+/** Curvature (1/m, + turning right) of a path at s, from the heading change over `d` metres either side. */
+export function curvature(p: Path, s: number, d = 2) {
+  const a = pathPoint(p, s - d), b = pathPoint(p, s + d);
+  // x east and z south: a right turn (clockwise seen from above, east to south) has a positive cross of the headings.
+  return Math.atan2(a.hx * b.hz - a.hz * b.hx, a.hx * b.hx + a.hz * b.hz) / (2 * d);
+}
+/** Highest speed (m/s) for the rear axle's path from s to s + ahead, holding sideways acceleration to `lat` m/s². */
+export function curveSpeed(p: Path, s: number, ahead: number, lat = 1.6) {
+  let v = Infinity;
+  for (let d = 0; d <= ahead; d += 2) {
+    const k = Math.abs(curvature(p, s + d));
+    if (k > 1e-4) v = Math.min(v, Math.sqrt(lat / k) + d * 0.25);
+  }
+  return v;
+}
+/** A traffic light on a bus line: the arc where the nose meets its stop line, the node and the signal group facing it. */
+export type SignalPoint = { s: number; node: number; group: number };
+/**
+ * The stop lines a bus line crosses heading into a signalled junction, in path order: the arc of `path` (the line's
+ * own, or a bus's rear-axle path) at which `probe(s)` (the path point, or the bus's nose) is level with the line.
+ */
+export function signalPoints(line: TransitLine, graph: RoadGraph = LEGACY_ROADS, path: Path = line.path, probe = (s: number) => pathPoint(path, s)): SignalPoint[] {
+  const out: SignalPoint[] = [];
+  for (const step of line.plan) {
+    const e = graph.edges[step.edge], node = step.dir > 0 ? e.b : e.a;
+    const a = graph.approaches.find((q) => q.node === node && q.edge === e.id && q.dir === step.dir);
+    if (!a) continue;
+    // Along the path, where the distance to the node centre (measured along the road) drops through the stop line.
+    const n = graph.nodes[node];
+    let prev = Infinity;
+    for (let s = 0; s <= path.len; s += 0.25) {
+      const p = probe(s), h = graph.project(e, p.x, p.z);
+      const along = (n.x - p.x) * a.hx + (n.z - p.z) * a.hz, aligned = p.hx * a.hx + p.hz * a.hz > 0.9;
+      if (aligned && Math.abs(h.off) < e.half && prev > a.stop && along <= a.stop && along > a.stop - 2) { out.push({ s, node, group: a.group }); break; }
+      prev = aligned ? along : Infinity;
+    }
+  }
+  return out.sort((p, q) => p.s - q.s);
+}
+/**
+ * How a 12 m bus drives a line: the path its rear axle follows, built by running the line's lane path with a guide
+ * point. Through right turns the rear axle is the guide (the nose swings wide, over the oncoming lanes of the
+ * street it turns into, and the rear wheels clear the corner kerb); through left turns the front axle is (the rear
+ * cuts in towards the middle of the junction and the nose stays off the far kerb), easing between the two on the
+ * straights. Then, on that rear path: the arc to dock at each visit (centre at the stop), the stop lines the nose
+ * must wait at, and a table from the line's own arc lengths (the timetable's) to rear-path arcs.
+ */
+export function busCourse(line: TransitLine, graph: RoadGraph = LEGACY_ROADS) {
+  const p = line.path, W = BUS_GEOMETRY.WHEELBASE, n = Math.ceil(p.len);
+  const left = new Uint8Array(n + 1);
+  for (let i = 0; i <= n; i++) left[i] = curvature(p, i) < -0.03 ? 1 : 0;
+  // The guide's distance ahead of the rear axle per metre of the line: full through a left corner, easing in over
+  // the 14 m before it and out over the 8 m after it.
+  const guide = new Float32Array(n + 1);
+  for (let i = 0; i <= n; i++) {
+    let g = 0;
+    for (let d = 0; d <= 18; d++) if (left[(i + d) % (n + 1)]) { g = Math.max(g, 1 - smooth((d - 4) / 14)); break; }
+    for (let d = 1; d <= 10; d++) if (left[(i - d + n + 1) % (n + 1)]) { g = Math.max(g, 1 - smooth((d - 2) / 8)); break; }
+    guide[i] = g * W;
+  }
+  const gOf = (s: number) => { const i = Math.floor(s), f = s - i; return guide[i % (n + 1)] * (1 - f) + guide[(i + 1) % (n + 1)] * f; };
+  // The rear axle trails the guide at the guide's distance; one lap settles it, the second is recorded.
+  const start = pathPoint(p, 0), pts: number[] = [];
+  let rx = start.x, rz = start.z;
+  for (let s = 0.1; s <= 2 * p.len + 1e-6; s += 0.1) {
+    const q = pathPoint(p, s), g = gOf(s % p.len);
+    if (g < 0.01) { rx = q.x; rz = q.z; } else {
+      const dx = q.x - rx, dz = q.z - rz, l = Math.hypot(dx, dz) || 1;
+      rx = q.x - (dx / l) * g; rz = q.z - (dz / l) * g;
+    }
+    if (s < p.len) continue;
+    if (!pts.length || Math.hypot(rx - pts[pts.length - 2], rz - pts[pts.length - 1]) >= 0.5) pts.push(rx, rz);
+  }
+  if (Math.hypot(pts[0] - pts[pts.length - 2], pts[1] - pts[pts.length - 1]) > 1e-6) pts.push(pts[0], pts[1]);
+  const path = makePath(pts);
+  const nose = (s: number) => { const b = busPose(path, s); return { x: b.x + b.hx * BUS_GEOMETRY.NOSE, z: b.z + b.hz * BUS_GEOMETRY.NOSE, hx: b.hx, hz: b.hz }; };
+  // Line arc -> rear arc, every metre (the centre of a bus at line arc s has its rear axle REAR behind it).
+  const map = new Float32Array(n + 1);
+  for (let i = 0; i <= n; i++) {
+    const c = pathPoint(p, i);
+    map[i] = pathProject(path, c.x - c.hx * BUS_GEOMETRY.REAR, c.z - c.hz * BUS_GEOMETRY.REAR).s;
+  }
+  const docks = line.visits.map((v) => { const c = pathPoint(p, v.s); return pathProject(path, c.x - c.hx * BUS_GEOMETRY.REAR, c.z - c.hz * BUS_GEOMETRY.REAR).s; });
+  return {
+    path, docks, signals: signalPoints(line, graph, path, nose), guide,
+    /** The rear-path arc of a bus whose centre the timetable puts at line arc s. */
+    rearOf(s: number) { const w = ((s % p.len) + p.len) % p.len, i = Math.floor(w), a = map[i], b = map[Math.min(n, i + 1)]; return b >= a ? a + (b - a) * (w - i) : a; },
+  };
+}
+export type BusCourse = ReturnType<typeof busCourse>;
+/** Forward distance along a closed path from arc a to arc b. */
+export const pathAhead = (p: Path, a: number, b: number) => (((b - a) % p.len) + p.len) % p.len;
+/** Where a rider waiting for a bus line stands: the shelter (its back panel), from the bench and the way it faces. */
+export function shelterOf(spec: StopSpec) {
+  const yaw = spec.yaw ?? 0;
+  return { x: spec.wait.x - Math.sin(yaw) * 1.15, z: spec.wait.z - Math.cos(yaw) * 1.15, yaw };
+}
+/** "TUYẾN 03 • 08 • 15": the route numbers a shelter's sign may show (the lines that call there). */
+export function shelterSign(network: TransitNetwork, stopId: string) {
+  const ids = network.lines.filter((l) => l.mode === 'bus' && l.visits.some((v) => v.stop.id === stopId)).map((l) => l.id);
+  return ids.length ? `TUYẾN ${ids.join(' • ')}` : 'TẠM NGƯNG PHỤC VỤ';
+}
+/** A stop's name for people: "BẾN ĐÒ AN HÒA" reads "Bến Đò An Hòa". */
+export function stopTitle(name: string) {
+  return name.toLocaleLowerCase('vi').replace(/(^|[\s–-])(\p{L})/gu, (_, a: string, b: string) => a + b.toLocaleUpperCase('vi'));
+}
+/**
+ * Moored boats the player can use (boats.ts draws them): the đò at the west face of the An Hòa pier, and a fishing
+ * sampan anchored off the promenade that is only reached from the water.
+ */
+export const MOORINGS = [
+  { id: 'do-an-hoa', kind: 'ferry' as const, x: -83.2, z: -145.5, yaw: 0, name: 'ĐÒ BẾN AN HÒA' },
+  { id: 'ghe-cau', kind: 'fishing' as const, x: 74, z: -150, yaw: -0.3, name: 'GHE CÂU' },
+];
+/**
+ * Everything transit answers with E, as pure data for the interact audit (interact.ts auditEntries): each shelter's
+ * timetable and route sign, each waterbus pier's ring, the moored đò and ghe. buses.ts registers the same places.
+ */
+export const AUDIT_ENTRIES: { id: string; covers: ('transit' | 'boat')[]; x: number; z: number; r: number }[] = [
+  ...STOP_SPECS.filter((s) => s.mode === 'bus' && !s.planned).map((s) => ({ id: `transit:shelter:${s.id}`, covers: ['transit' as const], ...xz(shelterOf(s)), r: 3.2 })),
+  ...STOP_SPECS.filter((s) => s.mode === 'waterbus' && !s.planned).map((s) => ({ id: `transit:pier:${s.id}`, covers: ['transit' as const], x: s.wait.x, z: s.wait.z, r: 4 })),
+  ...MOORINGS.map((m) => ({ id: `transit:boat:${m.id}`, covers: ['boat' as const], x: m.x, z: m.z, r: 3.5 })),
+];
+function xz(p: Pt) { return { x: p.x, z: p.z }; }

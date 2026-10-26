@@ -474,8 +474,8 @@ export const ANCHORS: Record<string, Record<string, string>> = {
   },
 };
 /**
- * The chapter's own named points (validated on the map by scripts/story-ch04.test.mjs): the door of QUÁN CƠM
- * (building 79, the only "QUÁN CƠM · CƠM TẤM" in An Hòa) and the Dream's restart in the eastbound curb lane 24 m
+ * The chapter's own named points (validated on the map by scripts/story-ch04.test.mjs): the door of QUÁN CƠM DÌ SÁU
+ * (building 79, the only "QUÁN CƠM DÌ SÁU · CƠM TẤM SƯỜN BÌ CHẢ" in An Hòa) and the Dream's restart in the eastbound curb lane 24 m
  * behind the van at BẾN XE AN HÒA (a road spot: the chase begins on the carriageway).
  */
 export const PLACES = {

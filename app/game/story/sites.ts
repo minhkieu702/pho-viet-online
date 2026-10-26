@@ -98,7 +98,7 @@ export const SITES: Record<string, Site> = {
       tarp: { x: -69, z: -63.4, r: 0.9, note: 'c5-m1 dawn: the rebuilt matte-black Dream under a tarp on the sidewalk' },
       plateCar: { x: -40, z: -57.4, yaw: -H, road: true, note: 'c1-m2 observation test: the scripted car passes westbound in front of the shop' },
     },
-    notes: 'Ông Tư\'s shop: the corner XE MÁY of ĐƯỜNG HOA SỮA × ĐƯỜNG BÀNG LĂNG (building 21), renamed SỬA XE TƯ; burning in c6-m2, a burnt-out variant until the epilogue, then XE MÁY ÔNG TƯ. The player\'s bike dealer (building 5, BIKE_SHOP (20,-10.9)) is never touched by the story.',
+    notes: 'Ông Tư\'s shop: the corner bike shop of ĐƯỜNG HOA SỮA × ĐƯỜNG BÀNG LĂNG (building 21, XE MÁY HÙNG on today\'s sign), renamed SỬA XE TƯ; burning in c6-m2, a burnt-out variant until the epilogue, then XE MÁY ÔNG TƯ. The player\'s bike dealer (building 5, BIKE_SHOP (20,-10.9)) is never touched by the story.',
   },
   'xe-may-alley': {
     name: 'HẺM SAU TIỆM ÔNG TƯ', district: 'D1', phase: 'P0', kind: 'alley', x: -80, z: -81.3, area: [-97, -60.5, -85, -77.5],
@@ -135,8 +135,8 @@ export const SITES: Record<string, Site> = {
     notes: 'c3-m1: break the SUV\'s line of sight through the park (cars cannot follow).',
   },
   'nha-thuoc': {
-    name: 'NHÀ THUỐC', district: 'D1', phase: 'P0', kind: 'door', building: 112, x: -119.7, z: 26.68, yaw: H, door: { x: -119.7, z: 26.68 },
-    notes: 'The only NHÀ THUỐC in An Hòa (ĐƯỜNG TRE XANH): its night window is the door. c2-m1 blank order, c5-m1 Quang\'s pickup.',
+    name: 'NHÀ THUỐC HẠNH', district: 'D1', phase: 'P0', kind: 'door', building: 112, x: -119.7, z: 26.68, yaw: H, door: { x: -119.7, z: 26.68 },
+    notes: 'The only pharmacy in An Hòa (ĐƯỜNG TRE XANH): NHÀ THUỐC CÔ BA on today\'s sign, renamed NHÀ THUỐC HẠNH by RENAMES so "Cô Ba" stays one woman. Its night window is the door. c2-m1 blank order, c5-m1 Quang\'s pickup.',
   },
   'benh-vien': {
     name: 'BỆNH VIỆN AN HÒA', district: 'D1', phase: 'P0', kind: 'door', building: 54, x: 119.7, z: -27, yaw: -H, door: { x: 119.7, z: -27 },
@@ -149,19 +149,19 @@ export const SITES: Record<string, Site> = {
     notes: 'c1-m2 order 1: bánh mì to the office lobby.',
   },
   'banh-mi': {
-    name: 'BÁNH MÌ', district: 'D1', phase: 'P0', kind: 'door', building: 41, x: -66.5, z: -44.8, yaw: PI, door: { x: -66.5, z: -44.8 },
+    name: 'BÁNH MÌ PHÚC', district: 'D1', phase: 'P0', kind: 'door', building: 41, x: -66.5, z: -44.8, yaw: PI, door: { x: -66.5, z: -44.8 },
     spots: { curb: { x: -66.5, z: -46.4, yaw: H, r: 1, note: 'the Dream on the sidewalk in front, facing east along the street (checkpoint restore of order 1)' } },
-    notes: 'c1-m2 order 1 pickup, right across ĐƯỜNG HOA SỮA from Ông Tư\'s shop (keeps the name BÁNH MÌ after RENAMES).',
+    notes: 'c1-m2 order 1 pickup, right across ĐƯỜNG HOA SỮA from Ông Tư\'s shop. The site follows today\'s sign: the family-shop names make it the only BÁNH MÌ PHÚC, so it needs no rename.',
   },
   'tiem-hoa': {
-    name: 'TIỆM HOA', district: 'D1', phase: 'P0', kind: 'door', building: 43, x: -30, z: -44.8, yaw: PI, door: { x: -30, z: -44.8 },
+    name: 'TIỆM HOA CÔ THU', district: 'D1', phase: 'P0', kind: 'door', building: 43, x: -30, z: -44.8, yaw: PI, door: { x: -30, z: -44.8 },
     spots: { curb: { x: -30, z: -46.4, yaw: H, r: 1, note: 'the Dream on the sidewalk in front, facing east (checkpoint restore of order 2)' } },
-    notes: 'c1-m2 order 2 pickup (flowers for a new mother at BỆNH VIỆN AN HÒA); keeps the name TIỆM HOA.',
+    notes: 'c1-m2 order 2 pickup (flowers for a new mother at BỆNH VIỆN AN HÒA). The site follows today\'s sign, the only TIỆM HOA CÔ THU (the cast\'s "chị bán hoa" serves there).',
   },
   'pho-nong': {
-    name: 'PHỞ BÒ VIÊN', district: 'D1', phase: 'P0', kind: 'door', building: 44, x: -18, z: -44.8, yaw: PI, door: { x: -18, z: -44.8 },
+    name: 'PHỞ CHỊ BẢY', district: 'D1', phase: 'P0', kind: 'door', building: 44, x: -18, z: -44.8, yaw: PI, door: { x: -18, z: -44.8 },
     spots: { curb: { x: -18, z: -46.4, yaw: -H, r: 1, note: 'the Dream on the sidewalk in front, facing west toward the drop (checkpoint restore of order 3)' } },
-    notes: 'c1-m2 order 3 pickup (renamed from PHỞ CÔ BA so "Cô Ba" means one person).',
+    notes: 'c1-m2 order 3 pickup: phở bò viên, the sign\'s subtitle. The site follows today\'s sign, the only PHỞ CHỊ BẢY; no phở is called CÔ BA any more, so it needs no rename.',
   },
   'nha-khach-pho': {
     name: 'NHÀ SỐ 48 BỜ SÔNG', district: 'D1', phase: 'P0', kind: 'door', building: 63, x: -37.96, z: -96.3, yaw: PI, door: { x: -37.96, z: -96.3 },
@@ -314,22 +314,22 @@ export const SITES: Record<string, Site> = {
     notes: 'c7-m1 optional prep: buy rope at the riverside stalls (market POI).',
   },
   'sa-lan-07': {
-    name: 'SÀ LAN SEN VÀNG 07', district: 'D1', phase: 'P0', kind: 'water', x: 95, z: -191, yaw: H,
-    area: [80, 110, -194.5, -187.5],
+    name: 'SÀ LAN SEN VÀNG 07', district: 'D1', phase: 'P0', kind: 'water', x: 95, z: -194.5, yaw: H,
+    area: [80, 110, -198, -191],
     spots: {
-      cut: { x: 30, z: -190, water: true, note: 'c7-m2: cut the engine here, 50 m upstream of the stern, on the emptied lane' },
-      ladder: { x: 79.4, z: -191, water: true, note: 'stern ladder: the speedboat is tied here (scripted reposition)' },
-      fenders: { x: 92, z: -186.8, water: true, note: 'tyre fenders on the An Hòa side: climb aboard' },
-      wheelhouse: { x: 84, z: -191, y: 5.5, solid: true, note: 'wheelhouse at the stern, rotating searchlight on its roof' },
-      containers: { x: 100, z: -191, y: 1.6, solid: true, note: 'deck y 1.6, six 20 ft containers in two rows, 1 m side walks' },
-      tug: { x: 150, z: -196, water: true, note: 'c7-m2/3: the tug arrives from downstream with Cường' },
+      cut: { x: 30, z: -193.5, water: true, note: 'c7-m2: cut the engine here, 50 m upstream of the stern, on the emptied barge lane' },
+      ladder: { x: 79.4, z: -194.5, water: true, note: 'stern ladder: the speedboat is tied here (scripted reposition)' },
+      fenders: { x: 92, z: -190.9, water: true, note: 'tyre fenders hung on the An Hòa side of the hull: climb aboard (0.1 m off the hull, just outside the westbound speedboats\' sweep)' },
+      wheelhouse: { x: 84, z: -194.5, y: 5.5, solid: true, note: 'wheelhouse at the stern, rotating searchlight on its roof' },
+      containers: { x: 100, z: -194.5, y: 1.6, solid: true, note: 'deck y 1.6, six 20 ft containers in two rows, 1 m side walks' },
+      tug: { x: 150, z: -196, water: true, note: 'c7-m2/3: the tug arrives from downstream with Cường, along the barge lane' },
     },
-    notes: 'The traffic barge of lane -191 (boats.ts) switched to mode anchored at x 95, container-deck variant. Hull 30 × 7: clear of the speedboat lane -184.5 (envelope to -186.8) and the sampan lane -197.5; the fishing boats anchor at x 150 and -40.',
+    notes: 'The traffic barge of boats.ts LANES.barge (-194) switched to mode anchored at x 95, container-deck variant, its centre line 0.5 m toward the far bank. The 30 × 7 hull (z -198..-191) fills the gap between the westbound speedboats (lane -188.5, sweep to -190.8: 0.2 m) and the westbound sampans (lane -199, sweep from -198.25: 0.25 m); the fishing boats anchor at x 150 and -40 on -201.8. Chapter 7 asks boats.ts to hold speedWest off x 60..130 while the barge is anchored (story-decisions.md, amendment 2026-10-26).',
   },
   'r-thuyen-ruot': {
-    name: 'CA NÔ ĐUỔI BẮT', district: 'D1', phase: 'P0', kind: 'route', x: 77, z: -191,
-    route: [77, -191, 40, -186, 2, -176, -18, -188, -10, -199, 60, -199.5, 130, -199, 165, -185, 185, -165, 190, -154],
-    notes: 'c7-m3 boat chase: the tug blocks the run east, so loop west past BẾN AN HÒA, cross to the far bank, run east and in to BẾN BẠCH ĐẰNG (about 360 m). River traffic stays on as obstacles.',
+    name: 'CA NÔ ĐUỔI BẮT', district: 'D1', phase: 'P0', kind: 'route', x: 77, z: -194.5,
+    route: [77, -194.5, 40, -186, 2, -176, -18, -193, -10, -199, 60, -200.5, 130, -200.5, 165, -185, 185, -165, 190, -154],
+    notes: 'c7-m3 boat chase from the stern ladder: the tug blocks the run east, so loop west past BẾN AN HÒA, cross to the far bank, run east 2.5 m off the hull\'s far side (z -200.5) and in to BẾN BẠCH ĐẰNG (about 360 m). River traffic stays on as obstacles.',
   },
   // ---- D2 QUẬN 1 · BẾN NGHÉ (P0) ---------------------------------------------------------------------------
   'cp-162-0': { name: 'CHỐT VÀO QUẬN 1', district: 'D2', phase: 'P0', kind: 'road', x: 162, z: 0, notes: 'c9-m1 checkpoint at the downtown entry (ĐƯỜNG ĐỒNG KHỞI × ĐƯỜNG AN HÒA); the river swim bypasses it.' },
@@ -458,8 +458,8 @@ export const SITES: Record<string, Site> = {
   },
   'r-bin': {
     name: 'BÁM BIN QUA CHỢ ĐÊM', district: 'D1', phase: 'P0', kind: 'route', x: -62.6, z: -79.4,
-    route: [-62.6, -79.4, -62.4, -62.4, -62.4, 8.4, -62.4, 29.5, -46, 29.5, -12, 29.5],
-    notes: 'c3-m3 foot tail: from the alley mouth up the ĐƯỜNG BÀNG LĂNG sidewalk into the Chợ An Hòa night market (about 2 minutes); the lane leg runs at z 29.5, in front of the stalls (z 30.8..33.2).',
+    route: [-62.6, -79.4, -62.4, -62.4, -62.4, 8.4, -62.4, 29.2, -46, 29.5, -12, 29.5],
+    notes: 'c3-m3 foot tail: from the alley mouth up the ĐƯỜNG BÀNG LĂNG sidewalk into the Chợ An Hòa night market (about 2 minutes). It turns at z 29.2 and crosses to the market mouth 0.6 m south of the corner power pole (-61.6, 30); the lane leg runs at z 29.5, in front of the stalls (z 30.8..33.2).',
   },
   'r-ve-nha': {
     name: 'ĐƯỜNG VỀ QUÁN', district: 'D1', phase: 'P0', kind: 'route', x: -76, z: -117.95,
@@ -618,41 +618,22 @@ export const CUTSCENE_SITES: Record<string, { mission: string; phase: Phase; sit
 };
 
 /**
- * Unique names for the places the story names (for the world owner, city.ts): legacy shop names cycle over the
- * map, so "CÀ PHÊ CÔ BA" stands on 9 houses, "PHỞ CÔ BA" on 6, "XE MÁY" on 4, "TIỆM HOA" on 5, "BÁNH MÌ" on 7. One
- * keeps each name (CÀ PHÊ CÔ BA 13, TIỆM HOA 43, BÁNH MÌ 41) and "Cô Ba" stays one woman. Renamed shops keep
- * their kind and the word side-missions.ts matches (/BÁNH MÌ/, /PHỞ/). Apply as a post-pass by id (like VENUES),
- * so the layout and RNG are untouched; `from` and `door` guard against a shifted id.
+ * Names the story needs on today's signs (for the world owner, city.ts). city.ts already gives An Hòa's family shops
+ * a trade plus an owner ("PHỞ CHỊ BẢY") so no sign repeats within 120 m, and keeps CÀ PHÊ CÔ BA on the two cafés of
+ * the coffee mission. On top of that the story needs: "Cô Ba" on one building only (her café, 13), so the second
+ * mission café and the shops the owner pool gave "CÔ BA" are renamed (new owners from the same pool, none on the
+ * same trade within 120 m and none a story character); Ông Tư's shop, Bà Sáu's stall, Ánh Dương; and no real bank.
+ * Shops whose name the story only prints (BÁNH MÌ PHÚC, TIỆM HOA CÔ THU, PHỞ CHỊ BẢY) keep today's sign. Renamed shops
+ * keep their kind and trade word, which counters.ts, street-life.ts and side-missions.ts match. Apply as a post-pass
+ * by id (like VENUES), so the layout and RNG are untouched; `from` and `door` guard against a shifted id or a sign
+ * the owner pool changed.
  */
 export const RENAMES: { id: number; from: string; door: [number, number]; name: string; subtitle?: string }[] = [
-  { id: 0, from: 'CÀ PHÊ CÔ BA', door: [-76, -11.7], name: 'CÀ PHÊ SỮA ĐÁ', subtitle: 'CÀ PHÊ PHIN • BẠC XỈU' },
   { id: 3, from: 'CÀ PHÊ CÔ BA', door: [-31, -11.7], name: 'CÀ PHÊ VỢT', subtitle: 'CÀ PHÊ VỢT • TRÀ ĐÁ' },
-  { id: 8, from: 'CÀ PHÊ CÔ BA', door: [66.93, -11.7], name: 'CÀ PHÊ CÓC', subtitle: 'CÀ PHÊ • NƯỚC NGỌT' },
-  { id: 16, from: 'CÀ PHÊ CÔ BA', door: [32, 14.7], name: 'CÀ PHÊ GÓC PHỐ', subtitle: 'CÀ PHÊ • SINH TỐ' },
-  { id: 24, from: 'CÀ PHÊ CÔ BA', door: [-18, -65.7], name: 'CÀ PHÊ MUỐI', subtitle: 'CÀ PHÊ MUỐI • CA CAO' },
-  { id: 32, from: 'CÀ PHÊ CÔ BA', door: [-41, 67.7], name: 'CÀ PHÊ ĐEN ĐÁ', subtitle: 'CÀ PHÊ RANG XAY' },
-  { id: 40, from: 'CÀ PHÊ CÔ BA', door: [-76, -44.8], name: 'CÀ PHÊ SÂN VƯỜN', subtitle: 'CÀ PHÊ • TRÀ SEN' },
-  { id: 48, from: 'CÀ PHÊ CÔ BA', door: [-66.5, 44.8], name: 'CÀ PHÊ NHẠC XƯA', subtitle: 'CÀ PHÊ • NHẠC TRỊNH' },
-  { id: 4, from: 'PHỞ CÔ BA', door: [-20, -11.7], name: 'PHỞ CHÚ BẢY' },
-  { id: 12, from: 'PHỞ CÔ BA', door: [-41, 14.7], name: 'PHỞ BÀ HAI' },
-  { id: 20, from: 'PHỞ CÔ BA', door: [-76, -65.7], name: 'PHỞ GIA TRUYỀN' },
-  { id: 28, from: 'PHỞ CÔ BA', door: [67, -65.7], name: 'PHỞ ĐUÔI BÒ' },
-  { id: 36, from: 'PHỞ CÔ BA', door: [32, 67.7], name: 'PHỞ GÀ TA' },
-  { id: 44, from: 'PHỞ CÔ BA', door: [-18, -44.8], name: 'PHỞ BÒ VIÊN' },
-  { id: 5, from: 'XE MÁY', door: [20, -11.7], name: 'CỬA HÀNG XE MÁY', subtitle: 'XE MỚI • SỬA CHỮA • BẢO HÀNH' },
-  { id: 21, from: 'XE MÁY', door: [-66.5, -65.7], name: 'SỬA XE TƯ', subtitle: 'SỬA XE • THAY NHỚT • VÁ VỎ' },
-  { id: 29, from: 'XE MÁY', door: [77, -65.7], name: 'VÁ VỎ XE', subtitle: 'VÁ VỎ • BƠM BÁNH' },
-  { id: 37, from: 'XE MÁY', door: [41.5, 67.7], name: 'RỬA XE', subtitle: 'RỬA XE MÁY • THAY NHỚT' },
-  { id: 11, from: 'TIỆM HOA', door: [-66.5, 14.7], name: 'HOA TƯƠI LAN' },
-  { id: 19, from: 'TIỆM HOA', door: [77, 14.7], name: 'HOA CƯỚI NGỌC' },
-  { id: 27, from: 'TIỆM HOA', door: [41.5, -65.7], name: 'HOA LỤA THU' },
-  { id: 35, from: 'TIỆM HOA', door: [20, 67.7], name: 'HOA KIỂNG HẰNG' },
-  { id: 1, from: 'BÁNH MÌ', door: [-66.42, -11.7], name: 'BÁNH MÌ CHẢ CÁ' },
-  { id: 9, from: 'BÁNH MÌ', door: [77, -11.7], name: 'BÁNH MÌ XÍU MẠI' },
-  { id: 17, from: 'BÁNH MÌ', door: [41.5, 14.7], name: 'BÁNH MÌ HEO QUAY' },
-  { id: 25, from: 'BÁNH MÌ', door: [20, -65.7], name: 'BÁNH MÌ ỐP LA' },
-  { id: 33, from: 'BÁNH MÌ', door: [-30, 67.7], name: 'BÁNH MÌ PHÁ LẤU' },
-  { id: 49, from: 'BÁNH MÌ', door: [-41, 44.8], name: 'BÁNH MÌ BÌ' },
+  { id: 14, from: 'NHÀ SÁCH CÔ BA', door: [-18, 14.7], name: 'NHÀ SÁCH HÙNG' },
+  { id: 42, from: 'TẠP HÓA CÔ BA', door: [-41, -44.8], name: 'TẠP HÓA NGỌC' },
+  { id: 112, from: 'NHÀ THUỐC CÔ BA', door: [-119.7, 26.68], name: 'NHÀ THUỐC HẠNH' },
+  { id: 21, from: 'XE MÁY HÙNG', door: [-66.5, -65.7], name: 'SỬA XE TƯ', subtitle: 'SỬA XE • THAY NHỚT • VÁ VỎ' },
   { id: 116, from: 'CHÈ BÀ TƯ', door: [-119.7, 92.33], name: 'CHÈ BÀ SÁU' },
   { id: 70, from: 'CHÈ BÀ TƯ', door: [81.31, -96.3], name: 'CHÈ BƯỞI' },
   { id: 119, from: 'NHÀ SỐ 46', door: [-69.61, 119.7], name: 'VIỆC LÀM ÁNH DƯƠNG', subtitle: 'LƯƠNG CAO • BAO ĂN Ở • KHÔNG CẦN KINH NGHIỆM' },

@@ -487,14 +487,15 @@ test('places: every place is a site, a chapter place or a declared anchor; the m
     for (const space of ms.spaces ?? []) assert.ok(used(id, space), `${id} uses space ${space} (MISSION_SITES)`);
     assert.ok(![...refs.get(id)].some((r) => S.SITES[r.split(/[./]/)[0]]?.phase === 'P1'), `${id} stays on today's map`);
   }
-  // chapter places: QUÁN CƠM is building 79's door; the Dream's restart is on the eastbound asphalt behind the van
+  // chapter places: QUÁN CƠM DÌ SÁU is building 79's door; the Dream's restart is on the eastbound asphalt behind the van
   const keys = Object.keys(ch4.PLACES);
   assert.ok(keys.every((k) => k.startsWith('ch4.')));
   const b79 = city.BUILDINGS[79], q = ch4.PLACES['ch4.quan-com'];
-  assert.equal(b79.name, 'QUÁN CƠM'); assert.match(b79.subtitle, /CƠM TẤM/);
-  assert.ok(Math.hypot(b79.door.x - q.x, b79.door.z - q.z) < 0.02 && Math.abs(b79.facing - q.yaw) < 0.01, 'ch4.quan-com is the door of QUÁN CƠM');
+  assert.equal(b79.name, 'QUÁN CƠM DÌ SÁU'); assert.match(b79.subtitle, /CƠM TẤM/);
+  assert.ok(Math.hypot(b79.door.x - q.x, b79.door.z - q.z) < 0.02 && Math.abs(b79.facing - q.yaw) < 0.01, 'ch4.quan-com is the door of QUÁN CƠM DÌ SÁU');
   assert.ok(city.pointClear(q.x, q.z, 0.3), 'the door is clear');
-  assert.equal(city.BUILDINGS.filter((x) => x.name === 'QUÁN CƠM').length, 1, 'the only QUÁN CƠM: the marker is unambiguous');
+  assert.equal(city.BUILDINGS.filter((x) => x.name === b79.name).length, 1, 'the only QUÁN CƠM DÌ SÁU: the marker is unambiguous');
+  assert.equal(t4.TEXT['c4m1.mk.quanCom'], b79.name, 'the marker prints the sign over the door');
   const asphalt = (x, z) => TERRAIN.strips.some((s) => {
     const along = s.alongX ? x : z, v = s.alongX ? z : x;
     if ((s.lo !== -Infinity && along <= s.lo) || (s.hi !== Infinity && along >= s.hi)) return false;

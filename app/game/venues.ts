@@ -1,24 +1,15 @@
-import type { VenueKind } from './city';
+import type { VenueKind } from './map/consts';
+import type { Service } from './services';
 
 /**
  * What the nightlife strip sells. Everything happens off-screen: paying fades the screen out and back,
- * then the effect applies (health, a tipsy spell, points, time passing, lying low). Prices in thousands of đồng.
+ * then the effect applies (services.ts applyEffect: health, a tipsy spell, points, time passing, lying low).
+ * Prices in thousands of đồng.
  */
-export type ServiceEffect = {
-  /** Health restored, or `full` for all of it. */
-  heal?: number; full?: boolean;
-  /** Seconds of being tipsy (the camera sways, walking wanders a little). */
-  drunk?: number;
-  score?: number;
-  /** Hours that pass, or the hour to wake at the next morning. */
-  hours?: number; wakeAt?: number;
-  /** Police lose track of you if you are wanted at most this many stars. */
-  hide?: number;
-};
-export type Service = { id: string; name: string; price: number; description: string; effect: ServiceEffect };
+export type { Effect, Service, ServiceEffect } from './services';
 export type VenueDef = { title: string; intro: string; services: Service[] };
 
-/** Venues you can walk into (the beer garden is only scenery). */
+/** Venues you walk into (the beer garden is a counter with stools out front: counters.ts 'biahoi'). */
 export type VenueRoom = Exclude<VenueKind, 'beer'>;
 
 export const VENUE_SERVICES: Record<VenueRoom, VenueDef> = {

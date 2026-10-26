@@ -1,17 +1,22 @@
 import * as THREE from 'three';
-import { LAND, RIVER, SCENERY, WATER_LEVEL, inRect } from './city';
-import { BODY_SCALE, FIGURE, HAND, bakeFigure, chestMatrix, deriveStyle, palettesOf, sideX, type FigureStyle } from './figures';
+import { TERRAIN, navigable, waterLevel } from './map/terrain';
+import { SECONDS_PER_HOUR } from './clock';
+import { LINE_SPECS, MOORINGS, STOP_SPECS, buildNetwork, createTransit, pathAhead, pathPoint, type Trip } from './transit';
+import { BODY_SCALE, FIGURE, HAND, bakeFigure, chestMatrix, deriveStyle, palettesOf, sideX, type FigureLook, type FigureStyle } from './figures';
 import { ModelParts, vehicleMaterial, type Vec3 } from './vehicle-models';
 import { plantFoot, reachGrip } from './vehicles';
 
 /**
- * Boats on the river: sampans rowed by someone in a conical hat, the river bus that stops at every dock, a
- * dinner-cruise boat strung with lights, sand barges, speedboats and a fishing boat with eyes painted on its
- * bow. Each keeps to its own lane (one direction per lane, so they never meet head-on), bobs on the swell,
- * leaves a wake, slows down for anyone in the water ahead and wraps round far out of sight. One speedboat is
- * kept for the player to hire at a rental dock.
+ * Boats on the river (map/terrain.ts water): sampans rowed by someone in a conical hat, the river bus (driven on its
+ * timetable by buses.ts, berthing at the piers), a dinner-cruise boat strung with lights, sand barges, speedboats
+ * and a fishing boat with eyes painted on its bow. Each keeps to its own lane (one direction per lane, so they never
+ * meet head-on), bobs on the swell, leaves a wake, slows down for anyone in the water ahead and goes round far out
+ * of sight of the player. Two sampans are moored for people to use (transit.ts MOORINGS): the đò at the An Hòa pier
+ * and a fishing ghe off the promenade. One speedboat is kept for the player to hire at a rental dock.
  */
 export type BoatKind = 'sampan' | 'waterbus' | 'barge' | 'cruise' | 'speedboat' | 'fishing';
+/** Who is aboard a sampan: rowing it with a guest, rowing a fare (the guest's place left for them), sitting at the stern by the oar (the đò's boatman), fishing, or nobody. */
+export type Crew = 'rower' | 'rowing' | 'boatman' | 'fisher' | 'none';
 export type Boat = {
   kind: BoatKind;
   x: number; z: number; yaw: number;
@@ -22,20 +27,52 @@ export type Boat = {
   bank: number;
   /** Half beam and half length, for collisions. */
   half: [number, number];
-  mode: 'cruise' | 'docked' | 'anchored' | 'player' | 'idle';
+  /** `docked`: a river bus alongside a pier; `moored`: tied up (or at anchor), facing `moor`. */
+  mode: 'cruise' | 'docked' | 'anchored' | 'moored' | 'player' | 'idle';
   until: number; phase: number;
   group: THREE.Group;
+  mesh: THREE.Mesh;
   wake: THREE.Mesh;
   /** Where the helmsman's hips go, in the boat's frame. */
   seat: [number, number, number];
+  crew: Crew;
+  /** A moored boat: its mooring (transit.ts MOORINGS id), heading, and how far it swings on its rope. */
+  moor: { id: string; yaw: number; swing: number } | null;
+  /** A river bus on its line: see WaterRun. */
+  run: WaterRun | null;
 };
+/**
+ * A river bus on line W1 (transit.ts): its timetable vehicle, the arc it has reached on the course, the call it is at or
+ * heading for, the pier it lies alongside, whether its timetable has it in service, the trip, when it tied up, and
+ * whether it is off to the depot (out of service, on along the course until out of sight).
+ */
+export type WaterRun = { key: string; s: number; visit: number; stop: string | null; service: boolean; trip: Trip | null; docked: number; depot: boolean; since: number };
 
 const SPEC: Record<BoatKind, { length: number; beam: number }> = {
   sampan: { length: 6, beam: 1.5 }, waterbus: { length: 22, beam: 5 }, barge: { length: 30, beam: 7 },
   cruise: { length: 26, beam: 6.5 }, speedboat: { length: 6.5, beam: 2.2 }, fishing: { length: 10, beam: 3 },
 };
-/** Boats go round from one end of the river to the other well beyond the fog, then reappear at the far end. */
-const WRAP_WEST = LAND.minX - 260, WRAP_EAST = LAND.maxX + 260;
+/**
+ * River traffic goes round out of the player's sight: a boat farther than this along the river from the player
+ * reappears as far on the other side (the fog closes at 260 m), wherever the map's river reaches.
+ */
+const WRAP_REACH = 420;
+/** The river's surface (map/terrain.ts), and the level to use off its water. */
+const RIVER_LEVEL = TERRAIN.waters[0]?.level ?? -0.8;
+/** The river bus line and its timetable (transit.ts W1); boats drive its course to it (buses.ts keeps the clock). */
+const WATER_NET = buildNetwork(undefined, LINE_SPECS.filter((l) => l.mode === 'waterbus'), STOP_SPECS.filter((st) => st.mode === 'waterbus'));
+export const WATER_LINE = WATER_NET.lines[0] ?? null;
+function surface(x: number, z: number) { const y = waterLevel(x, z); return y > -1e6 ? y : RIVER_LEVEL; }
+/**
+ * Lanes across the river (design-real 7), from the promenade out to the far bank: sampans east, the river bus's
+ * east and west runs (transit.ts W1 course), the cruise boat, speedboats both ways, the barge, sampans west and the
+ * anchored fishing boats. The river bus berths alongside the pier ends at BERTH_Z (transit.ts).
+ */
+const LANES = { sampanEast: -160.5, cruise: -178.5, speedEast: -184, speedWest: -188.5, barge: -194, sampanWest: -199, anchored: -201.8 } as const;
+/** Bow benches on the river bus's foredeck, in front of the cabin: the passenger's seat, boat frame (seat top). */
+export const WATERBUS_SEAT: Vec3 = [0.55, 1.3, 7.05];
+/** A passenger's seat on a moored sampan: on the thwart in the bow, facing forward. */
+export const SAMPAN_SEAT: Vec3 = [0.05, 0.6, 1.65];
 
 /** Top-view outline of a hull, bow towards +z once extruded (shape y maps to -z). */
 function hullShape(length: number, beam: number, bow = 0.3, stern = 0.82) {
@@ -171,8 +208,8 @@ function rower(deck: number, z: number) {
 }
 
 /** A passenger sitting on the deck with knees drawn up and hands on them, under a nón lá. */
-function sitter(deck: number, at: Vec3, yaw: number) {
-  const style = deriveStyle({ shirt: '#b8463a', pants: '#2a2522', skin: '#d3a179', hat: '#e8d9a8' }, 'sampan-guest', 'retiree', { fem: true });
+function sitter(deck: number, at: Vec3, yaw: number, look: FigureLook = { shirt: '#b8463a', pants: '#2a2522', skin: '#d3a179', hat: '#e8d9a8' }, fem = true) {
+  const style = deriveStyle(look, fem ? 'sampan-guest' : 'boatman', 'retiree', { fem });
   return bakedPerson({
     style, at: [at[0], deck + at[1], at[2]], yaw,
     hip: [0, FIGURE.seatClear * BODY_SCALE, 0], lean: -0.08, pitch: 0.1, look: -0.3,
@@ -190,20 +227,46 @@ function squatter(deck: number, at: Vec3, yaw: number) {
   });
 }
 
-function boatGeometry(kind: BoatKind) {
+/** A rod of radius r from a to b (ModelParts.rod scales its unit cylinder by r twice). */
+const pole = (parts: ModelParts, a: Vec3, b: Vec3, r: number, color: string, finish: 'cloth' | 'metal' = 'cloth') => parts.add(new THREE.CylinderGeometry(1, 1, 1, 6), { color, finish, matrix: new THREE.Matrix4().compose(
+  new THREE.Vector3((a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2),
+  new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(b[0] - a[0], b[1] - a[1], b[2] - a[2]).normalize()),
+  new THREE.Vector3(r, Math.hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]), r)) });
+
+function boatGeometry(kind: BoatKind, crew: Crew = 'rower') {
   const parts = new ModelParts();
   const { length: L, beam: B } = SPEC[kind];
   if (kind === 'sampan') {
     hull(parts, L, B, 0.58, -0.32, '#7a5536', '#5a3c26', 0.36);
     deck(parts, L, B, 0.36, 0.09, 0.06, '#8a6a46');
-    // The arched bamboo canopy over the middle.
+    // The arched bamboo canopy over the middle, and a thwart across the bow to sit on.
     parts.add(new THREE.CylinderGeometry(0.7, 0.7, 2.3, 10, 1, true, -Math.PI / 2, Math.PI).rotateX(-Math.PI / 2), { at: [0, 0.2, 0.2], color: '#b08a4e', finish: 'cloth' });
-    // The rower's oar through both fists, pivoting on a post at the stern, its blade in the water.
-    const row = rower(0.15, -2.05);
-    parts.rod(row.grip.toArray() as Vec3, row.blade.toArray() as Vec3, 0.034, { color: '#8a6a46', finish: 'cloth' });
-    parts.add(box(0.05, 0.36, 0.05), { at: [row.pivot.x + 0.02, row.pivot.y - 0.1, row.pivot.z], color: '#5a3c26', finish: 'cloth' });
-    parts.beam(row.blade.clone().lerp(row.pivot, 0.45).toArray() as Vec3, row.blade.toArray() as Vec3, 0.15, 0.03, { color: '#8a6a46', finish: 'cloth' });
-    return withPeople(parts.build(), [row.person, sitter(0.15, [0.05, 0, 1.75], 0)]);
+    parts.add(box(B * 0.62, 0.06, 0.32), { at: [0, SAMPAN_SEAT[1] - 0.03, SAMPAN_SEAT[2] - 0.05], color: '#8a6a46', finish: 'cloth' });
+    for (const sx of [-1, 1]) parts.add(box(0.06, SAMPAN_SEAT[1] - 0.15, 0.06), { at: [sx * B * 0.26, (SAMPAN_SEAT[1] + 0.12) / 2, SAMPAN_SEAT[2] - 0.05], color: '#5a3c26', finish: 'cloth' });
+    // The stern post the oar pivots on.
+    parts.add(box(0.05, 0.36, 0.05), { at: [0.52, 0.1, -2.61], color: '#5a3c26', finish: 'cloth' });
+    if (crew === 'rower' || crew === 'rowing') {
+      // The rower's oar through both fists, pivoting on the post, its blade in the water; a guest in the bow.
+      const row = rower(0.15, -2.05);
+      parts.rod(row.grip.toArray() as Vec3, row.blade.toArray() as Vec3, 0.034, { color: '#8a6a46', finish: 'cloth' });
+      parts.beam(row.blade.clone().lerp(row.pivot, 0.45).toArray() as Vec3, row.blade.toArray() as Vec3, 0.15, 0.03, { color: '#8a6a46', finish: 'cloth' });
+      return withPeople(parts.build(), crew === 'rower' ? [row.person, sitter(0.15, [0.05, 0, 1.75], 0)] : [row.person]);
+    }
+    // Tied up: the oar shipped along the gunwale, its blade over the stern.
+    pole(parts, [0.5, 0.3, 1.6], [0.55, 0.3, -3.2], 0.034, '#8a6a46');
+    parts.beam([0.55, 0.3, -2.6], [0.56, 0.3, -3.35], 0.15, 0.03, { color: '#8a6a46', finish: 'cloth' });
+    if (crew === 'boatman') {
+      // The boatman waits for a fare at the stern, in áo bà ba and nón lá.
+      return withPeople(parts.build(), [sitter(0.15, [-0.05, 0, -1.95], 0, { shirt: '#3a4a52', pants: '#1d1b1a', skin: '#b98260', hat: '#e8d9a8' }, false)]);
+    }
+    if (crew === 'fisher') {
+      // The owner squats by the side with a bamboo rod over the water and its line down into it.
+      pole(parts, [0.48, 0.62, -1.45], [2.9, 1.55, -1.1], 0.016, '#b89a5e');
+      pole(parts, [2.9, 1.55, -1.1], [2.9, -0.4, -1.1], 0.003, '#e8e8e0');
+      parts.add(box(0.36, 0.24, 0.28), { at: [-0.35, 0.27, -1.0], color: '#3d6f8f', finish: 'plastic' });
+      return withPeople(parts.build(), [squatter(0.15, [0.15, 0, -1.6], Math.PI / 2)]);
+    }
+    return parts.build();
   } else if (kind === 'waterbus') {
     hull(parts, L, B, 1.5, -0.65, '#f2f1ec', '#1f5a8a', 0.26);
     parts.add(box(B * 0.98, 0.32, L * 0.62), { at: [0, 0.32, -0.6], color: '#1f5a8a', finish: 'paint' });
@@ -216,6 +279,18 @@ function boatGeometry(kind: BoatKind) {
     parts.rod([0, 3.4, -L * 0.36], [0, 5.2, -L * 0.36], 0.04, { color: '#cfd3d4', finish: 'metal' });
     parts.add(box(0.02, 0.5, 0.8), { at: [0, 4.9, -L * 0.36 - 0.4], color: '#c8322a', finish: 'cloth' });
     parts.add(box(0.5, 0.3, 0.3), { at: [0, 0.95, L / 2 - 0.9], color: '#fff4d6', finish: 'lamp' });
+    // Two benches on the foredeck for riders who like the breeze, and a rail round the bow.
+    for (const z of [WATERBUS_SEAT[2], WATERBUS_SEAT[2] + 1.25]) {
+      const w = z > WATERBUS_SEAT[2] ? 2.2 : 2.9;
+      parts.add(box(w, 0.07, 0.42), { at: [0, WATERBUS_SEAT[1] - 0.035, z - 0.02], color: '#2f6f9f', finish: 'paint' });
+      parts.add(box(w, 0.36, 0.06), { at: [0, WATERBUS_SEAT[1] + 0.17, z - 0.24], color: '#2f6f9f', finish: 'paint' });
+      for (const sx of [-1, 1]) parts.add(box(0.06, WATERBUS_SEAT[1] - 0.85, 0.06), { at: [sx * (w / 2 - 0.1), (WATERBUS_SEAT[1] + 0.85) / 2, z], color: '#cfd3d4', finish: 'metal' });
+    }
+    for (const sx of [-1, 1]) {
+      pole(parts, [sx * (B / 2 - 0.3), 1.55, L * 0.31 - 0.4], [sx * 1.2, 1.55, L / 2 - 1.6], 0.035, '#cfd3d4', 'metal');
+      pole(parts, [sx * 1.2, 1.55, L / 2 - 1.6], [0, 1.55, L / 2 - 0.5], 0.035, '#cfd3d4', 'metal');
+      for (const z of [L * 0.31 - 0.4, L / 2 - 1.6]) pole(parts, [z > L * 0.4 ? sx * 1.2 : sx * (B / 2 - 0.3), 0.85, z], [z > L * 0.4 ? sx * 1.2 : sx * (B / 2 - 0.3), 1.55, z], 0.03, '#cfd3d4', 'metal');
+    }
   } else if (kind === 'barge') {
     hull(parts, L, B, 1.4, -0.95, '#3c3a36', '#7a2f26', 0.14);
     parts.add(box(B - 0.6, 0.1, L * 0.7), { at: [0, 0.42, 1.5], color: '#4a4640', finish: 'metal' });
@@ -315,16 +390,17 @@ export function createBoats(scene: THREE.Scene) {
   const { material, lamps } = vehicleMaterial();
   const wakeGeometry = new THREE.PlaneGeometry(1, 1).rotateX(-Math.PI / 2).translate(0, 0, -0.5);
   const wakeMaterial = new THREE.MeshBasicMaterial({ color: '#f2fbf8', transparent: true, opacity: 0.8, depthWrite: false, map: wakeTexture() });
-  const geometries = new Map<BoatKind, THREE.BufferGeometry>();
-  const geometryOf = (kind: BoatKind) => {
-    let g = geometries.get(kind);
-    if (!g) { g = boatGeometry(kind); geometries.set(kind, g); }
+  const geometries = new Map<string, THREE.BufferGeometry>();
+  const geometryOf = (kind: BoatKind, crew: Crew) => {
+    const key = kind === 'sampan' ? `${kind}:${crew}` : kind;
+    let g = geometries.get(key);
+    if (!g) { g = boatGeometry(kind, crew); geometries.set(key, g); }
     return g;
   };
   const boats: Boat[] = [];
-  function make(kind: BoatKind, x: number, lane: number, dir: number, cruise: number, mode: Boat['mode'] = 'cruise', weave = 0): Boat {
+  function make(kind: BoatKind, x: number, lane: number, dir: number, cruise: number, mode: Boat['mode'] = 'cruise', weave = 0, crew: Crew = 'rower'): Boat {
     const group = new THREE.Group();
-    const mesh = new THREE.Mesh(geometryOf(kind), material);
+    const mesh = new THREE.Mesh(geometryOf(kind, crew), material);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     group.add(mesh);
@@ -334,28 +410,42 @@ export function createBoats(scene: THREE.Scene) {
     const { length, beam } = SPEC[kind];
     const boat: Boat = {
       kind, x, z: lane, yaw: dir > 0 ? Math.PI / 2 : -Math.PI / 2, speed: mode === 'cruise' ? cruise : 0, cruise, dir, lane, weave,
-      half: [beam / 2, length / 2], mode, until: 0, phase: boats.length * 1.7, group, wake, seat: [-0.45, 0.42, -0.6], bank: 0,
+      half: [beam / 2, length / 2], mode, until: 0, phase: boats.length * 1.7, group, mesh, wake, seat: [-0.45, 0.42, -0.6], bank: 0, crew, moor: null, run: null,
     };
     boats.push(boat);
     return boat;
   }
   // One lane per boat, one direction per lane: from the promenade side out to the far bank.
-  make('sampan', 40, -156.5, 1, 1.8);
-  make('waterbus', -60, -161.5, 1, 6);
-  make('waterbus', 260, -167.5, -1, 6);
-  make('cruise', 120, -174, -1, 2.6);
-  make('speedboat', -20, -180, 1, 11, 'cruise', 1.2);
-  make('speedboat', 300, -184.5, -1, 10, 'cruise', 1.2);
-  make('barge', -120, -191, 1, 3);
-  make('sampan', 210, -197.5, -1, 1.6);
-  make('fishing', 150, -200.5, -1, 0, 'anchored');
-  make('fishing', -40, -200.5, 1, 0, 'anchored');
+  make('sampan', 40, LANES.sampanEast, 1, 1.8);
+  make('cruise', 120, LANES.cruise, -1, 2.6);
+  make('speedboat', -20, LANES.speedEast, 1, 11, 'cruise', 1.2);
+  make('speedboat', 300, LANES.speedWest, -1, 10, 'cruise', 1.2);
+  make('barge', -120, LANES.barge, 1, 3);
+  make('sampan', 210, LANES.sampanWest, -1, 1.6);
+  make('fishing', 150, LANES.anchored, -1, 0, 'anchored');
+  make('fishing', -40, LANES.anchored, 1, 0, 'anchored');
+  /** The river buses (transit.ts line W1), one per timetable vehicle: out of sight until their first trip. */
+  const timetable = WATER_LINE ? createTransit(WATER_NET) : null;
+  const waterbuses = Array.from({ length: WATER_LINE ? Math.max(1, timetable!.fleet(WATER_LINE.id, 0)) : 0 }, (_, v) => {
+    const b = make('waterbus', 0, -166, 1, WATER_LINE!.spec.cruise, 'idle');
+    b.group.visible = b.wake.visible = false;
+    b.run = { key: `${WATER_LINE!.id}-${v + 1}`, s: 0, visit: 0, stop: null, service: false, trip: null, docked: 0, depot: false, since: 0 };
+    return b;
+  });
+  /** The game clock the river buses keep to (buses.ts sets it; until then it runs from 08:00). */
+  let clockH = 8, clockDay = 0, clockSet = false, service = true;
+  /** The moored đò and fishing ghe (transit.ts MOORINGS), empty until buses.ts puts their people aboard. */
+  const moored = MOORINGS.map((m) => {
+    const b = make('sampan', m.x, m.z, 1, 0, 'moored', 0, 'none');
+    b.yaw = m.yaw;
+    b.moor = { id: m.id, yaw: m.yaw, swing: m.kind === 'fishing' ? 0.12 : 0 };
+    return b;
+  });
   /** The speedboat the player hires; out of sight until it is. */
   const rental = make('speedboat', 0, -150, 1, 0, 'idle');
   rental.group.visible = false;
   rental.wake.visible = false;
 
-  const stops = SCENERY.docks.map((d) => d.x);
   const local = { x: 0, z: 0 };
   /** A point in a boat's frame (x to its right... its own +x, z towards the bow). */
   function toLocal(b: Boat, x: number, z: number) {
@@ -365,10 +455,89 @@ export function createBoats(scene: THREE.Scene) {
     return local;
   }
   function shown(b: Boat) { return b.mode !== 'idle'; }
+  /** Where the river traffic is kept: round the player (buses.ts passes their position). */
+  let focusX = (TERRAIN.bounds.minX + TERRAIN.bounds.maxX) / 2;
+  /** Bob, roll and pitch on the swell, and the wake: a boat drawn where it is now. */
+  function pose(b: Boat, time: number) {
+    // Small boats bob more than big ones, and the bow lifts at speed.
+    const size = Math.min(1, 6 / b.half[1]);
+    const bob = Math.sin(time * 1.4 + b.phase) * 0.06 * (0.4 + size);
+    const roll = Math.sin(time * 1.1 + b.phase * 1.3) * 0.035 * (0.3 + size);
+    const pitch = Math.sin(time * 0.9 + b.phase) * 0.02 * size - (b.kind === 'speedboat' ? Math.min(0.09, Math.abs(b.speed) * 0.007) : 0);
+    const level = surface(b.x, b.z);
+    b.group.position.set(b.x, level + bob, b.z);
+    b.group.rotation.set(pitch, b.yaw, roll + b.bank, 'YXZ');
+    // A wake trailing behind, longer and fainter the faster the boat goes.
+    const pace = Math.abs(b.speed);
+    b.wake.visible = pace > 0.4 && b.group.visible;
+    b.wake.position.set(b.x - Math.sin(b.yaw) * b.half[1] * Math.sign(b.speed || 1), level + 0.03, b.z - Math.cos(b.yaw) * b.half[1] * Math.sign(b.speed || 1));
+    b.wake.rotation.y = b.yaw + (b.speed < 0 ? Math.PI : 0);
+    b.wake.scale.set(b.half[0] * 2 * (1.3 + pace * 0.18), 1, 4 + pace * 2.2);
+  }
+  const at = new THREE.Vector3();
+  function hide(b: Boat) { b.mode = 'idle'; b.speed = 0; b.group.visible = b.wake.visible = false; }
+  /**
+   * A river bus along its course: in to each pier and alongside it while its timetable stands there, away when the
+   * timetable leaves, a little faster when running late, slowing for a swimmer ahead and holding off a pier the other
+   * boat lies at. Far from the player it is where the timetable says; out of service it finishes at its pier, then
+   * goes on to the depot out of sight.
+   */
+  function driveWater(b: Boat, dt: number, time: number, swimmer: { x: number; z: number } | null) {
+    const run = b.run!, line = WATER_LINE!, path = line.path, n = line.visits.length, spec = line.spec;
+    if (!service) { run.service = false; if (b.mode !== 'idle') hide(b); return; }
+    const st = timetable!.vehicle(run.key, clockDay * 24 + clockH);
+    const far = Math.abs(b.x - focusX) > 300 || b.mode === 'idle';
+    run.service = !!st;
+    if (st) { run.trip = st.trip; run.depot = false; }
+    if (st && far) {
+      // Where the timetable has it (unseen): on the course, or alongside the pier of its call.
+      Object.assign(run, { s: st.s, visit: st.visit, stop: st.phase === 'run' ? null : line.visits[st.visit].stop.id, docked: time });
+      b.mode = st.phase === 'run' ? 'cruise' : 'docked';
+      b.speed = st.speed;
+      b.group.visible = true;
+    } else if (!st && (b.mode === 'idle' || (far && b.mode !== 'docked') || (run.depot && (time - run.since > 120 || Math.abs(b.x - focusX) > 200)))) { hide(b); return; }
+    else if (b.mode === 'docked') {
+      b.speed = 0;
+      // Away once its timetable has left this pier; out of service, off to the depot after a while.
+      if (st ? st.visit !== run.visit : time - run.docked > 12) {
+        b.mode = 'cruise';
+        run.stop = null;
+        run.visit = (run.visit + 1) % n;
+        if (!st) { run.depot = true; run.since = time; }
+      }
+    } else if (b.mode === 'cruise') {
+      const berth = line.visits[run.visit].s, d = pathAhead(path, run.s, berth), toBerth = d > path.len - 0.5 ? 0 : d;
+      if (toBerth < 0.3 && b.speed < 0.6 && !run.depot) {
+        Object.assign(run, { s: berth, stop: line.visits[run.visit].stop.id, docked: time });
+        b.mode = 'docked';
+        b.speed = 0;
+      } else {
+        // Keep to the timetable: behind it (or its call) a little faster.
+        let behind = st ? pathAhead(path, run.s, st.phase === 'run' ? st.s : line.visits[st.visit].s) : 0;
+        if (behind > path.len / 2) behind -= path.len;
+        let target = spec.cruise * Math.min(1.3, Math.max(0.75, 1 + behind / 60));
+        if (!run.depot) {
+          target = Math.min(target, Math.sqrt(2 * spec.decel * Math.max(0, toBerth - 0.2)) + 0.15);
+          // The other boat alongside this pier: hold off until it leaves.
+          if (toBerth < 45 && waterbuses.some((o) => o !== b && o.mode === 'docked' && o.run!.visit === run.visit)) target = Math.min(target, Math.sqrt(2 * spec.decel * Math.max(0, toBerth - 40)));
+        }
+        if (swimmer) {
+          const p = toLocal(b, swimmer.x, swimmer.z);
+          if (p.z > 0 && p.z < b.half[1] + 16 && Math.abs(p.x) < b.half[0] + 2.5) target = Math.min(target, 0.3);
+        }
+        b.speed = THREE.MathUtils.damp(b.speed, target, target < b.speed ? 1.6 : 0.6, dt);
+        run.s = (run.s + b.speed * dt) % path.len;
+      }
+    }
+    const p = pathPoint(path, run.s);
+    b.x = p.x; b.z = p.z; b.yaw = Math.atan2(p.hx, p.hz);
+  }
 
   return {
     boats,
     rental,
+    waterbuses,
+    moored,
     /** The boat whose hull (grown by `radius`) covers a point, ignoring `except`. */
     hit(x: number, z: number, radius: number, except: Boat | null = null) {
       for (const b of boats) {
@@ -404,66 +573,69 @@ export function createBoats(scene: THREE.Scene) {
     },
     /** Takes the hire boat back (it drifts no more). */
     dock() { rental.mode = 'idle'; rental.group.visible = false; rental.wake.visible = false; },
+    /** Where the river traffic goes round: kept within WRAP_REACH of this point along the river (the player). */
+    setFocus(x: number) { focusX = x; },
+    /**
+     * Puts a boat its line drives (a river bus) at a spot, or (null) takes it out of service; it is drawn there at
+     * once, bobbing as it should.
+     */
+    /** The game clock (hours of the day and day count) the river buses keep to. */
+    setClock(hours: number, day: number) { clockH = hours; clockDay = day; clockSet = true; },
+    /** The river bus runs (false: zombie mode, it is gone from the river). */
+    setService(on: boolean) { service = on; },
+    /** Who is aboard a moored sampan (the boatman, the fisherman, nobody). */
+    setCrew(b: Boat, crew: Crew) {
+      if (b.crew === crew) return;
+      b.crew = crew;
+      b.mesh.geometry = geometryOf(b.kind, crew);
+    },
+    /** Takes a moored boat out on the water (the đò setting off with a fare), or back to its mooring (null). */
+    cast(b: Boat, to: { x: number; z: number; yaw: number; speed: number } | null, time: number) {
+      if (!b.moor) return;
+      if (to) Object.assign(b, { x: to.x, z: to.z, yaw: to.yaw, speed: to.speed });
+      else {
+        const m = MOORINGS.find((q) => q.id === b.moor!.id)!;
+        Object.assign(b, { x: m.x, z: m.z, yaw: m.yaw, speed: 0 });
+      }
+      pose(b, time);
+    },
+    /** A point in a boat's own frame (x left, y up from the waterline, z to the bow) where it is drawn now, and its heading. */
+    worldPoint(b: Boat, p: Vec3) {
+      b.group.updateMatrixWorld();
+      at.set(p[0], p[1], p[2]).applyMatrix4(b.group.matrixWorld);
+      return { x: at.x, y: at.y, z: at.z, yaw: b.yaw };
+    },
     /** `swimmer` is the player in the water (or in the hire boat): river traffic slows down for them. */
     update(dt: number, time: number, swimmer: { x: number; z: number } | null) {
+      if (!clockSet) { clockH += dt / SECONDS_PER_HOUR; if (clockH >= 24) { clockH -= 24; clockDay++; } }
+      for (const b of waterbuses) driveWater(b, dt, time, swimmer);
       for (const b of boats) {
-        if (b.mode === 'idle') continue;
-        if (b.mode === 'cruise' || b.mode === 'docked') {
-          // The river bus slows into each dock, waits there a few seconds, then carries on.
+        if (b.mode === 'idle' || b.run) { if (b.run && b.mode !== 'idle') pose(b, time); continue; }
+        if (b.mode === 'cruise') {
           let target = b.cruise;
-          if (b.kind === 'waterbus') {
-            if (b.mode === 'docked') {
-              target = 0;
-              if (time > b.until) { b.mode = 'cruise'; b.x += b.dir * 0.6; }
-            } else {
-              const next = stops.filter((sx) => (sx - b.x) * b.dir > 0).sort((p, q) => (p - q) * b.dir)[0];
-              if (next !== undefined) {
-                const gap = Math.abs(next - b.x);
-                if (gap < 26) target = Math.max(0.8, b.cruise * (gap / 26));
-                if (gap < 0.5) { b.mode = 'docked'; b.until = time + 9; }
-              }
-            }
-          }
           if (swimmer) {
             const p = toLocal(b, swimmer.x, swimmer.z);
             if (p.z > 0 && p.z < b.half[1] + 16 && Math.abs(p.x) < b.half[0] + 2.5) target = Math.min(target, 0.3);
           }
           b.speed = THREE.MathUtils.damp(b.speed, target, target < b.speed ? 1.6 : 0.6, dt);
           b.x += b.dir * b.speed * dt;
-          if (b.x > WRAP_EAST) b.x = WRAP_WEST;
-          if (b.x < WRAP_WEST) b.x = WRAP_EAST;
+          // Round the far side of the river from the player, well out of sight.
+          if (b.x - focusX > WRAP_REACH) b.x -= 2 * WRAP_REACH;
+          else if (b.x - focusX < -WRAP_REACH) b.x += 2 * WRAP_REACH;
           b.z = b.lane + Math.sin(time * 0.35 + b.phase) * b.weave;
           // Heading follows the motion: along the lane, swinging a little with the weave.
           b.yaw = Math.atan2(b.dir * Math.max(0.5, b.speed), Math.cos(time * 0.35 + b.phase) * b.weave * 0.35);
         } else if (b.mode === 'anchored') {
           // Swinging slowly on its anchor rope.
           b.yaw = (b.dir > 0 ? Math.PI / 2 : -Math.PI / 2) + Math.sin(time * 0.07 + b.phase) * 0.5;
-        }
-        // Bobbing on the swell; small boats more than big ones, and the bow lifts at speed.
-        const size = Math.min(1, 6 / b.half[1]);
-        const bob = Math.sin(time * 1.4 + b.phase) * 0.06 * (0.4 + size);
-        const roll = Math.sin(time * 1.1 + b.phase * 1.3) * 0.035 * (0.3 + size);
-        const pitch = Math.sin(time * 0.9 + b.phase) * 0.02 * size - (b.kind === 'speedboat' ? Math.min(0.09, Math.abs(b.speed) * 0.007) : 0);
-        b.group.position.set(b.x, WATER_LEVEL + bob, b.z);
-        b.group.rotation.set(pitch, b.yaw, roll + b.bank, 'YXZ');
-        // A wake trailing behind, longer and fainter the faster the boat goes.
-        const pace = Math.abs(b.speed);
-        b.wake.visible = pace > 0.4;
-        b.wake.position.set(b.x - Math.sin(b.yaw) * b.half[1] * Math.sign(b.speed || 1), WATER_LEVEL + 0.03, b.z - Math.cos(b.yaw) * b.half[1] * Math.sign(b.speed || 1));
-        b.wake.rotation.y = b.yaw + (b.speed < 0 ? Math.PI : 0);
-        b.wake.scale.set(b.half[0] * 2 * (1.3 + pace * 0.18), 1, 4 + pace * 2.2);
+        } else if (b.mode === 'moored' && b.moor && b.speed === 0) b.yaw = b.moor.yaw + Math.sin(time * 0.09 + b.phase) * b.moor.swing;
+        pose(b, time);
       }
     },
     /** Cabin windows, deck lights and bulbs glow after dark. */
     setNight(night: number) { lamps.value = 0.15 + night * 1.1; },
     /** Whether a point is open water a boat can be in (inside the buoys, clear of piers and steps). */
-    water(x: number, z: number, margin: number) {
-      if (!inRect(RIVER, x, z, margin)) return false;
-      for (const d of SCENERY.docks) {
-        if (x > d.pier.minX - margin && x < d.steps.maxX + margin && z > d.pier.minZ - margin) return false;
-      }
-      return true;
-    },
+    water(x: number, z: number, margin: number) { return navigable(x, z, margin); },
     dispose() {
       for (const b of boats) scene.remove(b.group, b.wake);
       for (const g of geometries.values()) g.dispose();
@@ -474,3 +646,4 @@ export function createBoats(scene: THREE.Scene) {
     },
   };
 }
+export type Boats = ReturnType<typeof createBoats>;

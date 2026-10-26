@@ -6,7 +6,7 @@ import { TEXT } from '../text/vi/ch05.ts';
  * Chương 5 · BÓNG TRONG ĐÈN NEON (story-final.md ch.5 with story-decisions.md 4, 7, 9, 14 and §8 "c5-m1 / c5-m2"):
  * c5-m1 dawn at SỬA XE TƯ (the matte-black rebuild, Ông Tư's bug), Cô Ba's porch camera on the café recorder (the
  * CCTV scrub: 03:36 a Rắn Đen rider grabs Quang, 03:41 Quang dials), the "Cuộc gọi đó để làm gì?" deduction, then
- * at night the tail of Quang (scooter → NHÀ THUỐC → the strip's back alley → on foot, he knows Tín's face), a bluff
+ * at night the tail of Quang (scooter → NHÀ THUỐC HẠNH → the strip's back alley → on foot, he knows Tín's face), a bluff
  * past the karaoke receptionist, the staff corridor under sound cover, the VIP door and the first real takedown
  * (drag him into the beer storeroom, check that he breathes) — chained into c5-m2 at 02:00: up the bia hơi downpipe,
  * over the tin roofs and the plank, down into the shared courtyard, the spa's closed back section (bug, floor plan,

@@ -179,7 +179,9 @@ test('renames match today\'s buildings and leave every story name unique; no bui
     const b = city.BUILDINGS[r.id];
     if (!b || b.name !== r.from || Math.hypot(b.door.x - r.door[0], b.door.z - r.door[1]) > 0.02) errors.push(`rename ${r.id}: today it is ${b?.name} at ${b && fmt(b.door.x, b.door.z)}, expected ${r.from} at ${fmt(r.door[0], r.door[1])}`);
   }
-  for (const keep of ['CÀ PHÊ CÔ BA', 'TIỆM HOA', 'BÁNH MÌ', 'SỬA XE TƯ', 'CHÈ BÀ SÁU', 'VIỆC LÀM ÁNH DƯƠNG', 'NHÀ THUỐC', 'NGÂN HÀNG KIM THÀNH']) {
+  // every sign a door site is named after (BÁNH MÌ PHÚC, TIỆM HOA CÔ THU, NHÀ THUỐC HẠNH, …) and the renamed story places stand once
+  const signs = Object.values(S.SITES).filter((s) => s.kind === 'door' && names[s.building] === s.name).map((s) => s.name);
+  for (const keep of new Set(['CÀ PHÊ CÔ BA', 'SỬA XE TƯ', 'CHÈ BÀ SÁU', 'VIỆC LÀM ÁNH DƯƠNG', 'NGÂN HÀNG KIM THÀNH', ...signs])) {
     const n = names.filter((v) => v === keep).length;
     if (n !== 1) errors.push(`name ${keep} on ${n} buildings after renames`);
   }
@@ -187,6 +189,18 @@ test('renames match today\'s buildings and leave every story name unique; no bui
   if (coBa.length !== 1) errors.push(`"CÔ BA" on ${coBa.map(([v, i]) => `${i}:${v}`).join(', ')}`);
   if (names.some((v) => /PHƯƠNG NAM/.test(v) && v !== 'THÁP PHƯƠNG NAM')) errors.push('a building is still named after the real Phương Nam bank');
   assert.deepEqual(errors, []);
+});
+
+test('story sign names are reserved: the district generator never prints them in any P1 slice', async () => {
+  const { reservedSign } = await import('../app/game/map/reserved-names.ts');
+  const { buildP1 } = await import('../app/game/map/p1.ts');
+  const signs = Object.values(S.SITES).filter((s) => s.kind === 'door' && names[s.building] === s.name).map((s) => s.name);
+  const keep = [...new Set(['CÀ PHÊ CÔ BA', 'SỬA XE TƯ', 'CHÈ BÀ SÁU', 'VIỆC LÀM ÁNH DƯƠNG', 'NGÂN HÀNG KIM THÀNH', ...S.RENAMES.map((r) => r.name), ...signs])];
+  assert.deepEqual(keep.filter((n) => !reservedSign(n)), [], 'add these story names to app/game/map/reserved-names.ts');
+  const p1 = buildP1(LEGACY_ROADS);
+  const built = (p1.buildings ?? p1.data?.buildings ?? p1.slices?.flatMap((x) => x.data?.buildings ?? x.buildings ?? []) ?? []).map((b) => b.name);
+  assert.ok(built.length > 1000, `P1 builds its buildings (${built.length})`);
+  assert.deepEqual(built.filter((n) => reservedSign(n) && !/^KHO 7/.test(n)), [], 'a P1 slice prints a story sign');
 });
 
 test('every site and spot is in its district and phase, on its ground, off the asphalt and clear; doors, stamps, routes and the barge hold', (t) => {

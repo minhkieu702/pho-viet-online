@@ -1,5 +1,8 @@
 import * as THREE from 'three';
 import type { Building, Plot, TowerSpec } from './city';
+import { counterKeyOf } from './counters';
+import { FRONT_OF, IRON, LIGHT_BOXES, acUnit, laundry, railing, verticalSign } from './facades';
+import { DECAL, type ColorLike, type Kit, type Kind as ShapeKind, type Role } from './kit';
 
 /**
  * Downtown's buildings: glass towers, a New York-style stepped tower, a lotus-bud tower with a helipad, a
@@ -9,16 +12,12 @@ import type { Building, Plot, TowerSpec } from './city';
  * that reflects the sky at grazing angles, and windows that light up at random after dark. Details (podiums,
  * canopies, balconies, crowns, signs) go through the world's own batched primitives.
  */
-type ShapeKind = 'box' | 'cylinder' | 'cone' | 'ball' | 'bead' | 'gable' | 'hip' | 'pyramid' | 'puff' | 'trunk' | 'frond';
-type Role = 'solid' | 'ground' | 'glass' | 'glassLit' | 'lamp' | 'lantern' | 'water' | 'neon';
-type ColorLike = string | THREE.Color;
-export type SkylineKit = {
+/** What world.ts lends the skyline: its scene root and disposal lists, and kit.ts drawing (frames carry the street dressing). */
+export type SkylineKit = Pick<Kit, 'shape' | 'sign' | 'frame' | 'fine'> & {
   root: THREE.Group;
   materials: THREE.Material[];
   geometries: THREE.BufferGeometry[];
   textures: THREE.Texture[];
-  shape: (kind: ShapeKind, color: ColorLike, x: number, y: number, z: number, sx: number, sy: number, sz: number, yaw?: number, tilt?: number, shadow?: boolean, role?: Role) => void;
-  sign: (text: string, subtitle: string, color: string, x: number, y: number, z: number, w: number, h: number, yaw?: number, background?: string) => void;
 };
 
 type Facade = { x: number; y: number; z: number; sx: number; sy: number; sz: number; yaw: number; glass: THREE.Color; frame: THREE.Color; floor: number; bay: number; pattern: number; lit: number; seed: number };
@@ -325,13 +324,45 @@ export function buildSkyline(kit: SkylineKit, plots: { plot: Plot; building: Bui
       const shop = spec.podium;
       part(0, shop / 2, 0, w, shop, d, darkFrame);
       face(0, shop, 0, w, h - shop, d, { ...look, lit: 0.5 });
-      part(0, shop / 2 - 0.2, front + 0.06, w - 1.2, shop - 1.4, 0.1, '#6f8fa8', 'glassLit', false);
+      // The shopfront: glass in bays between dark mullions under a transom, a framed door in the middle bay, goods (or
+      // the menu) showing in the glass and a tube light under the transom that glows after dark (not the whole pane).
+      const F = kit.frame(x, z, p.facing);
+      const paneW = w - 1.2, paneH = shop - 1.4, py = shop / 2 - 0.2, bays = Math.max(2, Math.min(5, Math.round(paneW / 3)));
+      part(0, py, front + 0.04, paneW, paneH, 0.08, '#4a5f70', 'solid', false);
+      for (let k = 0; k <= bays; k++) part(-paneW / 2 + (k * paneW) / bays, py, front + 0.1, 0.12, paneH, 0.1, darkFrame);
+      part(0, py + paneH / 2 - 0.7, front + 0.1, paneW, 0.1, 0.1, darkFrame);
+      const doorX = bays % 2 ? 0 : paneW / bays / 2;
+      part(doorX, 1.15, front + 0.12, 1.8, 2.3, 0.05, '#33404a', 'solid', false);
+      for (const k of [-1, 1]) part(doorX + k * 0.9, 1.15, front + 0.14, 0.1, 2.3, 0.06, darkFrame);
+      part(doorX, 2.32, front + 0.14, 1.9, 0.1, 0.06, darkFrame);
+      part(0, py + paneH / 2 - 0.82, front + 0.12, paneW - 0.4, 0.07, 0.07, '#eef8ff', 'tube', false);
+      kit.fine(true);
+      const inside = b.kind === 'food' || b.kind === 'cafe' ? DECAL.menu : DECAL.goods;
+      for (let k = 0; k < bays; k++) {
+        const cx = -paneW / 2 + ((k + 0.5) * paneW) / bays;
+        if (Math.abs(cx - doorX) < 0.95) continue;
+        F.decal(inside, cx, py - 0.25, front + 0.095, Math.min(1.7, paneW / bays - 0.6), Math.min(1.5, paneH - 1.7));
+      }
+      kit.fine(false);
       part(0, shop - 0.4, front + 0.9, w - 0.4, 0.15, 1.8, ['#c9493b', '#3f6f9f', '#5e927c', '#d9a441', '#7d5ba6'][Math.floor(r() * 5)]);
       const s = at(0, front + 0.14);
       sign(b.name, b.subtitle, p.signColor, s.x, shop + 1.0, s.z, Math.min(w - 1, 9), 1.25, p.facing);
       if (b.kind === 'home' || b.kind === 'hotel') {
         for (let y = shop + 3; y < h - 1.5; y += spec.floor) part(0, y, front + 0.5, w - 1.4, 0.15, 1.0, '#e6e0d4', 'solid', false);
       }
+      // Life on the facade: iron railings and washing on the flats' balconies (their AC units out there too), AC units
+      // under the office windows, a light box beside the shop sign.
+      const D = kit.frame(x, z, p.facing), q = seeded(p.seed * 7 + 3), iron = IRON[Math.floor(q() * IRON.length)];
+      const flats = b.kind === 'home' || b.kind === 'hotel';
+      for (let y = shop + 3; y < h - 1.5; y += spec.floor) {
+        if (flats) {
+          railing(D, -(w - 1.4) / 2, (w - 1.4) / 2, y + 0.07, front, 1.0, iron, true);
+          for (let lx = -w / 2 + 1.6; lx < w / 2 - 1.2; lx += 3.1) if (q() < 0.35) acUnit(D, lx, y + 0.36, front + 0.12);
+          if (q() < 0.25) { kit.fine(true); laundry(D, q, (q() - 0.5) * (w - 5), y + 2.3, front + 0.75, Math.min(w - 3, 3.2)); kit.fine(false); }
+        } else for (let lx = -w / 2 + 1.3; lx < w / 2 - 1; lx += 2.6) if (q() < 0.25) acUnit(D, lx, y - 0.9, front + 0.02);
+      }
+      const tag = FRONT_OF[counterKeyOf(b) ?? ''];
+      if (tag) verticalSign(D, tag[1], (q() < 0.5 ? -1 : 1) * (w / 2 - 0.35), shop + 2.3, front, ...LIGHT_BOXES[Math.floor(q() * LIGHT_BOXES.length)]);
       if (spec.crown === 'sign') {
         part(0, h + 2.4, -d * 0.1, w * 0.8, 3.4, 0.25, '#2b2f33');
         const ad = at(0, -d * 0.1 + 0.15);
