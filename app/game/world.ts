@@ -2148,11 +2148,14 @@ export function buildWorld(scene: THREE.Scene) {
       cut.aspect.value = camera.aspect;
       cut.radius.value = (CUT_RADIUS * cutStrength) / Math.max(1, depth * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
     },
-    /** Zombie mode on or off: power cut, dust over everything, debris and fire barrels in the streets. */
-    setApocalypse(on: boolean) {
+    /**
+     * Zombie mode on or off: power cut, dust over everything, debris and fire barrels in the streets. `debris` false
+     * leaves the legacy street debris and its barrels out (apocalypse.ts draws the ruins and their fires instead).
+     */
+    setApocalypse(on: boolean, debris = true) {
       apocalypse = on;
-      if (on && !wreckage) wreckage = buildWreckage();
-      if (wreckage) wreckage.visible = on;
+      if (on && debris && !wreckage) wreckage = buildWreckage();
+      if (wreckage) wreckage.visible = on && debris;
       roles.solid.color.set(on ? '#b9af9d' : '#ffffff');
       roles.glass.color.set(on ? '#8c8b86' : '#ffffff');
       roles.glassLit.color.set(on ? '#8c8b86' : '#ffffff');
@@ -2180,7 +2183,7 @@ export function buildWorld(scene: THREE.Scene) {
       lastNight = -1;
     },
     /** Burning barrels of zombie mode (empty in the normal city). */
-    get fires() { return apocalypse ? fires : []; },
+    get fires() { return apocalypse && wreckage?.visible ? fires : []; },
     /** `night` 0..1 lights windows, lamps, signs and light pools; `wet` 0..1 darkens and glosses the paving. */
     setAtmosphere(a: { night: number; wet: number; sky?: THREE.Color; hours?: number }) {
       if (a.sky) sky.copy(a.sky);

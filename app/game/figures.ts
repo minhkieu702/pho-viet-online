@@ -35,7 +35,8 @@ vec3 figColor(float slot) {
 }
 bool figBit(int part) {
   if (part == 0) return true;
-  int word = part > 24 ? int(look1.w + 0.5) : int(look1.z + 0.5);
+  // + 0.25, not + 0.5: an odd word at or above 2^23 plus 0.5 rounds up to the next integer in float32 (exact below 2^24).
+  int word = part > 24 ? int(look1.w + 0.25) : int(look1.z + 0.25);
   return ((word >> ((part - 1) % 24)) & 1) == 1;
 }
 bool figHidden() { int t = int(tag.y + 0.5); return !figBit(t % 64) || !figBit(t / 64); }

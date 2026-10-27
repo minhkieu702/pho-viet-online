@@ -43,6 +43,7 @@ export const ARM = {
 } as const;
 /** Leg word A: footwear and trouser bells. */
 export const LEG = { BARE: 1 << 0, SHOE: 1 << 1, /** dép */ DEP: 1 << 2, SANDAL: 1 << 3, BOOT: 1 << 4, /** flared trouser hem over the instep */ WIDE: 1 << 5, HEEL: 1 << 6 } as const;
+// ---- zombie co-op (design.md §5, MUTANTS): TORSO bits 19-22 (and 13, KIT's, which the variant never builds), ARM bits 14-18, LEG bits 7-9: zombie variant parts (zombie-looks.ts) ----
 /** Every held item bit, for clearing a hand. */
 export const ARM_ITEMS = ARM.PHONE | ARM.FAN | ARM.BROOM | ARM.BAG | ARM.CUP | ARM.NON_LA | ARM.BATON | ARM.PISTOL | ARM.TASER | ARM.RIFLE;
 
@@ -98,10 +99,15 @@ export class FigureParts {
   defaultRig: RigSource = [0, 0, 0, 0];
   /** Unique vertices per part index (0 = always shown). */
   readonly partCounts = new Map<number, number>();
+  // ---- zombie co-op (design.md §5, MUTANTS) ----
+  /** A variant build's parts it never shows: add() drops them (no vertices to shade). Human builds never set it. */
+  skip?: (bit: number, wordB: boolean) => boolean;
+  // ---- end zombie co-op ----
 
   get vertexCount() { return this.pos.length / 3; }
 
   add(src: THREE.BufferGeometry, o: AddOptions = {}, slots?: ArrayLike<number>, shades?: ArrayLike<number>) {
+    if (this.skip && o.part && this.skip(o.part, !!o.wordB)) { src.dispose(); return this; }
     let g = src;
     let vSlots = slots, vShades = shades;
     if (o.flat) {
@@ -708,8 +714,9 @@ function addHeadwear(parts: FigureParts, detail: Detail) {
     { y: 0.62, rx: 1.05, rz: 1.13, cz: -0.03, slot: SLOT.ACCENT }, { y: 0.95, rx: 1.2, rz: 1.33, cz: -0.06, slot: SLOT.ACCENT }, { y: 1.1, rx: 1.26, rz: 1.42, cz: -0.08, slot: SLOT.ACCENT },
     { y: 1.15, rx: 1.12, rz: 1.26, cz: -0.08, slot: SLOT.ACCENT, shade: 0.95 },
   ], lo ? 8 : seg, null, 1.2);
+  const beforeCap = parts.vertexCount;
   parts.add(cap.g, { at, scale: R, part: HEAD.CAP, rig: headRig }, cap.slots, cap.shades);
-  colorFixed(parts, cap, '#9c3a32');
+  if (parts.vertexCount > beforeCap) colorFixed(parts, cap, '#9c3a32');
   parts.add(peak(1.0, 0.33, 0.75, 0.32, lo ? 2 : 3), { at, scale: R, slot: SLOT.FIXED, shade: '#151a22', part: HEAD.CAP, rig: headRig, gloss: 1 });
   if (!lo) parts.add(plate(hp([0, 0.8, 1.22]), [0.13 * R, 0, 0], [0, 0.13 * R, 0.03 * R]), { slot: SLOT.FIXED, shade: '#d9b44a', part: HEAD.CAP, rig: headRig, gloss: 1 });
 
@@ -800,7 +807,7 @@ function peak(lift: number, e: number, reach: number, droop: number, cols: numbe
 }
 
 /** Skull, ears, eyes, brows, nose, lips, the upper neck, and the face's optional parts. */
-function addHead(parts: FigureParts, detail: Detail) {
+function addHead(parts: FigureParts, detail: Detail, face?: VariantHooks['face']) {
   const [w, h] = SEG[detail].head;
   const lo = detail === 'lo';
   const head = { part: TORSO.HEAD, wordB: true, rig: headRig } as const;
@@ -814,7 +821,7 @@ function addHead(parts: FigureParts, detail: Detail) {
     // Ears: a flattened shell angled back (their own bit: long hair and bobs cover them).
     parts.add(ball(lo ? 5 : 7, lo ? 3 : 5), { at: f(side * 0.86, -0.06, -0.06), scale: s(0.12, 0.27, 0.19), rot: [0, side * -0.35, 0], slot: SLOT.SKIN, shade: 0.94, ...head, part: HEAD.EARS, wordB: false, also: TORSO.HEAD, alsoB: true });
     // Brows (hair slot): a tapered arch.
-    parts.add(sweep([[side * 0.14, 0.29, 0.99], [side * 0.36, 0.33, 0.985], [side * 0.6, 0.27, 0.88]], (i) => [i === 0 ? 0.03 : i === 1 ? 0.032 : 0.02, 0.026], lo ? 3 : 4, { caps: true, up: [0, 0, 1] }),
+    if (!face) parts.add(sweep([[side * 0.14, 0.29, 0.99], [side * 0.36, 0.33, 0.985], [side * 0.6, 0.27, 0.88]], (i) => [i === 0 ? 0.03 : i === 1 ? 0.032 : 0.02, 0.026], lo ? 3 : 4, { caps: true, up: [0, 0, 1] }),
       { at: [0, HY, 0], scale: R, slot: SLOT.HAIR, shade: 0.9, ...head });
   }
   // Nose: a small flat-shaded wedge.
@@ -830,6 +837,9 @@ function addHead(parts: FigureParts, detail: Detail) {
   parts.add(nose, { at: [0, HY, 0], scale: R, slot: SLOT.SKIN, shade: 0.98, ...head, flat: true });
   // Lips: a thin upper and a fuller lower lip, a muted rose close to the skin (a linear multiplier that cools the
   // skin's orange a little), not a painted red.
+  // ---- zombie co-op (design.md §5, MUTANTS): a variant's own face replaces the eyes, brows, lips, lids and mouth ----
+  if (face) { face(parts, detail); return; }
+  // ---- end zombie co-op ----
   parts.add(ball(lo ? 5 : 7, 3), { at: f(0, -0.46, 0.9), scale: s(0.18, 0.032, 0.055), slot: SLOT.SKIN, shade: new THREE.Color(0.9, 0.82, 1.08), ...head });
   if (!lo) parts.add(ball(7, 3), { at: f(0, -0.522, 0.872), scale: s(0.165, 0.045, 0.058), slot: SLOT.SKIN, shade: new THREE.Color(0.95, 0.89, 1.14), ...head });
 
@@ -1073,9 +1083,10 @@ function outward(pos: number[], idx: number[]) {
 // ---- Body ----------------------------------------------------------------------------------------------
 
 /** The crowd body: both torso builds, the head and face, every hair style, hat and clothing part. */
-export function bodyGeometry(detail: Detail = 'hi') {
+export function bodyGeometry(detail: Detail = 'hi', hooks?: VariantHooks) {
   const parts = new FigureParts();
   parts.defaultRig = bodyRig;
+  parts.skip = hooks?.skip;
   const seg = SEG[detail].torso;
   for (const fem of [false, true]) {
     const t = loft(torsoRings(fem), seg, 0.92, null);
@@ -1084,10 +1095,11 @@ export function bodyGeometry(detail: Detail = 'hi') {
     flattenNormals(t.g, (y) => smooth(0.93, 1.07, y));
     parts.add(t.g, { part: fem ? TORSO.FEMALE : TORSO.MALE, wordB: true, rig: bodyRig }, t.slots, t.shades);
   }
-  addHead(parts, detail);
+  addHead(parts, detail, hooks?.face);
   addHair(parts, detail);
   addHeadwear(parts, detail);
   addClothing(parts, detail);
+  hooks?.body?.(parts, detail);
   return parts.build();
 }
 
@@ -1153,7 +1165,7 @@ const armWeights = (side: 1 | -1) => (p: THREE.Vector3): Rig => [smooth(-UA + 0.
  * -1 the mirrored one (a right arm, which carries the items). Slots: 0 upper sleeve, 1 lower arm, 2 hand,
  * 3 cuff, 4/5 item colours.
  */
-export function armGeometry(side: 1 | -1, detail: Detail = 'hi', items = side < 0) {
+export function armGeometry(side: 1 | -1, detail: Detail = 'hi', items = side < 0, hooks?: VariantHooks) {
   const parts = new FigureParts();
   if (side < 0) parts.base.makeScale(-1, 1, 1);
   const S = SEG[detail];
@@ -1183,6 +1195,7 @@ export function armGeometry(side: 1 | -1, detail: Detail = 'hi', items = side < 
   if (detail !== 'lo') parts.add(plate([0.0275, W + 0.021, 0], [0, 0, 0.011], [0, 0.011, 0]), { slot: SLOT.FIXED, shade: '#c9ccd0', part: ARM.WATCH, rig: armWeights(side), gloss: 1 });
   parts.add(band(W + 0.012, W - 0.002, 0.028, 0.029).g, { slot: SLOT.FIXED, shade: '#5f9e7a', part: ARM.BANGLE, rig: armWeights(side), gloss: 1 });
   if (items) addItems(parts, detail, side);
+  hooks?.arm?.(parts, side, detail);
   return parts.build();
 }
 
@@ -1275,7 +1288,7 @@ const footRig = (p: THREE.Vector3): Rig => [1, 1, smooth(FIGURE.ball - 0.02, FIG
  * A leg hanging from the hip pivot: one loft to the ankle with a calf and a hem ring at the knee (slot 0
  * thigh, 1 shin), the foot along +z bending at the ball, and the footwear parts.
  */
-export function legGeometry(detail: Detail = 'hi') {
+export function legGeometry(detail: Detail = 'hi', hooks?: VariantHooks) {
   const parts = new FigureParts();
   const S = SEG[detail];
   const lo = detail === 'lo';
@@ -1330,6 +1343,7 @@ export function legGeometry(detail: Detail = 'hi') {
   // Low heels: a pointed shell and a heel block.
   parts.add(shoeShell(0.038, 0.262).g, { at: [0, SOLE + 0.04, 0], rot: footRot, slot: LEG_SLOT.SHOE, part: LEG.HEEL, rig: footRig, gloss: 0.6 });
   parts.add(lo ? cheapBox(0.03, 0.035, 0.04) : box(0.03, 0.035, 0.04), { at: [0, SOLE + 0.017, -0.035], slot: LEG_SLOT.SOLE, part: LEG.HEEL, rig: footRig });
+  hooks?.leg?.(parts, detail);
   return parts.build();
 }
 
@@ -1363,7 +1377,10 @@ export function umbrellaGeometry(panels = 8) {
 export type FigurePiece = 'body' | 'armL' | 'armR' | 'leg';
 const cache = new Map<string, THREE.BufferGeometry>();
 /** Geometry built once per piece and detail (a module-wide cache; never dispose these). */
-export function figureGeometry(piece: FigurePiece, detail: Detail) {
+export function figureGeometry(piece: FigurePiece, detail: Detail, variant: FigureVariant = 'human') {
+  // ---- zombie co-op (design.md §5, MUTANTS): variant builds share the cache under their own key ----
+  if (variant !== 'human') return variantGeometry(piece, detail, variant);
+  // ---- end zombie co-op ----
   const key = `${piece}:${detail}`;
   let g = cache.get(key);
   if (!g) {
@@ -1374,3 +1391,45 @@ export function figureGeometry(piece: FigurePiece, detail: Detail) {
   }
   return g;
 }
+
+// ---- zombie co-op (design.md §5, MUTANTS) ----
+/** Figure builds: people, or a variant registered by another module (zombie-looks.ts registers 'zombie'). */
+export type FigureVariant = 'human' | 'zombie';
+/**
+ * What a variant adds to the human builds. The masks have free bits for it: TORSO bits 19-22, ARM bits 14-18 and
+ * LEG bits 7-9 are the zombie variant's parts (zombie-looks.ts; word B stays below bit 23, see ZT); HEAD has none
+ * left, so a variant face reuses HEAD.EYES, MOUTH and BLINK for its own eyes, open jaw and missing jaw.
+ */
+export type VariantHooks = {
+  /** Replaces the human face (eyes, brows, lips, lids, talking mouth); skull, ears, nose and neck stay. */
+  face?(parts: FigureParts, detail: Detail): void;
+  body?(parts: FigureParts, detail: Detail): void;
+  arm?(parts: FigureParts, side: 1 | -1, detail: Detail): void;
+  leg?(parts: FigureParts, detail: Detail): void;
+  /** Rewrites the finished build (part tags, vertex colours). */
+  finish?(piece: FigurePiece, geometry: THREE.BufferGeometry): void;
+  /** Body parts (HEAD word A, TORSO word B) the variant never shows: the body build skips them (arm and leg words reuse those bit values). */
+  skip?(bit: number, wordB: boolean): boolean;
+};
+const variants = new Map<string, VariantHooks>();
+/** Registers (or replaces) a variant's hooks; its cached builds are rebuilt on next use. */
+export function registerFigureVariant(name: Exclude<FigureVariant, 'human'>, hooks: VariantHooks) {
+  variants.set(name, hooks);
+  for (const key of [...cache.keys()]) if (key.endsWith(`:${name}`)) cache.delete(key);
+}
+function variantGeometry(piece: FigurePiece, detail: Detail, variant: Exclude<FigureVariant, 'human'>) {
+  const key = `${piece}:${detail}:${variant}`;
+  let g = cache.get(key);
+  if (!g) {
+    const hooks = variants.get(variant);
+    if (!hooks) throw new Error(`figure variant '${variant}' is not registered`);
+    // Variant arms carry no held items (both sides are the item-less build).
+    g = piece === 'body' ? bodyGeometry(detail, hooks) : piece === 'leg' ? legGeometry(detail, hooks) : armGeometry(piece === 'armR' ? -1 : 1, detail, false, hooks);
+    hooks.finish?.(piece, g);
+    g.userData.sharedGeometry = true;
+    g.userData.variant = variant;
+    cache.set(key, g);
+  }
+  return g;
+}
+// ---- end zombie co-op ----

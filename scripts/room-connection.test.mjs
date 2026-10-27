@@ -27,7 +27,7 @@ function setup(t) {
         close() { this.closed = true; this.readyState = 3; },
         open() { this.readyState = 1; this.onopen?.(); },
         message(data) { this.onmessage?.({ data: JSON.stringify(data) }); },
-        drop(code = 1006) { this.readyState = 3; this.onclose?.({ code }); },
+        drop(code = 1006, reason = '') { this.readyState = 3; this.onclose?.({ code, reason }); },
       };
       sockets.push(socket);
       return socket;
@@ -151,4 +151,19 @@ test('reconnect backlog is throttled instead of flooding the room', t => {
   const hits = second.sent.filter(m => m.type === 'hit');
   assert.ok(hits.length >= 20 && hits.length <= 28, `bounded hit rate, got ${hits.length}`);
   assert.equal(second.sent.filter(m => m.type === 'state').length, 20);
+});
+
+test('a 4403 for the send rate (the room released a backlog at once) reconnects with backoff; malformed JSON and the server overload close behave as before', t => {
+  const h = setup(t), first = h.ready();
+  first.drop(4403, 'Gửi dữ liệu quá nhanh.');
+  assert.equal(h.fatal.length, 0, 'not the end of the session');
+  h.advance(1000);
+  assert.equal(h.sockets.length, 2, 'a new socket after the backoff');
+  const second = h.ready();
+  second.drop(1013, 'Máy chủ đang quá tải, đang kết nối lại.');
+  assert.equal(h.fatal.length, 0);
+  h.advance(2000);
+  const third = h.ready();
+  third.drop(4403, 'JSON không hợp lệ.');
+  assert.equal(h.fatal.length, 1, 'a malformed frame stays fatal');
 });

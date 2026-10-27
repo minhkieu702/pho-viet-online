@@ -23,6 +23,9 @@ export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight
   // Zombie mode's mood: a smoky, sickly haze, a weaker sun, and never a clear sky.
   let apocalypse = false;
   let mood = 0;
+  // ---- zombie co-op (design.md §5, MUTANTS): the dread director's fog (night fog, boss haze) ----
+  let dreadNear: number | null = null, dreadFar: number | null = null;
+  // ---- end zombie co-op ----
   const haze = new THREE.Color('#8d8c78'), hazeNight = new THREE.Color('#2a2c27'), emberSun = new THREE.Color('#ffb27a'), hazeTint = new THREE.Color('#b8a988');
   let lastShadowDir = new THREE.Vector3();
   const sunDirection = new THREE.Vector3(-0.45, 0.8, 0.25).normalize();
@@ -90,6 +93,10 @@ export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight
     label() { return `${clockText(clock.hours)} · ${WEATHER_LABEL[weather]}`; },
     setWeather(next: Weather) { weather = next; weatherTimer = (2 + Math.random() * 4) * SECONDS_PER_HOUR; },
     setHours(next: number) { clock.set(next); },
+    // ---- zombie co-op (design.md §5, MUTANTS) ----
+    /** Fog from dread.ts: when set, fog near/far become min(own, dread); null gives the weather's fog back. */
+    setDread(fogNear: number | null, fogFar: number | null) { dreadNear = fogNear; dreadFar = fogFar; },
+    // ---- end zombie co-op ----
     setApocalypse(on: boolean) {
       apocalypse = on;
       if (on && weather === 'clear') weather = 'cloudy';
@@ -132,6 +139,10 @@ export function createAtmosphere(scene: THREE.Scene, sun: THREE.DirectionalLight
       }
       fog.near = (120 - rain * 70) * (1 - mood * 0.6);
       fog.far = (260 - rain * 110) * (1 - mood * 0.35);
+      // ---- zombie co-op (design.md §5, MUTANTS) ----
+      if (dreadNear !== null) fog.near = Math.min(fog.near, dreadNear);
+      if (dreadFar !== null) fog.far = Math.max(fog.near + 1, Math.min(fog.far, dreadFar));
+      // ---- end zombie co-op ----
       tint.copy(dayTint).lerp(duskTint, dusk).lerp(nightTint, night).lerp(rainTint, rain * (1 - night * 0.6)).lerp(hazeTint, mood * 0.45 * (1 - night));
       material.uniforms.time.value = time;
       material.uniforms.amount.value = rain;

@@ -33,12 +33,21 @@ import type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib
 import { BIKES, CAR_STATS, MOTO_STATS, POLICE_CAR_STATS, bikeById, repairCost, type BikeId } from './bikes';
 import { createVehicles, makeCarMesh, seatOf, vehicleLabel, vehicleStyle, CAR_HEALTH, MASS, MOTO_HEALTH, POLICE_CAR_HEALTH, type Body, type Car, type Crash } from './vehicles';
 import { MOTO_RIDER, motoParts, vehicleMaterial, type MotoStyle } from './vehicle-models';
+// ---- zombie co-op (design.md §5.4, MODE) ----
+import { createZombieCoop, type ZombieHudView } from './zombie-coop';
+import { createZombieWorld } from './zombie-world';
+import { createApocalypse, createRuinPlanner, planRuins, type RuinInput, type RuinPlan, type RuinPlanner } from './apocalypse';
+import RuinWorker from './ruin-worker.ts?worker';
+import { ruinInputsFromCity } from './apocalypse-inputs';
+import type { RoomMode, ZombieClientMessage, ZombieServerMessage } from '../../lib/zombie-protocol';
+import type { DogCommand } from './companion';
+// ---- end zombie co-op ----
 import {
   ARM_POSES, BODY_SCALE, CAR_DRIVER, FIGURE, HAND, HAND_SOCKET, HEAD, TORSO, armFK, createHeroFigure, deriveStyle, gait, handCode, mixHand, newGait,
   releaseView, setBits, setStyle, sideX, socket, styleOf, twoBoneIK, type FigureLook, type HeroFigure, type WardrobeRole,
 } from './figures';
 import { createPolice } from './police';
-import { createZombies, type Zombie } from './zombies';
+import { createZombies } from './zombies';
 import { createInteriors, type InteriorKind, type RoomAct } from './interiors';
 import { VENUE_SERVICES, serviceOf, type VenueRoom } from './venues';
 import { createSky, HORIZON } from './sky';
@@ -61,8 +70,8 @@ export type Hud = {
   surrendered: boolean; gassed: boolean;
   /** Seconds until the police arrive after a crime was reported (0 when they are here or not coming). */
   policeIn: number;
-  /** Zombie mode: wave, zombies left in it, kills, seconds of rest left, best wave reached. */
-  zombie: { wave: number; left: number; kills: number; breakLeft: number; best: number; dots: { x: number; z: number }[] } | null;
+  /** Zombie mode: wave, zombies left in it, kills, seconds of rest left, best wave reached; co-op, bosses, dog... (zombie-coop.ts). */
+  zombie: ZombieHudView | null;
   /** What E does right here (interact.ts focus, a hold in progress, getting up, getting off), or null. */
   prompt: PromptView | null;
   /** Minimap pins: own bike and last car, the impound, bus stops, ATMs, piers. */
@@ -939,8 +948,6 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const interiorLook = new THREE.Vector3();
   /** What the residents report in a frame when there are none (zombie mode). */
   const NO_NPC_EVENTS: ReturnType<typeof npcs.update> = { robbed: [], strikes: 0, shots: [], crowd: { outside: 0, umbrellas: 0, sheltering: 0, exposed: 0, watching: 0, chatting: 0 } };
-  let zombieBest = 0;
-  try { zombieBest = Number(localStorage.getItem('pvo-zombie-best')) || 0; } catch { /* storage blocked */ }
   let fireAt = 0;
   // A flashlight for zombie nights, with no power in the city.
   const torch = new THREE.SpotLight('#fff1d0', 0, 36, 0.48, 0.55, 1.1);
@@ -1390,6 +1397,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   function adaptQuality(now: number, interval: number) {
     const verdict = monitor.sample(now, interval);
     if (qualityMode !== 'auto' || !verdict) return;
+    const before = level;
     if (verdict < 0 && level < QUALITY_LEVELS.length - 1) {
       // Remember failures so automatic mode does not bounce back into a level that just stuttered.
       const failures = (levelFailures.get(level) ?? 0) + 1;
@@ -1399,6 +1407,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     } else if (verdict > 0 && level > 0 && (levelBlockedUntil.get(level - 1) ?? 0) < now) {
       applyLevel(level - 1);
     }
+    // zombie co-op: a new level changes lit programs (plain surfaces from level 4); with the menu up they and their
+    // flashlight variants are compiled now, as setQuality does, not on zombie mode's first frame (a 1.3 s freeze).
+    if (level !== before && !active) prewarm();
   }
 
   function distance(target: { x: number; z: number }) {
@@ -1619,6 +1630,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     shake = Math.max(shake, 0.25);
     const dx = from ? state.x - from.x : 0, dz = from ? state.z - from.z : 0, d = Math.hypot(dx, dz) || 1;
     effects.blood(hitPoint.set(state.x, inCar() ? 1.3 : 1.1, state.z), rayDir.set(dx / d, 0, dz / d), inCar() ? 2 : 5);
+    // ---- zombie co-op: at 0 a zombie-mode player goes down (revivable) instead of being wasted ----
+    if (health <= 0 && zombieMode && coop.onLethal(now)) { health = 0; if (state.riding) leaveVehicleNow(); if (owned.has('pistol')) equip('pistol'); return; }
+    // ---- end zombie co-op ----
     if (health <= 0) wasted(now, by);
   }
 
@@ -1714,7 +1728,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     npcs.setEnabled(!zombie);
     police.setEnabled(!zombie);
     vehicles.setTraffic(!zombie, state.x, state.z);
-    world.setApocalypse(zombie);
+    world.setApocalypse(zombie, false); // zombie co-op: apocalypse.ts draws the ruins and their fires (MODE)
     atmosphere.setApocalypse(zombie);
     torch.visible = zombie;
     marker.visible = !zombie && missions.view().target !== null;
@@ -1722,10 +1736,23 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       atmosphere.setHours(16.5);
       sideMissions.cancel();
       zombieKit();
-      zombies.start(performance.now() / 1000);
+      // ---- zombie co-op (design.md §5.4, MODE): the ruins (planned once, the same on every client), the fleet's wrecks on them ----
+      const plan = planNow();
+      apocalypse.setEnabled(true, plan);
+      const spots = { car: plan.fleetSpots.filter((f) => f.kind === 'car'), moto: plan.fleetSpots.filter((f) => f.kind === 'moto') }, used = { car: 0, moto: 0 };
+      for (const car of vehicles.cars) {
+        if ((car as CurbCar).role !== 'wreck') continue;
+        const kind = car.kind === 'moto' ? 'moto' : 'car', spot = spots[kind][used[kind]++];
+        if (spot) Object.assign(car, { x: spot.x, z: spot.z, yaw: spot.yaw, vx: 0, vz: 0, speed: 0 });
+      }
+      coop.start(performance.now());
+      // The chunks around the start build off the frame during the prep phase; zombie hits bleed dark, not red.
+      void apocalypse.prebuild(state.x, state.z, 300);
+      effects.bloodTint('#3a2a1a');
+      // ---- end zombie co-op ----
       showBanner('ZOMBIE TRÀN NGẬP KHU PHỐ', performance.now(), 4000);
       notify('Cả khu phố đã biến thành zombie · Sống sót qua từng đợt! Bắn vào đầu để hạ nhanh.', 6000);
-    } else zombies.stop();
+    } else { zombies.stop(); coop.stop(); apocalypse.setEnabled(false); effects.bloodTint(null); }
   }
 
   function teleport(at: { x: number; z: number }) {
@@ -1752,11 +1779,11 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     teleport(LANDMARKS.hospital);
     health = MAX_HEALTH;
     if (zombieMode) {
-      const run = zombies.stats(now / 1000);
+      const run = coop.test.state();
       showBanner(`GỤC Ở ĐỢT ${run.wave} · HẠ ${run.kills} ZOMBIE`, now, 4500);
       notify('Bạn tỉnh lại ở bệnh viện · Lũ zombie lại kéo đến từ đầu!', 4500);
       zombieKit();
-      zombies.start(now / 1000);
+      coop.restart(now);
       return;
     }
     notify(fee ? `Xuất viện · Viện phí ${formatThousands(fee)}` : 'Xuất viện, khỏe lại rồi!', 3500);
@@ -1886,6 +1913,155 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   /** What E would do now (computed once per frame), and a hold-E in progress. */
   let focus: Focus | null = null;
   let hold: { entry: Entry; view: PromptView; started: number; x: number; z: number } | null = null;
+  // ---- zombie co-op (design.md §5.4, MODE): the ruined city, who sees what, and the coordinator of zombie mode ----
+  const apocalypse = createApocalypse(scene, solids, { ground: groundHeight, level });
+  let ruinPlan: RuinPlan | null = null;
+  /**
+   * Zombie mode's ruins, prepared ahead so choosing zombie mode no longer plans and builds them inside the click (a
+   * 0.5-2 s freeze): the ruin inputs (one ~20-50 ms step), the plan in a worker (ruin-worker.ts; without one, the
+   * planner's global pass and its chunks in slices, lobby only), then the wreck models, then the pool (lobby only). With
+   * the lobby up (page.tsx calls this) a 20-40 ms slice runs at least every 60 ms; in a game a 6 ms one every 400 ms,
+   * longer only in the browser's own idle time.
+   */
+  let zombiePrep = false, ruinInput: RuinInput | null = null, planner: RuinPlanner | null = null, plannerKeys: number[] = [];
+  let planWorker: Worker | null = null;
+  const planNow = () => ruinPlan ??= planner ? planner.plan() : planRuins(ruinInput ?? ruinInputsFromCity({ solids: world.colliders, roads: nav.roads }));
+  /** Plans `input` in a worker; false when there is none (the slices take over). */
+  function planOffThread(input: RuinInput) {
+    if (typeof Worker !== 'function') return false;
+    try {
+      const worker = planWorker = new RuinWorker();
+      const done = (plan: RuinPlan | null) => {
+        if (planWorker !== worker) return;
+        worker.terminate(); planWorker = null;
+        if (plan && !ruinPlan) ruinPlan = plan;
+        else if (!plan) console.warn('Zombie ruins: the planning worker failed; planning in slices instead.');
+        zombiePrep = false;
+        if (!disposed && !zombieMode) prepareZombie();
+      };
+      worker.onmessage = (event: MessageEvent<RuinPlan>) => done(event.data);
+      worker.onerror = (event) => { event.preventDefault(); done(null); };
+      worker.postMessage(input);
+      return true;
+    } catch (error) { planWorker = null; console.warn('Zombie ruins: no planning worker;', error); return false; }
+  }
+  function prepareZombie() {
+    // Back in the lobby after automatic quality changed the level in a game: its programs and their flashlight
+    // variants are compiled now, not on zombie mode's first frame.
+    if (!active && warmedLevel !== level) prewarm();
+    if (zombiePrep || planWorker || ruinPlan && apocalypse.plan === ruinPlan) return;
+    zombiePrep = true;
+    // At least every 60 ms with the lobby up, every 400 ms in a game (a 6 ms slice unless the browser is idle).
+    const idle = (cb: (d: { timeRemaining(): number }) => void) => {
+      if (typeof requestIdleCallback === 'function') requestIdleCallback(cb, { timeout: active ? 400 : 60 });
+      else setTimeout(() => cb({ timeRemaining: () => 0 }), active ? 400 : 60);
+    };
+    const step = (deadline: { timeRemaining(): number }) => {
+      if (disposed || zombieMode) { zombiePrep = false; return; }
+      if (!ruinPlan && !ruinInput) {
+        ruinInput = ruinInputsFromCity({ solids: world.colliders, roads: nav.roads });
+        if (planOffThread(ruinInput)) { zombiePrep = false; return; } // the worker's answer restarts the slices
+        idle(step);
+        return;
+      }
+      if (!ruinPlan && !planner) {
+        // No worker (or it failed): the planner's global pass (one ~30-150 ms step), with the lobby up only.
+        if (active) { zombiePrep = false; return; }
+        planner = createRuinPlanner(ruinInput!); plannerKeys = planner.keys();
+        idle(step);
+        return;
+      }
+      // A menu can take 20-40 ms slices; a game what its idle period has left, or 6 ms (about one wreck model).
+      const left = deadline.timeRemaining(), start = performance.now();
+      const budget = !active ? Math.max(20, Math.min(40, left)) : left >= 10 ? left - 2 : 6, more = () => performance.now() - start < budget;
+      if (!ruinPlan) {
+        if (!planner || active) { zombiePrep = false; return; } // the planner's chunks run with the lobby up only
+        while (plannerKeys.length && more()) planner.chunk(plannerKeys.shift()!);
+        if (!plannerKeys.length && more()) { planNow(); planner = null; }
+        idle(step);
+        return;
+      }
+      // The pool itself (one ~30 ms step) is only built with the lobby up (or by the click).
+      const done = apocalypse.prepare(ruinPlan, more, !active);
+      if (done || (active && apocalypse.modelsReady)) zombiePrep = false;
+      else idle(step);
+    };
+    idle(step);
+  }
+  const zombieWorld = createZombieWorld({
+    clear: worldClear, sight: lineOfSight, ground: groundHeight, walkable: (x, z, r) => walkable(x, z, r), roofs, roads: () => nav.roads, frustum: viewFrustum,
+    smashables: (x, z, r, cb) => {
+      vehicles.cars.forEach((car, i) => { if (car.mode !== 'off' && car !== playerCar && (car.x - x) ** 2 + (car.z - z) ** 2 <= r * r) cb('car', i, car.x, car.z); });
+      apocalypse.smashables(x, z, r, (id, wx, wz) => cb('ruin', id, wx, wz));
+    },
+  });
+  /** Slowed by a crawler's bite or bile, until (ms); the shuffle of a downed player. */
+  let zSlow = 1, zSlowUntil = 0, torchFlicker = 0, frameInterval = 16, coopLevel = -1;
+  const coop = createZombieCoop({
+    scene, camera, zombies, world: zombieWorld, registry, apocalypse, roads: () => nav.roads,
+    ground: groundHeight, clear: worldClear, sight: lineOfSight, walkable: (x, z, r) => walkable(x, z, r),
+    doors: PLACES.filter((p) => p.kind === 'gunstore' || p.kind === 'hospital' || p.kind === 'deck').map((p) => ({ kind: p.kind as 'gunstore' | 'hospital' | 'deck', x: p.x, z: p.z, r: p.r })),
+    damagePlayer: (amount, from, by) => damagePlayer(amount, performance.now(), from ?? undefined, by),
+    knockPlayer: (dx, dz, speed) => { if (!down && !state.riding) knockPlayer(dx * speed, 2 + speed * 0.2, dz * speed, performance.now(), 'crash', null, 'melee'); },
+    slowPlayer: (factor, seconds) => { zSlow = Math.min(zSlow, factor); zSlowUntil = Math.max(zSlowUntil, performance.now() + seconds * 1000); },
+    healPlayer: (amount) => { health = Math.min(MAX_HEALTH, health + amount); },
+    respawn: (x, z, hp, near) => {
+      if (playerBody) { ragdolls.remove(playerBody); playerBody = null; }
+      down = null;
+      if (near) teleport({ x, z });
+      health = hp;
+      lastDamage = performance.now() / 1000;
+      const pistol = ammo.get('pistol');
+      if (pistol) { pistol.mag = weaponById('pistol').magazine; pistol.reserve = Math.max(pistol.reserve, weaponById('pistol').startAmmo); }
+    },
+    endRun: () => { health = 0; wasted(performance.now(), 'Zombie'); },
+    notify: (text, ms) => notify(text, ms),
+    banner: (text, ms) => showBanner(text, performance.now(), ms),
+    shake: (amount) => { shake = Math.max(shake, amount); },
+    supply: (wave) => {
+      // A supply drop between waves: ammo for every gun, some health (standing players) and cash.
+      for (const [id, rounds] of ammo) rounds.reserve += Math.ceil(weaponById(id).startAmmo * 0.6);
+      if (!coop.downed) health = Math.min(MAX_HEALTH, health + 30);
+      cash += 80 + wave * 40;
+      state.score += wave * 100;
+    },
+    loot: (_kind, wave) => {
+      for (const [id, rounds] of ammo) rounds.reserve += weaponById(id).startAmmo;
+      cash += 300 + 100 * wave;
+    },
+    blood: (x, y, z, dx, dz, amount) => effects.blood(hitPoint.set(x, y, z), rayDir.set(dx, 0.3, dz).normalize(), amount),
+    shove: (x, z, r, f) => {
+      // A mutant shoves the cars around it (never the one the player drives: that one is hit through the victim path).
+      for (const car of vehicles.cars) {
+        if (car.mode === 'off' || car === playerCar) continue;
+        const dx = car.x - x, dz = car.z - z, d = Math.hypot(dx, dz);
+        if (d > r) continue;
+        car.mode = 'knocked'; car.recoverAt = 0;
+        car.vx = (dx / (d || 1)) * f; car.vz = (dz / (d || 1)) * f; car.spin = (Math.random() - 0.5) * f * 0.3;
+        if (car.kind === 'moto') car.fallen = true;
+      }
+    },
+    alarmAnimals: (x, z, r) => animals.alarm(x, z, r),
+    setDread: (near, far) => atmosphere.setDread(near, far),
+    torch: (flicker) => { torchFlicker = flicker; },
+    hold: () => (hold ? { id: hold.entry.id, progress: Math.min(1, (performance.now() - hold.started) / ((hold.entry.hold ?? 1) * 1000)) } : null),
+    peerRenderTime: () => peerClock.renderTime(performance.now()),
+    night: () => atmosphere.night,
+    playThud: () => playThud(),
+    dropCash: (x, z) => { if (Math.random() < 0.22) pickups.drop(x, z, 10 + Math.floor(Math.random() * 40), performance.now()); },
+  });
+  zombies.extendWorld({ spawnOk: zombieWorld.spawnOk, seen: zombieWorld.seen, seenLocal: zombieWorld.seenLocal, ambush: zombieWorld.ambush });
+  /** The player as the coordinator sees them this frame. */
+  function coopPlayer(now: number) {
+    const fx = Math.sin(state.angle), fz = Math.cos(state.angle), v = state.riding ? velocity : velocity;
+    return {
+      x: state.x, z: state.z, angle: state.angle, vx: fx * v, vz: fz * v, speed: Math.abs(velocity), riding: state.riding, inCar: inCar(), swimming,
+      reach: playerCar ? (playerCar.kind === 'moto' ? 0.9 : 1.6) : state.riding ? 0.9 : 0, health, knocked: down !== null,
+      sprint: !state.riding && keys.has('shift') && Math.abs(velocity) > 5, quiet: !state.riding && Math.abs(velocity) < 2.5 && now - lastShot > 2000,
+      firing: now < firingUntil, aimX: reticlePoint.x, aimZ: reticlePoint.z, active, bag: bagOpen,
+    };
+  }
+  // ---- end zombie co-op ----
   /** Savings (safe from hospital fees and fines), buffs (until, in seconds), lottery tickets, litter and scrap in hand. */
   let bank = 0;
   const buffs = new Map<BuffId, number>();
@@ -2707,7 +2883,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       }
     }
     // Nothing to use at speed: the registry is only asked on foot, or riding slowly (a stop, a parking lot).
-    const canFocus = active && !down && !playerBody && !glide && !boat && !heist && !menu && !hold && !ride && !seat && !interior && !surrendered && (!state.riding || Math.abs(velocity) < 2);
+    const canFocus = active && !down && !playerBody && !glide && !boat && !heist && !menu && !hold && !ride && !seat && !interior && !surrendered && (!state.riding || Math.abs(velocity) < 2) && !(zombieMode && coop.downed); // zombie co-op: nothing to use while downed or dead
     focus = canFocus ? registry.best(ctx) : null;
     // The day's lottery draw at 16:15 (numbers from services.ts, so everyone in a room gets the same).
     const day = atmosphere.clock.day;
@@ -3138,6 +3314,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       // Riding along, F (the fire key) also asks to get off.
       if (normalized === 'f' && ride && active) ride.onLeave();
       else if (normalized === 'f') { triggerQueued = true; unlockAudio(); }
+      // ---- zombie co-op (MODE): the dog, bandages, and whom a dead player watches ----
+      if (zombieMode && coop.running) {
+        if (normalized === 'g') coop.dogCommand('call');
+        if (normalized === 't') coop.dogCommand('attack');
+        if (normalized === 'x') { const text = coop.bandage(); if (text) notify(text, 2200); }
+        if (coop.downed === 2 && (normalized === 'q' || normalized === 'e')) coop.spectateNext(normalized === 'q' ? -1 : 1);
+      }
+      // ---- end zombie co-op ----
       if (normalized === 'q') cycleWeapon();
       if (normalized === 'r') startReload(performance.now());
       if (normalized === 'v') Object.assign(view, CAMERA_DEFAULT);
@@ -3319,6 +3503,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (!nextPeers.length) {
       for (const [id, peer] of peers) removePeer(id, peer);
       peerClock.reset();
+      if (zombieMode) coop.setPeers([], serverTime ?? NaN); // zombie co-op: the last teammate left (no ghost prey, team of 1)
       return;
     }
     const receivedAt = performance.now();
@@ -3362,6 +3547,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (existing.target.health !== peer.health) existing.predicted = 0;
       existing.target = { ...peer };
     }
+    if (zombieMode) coop.setPeers(nextPeers, snapshotTime); // zombie co-op (MODE)
   }
 
   function peerVehicle(peer: Peer): VehicleKind {
@@ -3371,6 +3557,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   /** Attacking another player is a crime too. */
   function hitPeer(id: string, peer: Peer, damage: number, dx: number, dz: number, now: number) {
     if (peer.target.down) return;
+    if (zombieMode && coop.online && !coop.friendlyFire) return; // zombie co-op: no friendly fire (MODE)
     pendingHits.push({ target: id, damage: Math.round(damage), dx, dz });
     peer.hurtAt = now / 1000;
     peer.predicted += damage;
@@ -3416,17 +3603,6 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
   }
 
-  /**
-   * Damages a zombie; a kill tears limbs on a big hit and sometimes leaves money on the street. `near` is what limbs
-   * tear nearest to; `at` and `kind` where and what struck it, for the ragdoll.
-   */
-  function hurtZombie(zb: Zombie, amount: number, vx: number, vy: number, vz: number, now: number, force: boolean, gore: number, near: THREE.Vector3 | null, kind?: HitKind, at = near) {
-    const result = zombies.damage(zb, amount, vx, vy, vz, now / 1000, force, at, kind);
-    if (!result?.killed) return;
-    dismember(result.body, gore, near, now);
-    if (Math.random() < 0.22) pickups.drop(zb.x, zb.z, 10 + Math.floor(Math.random() * 40), now);
-  }
-
   /** Everything that can be shot, as upright capsules: centre (x, z), bottom and top heights, radius. */
   function forEachTarget(callback: (x: number, z: number, y0: number, y1: number, radius: number) => void) {
     npcs.forEachStanding((x, z, npc) => callback(x, z, npc.y, npc.y + 1.8, 0.38));
@@ -3434,12 +3610,26 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     for (const peer of peers.values()) if (!peer.target.down && peerVehicle(peer) === 'foot') callback(peer.group.position.x, peer.group.position.z, 0.1, 1.9, 0.4);
     animals.forEachShadow((x, z, size) => callback(x, z, 0.05, 0.1 + size * 0.6, Math.max(0.2, size * 0.45)));
     ragdolls.forEach((body) => { if (body !== playerBody) { ragdolls.center(body, scratch); callback(scratch.x, scratch.z, scratch.y - 0.3, scratch.y + 0.3, 0.45); } });
-    if (zombieMode) zombies.forEachStanding(callback);
+    if (zombieMode) { zombies.forEachStanding(callback); coop.mutants?.forEachCapsule(callback); }
   }
 
   /** Without a mouse (F key, touch): straight ahead where the player faces, at chest height. No auto-aim. */
   function aimAhead(range: number, out: THREE.Vector3) {
-    return out.set(state.x + Math.sin(state.angle) * range, groundHeight(state.x, state.z) + 1.2, state.z + Math.cos(state.angle) * range);
+    out.set(state.x + Math.sin(state.angle) * range, groundHeight(state.x, state.z) + 1.2, state.z + Math.cos(state.angle) * range);
+    // ---- zombie co-op (integration): a giant mutant straight ahead is shot at its own chest height, not between its
+    // legs (same line, no sideways assist) ----
+    if (zombieMode) {
+      const fx = Math.sin(state.angle), fz = Math.cos(state.angle);
+      let best = range;
+      coop.mutants?.forEachCapsule((x, z, y0, y1, r) => {
+        const along = (x - state.x) * fx + (z - state.z) * fz, across = Math.abs((x - state.x) * fz - (z - state.z) * fx);
+        if (along <= 0 || along >= best || across > r) return;
+        best = along;
+        out.set(state.x + fx * along, y0 + (y1 - y0) * 0.55, state.z + fz * along);
+      });
+    }
+    // ---- end zombie co-op ----
+    return out;
   }
 
   /**
@@ -3540,12 +3730,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         effects.blood(hitPoint.set(peer.group.position.x, 1.4, peer.group.position.z), rayDir.set(fx, 0, fz), 4);
       }
     }
-    if (!hit && zombieMode) zombies.near(cx, cz, 0.95, (zb) => {
-      if (hit) return;
+    if (!hit && zombieMode && coop.melee(cx, cz, 0.95, def.damage, fx, fz, hitPoint.set(cx, groundHeight(cx, cz) + 1.2, cz))) {
       hit = true;
-      hurtZombie(zb, def.damage, fx * def.force * PUNCH_PUSH, 1.8, fz * def.force * PUNCH_PUSH, now, false, 0, null, 'melee', hitPoint.set(zb.x - fx * 0.15, groundHeight(zb.x, zb.z) + 1.2, zb.z - fz * 0.15));
-      effects.blood(hitPoint.set(zb.x, 1.4, zb.z), rayDir.set(fx, 0, fz), 4);
-    });
+      effects.blood(hitPoint.set(cx, 1.4, cz), rayDir.set(fx, 0, fz), 4);
+    }
     if (!hit) animals.near(cx, cz, 0.9, (index) => { if (!hit) { hit = true; animals.hit(index, fx * 6, 3, fz * 6); } });
     if (!hit) hit = ragdolls.push(cx, cz, 0.9, fx * 3.5, 1.5, fz * 3.5) > 0;
     if (hit) { playThud(); shake = Math.max(shake, 0.15); npcs.notice(cx, cz, 'fight', time); }
@@ -3573,14 +3761,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const d = Math.hypot(o.x - b.x, o.z - b.z), f = 1 - d / b.radius, dx = (o.x - b.x) / (d || 1), dz = (o.z - b.z) / (d || 1);
       police.damage(o, b.damage * f + 15, dx * (8 + 14 * f), 6 + 9 * f, dz * (8 + 14 * f), time, true, blastPoint, 'blast');
     });
-    if (zombieMode) {
-      zombies.hear(b.x, b.z, 70, time);
-      zombies.near(b.x, b.z, b.radius, (zb) => {
-        const d = Math.hypot(zb.x - b.x, zb.z - b.z), f = 1 - d / b.radius, dx = (zb.x - b.x) / (d || 1), dz = (zb.z - b.z) / (d || 1);
-        hurtZombie(zb, b.damage * f + 20, dx * (8 + 14 * f), 6 + 9 * f, dz * (8 + 14 * f), now, true, f > 0.4 ? 0.8 : 0.3, blastPoint, 'blast');
-        effects.blood(hitPoint.set(zb.x, 1, zb.z), rayDir.set(dx, 0.6, dz), 6);
-      });
-    }
+    if (zombieMode) coop.blast(b.x, b.y, b.z, b.radius, b.damage); // zombie co-op: one area hit, applied by the host (MODE)
     for (const [id, peer] of peers) {
       const d = Math.hypot(peer.group.position.x - b.x, peer.group.position.z - b.z);
       if (d < b.radius && byPlayer) hitPeer(id, peer, Math.min(100, b.damage * (1 - d / b.radius) + 10), (peer.group.position.x - b.x) / (d || 1), (peer.group.position.z - b.z) / (d || 1), now);
@@ -3645,7 +3826,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (def.projectile.gravity > 0) lob(rayOrigin, aimPoint, def.projectile.speed, def.projectile.gravity, rayDir);
       else rayDir.copy(aimDir);
       explosives.launch(def.id, def.projectile, rayOrigin, rayDir, false);
-      if (zombieMode) zombies.hear(state.x, state.z, 45, time);
+      if (zombieMode) coop.hear(state.x, state.z, 45);
       shake = Math.max(shake, 0.3);
       npcs.alarm(state.x, state.z, 45, time);
       animals.alarm(state.x, state.z, 30);
@@ -3670,15 +3851,15 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         hitMarkAt = now;
         headMark = head;
       });
-      const zombieHit = zombieMode ? zombies.raycast(rayOrigin, rayDir, maxT) : null;
-      if (zombieHit) consider(zombieHit.t, () => {
-        // Zombies report the hit height in figure units (and whether it was above a bent-over neck).
-        const head = (zombieHit as unknown as { head?: boolean }).head ?? zombieHit.height > FIGURE.neckY;
-        hurtZombie(zombieHit.zombie, def.damage * (head ? 3 : 1), rayDir.x * def.force * BULLET_PUSH, 1.4, rayDir.z * def.force * BULLET_PUSH, now, false, pointBlank && zombieHit.t < 4 ? 0.6 : head ? 0.35 : 0.08, hitPoint.clone(), 'bullet');
-        effects.blood(hitPoint, rayDir, def.pellets > 1 ? 3 : head ? 10 : 6);
+      // ---- zombie co-op: zombies and mutants (the host applies the zone and armour rules; a client predicts and sends) ----
+      const coopShot = zombieMode ? coop.shoot(rayOrigin, rayDir, maxT) : null;
+      if (coopShot) consider(coopShot.t, () => {
+        coop.hit(coopShot, def.damage, def.pellets > 1 ? 'pellet' : 'bullet', def.id, rayDir, def.force * BULLET_PUSH, hitPoint.clone());
+        effects.blood(hitPoint, rayDir, def.pellets > 1 ? 3 : coopShot.head ? 10 : 6);
         hitMarkAt = now;
-        headMark = head;
+        headMark = coopShot.head;
       });
+      // ---- end zombie co-op ----
       const officerHit = police.raycast(rayOrigin, rayDir, maxT);
       if (officerHit) consider(officerHit.t, () => {
         const head = (officerHit as unknown as { head?: boolean }).head ?? hitPoint.y - groundHeight(officerHit.officer.x, officerHit.officer.z) > OFFICER_NECK_Y;
@@ -3733,7 +3914,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     shake = Math.max(shake, def.id === 'shotgun' ? 0.35 : def.id === 'smg' ? 0.1 : 0.15);
     npcs.alarm(state.x, state.z, 42, time);
     npcs.notice(state.x, state.z, 'shots', time);
-    if (zombieMode) zombies.hear(state.x, state.z, def.id === 'pistol' ? 38 : 50, time);
+    if (zombieMode) coop.hear(state.x, state.z, def.id === 'pistol' ? 38 : 60);
     animals.alarm(state.x, state.z, 30);
     // Shooting near the police is a crime even if nobody gets hurt.
     let policeNear = false;
@@ -3748,7 +3929,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (npcHit) t = npcHit.t;
     const officerHit = police.raycast(origin, dir, t);
     if (officerHit) t = officerHit.t;
-    const zombieHit = zombieMode ? zombies.raycast(origin, dir, t) : null;
+    const zombieHit = zombieMode ? coop.shoot(origin, dir, t) : null;
     if (zombieHit) t = zombieHit.t;
     const carHit = vehicles.raycast(origin, dir, t);
     if (carHit && carHit.car !== playerCar) t = carHit.t;
@@ -3811,10 +3992,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       thrown(o.x, o.z);
     });
     animals.near(cx, cz, radius, (index, ax, az) => { animals.hit(index, fx * speed, 3, fz * speed); thrown(ax, az); });
-    if (zombieMode) zombies.near(cx, cz, radius + 0.1, (zb) => {
-      hurtZombie(zb, speed * 6, fx * speed * 0.85, 3 + speed * 0.22, fz * speed * 0.85, now, true, gore, null, 'vehicle', bumper(zb.x, zb.z));
-      thrown(zb.x, zb.z);
-    });
+    if (zombieMode && coop.ram(cx, cz, radius + 0.1, speed, fx, fz) > 0) thrown(cx, cz);
     for (const [id, peer] of peers) {
       const kind = peerVehicle(peer);
       if (peer.target.down || kind === 'car' || kind === 'police') continue;
@@ -3910,7 +4088,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       hospital: { x: Math.round(LANDMARKS.hospital.x), z: Math.round(LANDMARKS.hospital.z) }, policeStation: { x: Math.round(LANDMARKS.police.x), z: Math.round(LANDMARKS.police.z) },
       arsenal: [...ammo.entries()].map(([id, a]) => ({ id, mag: a.mag, reserve: a.reserve })), stunned: now < stunUntil, flatTires,
       surrendered, gassed: now < gassedUntil, policeIn: Math.ceil(police.responseIn(now / 1000)),
-      zombie: zombieMode ? { ...zombies.stats(now / 1000), best: zombieBest, dots: zombieDots() } : null,
+      zombie: zombieMode ? coop.hud(now) : null,
       healCost: Math.ceil((MAX_HEALTH - health) * 1.2), respawnIn: down === 'wasted' || down === 'busted' ? Math.max(0, Math.ceil((downUntil - now) / 1000)) : 0,
     };
     // React re-renders only when something visible changed.
@@ -3920,53 +4098,22 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     onHud(hud);
   }
 
-  /** Zombies within 70 m for the minimap, rounded so the HUD only re-renders when they really move. */
-  function zombieDots() {
-    const dots: { x: number; z: number }[] = [];
-    zombies.forEachStanding((x, z) => { if (dots.length < 48 && Math.hypot(x - state.x, z - state.z) < 70) dots.push({ x: Math.round(x / 2) * 2, z: Math.round(z / 2) * 2 }); });
-    return dots;
-  }
-
   /** Zombie mode each frame: the horde, its blows, waves and supply drops, burning barrels, the flashlight. */
   function updateZombies(dt: number, now: number, time: number) {
-    const reach = playerCar ? (playerCar.kind === 'moto' ? 0.9 : 1.6) : state.riding ? 0.9 : 0;
-    const result = zombies.update(dt, time, { x: state.x, z: state.z, down: down !== null, inVehicle: state.riding, reach, night: atmosphere.night });
-    for (const strike of result.strikes) {
-      if (down) break;
-      const d = Math.hypot(state.x - strike.x, state.z - strike.z) || 1;
-      const dx = (state.x - strike.x) / d, dz = (state.z - strike.z) / d;
-      playThud();
-      if (inCar()) { damageVehicle(strike.damage * 1.4, now); shake = Math.max(shake, 0.2); continue; }
-      damagePlayer(strike.damage * (state.riding ? 0.8 : 1), now, { x: strike.x, z: strike.z }, 'Zombie');
-      effects.blood(hitPoint.set(state.x, 1.3, state.z), rayDir.set(dx, 0.3, dz), 5);
-      shake = Math.max(shake, strike.heavy ? 0.45 : 0.18);
-      if (strike.heavy && !down && !state.riding) knockPlayer(dx * 7 * PUNCH_PUSH, 1.8, dz * 7 * PUNCH_PUSH, now, 'crash', hitPoint.set(state.x - dx * 0.15, groundHeight(state.x, state.z) + 1.2, state.z - dz * 0.15), 'melee');
-      else if (state.riding && !playerCar && strike.heavy) bikeHealth = Math.max(0, bikeHealth - strike.damage);
-    }
-    for (const spot of result.risen) effects.smoke(spot.x, groundHeight(spot.x, spot.z) + 0.2, spot.z, now, false, '#6b5a48');
-    if (result.waveStarted) {
-      showBanner(`ĐỢT ${result.waveStarted}`, now, 2600);
-      notify(result.waveStarted === 1 ? 'Chúng đến rồi! Bắn vào đầu, giữ khoảng cách.' : `Đợt ${result.waveStarted}: đông hơn, nhanh hơn${result.waveStarted >= 3 ? ', có cả zombie khổng lồ' : ''}!`, 3500);
-    }
-    if (result.waveCleared) {
-      const wave = result.waveCleared;
-      if (wave > zombieBest) {
-        zombieBest = wave;
-        try { localStorage.setItem('pvo-zombie-best', String(wave)); } catch { /* storage blocked */ }
-      }
-      // A supply drop between waves: ammo for every gun, some health and cash.
-      for (const [id, rounds] of ammo) rounds.reserve += Math.ceil(weaponById(id).startAmmo * 0.6);
-      health = Math.min(MAX_HEALTH, health + 30);
-      cash += 80 + wave * 40;
-      state.score += wave * 100;
-      showBanner(`ĐÃ DỌN SẠCH ĐỢT ${wave}`, now, 3000);
-      notify('Tiếp tế đã tới: đạn, máu và tiền · Nghỉ 20 giây trước đợt sau', 4500);
-    }
-    // Burning barrels near the player keep their fires going.
+    void dt; void time;
+    // ---- zombie co-op (design.md §5.4, MODE): the coordinator steps the horde in real time (frameInterval, not dt) ----
+    if (coopLevel !== level) { coopLevel = level; coop.setDetail(level); apocalypse.setDetail(level); }
+    if (now > zSlowUntil) zSlow = 1;
+    coop.update(Math.max(0, frameInterval) / 1000, now, coopPlayer(now));
+    // Downed: a kneeling shuffle with the pistol only.
+    if (coop.downed === 1 && weapon !== 'pistol' && owned.has('pistol')) equip('pistol');
+    // ---- end zombie co-op ----
+    // Burning barrels near the player keep their fires going (the two nearest: every flame and smoke puff is a sprite,
+    // a draw call; the ruins' smoke columns further off are instanced, horror-fx).
     if (now > fireAt) {
       fireAt = now + 2600;
-      const near = world.fires.filter((f) => Math.hypot(f.x - state.x, f.z - state.z) < 70).sort((a, b) => Math.hypot(a.x - state.x, a.z - state.z) - Math.hypot(b.x - state.x, b.z - state.z)).slice(0, 6);
-      for (const f of near) explosives.burn(f.x, groundHeight(f.x, f.z) + 0.95, f.z, 3.4, 0.55, now);
+      const near = (apocalypse.fires.length ? apocalypse.fires : world.fires).filter((f) => Math.hypot(f.x - state.x, f.z - state.z) < 45).sort((a, b) => Math.hypot(a.x - state.x, a.z - state.z) - Math.hypot(b.x - state.x, b.z - state.z)).slice(0, 2);
+      for (const f of near) explosives.burn(f.x, groundHeight(f.x, f.z) + ((f as { y?: number }).y ?? 0.95), f.z, 3.4, 0.55, now); // zombie co-op: a ruin fire's own flame height
     }
     // The flashlight points where the player faces (or aims), brighter as night falls.
     const yaw = now < aimUntil || pointerInside ? aimYaw : state.angle;
@@ -3974,7 +4121,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     torch.position.set(state.x + Math.sin(yaw) * 0.3, y + 1.55, state.z + Math.cos(yaw) * 0.3);
     torch.target.position.set(state.x + Math.sin(yaw) * 11, y, state.z + Math.cos(yaw) * 11);
     torch.target.updateMatrixWorld();
-    torch.intensity = 60 * Math.max(0, atmosphere.night - 0.15);
+    torch.intensity = 60 * Math.max(0, atmosphere.night - 0.15) * (torchFlicker > 0 ? 1 - torchFlicker * (Math.sin(now * 0.037) * Math.sin(now * 0.011) > 0.2 ? 0.85 : 0.15) : 1);
     marker.visible = false;
   }
 
@@ -4114,7 +4261,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     return cuffedArms;
   }
   /** Poses the walker for this frame; `look` is how far the aim is turned from the body (radians), or null. */
-  function animateWalker(dt: number, now: number, time: number, walking: boolean, o: { gun: GunId | null; kneeling: boolean; handsUp: boolean; armed: boolean; swim: number; sky: 'deck' | 'fall' | 'chute' | null; look: number | null }) {
+  function animateWalker(dt: number, now: number, time: number, walking: boolean, o: { gun: GunId | null; kneeling: boolean; handsUp: boolean; armed: boolean; swim: number; sky: 'deck' | 'fall' | 'chute' | null; look: number | null; down?: boolean }) {
     const w = walker;
     const speed = walking ? Math.abs(velocity) : 0;
     const go = Math.min(1, speed / 1.2);
@@ -4178,7 +4325,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       // Forced to kneel on both knees, the tops of the feet flat, hands cuffed behind the back.
       thighL = thighR = 0.15; kneeL = kneeR = 1.45; ankleL = ankleR = 0.9; toeL = toeR = 0;
       drop = FIGURE.hipY - FIGURE.thigh * Math.cos(0.15) - 0.06; planted = false;
-      lean = 0.1; twist = 0; gaze = 0; headPitch = 0.15; cuffed = true;
+      lean = 0.1; twist = 0; gaze = 0; headPitch = 0.15; cuffed = !o.down;
     }
     if (now < stunUntil) {
       // Tasered: limbs jerk, fingers hooked.
@@ -4256,7 +4403,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const aiming = now < aimUntil;
     if (moving && !aiming) state.angle = angleLerp(state.angle, Math.atan2(dirX, dirZ), 1 - Math.exp(-dt * 12));
     // Tear gas makes it hard to run; swimming is slow (Shift for a faster crawl).
-    const topSpeed = swimming ? (keys.has('shift') ? 2.9 : 1.8) : (keys.has('shift') ? 6.8 : aiming ? 3.4 : 4.2) * (performance.now() < gassedUntil ? 0.55 : 1) * footSpeed(buffOn('mat'));
+    const topSpeed = (swimming ? (keys.has('shift') ? 2.9 : 1.8) : (keys.has('shift') ? 6.8 : aiming ? 3.4 : 4.2) * (performance.now() < gassedUntil ? 0.55 : 1) * footSpeed(buffOn('mat'))) * (zombieMode ? (coop.downed === 1 ? 0.6 / (keys.has('shift') ? 6.8 : 4.2) : zSlow) : 1);
     velocity = THREE.MathUtils.damp(velocity, moving ? topSpeed : 0, 9, dt);
     if (velocity < 0.025) velocity = 0;
     // While aiming the player strafes in the input direction instead of turning.
@@ -4323,6 +4470,16 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     p.sync();
   }
 
+  // ---- zombie co-op (MODE): a downed teammate kneels, as the arrest pose does ----
+  function kneelPeer(p: Person) {
+    p.limbLeft.rotation.set(0.15, 0, 0); p.limbRight.rotation.set(0.15, 0, 0);
+    p.kneeLeft.rotation.x = p.kneeRight.rotation.x = 1.45; p.ankleLeft.rotation.x = p.ankleRight.rotation.x = 0.9;
+    p.toe.left = p.toe.right = 0;
+    p.body.rotation.set(0.1, 0, 0);
+    p.group.position.y = -(FIGURE.hipY - FIGURE.thigh * Math.cos(0.15) - 0.06) * PERSON_SCALE;
+    p.sync();
+  }
+  // ---- end zombie co-op ----
   function updatePeers(now: number, time: number, dt: number) {
     const renderTime = peerClock.renderTime(now);
     for (const [, peer] of peers) {
@@ -4367,6 +4524,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       const gun = target.weapon && target.weapon !== 'fists' ? target.weapon : null;
       for (const [id, model] of peer.guns) model.visible = id === gun;
       if (peer.foot.group.visible) posePeer(peer.foot, kind === 'swim', pose.speed, gun, dt, time);
+      if (peer.foot.group.visible && target.zd === 1) kneelPeer(peer.foot); // zombie co-op: downed, waiting for a revive (MODE)
       if (target.firing && now - peer.flashAt > 160) {
         peer.flashAt = now;
         // The muzzle of a gun held out at shoulder height.
@@ -4385,8 +4543,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   function update(now: number) {
     if (disposed) return;
     const interval = now - previousTime;
-    // Holding Tab for the weapon bag slows the street down, like a weapon wheel.
-    const dt = Math.min(interval / 1000, 0.05) * (bagOpen ? 0.25 : 1);
+    frameInterval = interval; // zombie co-op: the coordinator steps the horde in real time (MODE)
+    // Holding Tab for the weapon bag slows the street down, like a weapon wheel (not in an online zombie room: A7).
+    const dt = Math.min(interval / 1000, 0.05) * (bagOpen && !(zombieMode && coop.online) ? 0.25 : 1);
     previousTime = now;
     // Frames behind an opaque overlay say nothing about how fast the street draws.
     adaptQuality(now, covered ? 0 : interval);
@@ -4408,7 +4567,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const stunned = now < stunUntil;
     if (!state.riding) wasDriving = false;
     if (police.wanted === 0) surrendered = false;
-    if (active && !down && !stunned && !surrendered) {
+    if (active && !down && !stunned && !surrendered && !(zombieMode && coop.downed === 2)) {
       let horizontal = 0;
       let vertical = 0;
       if (!focusedInput()) {
@@ -4441,7 +4600,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       }
       state.speed = velocity;
       // Natural healing (services.ts): to 60 in the city (70 seated), a full stomach to 100; zombie mode as before.
-      if (time - lastDamage > 6 && police.wanted === 0) {
+      if (time - lastDamage > 6 && police.wanted === 0 && !(zombieMode && coop.downed)) {
         const rate = regenRate(health, { zombie: zombieMode, full: buffOn('no'), seated: !!seat });
         if (rate) health = Math.min(MAX_HEALTH, health + dt * rate);
       }
@@ -4718,8 +4877,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       }
     } else {
       animateWalker(dt, now, time, moving && active && !state.riding, {
-        gun: weapon === 'fists' ? null : weapon, kneeling, handsUp, armed: armed && now < aimUntil + 600 && !swimming && !glide,
-        swim: swimming ? 0.25 + swimPace * 0.75 : 0, sky: glide ? glide.phase : null, look: aimTurn,
+        gun: weapon === 'fists' ? null : weapon, kneeling: kneeling || (zombieMode && coop.downed === 1), handsUp, armed: armed && now < aimUntil + 600 && !swimming && !glide,
+        swim: swimming ? 0.25 + swimPace * 0.75 : 0, sky: glide ? glide.phase : null, look: aimTurn, down: zombieMode && coop.downed === 1,
       });
       if (cupOn && now >= punchUntil) {
         setArm(walker, 1, sip > 0.02 ? arm(handPose, -1.05 - 0.45 * sip, 0.1, 0, -1.25 - 0.9 * sip, 0, 0, HAND.CUP) : HOLD_CUP);
@@ -4728,6 +4887,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     for (const cuff of cuffs) cuff.visible = kneeling;
     for (const [id, gun] of guns) gun.group.visible = id === weapon && !kneeling && !handsUp && !swimming && !glide && !seat && !ride;
+    if (zombieMode && coop.downed === 2) walker.group.visible = false; // zombie co-op: dead, spectating (MODE)
     const onBike = state.riding && !playerCar;
     rider.group.visible = onBike;
     seatHolder.visible = (!!playerCar && state.riding) || ride?.pose === 'pillion';
@@ -4862,6 +5022,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     npcs.forEachStanding((x, z, npc) => { if ((x - eyeX) ** 2 + (z - eyeZ) ** 2 < 5600) effects.blob(x, npc.y + 0.02, z, 0.85); });
     police.forEachUnit((x, z, onFoot) => { if (onFoot) effects.blob(x, groundHeight(x, z) + 0.02, z, 0.85); });
     animals.forEachShadow((x, z, size) => effects.blob(x, groundHeight(x, z) + 0.02, z, size, size * 1.6));
+    if (zombieMode) coop.companions.forEachShadow((x, z, size) => effects.blob(x, groundHeight(x, z) + 0.02, z, size * 0.7, size * 1.3)); // zombie co-op: the dogs (MODE)
     // Bodies on the street last (when the blobs run out, standing people keep theirs): along the body, smaller in the air.
     ragdolls.forEachShadow((x, z, width, length, yaw, height) => {
       const ground = groundHeight(x, z), lift = THREE.MathUtils.clamp(1 - (height - ground - 0.3) / 2.5, 0.35, 1);
@@ -4889,6 +5050,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const cameraBlend = 1 - Math.exp(-dt * 4.5);
     const follow = playerBody ? scratch : null;
     desiredTarget.set(street ? (follow ? follow.x : state.x) : -3, glide && street ? glide.y + 1.2 : 1, street ? (follow ? follow.z : state.z) : -5);
+    const spectated = zombieMode ? coop.spectateTarget() : null; // zombie co-op: a dead player watches a teammate (MODE)
+    if (spectated) desiredTarget.set(spectated.x, 1, spectated.z);
     cameraTarget.lerp(desiredTarget, cameraBlend);
     const viewBlend = 1 - Math.exp(-dt * 14);
     // The camera closes in on an arrest.
@@ -4935,6 +5098,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     camera.updateMatrixWorld();
     // Buildings between the camera and the player open up around them.
     world.focus(camera, desiredTarget.x, glide ? glide.y + 1.1 : groundHeight(desiredTarget.x, desiredTarget.z) + 1.1, desiredTarget.z, dt, street && !interior);
+    // zombie co-op: so does a giant mutant, dithered away around the player (see-through.ts).
+    if (zombieMode) coop.mutants?.xray(camera, desiredTarget.x, groundHeight(desiredTarget.x, desiredTarget.z) + 1.1, desiredTarget.z, renderer, dt);
 
     // Floating health bars over anyone hurt recently, and speech bubbles.
     effects.beginBars(camera);
@@ -4968,7 +5133,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   // things out of view. The driver (ANGLE on Windows) finishes a shader at its first draw, so compiling alone would
   // still stall. Zombie mode's flashlight changes every lit program: those variants compile in the background
   // (parallel where the driver can) while the menu is up, and are drawn once when they are ready.
-  let warmed = 0;
+  let warmed = 0, warmedLevel = -1;
   function drawEverything(flashlight: boolean) {
     const shown: THREE.Object3D[] = [], filled: THREE.InstancedMesh[] = [], culled: THREE.Object3D[] = [];
     scene.traverse((o) => {
@@ -4992,6 +5157,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
   function prewarm() {
     const round = ++warmed;
+    warmedLevel = level;
     drawEverything(false);
     // The flashlight variants: start their compiles now without waiting, draw them once they are done.
     const shown: THREE.Object3D[] = [];
@@ -5079,6 +5245,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         return null;
       },
     };
+    // ---- zombie co-op (design.md §7.2, MODE): __pvo.z test hooks ----
+    Object.assign((window as unknown as { __pvo: Record<string, unknown> }).__pvo, { z: coop.test, coop, apocalypse,
+      zprep: () => ({ input: !!ruinInput, worker: !!planWorker, planner: !!planner, plan: !!ruinPlan, models: apocalypse.modelsReady, pool: !!ruinPlan && apocalypse.plan === ruinPlan }) });
+    // ---- end zombie co-op ----
   }
   return {
     /** Opens (or closes, with null) a shop interior: the camera cuts inside and the player stands at the door. */
@@ -5136,10 +5306,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     /** An opaque overlay covers the whole street (the big map): skips drawing until it closes. */
     setCovered(value: boolean) { covered = value; },
     getState(): PlayerState {
+      // ---- zombie co-op (MODE): numbers rounded (−16% on peer snapshots, §1.9); a zombie room's fields ----
+      const zf = zombieMode && coop.online ? coop.playerFields() : null;
       return {
-        ...state, health: Math.ceil(health), weapon, vehicle: vehicleKind(), down: down === 'wasted',
-        firing: performance.now() < firingUntil, wanted: police.wanted,
+        ...state, x: Math.round(state.x * 100) / 100, z: Math.round(state.z * 100) / 100, angle: Math.round(state.angle * 1000) / 1000, speed: Math.round(state.speed * 100) / 100,
+        health: Math.ceil(health), weapon, vehicle: vehicleKind(), down: down === 'wasted' || zf?.zd === 2,
+        firing: performance.now() < firingUntil, wanted: police.wanted, ...(zf ?? {}),
       };
+      // ---- end zombie co-op ----
     },
     /** Hits this player dealt since the last sync, at most eight. */
     takeHits() { return pendingHits.splice(0, 8); },
@@ -5152,6 +5326,39 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       }
     },
     setPeers,
+    // ---- zombie co-op (design.md §5.4, MODE) ----
+    /** The room this game plays in (null: solo). A zombie room hands the horde to one player's game (the host). Call before reset(mode). */
+    setRoom(room: { mode: RoomMode; selfId: string; slot: number; host: string | null; epoch: number; ff: boolean; name?: string; color?: string } | null) {
+      coop.setRoom(room && room.mode === 'zombie' ? { online: true, selfId: room.selfId, slot: room.slot, host: room.host, epoch: room.epoch, ff: room.ff, name: room.name, color: room.color } : null);
+    },
+    /** Zombie frames for the room this tick (room-connection takeZombie). */
+    takeZombie(maxBytes: number): ZombieClientMessage[] { return zombieMode ? coop.takeOutgoing(maxBytes) : []; },
+    receiveZombie(message: ZombieServerMessage) { if (zombieMode) coop.receive(message); },
+    zombieReady(info: { mode?: RoomMode; slot?: number; serverTime: number; reconnect: boolean }) { coop.onReady(info); },
+    zombieServerTime(serverTime: number) { coop.onServerTime(serverTime); },
+    zombieClose(code: number) { coop.onClose(code); },
+    /** G/T/X and the paw button: call or sit the dog, send it to bite, bandage. */
+    dogCommand(cmd: DogCommand) { if (zombieMode) coop.dogCommand(cmd); },
+    zombieBandage() { if (zombieMode) { const text = coop.bandage(); if (text) notify(text, 2200); } },
+    /** "Chơi lại ngay" on the game-over card. */
+    zombieRestart() { if (zombieMode) coop.requestRestart(); },
+    /** "Bắt đầu" on the online waiting card. */
+    zombieStart() { if (zombieMode) coop.requestStart(); },
+    /** The lobby is up: prepare zombie mode's ruins in idle time (the first switch into zombie mode then has nothing to build). */
+    prepareZombie,
+    /** Leaving a zombie room: the horde stops at once (the city comes back with reset(), after the leave request). */
+    zombieSuspend() { if (zombieMode) { coop.stop(); coop.setRoom(null); } },
+    /** The room session ended for good (a fatal close): a zombie room carries on as solo zombie mode from wave 1. */
+    zombieRoomLost(): boolean {
+      if (!zombieMode) return false;
+      this.setRoom(null);
+      this.reset('zombie');
+      notify('Mất kết nối phòng · chuyển sang chơi một mình', 5000);
+      return true;
+    },
+    /** Frames per second (the room's host election prefers fast hosts). */
+    fps() { return monitor.fps; },
+    // ---- end zombie co-op ----
     action,
     setInput,
     selectMission(id: MissionId) {
@@ -5299,7 +5506,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       reticle.remove();
       fade.remove();
       interiors.dispose();
+      coop.stop();
       zombies.dispose();
+      apocalypse.dispose();
       scene.remove(torch, torch.target);
       torch.dispose();
       canvas.removeEventListener('pointerup', onPointerUp);
