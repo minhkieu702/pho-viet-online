@@ -3,6 +3,10 @@ import { ATM_SPOTS, VENDING_SPOTS } from './counters';
 import { ASPHALT_HALF } from './map/terrain';
 import { APPROACHES } from './signals';
 import type { CarStyle, MotoStyle } from './vehicle-models';
+import { district, noseYaw, sliceAt, type DistrictView } from './district-life';
+import { createCollisionIndex } from './map/collision';
+import { curbFleetRoad } from './map/curb-fleet';
+import type { GenBuilding } from './map/gen/buildings';
 
 /**
  * Where vehicles stand parked, as deterministic data (no randomness, nothing drawn): the 60 sidewalk scooters of
@@ -70,10 +74,13 @@ export const LOTS: Lot[] = [];
 
 function addSpot(kind: SpotKind, occ: Occ, x: number, z: number, yaw: number, vehicle: 'moto' | 'car', host: number, lot: number, legacy = false) {
   const id = SPOTS.length;
-  const jitter = vehicle === 'moto' ? (hash01(id, 11) * 2 - 1) * JITTER : (hash01(id, 11) * 2 - 1) * 0.02;
-  const style = vehicle === 'moto' ? pickMix(MOTO_MIX, hash01(id, 12)) : pickMix(CAR_MIX, hash01(id, 12));
-  SPOTS.push({ id, kind, occ, x, z, yaw: yaw + jitter, vehicle, style, tint: hash01(id, 13), host, lot, legacy });
+  SPOTS.push(makeSpot(id, kind, occ, x, z, yaw, vehicle, host, lot, legacy));
   return id;
+}
+function makeSpot(id: number, kind: SpotKind, occ: Occ, x: number, z: number, yaw: number, vehicle: 'moto' | 'car', host: number, lot: number, legacy = false, jitter = true): ParkSpot {
+  const j = !jitter ? 0 : vehicle === 'moto' ? (hash01(id, 11) * 2 - 1) * JITTER : (hash01(id, 11) * 2 - 1) * 0.02;
+  const style = vehicle === 'moto' ? pickMix(MOTO_MIX, hash01(id, 12)) : pickMix(CAR_MIX, hash01(id, 12));
+  return { id, kind, occ, x, z, yaw: yaw + j, vehicle, style, tint: hash01(id, 13), host, lot, legacy };
 }
 
 const nearestDoor = (x: number, z: number) => BUILDINGS.reduce((best, b) => (Math.hypot(b.door.x - x, b.door.z - z) < Math.hypot(best.door.x - x, best.door.z - z) ? b : best), BUILDINGS[0]);
@@ -259,6 +266,192 @@ function carPark(name: string, x0: number, x1: number, z: number, yaw: number, o
 carPark('BÃI ĐỖ XE Ô TÔ · HÀM NGHI', 284.5, 309.5, 91.4, Math.PI, 'carpark');
 carPark('BÃI ĐỖ XE Ô TÔ · KHÁCH SẠN', 284.5, 309.5, -75.9, Math.PI, 'hotel');
 carPark('BÃI ĐỖ XE Ô TÔ · TÀI CHÍNH', 232.5, 253.5, -70.0, Math.PI, 'carpark');
+
+// ---- The wired districts: their parked bikes, giữ-xe rows and car bays. ----
+
+/** A district building's occupancy curve (the same curves as today's, by what the building is). */
+function occOfGen(b: GenBuilding | undefined): Occ {
+  if (!b) return 'home';
+  if (b.zone === 'night' && (b.kind === 'food' || b.kind === 'cafe')) return 'night';
+  switch (b.kind) {
+    case 'home': return 'home';
+    case 'food': return 'food';
+    case 'cafe': return 'cafe';
+    case 'hotel': return 'hotel';
+    case 'school': return 'school';
+    case 'pagoda': return 'pagoda';
+    case 'police': return 'police';
+    case 'hospital': return 'hospital';
+    case 'office': return 'office';
+    default: return b.typology === 'market-hall' ? 'market' : 'shop';
+  }
+}
+const SPOT_KIND: Partial<Record<Occ, SpotKind>> = { home: 'home', night: 'night', market: 'market', school: 'school', pagoda: 'pagoda' };
+/** Who minds a row of bikes in front of these (and how much, when): a giữ-xe lot of 6 or more. */
+const MINDED: Partial<Record<Occ, { price: number; hours: [number, number] }>> = {
+  market: { price: 3, hours: [5, 19] }, school: { price: 3, hours: [6, 17.5] }, pagoda: { price: 3, hours: [5, 20] }, hospital: { price: 5, hours: [0, 24] },
+  office: { price: 5, hours: [7, 18] }, night: { price: 10, hours: [17, 2] }, hotel: { price: 10, hours: [0, 24] },
+};
+
+/**
+ * The parked vehicles of a set of districts, as spots after `firstSpot` and lots after `firstLot`: every bike the
+ * generator parked on a sidewalk band or along a hẻm (gen/dressing.ts keeps them off doors, walking lines, crosswalks
+ * and solids), nose toward its building and on that building's occupancy curve; rows of 6 or more in front of a chợ,
+ * a school, a pagoda or church, a hospital, an office, a hotel or along a night street become giữ-xe lots with an
+ * attendant's chair at the end nearest the door; and cars in the car and taxi bays of the district roads (bays only
+ * exist where the asphalt half-width is 9 m or more, plan decision 10), along the curb facing the traffic beside them.
+ */
+export function districtSpots(v: DistrictView, firstSpot: number, firstLot: number): { spots: ParkSpot[]; lots: Lot[] } {
+  const spots: ParkSpot[] = [], lots: Lot[] = [];
+  const byId = (id: number) => (id >= v.buildingBase ? v.buildings[id - v.buildingBase] : undefined);
+  // The slices' solids (no parked bikes): an attendant's chair must stand clear of them.
+  const solids = createCollisionIndex();
+  for (const s of v.world.slices) for (const c of s.data.colliders) if (c.kind !== 'moto') solids.addBox(c.cx, c.cz, c.hx, c.hz, c.yaw);
+  const rows = new Map<string, number[]>(), minded: number[] = [];
+  const perch = new Set(v.perches.map((q) => q.parked));
+  v.parked.forEach((p, k) => {
+    const b = byId(p.building), id = firstSpot + spots.length;
+    // A xe ôm driver's scooter (district-life.ts corners) is there in his hours, whoever's door it stands at.
+    const occ: Occ = perch.has(k) ? 'xeom' : occOfGen(b);
+    // Nose toward the building it belongs to (its door), as today's rows stand.
+    const spot = makeSpot(id, perch.has(k) ? 'perch' : SPOT_KIND[occ] ?? 'shop', occ, p.x, p.z, noseYaw(p, b?.door ?? null), 'moto', p.building, -1, false, false);
+    spot.style = p.model;
+    spot.tint = p.tint;
+    spots.push(spot);
+    if (MINDED[occ] && b) minded.push(spots.length - 1);
+  });
+  // The generator's bikes stand where they are; the busy places add rows of their own round them.
+  for (const p of v.parked) solids.addBox(p.x, p.z, 0.31, 0.875, p.yaw);
+  for (const spot of busyRows(v, solids, spots, firstSpot + spots.length)) { spots.push(spot); minded.push(spots.length - 1); }
+  // Rows: bikes of minded places chained along the band (a door's gap between them still one row).
+  const cluster = new Int32Array(spots.length).fill(-1);
+  let clusters = 0;
+  for (const i of minded) {
+    if (cluster[i] >= 0) continue;
+    const stack = [i];
+    cluster[i] = clusters;
+    while (stack.length) {
+      const k = stack.pop()!;
+      for (const j of minded) if (cluster[j] < 0 && spots[j].occ === spots[k].occ && Math.hypot(spots[j].x - spots[k].x, spots[j].z - spots[k].z) < 3.6) { cluster[j] = clusters; stack.push(j); }
+    }
+    clusters++;
+  }
+  for (const i of minded) { const key = `c${cluster[i]}`; const list = rows.get(key) ?? []; list.push(i); rows.set(key, list); }
+  for (const members of rows.values()) {
+    if (members.length < 6) continue;
+    // The row belongs to the place most of its bikes are for.
+    const hosts = new Map<number, number>();
+    for (const i of members) hosts.set(spots[i].host, (hosts.get(spots[i].host) ?? 0) + 1);
+    const host = [...hosts].sort((p, q) => q[1] - p[1])[0][0];
+    const first = spots[members[0]], b = byId(host), m = MINDED[first.occ]!;
+    if (!b) continue;
+    // The chair: beside the member nearest the door, a little nearer the building than the bikes, facing them.
+    const near = members.reduce((a, i) => (Math.hypot(spots[i].x - b.door.x, spots[i].z - b.door.z) < Math.hypot(spots[a].x - b.door.x, spots[a].z - b.door.z) ? i : a), members[0]);
+    const s = spots[near], fx = Math.sin(s.yaw), fz = Math.cos(s.yaw), rx = Math.cos(s.yaw), rz = -Math.sin(s.yaw);
+    let chair: { x: number; z: number; yaw: number } | null = null;
+    for (const along of [0.95, -0.95, 1.4, -1.4]) {
+      const x = s.x + rx * along + fx * 0.25, z = s.z + rz * along + fz * 0.25;
+      if (solids.clear(x, z, 0.32) && !spots.some((o) => Math.hypot(o.x - x, o.z - z) < 0.75)) { chair = { x, z, yaw: s.yaw + Math.PI }; break; }
+    }
+    if (!chair) continue;
+    const lot = firstLot + lots.length;
+    for (const i of members) spots[i].lot = lot;
+    const name = first.occ === 'night' ? 'GIỮ XE · PHỐ ĐÊM' : `GIỮ XE · ${b.name}`;
+    lots.push({ id: lot, kind: 'giuxe', host: b.id, name, attendant: chair, spots: members.map((i) => spots[i].id), price: m.price, hours: m.hours });
+  }
+  // Cars in the district roads' car and taxi bays: parallel to the curb, 5.6 m apart, clear of the bay's ends.
+  const roads = v.world.roads;
+  if (roads) {
+    for (const e of roads.edges) {
+      // (Bến xe Miền Đông's coach bays hold coaches: map/curb-fleet.ts)
+      if (!e.bays.length || curbFleetRoad(e.name) || !sliceAt(v.keys, e.pts[0], e.pts[1], 1)) continue;
+      for (const bay of e.bays) {
+        if (bay.kind !== 'car' && bay.kind !== 'taxi') continue;
+        const off = e.half - bay.depth / 2;
+        for (let at = bay.s0 + 3; at <= bay.s1 - 3 + 1e-6; at += 5.6) {
+          const p = roads.pointAt(e, at), id = firstSpot + spots.length;
+          const x = p.x - p.hz * bay.side * off, z = p.z + p.hx * bay.side * off;
+          // Facing the way the traffic on that side runs (right of a→b runs a→b).
+          const yaw = Math.atan2(p.hx * bay.side, p.hz * bay.side);
+          const spot = makeSpot(id, 'carpark', 'carpark', x, z, yaw, 'car', -1, -1, false);
+          if (bay.kind === 'taxi') spot.style = 'taxi';
+          spots.push(spot);
+        }
+      }
+    }
+  }
+  return { spots, lots };
+}
+/** Bikes a busy place adds to its frontage's band (beyond what the generator parked), and how far along it they reach. */
+const BUSY: Partial<Record<Occ, { max: number; reach: number }>> = {
+  night: { max: 9, reach: 1.2 }, market: { max: 26, reach: 18 }, school: { max: 14, reach: 12 }, pagoda: { max: 12, reach: 10 }, hospital: { max: 16, reach: 14 }, hotel: { max: 8, reach: 8 },
+};
+/**
+ * Giữ-xe rows in front of the districts' busy places (today's rule: a row on the 10.2–11.9 m band of the road the
+ * door faces, slots nearest the door first, none within 1.7 m of any door): along night streets where every quán
+ * fills the band after dark, round the chợ halls, at school, pagoda and church gates, hospitals and hotels. A slot
+ * is kept only clear of the asphalt, the walking line, every solid (tables, trees, poles, carts, bikes already
+ * there), the doors and their paths, every seat or standing spot and its path, and the crosswalks.
+ */
+function busyRows(v: DistrictView, solids: ReturnType<typeof createCollisionIndex>, taken: ParkSpot[], firstSpot: number): ParkSpot[] {
+  const roads = v.world.roads, out: ParkSpot[] = [];
+  if (!roads) return out;
+  const paths: [number, number, number, number][] = [];
+  for (const b of v.buildings) paths.push([b.door.x, b.door.z, b.curb.x, b.curb.z]);
+  for (const p of v.pois) paths.push([p.x, p.z, p.curb.x, p.curb.z]);
+  const doors = v.buildings.map((b) => b.door);
+  const segDist = (x: number, z: number, [ax, az, bx, bz]: [number, number, number, number]) => {
+    const dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz, t = l2 ? Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / l2)) : 0;
+    return Math.hypot(x - ax - dx * t, z - az - dz * t);
+  };
+  const near = (x: number, z: number) => {
+    for (const d of doors) if (Math.abs(d.x - x) < 2.6 && Math.abs(d.z - z) < 2.6 && Math.hypot(d.x - x, d.z - z) < 2.0) return true;
+    for (const s of paths) if (Math.min(s[0], s[2]) - 1.2 < x && Math.max(s[0], s[2]) + 1.2 > x && Math.min(s[1], s[3]) - 1.2 < z && Math.max(s[1], s[3]) + 1.2 > z && segDist(x, z, s) < 1.0) return true;
+    for (const c of roads.crosswalks) if (Math.abs(c.ax - x) < 20 && Math.abs(c.az - z) < 20 && segDist(x, z, [c.ax, c.az, c.bx, c.bz]) < 1.9) return true;
+    return false;
+  };
+  const busy = (b: GenBuilding) => {
+    const occ = occOfGen(b);
+    if (occ === 'pagoda' || occ === 'school' || occ === 'hospital' || occ === 'night' || occ === 'market') return occ;
+    if (occ === 'hotel' && b.stamp) return occ;
+    return null;
+  };
+  for (const b of v.buildings) {
+    const occ = busy(b), rule = occ ? BUSY[occ] : undefined;
+    if (!occ || !rule) continue;
+    const hit = roads.nearestEdge(b.curb.x, b.curb.z, 14, (e) => e.cls !== 'hem');
+    if (!hit) continue;
+    const e = hit.edge, side = hit.off >= 0 ? 1 : -1, band = e.half + e.sidewalk - 1.45;
+    // No band: a sidewalk too narrow for a bike beside the walking line.
+    if (e.sidewalk < 4.4 || band - e.walk < 1.4 || band - e.half < 1.4) continue;
+    const at0 = roads.project(e, b.door.x, b.door.z).s, reach = occ === 'night' ? b.w / 2 + rule.reach : rule.reach;
+    const slots: number[] = [];
+    for (let s = at0 - reach; s <= at0 + reach + 1e-6; s += 0.8) if (s > 14 && s < e.len - 14) slots.push(s);
+    slots.sort((p, q) => Math.abs(p - at0) - Math.abs(q - at0));
+    let placed = 0;
+    for (const s of slots) {
+      if (placed >= rule.max) break;
+      const p = roads.pointAt(e, s), nx = -p.hz * side, nz = p.hx * side;
+      const x = p.x + nx * band, z = p.z + nz * band, yaw = Math.atan2(nx, nz);
+      // The whole bike (1.75 m along its heading) clear of solids and of every bike already standing there.
+      if (![-0.6, 0, 0.6].every((t) => solids.clear(x + nx * t, z + nz * t, 0.36))) continue;
+      if (near(x, z)) continue;
+      if ([...taken, ...out].some((o) => Math.abs(o.x - x) < 2.2 && Math.abs(o.z - z) < 2.2 && Math.hypot(o.x - x, o.z - z) < 0.78)) continue;
+      const spot = makeSpot(firstSpot + out.length, SPOT_KIND[occ] ?? 'lot', occ, x, z, yaw, 'moto', b.id, -1);
+      out.push(spot);
+      solids.addBox(x, z, 0.31, 0.875, yaw);
+      placed++;
+    }
+  }
+  return out;
+}
+/** How many spots and lots are today's (the wired districts' follow them). */
+export const LEGACY_SPOT_COUNT = SPOTS.length, LEGACY_LOT_COUNT = LOTS.length;
+{
+  const d = districtSpots(district(), SPOTS.length, LOTS.length);
+  SPOTS.push(...d.spots);
+  LOTS.push(...d.lots);
+}
 
 /** The rects of every spot (for tests and for anyone placing things on the sidewalk). */
 export function spotRect(s: ParkSpot): Rect {

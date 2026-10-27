@@ -1,11 +1,11 @@
 import * as THREE from 'three';
 import { SECONDS_PER_HOUR } from './clock';
 import { groundHeight } from './map/terrain';
-import { LEGACY_ROADS } from './map/roads-legacy';
+import { worldRoads } from './map/world-types';
 import { nodeLight } from './signals';
 import { playHorn } from './audio';
 import {
-  BUS_GEOMETRY as BG, MOORINGS, buildNetwork, busCourse, busPose, createTransit, curvature, curveSpeed, demand, pathAhead, shelterOf, stopTitle,
+  BUS_GEOMETRY as BG, MOORINGS, busCourse, busPose, createTransit, curvature, curveSpeed, demand, pathAhead, shelterOf, stopTitle, worldNetwork,
   type BusCourse, type TransitLine, type TransitStop, type Trip, type VehicleState,
 } from './transit';
 import { FLEET, fleetGeometry, fleetWheelGeometry, vehicleMaterial } from './vehicle-models';
@@ -41,7 +41,9 @@ type Passengers = { board(p: Provider): void; leave(): void };
 export type TransitHost = {
   vehicles: {
     cars: Car[]; halfSize(kind: CarKind): [number, number];
-    registerObstacle(id: string, x: number, z: number, hx: number, hz: number, yaw: number, follow?: boolean): void; clearObstacle(id: string): void;
+    /** The vehicles that are entities this frame (vehicles.ts `live`: the fleet and the woken parked ones); `cars` when absent. */
+    live?: readonly Car[];
+    registerObstacle(id: string, x: number, z: number, hx: number, hz: number, yaw: number, follow?: boolean, speed?: number): void; clearObstacle(id: string): void;
   };
   boats: Boats;
   /** Takes a fare; false when the player cannot pay. */
@@ -114,7 +116,9 @@ const SKINS = ['#d3a179', '#c58f69', '#e0b48e', '#b98260'];
 const ROLES = ['worker', 'student', 'retiree', 'worker', 'vendor'] as const;
 
 export function createBuses(scene: THREE.Scene, host: TransitHost) {
-  const network = buildNetwork();
+  // The live map's network (map/world-types.ts): today's three lines, run on into the wired districts.
+  const roads = worldRoads().roads;
+  const network = worldNetwork();
   const transit = createTransit(network);
   const { material, lamps } = vehicleMaterial();
   const busLines = network.lines.filter((l) => l.mode === 'bus');
@@ -131,7 +135,7 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
       scene.add(mesh);
       return mesh;
     });
-    return { line, course: busCourse(line, LEGACY_ROADS), meshes, counts: [0, 0] };
+    return { line, course: busCourse(line, roads), meshes, counts: [0, 0] };
   });
   const buses: Bus[] = runs.flatMap((run) => Array.from({ length: Math.max(1, transit.fleet(run.line.id, 0)) }, (_, v): Bus => ({
     key: `${run.line.id}-${v + 1}`, run, v, phase: 'off', live: false, trip: null, visit: 0, s: 0, speed: 0, lat: 0, latT: 0, doors: 0, doorsWant: 0,
@@ -223,7 +227,7 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
   }
   /** Whether a vehicle or another bus stands where this bus is. */
   function occupied(bus: Bus) {
-    for (const c of host.vehicles.cars) {
+    for (const c of host.vehicles.live ?? host.vehicles.cars) {
       if (c.mode === 'off' || Math.abs(c.x - bus.x) > 9 || Math.abs(c.z - bus.z) > 9) continue;
       const along = (c.x - bus.x) * bus.hx + (c.z - bus.z) * bus.hz, across = (c.x - bus.x) * -bus.hz + (c.z - bus.z) * bus.hx;
       if (Math.abs(along) < BG.NOSE + 2.5 && Math.abs(across) < BG.HW + 1.3) return true;
@@ -237,7 +241,7 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
   let playerOb: Ob | null = null;
   function gather(view: View, walking: readonly Walking[]) {
     obs.length = 0;
-    for (const car of host.vehicles.cars) {
+    for (const car of host.vehicles.live ?? host.vehicles.cars) {
       if (car.mode === 'off') continue;
       const [hw, hl] = host.vehicles.halfSize(car.kind);
       const lane = car.mode === 'lane' || car.mode === 'chase' || car.mode === 'leave' || car.mode === 'player';
@@ -285,17 +289,17 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
     const path = bus.run.course.path;
     // On a straight, with the obstacle out of the junctions.
     for (let d = -2; d <= 26; d += 2) if (Math.abs(curvature(path, bus.s + d)) > 0.02) return null;
-    if (LEGACY_ROADS.junctionAt(o.x, o.z, 15)) return null;
+    if (roads.junctionAt(o.x, o.z, 15)) return null;
     const p = busPose(path, bus.s), rx = -p.hz, rz = p.hx;
     const oLat = (o.x - p.x) * rx + (o.z - p.z) * rz, across = o.r + o.half * Math.abs(o.hx * rx + o.hz * rz);
     const need = oLat - across - BG.HW - 0.45;
     if (need > -0.2) return null;
-    const road = LEGACY_ROADS.nearestEdge(p.x, p.z, 12);
+    const road = roads.nearestEdge(p.x, p.z, 12);
     if (!road) return null;
     const right = road.off * (p.hx * road.hx + p.hz * road.hz >= 0 ? 1 : -1);
     if (right + need < -(road.edge.half - BG.HW - 0.3)) return null;
     // Nothing coming the other way in the lanes it would use, nothing alongside or close behind on that side.
-    for (const c of host.vehicles.cars) {
+    for (const c of host.vehicles.live ?? host.vehicles.cars) {
       if (c.mode !== 'lane' && c.mode !== 'player') continue;
       const along = (c.x - p.x) * p.hx + (c.z - p.z) * p.hz, side = (c.x - p.x) * rx + (c.z - p.z) * rz;
       if (side > -1.2 || side < need - BG.HW - 3.5) continue;
@@ -320,7 +324,8 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
   // ---- Driving ----
   function drive(bus: Bus, dt: number, view: View) {
     const run = bus.run, path = run.course.path;
-    let target = bus.late > 4 && bus.phase === 'run' ? CATCH_UP : CRUISE, why = '', left = Infinity;
+    // Running late it makes up time: quicker the later it is (and a little quicker off the mark).
+    let target = bus.late > 4 && bus.phase === 'run' ? CATCH_UP + Math.min(2, Math.max(0, (bus.late - 30) / 20)) : CRUISE, why = '', left = Infinity;
     if (bus.phase === 'run') {
       // Into the stop: brake to stand with the centre at the shelter.
       const d = pathAhead(path, bus.s, run.course.docks[bus.visit]);
@@ -351,7 +356,8 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
     const reach = Math.max(10, (bus.speed * bus.speed) / (2 * 2.5) + 8);
     const hit = corridor(bus, reach, bus.lat);
     if (hit) {
-      const limit = Math.sqrt(2 * 2.5 * Math.max(0, hit.at - 1.2));
+      // Behind something moving the same way: at its pace, able to stop if it does.
+      const vo = Math.max(0, hit.o.vx * bus.hx + hit.o.vz * bus.hz), limit = Math.sqrt(2 * 2.5 * Math.max(0, hit.at - 1.2) + vo * vo);
       if (limit < target) { target = limit; if (limit < 1.5 && !why) { why = hit.o.who; bus.by = hit.o.bus?.key ?? (hit.o.car ? `${hit.o.car.kind}${hit.o.car.index} ${hit.o.car.mode} ${hit.o.car.wait ?? ''}` : ''); } }
       // In behind another bus at this stop: open the doors here (the second berth), and get round it afterwards.
       const ahead = hit.o.bus, sameStop = !!ahead && bus.phase === 'run' && docked(ahead) && stopOf(ahead).id === stopOf(bus).id && left < 45;
@@ -385,7 +391,7 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
     const stopped = bus.speed < 0.3 && target < 0.5;
     bus.stuck = stopped && why !== 'light' ? bus.stuck + dt : 0;
     if (bus.stuck > 1.6 && (why === 'player' || why === 'car' || why === 'body') && time > bus.honkAt && Math.hypot(bus.x - view.x, bus.z - view.z) < 45) { bus.honkAt = time + 4; playHorn(bus.stuck > 6); }
-    bus.speed = target < bus.speed ? Math.max(target, bus.speed - (target < bus.speed - 2 ? HARD : BRAKE * 1.6) * dt) : Math.min(target, bus.speed + ACCEL * dt);
+    bus.speed = target < bus.speed ? Math.max(target, bus.speed - (target < bus.speed - 2 ? HARD : BRAKE * 1.6) * dt) : Math.min(target, bus.speed + (bus.late > 30 ? ACCEL * 1.25 : ACCEL) * dt);
     bus.s = (bus.s + bus.speed * dt) % path.len;
   }
   /** Docked at its next stop: the doors open; the end of a trip, a layover or the depot. */
@@ -417,7 +423,9 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
     const waited = time - bus.dockedAt, line = bus.run.line;
     // Riders still on their way to the door are waited for a little (not when the bus is running late).
     const busy = (bus.boarding > 0 || bus.alighting > 0) && waited < MIN_DWELL + (bus.late > 15 ? 1 : MAX_EXTRA);
-    if (bus.doorsWant === 1 && waited >= (bus.late > 20 ? MIN_DWELL - 2 : MIN_DWELL) && t >= bus.leaveAt && !busy && !(aboard?.kind === 'bus' && aboard.bus === bus && aboard.leaving)) bus.doorsWant = 0;
+    // Early it holds for its time, unless another bus waits behind it to get on (then it goes, rather than block the stop).
+    const blocking = t < bus.leaveAt && buses.some((b) => b !== bus && b.phase === 'run' && b.wait === 'bus' && b.by === bus.key && b.speed < 0.3);
+    if (bus.doorsWant === 1 && waited >= (bus.late > 20 ? MIN_DWELL - 2 : MIN_DWELL) && (t >= bus.leaveAt || blocking) && !busy && !(aboard?.kind === 'bus' && aboard.bus === bus && aboard.leaving)) bus.doorsWant = 0;
     if (bus.doorsWant === 0 && bus.doors <= 0) {
       if (bus.last) { bus.phase = 'depot'; bus.depotSince = time; return; }
       bus.late = Math.max(0, (t - bus.leaveAt) * SPH);
@@ -847,7 +855,7 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
             { id: 'ride', name: 'Chở sang Bến Bạch Đằng', price: FARE.do, desc: `${DO_TRIP.meters} m · chừng ${Math.round(DO_TRIP.meters / DO_TRIP.pace / 60)} phút`, disabled: c.cash < FARE.do },
             { id: 'sit', name: 'Ngồi chơi trên đò', price: 0, desc: 'miễn phí, chú không lấy tiền' },
           ],
-          foot: 'Đò ngang đi Thủ Thiêm sẽ có khi bến bên kia xây xong.', wallet: { cash: c.cash },
+          foot: host.boats.ferry ? 'Đò ngang sang Thủ Thiêm cập mạn đông cầu tàu, 5.000đ một lượt.' : 'Đò ngang đi Thủ Thiêm sẽ có khi bến bên kia xây xong.', wallet: { cash: c.cash },
         }, (item) => {
           if (item === 'sit') { sitIn(boat, 'sit'); return 'Mời con ngồi.'; }
           if (item !== 'ride') return;
@@ -1005,13 +1013,14 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
           bus.steer = THREE.MathUtils.damp(bus.steer, -Math.atan(BG.WHEELBASE * curvature(bus.run.course.path, bus.s, 1.5)), 6, dt);
           alightNext(bus);
           // Lane traffic queues behind a bus on the move or at a light, and gets round one standing at a stop.
-          // Passed only standing straight at the kerb of its own stop; one queued at an angle behind another is followed.
-          const toDock = pathAhead(bus.run.course.path, bus.s, bus.run.course.docks[bus.visit]), atDock = toDock < 1.5 || toDock > bus.run.course.path.len - 1.5;
-          const atStop = ((bus.phase === 'dwell' || bus.phase === 'layover') && atDock) || (bus.phase === 'run' && bus.speed < 3 && toDock < 40 && toDock > 16);
+          // Passed standing at a stop with its doors open (its own berth or the second one behind another bus), or pulling in
+          // to one or waiting to; followed while it drives.
+          const toDock = pathAhead(bus.run.course.path, bus.s, bus.run.course.docks[bus.visit]);
+          const atStop = bus.phase === 'dwell' || bus.phase === 'layover' || (bus.phase === 'run' && bus.speed < 3 && toDock < 40);
           // Pulling in to the kerb or out from it, the box covers the lane it is moving across.
           const next = busPose(bus.run.course.path, bus.s + 12, bus.latT), sweep = bus.phase === 'run' ? (next.x - bus.x) * -bus.hz + (next.z - bus.z) * bus.hx : 0;
           const wide = Math.abs(sweep) > 0.3 ? Math.min(2.2, Math.abs(sweep)) / 2 * Math.sign(sweep) : 0;
-          host.vehicles.registerObstacle(`bus:${bus.key}`, bus.x - bus.hz * wide, bus.z + bus.hx * wide, BG.HW + Math.abs(wide), BG.NOSE, bus.yaw, !atStop);
+          host.vehicles.registerObstacle(`bus:${bus.key}`, bus.x - bus.hz * wide, bus.z + bus.hx * wide, BG.HW + Math.abs(wide), BG.NOSE, bus.yaw, !atStop, bus.speed);
         } else host.vehicles.clearObstacle(`bus:${bus.key}`);
         // The player's bus has docked where they rang for (or at the end of its run): off they get.
         if (mine && aboard?.kind === 'bus' && docked(bus) && time - bus.dockedAt > 1.2 && (aboard.ring || bus.last)) busOff(bus);

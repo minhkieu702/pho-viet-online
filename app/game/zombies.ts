@@ -1,5 +1,7 @@
 import * as THREE from 'three';
-import { BUILDINGS, LAND, ROADS_X, ROADS_Z, SIDEWALK, inRect } from './city';
+import { BUILDINGS } from './city';
+import { worldRoads } from './map/world-types';
+import type { RoadEdge } from './map/roads';
 import type { FallMode, HitKind, RagdollBody, RagdollLook } from './ragdoll';
 import type { createRagdolls } from './ragdoll';
 import {
@@ -115,21 +117,27 @@ export function createZombies(scene: THREE.Scene, ragdolls: ReturnType<typeof cr
     say(z, pick(GROANS));
   };
 
-  /** A spot 22–55 m from the player: a doorway (they stumble out) or the sidewalk (they claw out of the ground). */
+  /**
+   * A spot 22–55 m from the player: a doorway (they stumble out) or a walking line of the live roads, a sidewalk or
+   * the middle of a hẻm (they claw out of the ground).
+   */
+  const ring: { e: RoadEdge; w: number }[] = [];
   function spawnSpot(px: number, pz: number): (Point & { rise: boolean }) | null {
+    const roads = worldRoads().roads;
+    ring.length = 0;
+    let total = 0;
+    for (const h of roads.edgesNear(px, pz, 55)) { const w = Math.min(h.edge.len, 110); ring.push({ e: h.edge, w }); total += w; }
     for (let attempt = 0; attempt < 24; attempt++) {
       if (random() < 0.45) {
         const door = pick(doors);
         const d = Math.hypot(door.x - px, door.z - pz);
         if (d > 20 && d < 60 && world.clear(door.x, door.z, 0.4)) return { x: door.x, z: door.z, rise: false };
-      } else {
-        const a = random() * Math.PI * 2, r = 22 + random() * 33;
-        const road = ROADS_Z.reduce((best, v) => (Math.abs(v - (pz + Math.sin(a) * r)) < Math.abs(best - (pz + Math.sin(a) * r)) ? v : best), ROADS_Z[0]);
-        const along = random() < 0.5;
-        const x = along ? px + Math.cos(a) * r : ROADS_X.reduce((best, v) => (Math.abs(v - (px + Math.cos(a) * r)) < Math.abs(best - (px + Math.cos(a) * r)) ? v : best), ROADS_X[0]) + (random() < 0.5 ? -1 : 1) * SIDEWALK;
-        const z = along ? road + (random() < 0.5 ? -1 : 1) * SIDEWALK : pz + Math.sin(a) * r;
-        if (!inRect(LAND, x, z, 3)) continue;
-        if (Math.hypot(x - px, z - pz) > 18 && world.clear(x, z, 0.45)) return { x, z, rise: true };
+      } else if (total > 0) {
+        let k = random() * total, e = ring[0].e;
+        for (const r of ring) { k -= r.w; if (k <= 0) { e = r.e; break; } }
+        const p = roads.pointAt(e, random() * e.len), side = e.walk > 0 ? (random() < 0.5 ? -1 : 1) * e.walk : 0;
+        const x = p.x - p.hz * side, z = p.z + p.hx * side, d = Math.hypot(x - px, z - pz);
+        if (d > 22 && d < 55 && world.clear(x, z, 0.45)) return { x, z, rise: true };
       }
     }
     return null;

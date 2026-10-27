@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { handleRoom, handleRoomSocket } from '../lib/room-service.ts';
 import { RealtimeRoom } from '../lib/realtime-room.ts';
 import { playerState, playerHit, hashToken, worldVersion, ACTIVE_MS, SESSION_MS } from '../lib/room-validation.ts';
-import { PEER_BOUNDS, WORLD_BOUNDS, WORLD_VERSION } from '../lib/world-bounds.ts';
+import { P1_SLICE_COUNT, PEER_BOUNDS, WIRED_SLICES, WORLD_BOUNDS, WORLD_VERSION, peerBoundsFor, worldBoundsFor, worldVersionFor } from '../lib/world-bounds.ts';
 
 function memory() {
   const values = new Map();
@@ -132,8 +132,9 @@ test('authentication, replacement, state bounds/sequence and movement do not wri
   const peers = second.messages.filter(message => message.type === 'snapshot').at(-1).peers;
   assert.equal(peers.length, 1);
   assert.equal(peers[0].id, host.id);
-  assert.equal(peers[0].x, 355);
-  assert.equal(peers[0].z, -206);
+  // Clamped to the peer box (lib/world-bounds.ts PEER_BOUNDS; x 355, z -206 on today's map).
+  assert.equal(peers[0].x, PEER_BOUNDS.maxX);
+  assert.equal(peers[0].z, PEER_BOUNDS.minZ);
   assert.equal(peers[0].speed, 36);
   assert.equal(peers[0].tokenHash, undefined);
   assert.equal(entry.storage.writes, writes);
@@ -265,10 +266,35 @@ test('state and hit validation keep numerical bounds and reject NaN/impersonatio
   assert.equal(bounded.vehicle, 'foot');
 });
 
-test('peer positions are clamped to the shared world bounds, which cover the playable world with slack', () => {
-  // Today's numbers: the playable rectangle x -138..352, z -203.6..137.5, accepted as x -140..355, z -206..140.
-  assert.deepEqual(PEER_BOUNDS, { minX: -140, maxX: 355, minZ: -206, maxZ: 140 });
-  assert.deepEqual(WORLD_BOUNDS, { minX: -138, maxX: 352, minZ: -203.6, maxZ: 137.5 });
+test('peer positions are clamped to the shared world bounds, which cover the playable world with slack', async () => {
+  // Per wiring step (WIRING-PLAN §3): today's rectangle x -138..352, z -203.6..137.5 (accepted as x -140..355,
+  // z -206..140); step 14 (Quận 4) east to 700 and south to 445; step 15 (Bình Thạnh) west to -720; steps 16–17 the
+  // same box; step 18 (Thủ Thiêm) north to -440.
+  const steps = [
+    [{ minX: -138, maxX: 352, minZ: -203.6, maxZ: 137.5 }, { minX: -140, maxX: 355, minZ: -206, maxZ: 140 }],
+    [{ minX: -138, maxX: 700, minZ: -203.6, maxZ: 445 }, { minX: -140, maxX: 703, minZ: -206, maxZ: 448 }],
+    [{ minX: -720, maxX: 700, minZ: -203.6, maxZ: 445 }, { minX: -723, maxX: 703, minZ: -206, maxZ: 448 }],
+    [{ minX: -720, maxX: 700, minZ: -203.6, maxZ: 445 }, { minX: -723, maxX: 703, minZ: -206, maxZ: 448 }],
+    [{ minX: -720, maxX: 700, minZ: -203.6, maxZ: 445 }, { minX: -723, maxX: 703, minZ: -206, maxZ: 448 }],
+    [{ minX: -720, maxX: 700, minZ: -440, maxZ: 445 }, { minX: -723, maxX: 703, minZ: -443, maxZ: 448 }],
+  ];
+  steps.forEach(([world, peer], n) => {
+    assert.deepEqual(worldBoundsFor(n), world, `world bounds with ${n} slices wired`);
+    assert.deepEqual(peerBoundsFor(n), peer, `peer bounds with ${n} slices wired`);
+    for (const side of ['minX', 'minZ']) assert.ok(peer[side] <= world[side] - 2);
+    for (const side of ['maxX', 'maxZ']) assert.ok(peer[side] >= world[side] + 2);
+    assert.equal(worldVersionFor(n), n + 1, 'each wiring step bumps the layout version');
+    // Each step's box holds the one before (land only ever grows).
+    if (n) for (const side of ['minX', 'minZ']) assert.ok(world[side] <= steps[n - 1][0][side]);
+    if (n) for (const side of ['maxX', 'maxZ']) assert.ok(world[side] >= steps[n - 1][0][side]);
+  });
+  assert.ok(Number.isInteger(WIRED_SLICES) && WIRED_SLICES >= 0 && WIRED_SLICES <= P1_SLICE_COUNT);
+  assert.deepEqual(WORLD_BOUNDS, worldBoundsFor(WIRED_SLICES));
+  assert.deepEqual(PEER_BOUNDS, peerBoundsFor(WIRED_SLICES));
+  assert.equal(WORLD_VERSION, worldVersionFor(WIRED_SLICES));
+  // The wiring module wires the same count (app/game/map/wiring.ts P1_WIRED: pure, no generation).
+  const { P1_WIRED } = await import('../app/game/map/wiring.ts');
+  assert.equal(P1_WIRED, WIRED_SLICES, 'map/wiring.ts P1_WIRED and lib/world-bounds.ts WIRED_SLICES differ');
   for (const side of ['minX', 'minZ']) assert.ok(PEER_BOUNDS[side] <= WORLD_BOUNDS[side] - 2);
   for (const side of ['maxX', 'maxZ']) assert.ok(PEER_BOUNDS[side] >= WORLD_BOUNDS[side] + 2);
   const low = playerState({ ...state, x: -1e6, z: -1e6 }), high = playerState({ ...state, x: 1e6, z: 1e6 });
@@ -288,7 +314,12 @@ test('room joins carry the world version; old clients count as version 1', async
   const host = await call(rooms, { action: 'create', name: 'Host', world: WORLD_VERSION });
   assert.equal(host.status, 201);
   assert.equal((await call(rooms, { action: 'join', name: 'Guest', code: host.body.room, world: WORLD_VERSION })).status, 200);
-  assert.equal((await call(rooms, { action: 'join', name: 'Old client', code: host.body.room })).status, 200);
+  // A client from before the field (today's map, version 1) joins only a version-1 room: once a slice is wired it builds another map.
+  assert.equal((await call(rooms, { action: 'join', name: 'Old client', code: host.body.room })).status, WORLD_VERSION === 1 ? 200 : 409);
+  const v1 = await call(rooms, { action: 'create', name: 'Host v1', world: 1 });
+  assert.equal(v1.status, 201);
+  assert.equal((await call(rooms, { action: 'join', name: 'Old client', code: v1.body.room })).status, 200);
+  if (WORLD_VERSION !== 1) assert.equal((await call(rooms, { action: 'join', name: 'Current', code: v1.body.room, world: WORLD_VERSION })).status, 409);
   // A client building another layout cannot join, and the room is left as it was.
   const newer = await call(rooms, { action: 'join', name: 'Newer', code: host.body.room, world: WORLD_VERSION + 1 });
   assert.equal(newer.status, 409);

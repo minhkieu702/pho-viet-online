@@ -2,6 +2,7 @@ import { SECONDS_PER_HOUR } from './clock';
 import { DOCKS } from './map/consts';
 import { LEGACY_ROADS } from './map/roads-legacy';
 import type { RoadEdge, RoadGraph } from './map/roads';
+import { worldRoads, type WorldRoads } from './map/world-types';
 
 /**
  * Public transport as pure data and maths (no three.js): city bus lines over a RoadGraph, the river bus (tàu buýt
@@ -28,6 +29,8 @@ export type StopSpec = {
   berth?: Pt;
   /** Not built on today's map yet (no shelter or pier). */
   planned?: boolean;
+  /** Bus: pull in only as far as the room before the junction ahead allows (a district shelter near a corner). */
+  fit?: boolean;
 };
 /** Service from `from` to `to` (game hours, [from, to)) with a departure every `every` game minutes. */
 export type HeadwayBand = { from: number; to: number; every: number };
@@ -35,8 +38,13 @@ export type LineSpec = {
   id: string; name: string; mode: TransitMode;
   /** Stops in service order; the cycle returns to the first, the terminus. */
   stops: string[];
-  /** Bus: points the route must pass between stop k and the next (lane side of a road), keyed by k. */
-  via?: Record<number, Pt[]>;
+  /**
+   * Bus: points the route must pass between stop k and the next (lane side of a road), keyed by k. A point with a
+   * heading (hx, hz) is passed driving that way along the road nearest it.
+   */
+  via?: Record<number, (Pt & { hx?: number; hz?: number })[]>;
+  /** Bus: route every leg with a fixed heading at each end (stops, headed via points), never through a street with closing hours. */
+  directed?: boolean;
   /** Boats: the closed course as x,z pairs, starting at the terminus berth. */
   course?: number[];
   /** Cruise speed (m/s), acceleration and braking (m/s²). */
@@ -58,6 +66,8 @@ export type TransitStop = StopSpec & {
   x: number; z: number; hx: number; hz: number;
   /** Bus: the road edge, the travel direction that serves it (stop on the right) and the centre's arc length. */
   edge: number; dir: 1 | -1; s: number;
+  /** Bus: how far right of the road's centre line the docked bus stands. */
+  lat?: number;
 };
 export type Path = { pts: number[]; cum: number[]; len: number };
 /** A call at a stop: arc length on the line's path, seconds after the trip leaves the terminus. */
@@ -112,8 +122,9 @@ function waterbusCourse(east = -166, west = -172) {
   pts.push(b, BERTH_Z);
   arc(b + 14, 0, Math.PI);
   arc(a - 14, Math.PI, 2 * Math.PI);
-  pts.push(a, BERTH_Z, a + 8, BERTH_Z, a + 18, BERTH_Z + (east - BERTH_Z) * 0.15, a + 28, east + (BERTH_Z - east) * 0.15, a + 38, east);
-  pts.push(b - 32, east, b - 22, east + (BERTH_Z - east) * 0.15, b - 12, BERTH_Z + (east - BERTH_Z) * 0.15, b, BERTH_Z);
+  // Long, eased S-curves off and onto the berths: a 22 m hull's stern stays out of the outer run while it swings across.
+  pts.push(a, BERTH_Z, a + 8, BERTH_Z, a + 22, BERTH_Z + (east - BERTH_Z) * 0.15, a + 36, east + (BERTH_Z - east) * 0.15, a + 50, east);
+  pts.push(b - 48, east, b - 34, east + (BERTH_Z - east) * 0.15, b - 18, BERTH_Z + (east - BERTH_Z) * 0.15, b, BERTH_Z);
   return pts;
 }
 /** A polyline (x,z pairs) shifted d metres to the right of its direction of travel, corners mitred. */
@@ -200,7 +211,9 @@ function turning(p: Path, s0: number, s1: number) {
 // ---- Building lines ---------------------------------------------------------------------------------------
 
 /** A bus stop on the road its bench faces: the edge, the direction with the stop on its right, the docked centre. */
-function busStop(graph: RoadGraph, spec: StopSpec, line: Pick<LineSpec, 'door' | 'hw'>, issues: string[]): TransitStop | null {
+/** Most a bus pulls over from its lane to a stop's curb, unless a bus bay waits there (a boulevard's curb is far out). */
+const PULL_IN = 2.6;
+function busStop(graph: RoadGraph, spec: StopSpec, line: Pick<LineSpec, 'door' | 'hw'>, issues: string[], bay?: (edge: number, s: number, dir: 1 | -1) => boolean): TransitStop | null {
   const fx = Math.sin(spec.yaw ?? 0), fz = Math.cos(spec.yaw ?? 0);
   // The road the bench faces runs across its line of sight.
   const across = (e: RoadEdge) => { const h = graph.project(e, spec.wait.x, spec.wait.z); return !e.closed && Math.abs(h.hx * fx + h.hz * fz) < 0.3; };
@@ -208,32 +221,96 @@ function busStop(graph: RoadGraph, spec: StopSpec, line: Pick<LineSpec, 'door' |
   if (!hit) { issues.push(`stop ${spec.id}: no road in front of the shelter`); return null; }
   const e = hit.edge, seat = graph.project(e, spec.wait.x, spec.wait.z), dir: 1 | -1 = seat.off > 0 ? 1 : -1;
   if (!e.traffic || !graph.laneFor(e, dir, 'car')) issues.push(`stop ${spec.id}: ${e.name} (edge ${e.id}) carries no traffic ${dir > 0 ? 'a→b' : 'b→a'}`);
-  const s = seat.s - dir * line.door, p = graph.pointAt(e, s), hx = p.hx * dir, hz = p.hz * dir, lat = e.half - line.hw - 0.75;
+  const s = seat.s - dir * line.door, p = graph.pointAt(e, s), hx = p.hx * dir, hz = p.hz * dir;
+  // At the curb (a bus bay's middle), or as near it as a pull-in from the curb-side car lane goes.
+  const lanes = (dir > 0 ? e.fwd : e.back).filter((l) => l.use !== 'moto'), lane = lanes.length ? Math.max(...lanes.map((l) => l.off)) : 0;
+  // A shelter near the junction ahead pulls in less, so the bus is back in its lane before it turns there.
+  const ahead = (dir > 0 ? e.len - s : s) - graph.nodes[dir > 0 ? e.b : e.a].radius, room = spec.fit ? Math.max(0.35, Math.min(1, (ahead - 6) / 22)) : 1;
+  const curb = e.half - line.hw - 0.75, lat = bay?.(e.id, s, dir) ? curb : Math.min(curb, lane + PULL_IN * room);
   if (s < 0 || s > e.len) issues.push(`stop ${spec.id}: the docked bus would stand past the end of edge ${e.id}`);
-  return { ...spec, x: p.x - hz * lat, z: p.z + hx * lat, hx, hz, edge: e.id, dir, s };
+  return { ...spec, x: p.x - hz * lat, z: p.z + hx * lat, hx, hz, edge: e.id, dir, s, lat };
 }
 
 type Piece = { edge: RoadEdge; dir: 1 | -1; s0: number; s1: number; stop: number };
+/** A point on the road graph driven one way: edge, arc from its node a, direction (+1 a→b). */
+export type Anchor = { edge: number; s: number; dir: 1 | -1 };
+/** Seconds the router adds for a turn at a node (as roads.ts route): right, left. A bus never turns back. */
+const TURN_RIGHT = 1, TURN_LEFT = 4;
+/**
+ * The quickest way for a bus from one anchor to another: leaving the first and reaching the second in their own
+ * directions, only on roads that carry traffic and are not `avoid`ed, never turning back at a node (Dijkstra over
+ * edges driven one way, with turn delays). On the same edge, straight along it when the second lies ahead.
+ */
+export function routeDirected(graph: RoadGraph, from: Anchor, to: Anchor, avoid: (e: RoadEdge) => boolean = () => false): { edges: number[]; dirs: (1 | -1)[] } | null {
+  const E = graph.edges, ahead = (to.s - from.s) * from.dir;
+  if (from.edge === to.edge && from.dir === to.dir && ahead >= 0) return { edges: [from.edge], dirs: [from.dir] };
+  const S = E.length * 2, cost = new Float64Array(S).fill(Infinity), parent = new Int32Array(S).fill(-1), done = new Uint8Array(S);
+  const key = (e: number, d: number) => e * 2 + (d > 0 ? 0 : 1);
+  const fe = E[from.edge], start = key(from.edge, from.dir);
+  cost[start] = (from.dir > 0 ? fe.len - from.s : from.s) / fe.speed;
+  const heap: number[] = [start];
+  const pop = () => { let bi = 0; for (let i = 1; i < heap.length; i++) if (cost[heap[i]] < cost[heap[bi]]) bi = i; const k = heap[bi]; heap[bi] = heap[heap.length - 1]; heap.pop(); return k; };
+  const goal = key(to.edge, to.dir);
+  while (heap.length) {
+    const k = pop();
+    if (done[k]) continue;
+    done[k] = 1;
+    if (k === goal && k !== start) break;
+    const e = E[k >> 1], d = k & 1 ? -1 : 1, node = graph.nodes[d > 0 ? e.b : e.a];
+    const inArm = node.arms.find((a) => a.edge === e.id && a.end === (d > 0 ? 1 : 0))!;
+    const hx = -inArm.hx, hz = -inArm.hz;
+    for (const arm of node.arms) {
+      if (arm === inArm) continue;
+      const e2 = E[arm.edge], d2: 1 | -1 = arm.end === 0 ? 1 : -1;
+      if (!e2.traffic || e2.closed || avoid(e2) || !(d2 > 0 ? e2.fwd : e2.back).some((l) => l.use !== 'moto')) continue;
+      const dot = hx * arm.hx + hz * arm.hz;
+      if (dot < -0.95) continue;
+      const turn = dot > 0.7 ? 0 : hx * arm.hz - hz * arm.hx > 0 ? TURN_RIGHT : TURN_LEFT;
+      const k2 = key(arm.edge, d2), g = cost[k] + turn + (k2 === goal ? (d2 > 0 ? to.s : e2.len - to.s) : e2.len) / e2.speed;
+      if (g < cost[k2] && !done[k2]) { cost[k2] = g; parent[k2] = k; heap.push(k2); }
+    }
+  }
+  if (!done[goal] || parent[goal] < 0) return null;
+  const chain: number[] = [];
+  for (let k = goal; k >= 0; k = parent[k]) { chain.push(k); if (k === start) break; }
+  if (chain[chain.length - 1] !== start) return null;
+  chain.reverse();
+  return { edges: chain.map((k) => k >> 1), dirs: chain.map((k) => (k & 1 ? -1 : 1) as 1 | -1) };
+}
 /**
  * A bus line: road A* (roads.ts route) from stop to stop through its via points, checked to leave and reach
  * every stop in its serving direction with no U-turn, then drawn in the car lane, pulled in to the curb at
  * each stop and rounded through the junctions.
  */
-function busLine(graph: RoadGraph, spec: LineSpec, stops: Map<string, TransitStop>, issues: string[]): TransitLine | null {
+function busLine(graph: RoadGraph, spec: LineSpec, stops: Map<string, TransitStop>, issues: string[], avoid: (e: RoadEdge) => boolean = () => false): TransitLine | null {
   const fail = (m: string) => { issues.push(`line ${spec.id}: ${m}`); return null; };
-  type Way = { x: number; z: number; stop: number };
+  type Way = { x: number; z: number; stop: number; hx?: number; hz?: number };
   const ways: Way[] = [];
   for (const [k, id] of spec.stops.entries()) {
     const st = stops.get(id);
     if (!st) return fail(`unknown stop ${id}`);
     const p = graph.pointAt(graph.edges[st.edge], st.s);
     ways.push({ x: p.x, z: p.z, stop: k });
-    for (const v of spec.via?.[k] ?? []) ways.push({ x: v.x, z: v.z, stop: -1 });
+    for (const v of spec.via?.[k] ?? []) ways.push({ x: v.x, z: v.z, stop: -1, hx: v.hx, hz: v.hz });
   }
+  /** Where a way is on the road graph and which way it is driven (a stop's serving direction, a via point's heading). */
+  const anchor = (w: Way): Anchor | null => {
+    if (w.stop >= 0) { const st = stops.get(spec.stops[w.stop])!; return { edge: st.edge, s: st.s, dir: st.dir }; }
+    const hit = graph.nearestEdge(w.x, w.z, 12, (e) => e.traffic && !e.closed && !avoid(e));
+    if (!hit) return null;
+    // Headed: driven that way; else on the lane side of its road (right of the way it is driven).
+    if (w.hx === undefined || w.hz === undefined) return Math.abs(hit.off) < 0.5 ? null : { edge: hit.edge.id, s: hit.s, dir: hit.off > 0 ? 1 : -1 };
+    return { edge: hit.edge.id, s: hit.s, dir: hit.hx * w.hx + hit.hz * w.hz >= 0 ? 1 : -1 };
+  };
   const pieces: Piece[] = [];
   for (let w = 0; w < ways.length; w++) {
     const a = ways[w], b = ways[(w + 1) % ways.length];
-    const r = graph.route(a.x, a.z, b.x, b.z, { use: 'car', snap: 12 });
+    let r: { edges: number[]; dirs: (1 | -1)[] } | null = null;
+    if (spec.directed) {
+      const from = anchor(a), to = anchor(b);
+      if (!from || !to) return fail(`waypoint ${w} has no road and heading`);
+      r = routeDirected(graph, from, to, avoid);
+    } else r = graph.route(a.x, a.z, b.x, b.z, { use: 'car', snap: 12 });
     if (!r) return fail(`no road route from waypoint ${w}`);
     const first = graph.edges[r.edges[0]], last = graph.edges[r.edges[r.edges.length - 1]];
     const sa = graph.project(first, a.x, a.z).s, sb = graph.project(last, b.x, b.z).s;
@@ -246,13 +323,27 @@ function busLine(graph: RoadGraph, spec: LineSpec, stops: Map<string, TransitSto
       if (last.id !== st.edge || r.dirs[r.dirs.length - 1] !== st.dir) return fail(`reaches ${st.id} the wrong way`);
     }
     r.edges.forEach((id, i) => {
-      const e = graph.edges[id], dir = r.dirs[i], s0 = i === 0 ? sa : dir > 0 ? 0 : e.len, s1 = i === r.edges.length - 1 ? sb : dir > 0 ? e.len : 0;
+      const e = graph.edges[id], dir = r!.dirs[i], s0 = i === 0 ? sa : dir > 0 ? 0 : e.len, s1 = i === r!.edges.length - 1 ? sb : dir > 0 ? e.len : 0;
       if (Math.abs(s1 - s0) < 1e-6) return;
       const prev = pieces[pieces.length - 1];
       // A via point splits nothing: the same edge carries on in the same direction.
       if (prev && i === 0 && a.stop < 0 && prev.edge === e && prev.dir === dir && Math.abs(prev.s1 - s0) < 1e-6) { prev.s1 = s1; return; }
       pieces.push({ edge: e, dir, s0, s1, stop: i === 0 ? a.stop : -1 });
     });
+  }
+  // A sharp bend inside an edge (Võ Văn Kiệt round the canal corner) is a corner like a node's: split the piece there.
+  for (let i = 0; i < pieces.length; i++) {
+    const p = pieces[i], e = p.edge, lo = Math.min(p.s0, p.s1), hi = Math.max(p.s0, p.s1);
+    for (let k = 1; k + 1 < e.cum.length; k++) {
+      const at = p.dir > 0 ? e.cum[k] : e.cum[e.cum.length - 1 - k];
+      if (at <= lo + 3 || at >= hi - 3) continue;
+      const j = p.dir > 0 ? k : e.cum.length - 1 - k;
+      const ax = e.pts[j * 2] - e.pts[j * 2 - 2], az = e.pts[j * 2 + 1] - e.pts[j * 2 - 1], bx = e.pts[j * 2 + 2] - e.pts[j * 2], bz = e.pts[j * 2 + 3] - e.pts[j * 2 + 1];
+      if ((ax * bx + az * bz) / (Math.hypot(ax, az) * Math.hypot(bx, bz) || 1) > Math.cos(0.35)) continue;
+      pieces.splice(i + 1, 0, { edge: e, dir: p.dir, s0: at, s1: p.s1, stop: -1 });
+      p.s1 = at;
+      break;
+    }
   }
   for (let i = 0; i < pieces.length; i++) {
     const p = pieces[i], q = pieces[(i + 1) % pieces.length];
@@ -264,22 +355,44 @@ function busLine(graph: RoadGraph, spec: LineSpec, stops: Map<string, TransitSto
   }
   // Car-lane polyline, pulled to the berth lateral at stops; junction corners trimmed and rounded.
   const heading = (p: Piece, s: number) => { const c = graph.pointAt(p.edge, s); return { x: c.x, z: c.z, hx: c.hx * p.dir, hz: c.hz * p.dir }; };
+  /** The heading leaving a piece's end and entering the next piece, across its corner (a node or a bend inside an edge). */
+  const headings = (i: number) => {
+    const p = pieces[i], q = pieces[(i + 1) % pieces.length], e = p.edge;
+    if (e !== q.edge) return [heading(p, p.s1), heading(q, q.s0)];
+    // The two segments either side of the bend.
+    const step = 0.5 * p.dir;
+    return [heading(p, p.s1 - step), heading(q, q.s0 + step)];
+  };
+  const bend = (i: number) => { const p = pieces[i], q = pieces[(i + 1) % pieces.length]; return p.edge === q.edge && p.dir === q.dir && Math.abs(p.s1 - q.s0) < 1e-6; };
   const turnAt = (i: number) => {
     const p = pieces[i], q = pieces[(i + 1) % pieces.length];
-    if (p.edge === q.edge) return false;
-    const a = heading(p, p.s1), b = heading(q, q.s0);
+    if (p.edge === q.edge && !bend(i)) return false;
+    const [a, b] = headings(i);
     return a.hx * b.hx + a.hz * b.hz < 0.95;
+  };
+  /** How far before and after a node a turn's corner reaches: the junction's radius, less for a shallow turn (a 12 m radius). */
+  const trimAt = (i: number, room: number) => {
+    const p = pieces[i], [a, b] = headings(i);
+    const turn = Math.acos(Math.max(-1, Math.min(1, a.hx * b.hx + a.hz * b.hz)));
+    return Math.min(bend(i) ? Infinity : graph.nodes[p.dir > 0 ? p.edge.b : p.edge.a].radius, room, 12 * Math.tan(turn / 2));
   };
   type Sample = { x: number; z: number; hx: number; hz: number; arc: number; lane: number; half: number; stop: number };
   const samples: (Sample | null)[] = [];
-  const stopArc = new Array<number>(spec.stops.length).fill(0);
+  const stopArc = new Array<number>(spec.stops.length).fill(0), stopWide = new Array<number>(spec.stops.length).fill(2);
+  /** Where each turn's corner starts and ends along the line (a pull into the curb is done with before the corner). */
+  const corners: [number, number][] = [];
   let arc = 0;
   pieces.forEach((p, i) => {
     const len = Math.abs(p.s1 - p.s0), node = graph.nodes[p.dir > 0 ? p.edge.b : p.edge.a], startNode = graph.nodes[p.dir > 0 ? p.edge.a : p.edge.b];
-    const trimIn = turnAt((i + pieces.length - 1) % pieces.length) ? Math.min(startNode.radius, len * 0.45) : 0, trimOut = turnAt(i) ? Math.min(node.radius, len * 0.45) : 0;
-    if (p.stop >= 0) stopArc[p.stop] = arc;
-    const lane = graph.laneFor(p.edge, p.dir, 'car')!.off, from = trimIn, to = len - trimOut, n = Math.max(1, Math.ceil((to - from) / 4));
+    const before = (i + pieces.length - 1) % pieces.length;
+    const trimIn = turnAt(before) ? Math.min(bend(before) ? Infinity : startNode.radius, len * 0.45, trimAt(before, Infinity)) : 0;
+    const trimOut = turnAt(i) ? Math.min(bend(i) ? Infinity : node.radius, len * 0.45, trimAt(i, Infinity)) : 0;
+    // The curb-side car lane (a boulevard's outer one).
+    const lane = Math.max(...(p.dir > 0 ? p.edge.fwd : p.edge.back).filter((l) => l.use !== 'moto').map((l) => l.off)), from = trimIn, to = len - trimOut, n = Math.max(1, Math.ceil((to - from) / 4));
+    if (p.stop >= 0) { stopArc[p.stop] = arc; stopWide[p.stop] = (stops.get(spec.stops[p.stop])!.lat ?? p.edge.half - spec.hw - 0.75) - lane; }
     if (trimIn > 0) samples.push(null);
+    if (trimOut > 0) corners.push([arc + len - trimOut, arc + len + trimOut]);
+
     for (let j = 0; j <= n; j++) {
       if (j === n && trimOut === 0 && i !== pieces.length - 1) continue;
       const u = from + ((to - from) * j) / n, c = heading(p, p.s0 + p.dir * u);
@@ -287,17 +400,27 @@ function busLine(graph: RoadGraph, spec: LineSpec, stops: Map<string, TransitSto
     }
     arc += len;
   });
-  const cycle = arc, berth = (s: Sample) => s.half - spec.hw - 0.75;
-  const bump = (a: number) => {
+  const cycle = arc;
+  // Into the curb at each stop and out again, over a run as long as the move across asks (29 m in, 20 m out for today's
+  // 2 m), but done with between the corners either side of it.
+  const ramps = stopArc.map((sa, k) => {
+    const rin = Math.max(29, 12 * stopWide[k]), rout = Math.max(20, 8 * stopWide[k]);
+    if (!spec.directed) return [rin, rout];
+    const ahead = (a: number) => (((a - sa) % cycle) + cycle) % cycle, behind = (a: number) => (((sa - a) % cycle) + cycle) % cycle;
+    const next = Math.min(...corners.map(([c0]) => ahead(c0)), cycle), prev = Math.min(...corners.map(([, c1]) => behind(c1)), cycle);
+    return [Math.max(29, Math.min(rin, prev - 8)), Math.max(20, Math.min(rout, next - 8))];
+  });
+  /** How far right of its lane a sample is pulled: towards each stop's berth, the most of any. */
+  const pull = (a: number) => {
     let m = 0;
-    for (const sa of stopArc) {
-      const d = ((a - sa + cycle * 1.5) % cycle) - cycle / 2;
-      m = Math.max(m, d < 0 ? smooth((d + 35) / 29) : 1 - smooth((d - 6) / 20));
-    }
+    stopArc.forEach((sa, k) => {
+      const d = ((a - sa + cycle * 1.5) % cycle) - cycle / 2, [rin, rout] = ramps[k];
+      m = Math.max(m, stopWide[k] * (d < 0 ? smooth((d + 6 + rin) / rin) : 1 - smooth((d - 6) / rout)));
+    });
     return m;
   };
   const pts: number[] = [], stopIndex: number[] = [];
-  const out = (s: Sample) => { const lat = s.lane + (berth(s) - s.lane) * bump(s.arc); return { x: s.x - s.hz * lat, z: s.z + s.hx * lat, hx: s.hx, hz: s.hz }; };
+  const out = (s: Sample) => { const lat = s.lane + pull(s.arc); return { x: s.x - s.hz * lat, z: s.z + s.hx * lat, hx: s.hx, hz: s.hz }; };
   let prev: { x: number; z: number; hx: number; hz: number } | null = null, gap = false;
   for (const s of samples) {
     if (!s) { gap = true; continue; }
@@ -375,21 +498,21 @@ function timed(spec: LineSpec, path: Path, calls: { stop: TransitStop; s: number
  * out unless `planned`. `issues` lists anything that keeps a stop or line from working: a stop on a road that
  * carries no traffic, a route leaving a stop the wrong way, a line breaking between edges.
  */
-export function buildNetwork(graph: RoadGraph = LEGACY_ROADS, specs: LineSpec[] = LINE_SPECS, stopSpecs: StopSpec[] = STOP_SPECS, opts: { planned?: boolean } = {}): TransitNetwork {
+export function buildNetwork(graph: RoadGraph = LEGACY_ROADS, specs: LineSpec[] = LINE_SPECS, stopSpecs: StopSpec[] = STOP_SPECS, opts: { planned?: boolean; avoid?: (e: RoadEdge) => boolean; bay?: (edge: number, s: number, dir: 1 | -1) => boolean } = {}): TransitNetwork {
   const issues: string[] = [], stops = new Map<string, TransitStop>();
   const lineOf = (id: string) => specs.find((l) => l.stops.includes(id));
   for (const spec of stopSpecs) {
     if (spec.planned && !opts.planned) continue;
     const line = lineOf(spec.id);
     if (spec.mode === 'bus') {
-      const st = busStop(graph, spec, line ?? BUS, issues);
+      const st = busStop(graph, spec, line ?? BUS, issues, opts.bay);
       if (st) stops.set(spec.id, st);
     } else stops.set(spec.id, { ...spec, x: spec.berth!.x, z: spec.berth!.z, hx: 1, hz: 0, edge: -1, dir: 1, s: 0 });
   }
   const lines: TransitLine[] = [];
   for (const spec of specs) {
     if (spec.planned && !opts.planned) continue;
-    const line = spec.mode === 'bus' ? busLine(graph, spec, stops, issues) : boatLine(spec, stops, issues);
+    const line = spec.mode === 'bus' ? busLine(graph, spec, stops, issues, opts.avoid) : boatLine(spec, stops, issues);
     if (line) lines.push(line);
   }
   // A built stop that only planned lines (left out) call at waits for them: the ferry's An Hòa landing.
@@ -398,6 +521,120 @@ export function buildNetwork(graph: RoadGraph = LEGACY_ROADS, specs: LineSpec[] 
     if (callers.length && callers.every((l) => l.planned && !opts.planned)) stops.delete(id);
   }
   return { lines, stops, issues };
+}
+
+// ---- The live map's lines ---------------------------------------------------------------------------------
+
+/** A heading for a via point (unit vector of travel). */
+const EAST = { hx: 1, hz: 0 }, WEST = { hx: -1, hz: 0 }, NORTH = { hx: 0, hz: -1 }, SOUTH = { hx: 0, hz: 1 };
+type Via = Pt & { hx?: number; hz?: number };
+/**
+ * How each line runs on with the wired slices: its name once it starts from the 23/9 terminus, and headed via points
+ * after a stop (an index into the line's stops of today; -1: after the terminus), each needing a slice wired; `replace`
+ * drops today's via points after that stop. Line 15 runs from the terminus up Hàm Nghi; 08 comes back along Trần Hưng
+ * Đạo and, with Quận 4, runs on along Hoa Sữa into Khánh Hội, round it on Nguyễn Tất Thành and up Võ Văn Kiệt to the
+ * river instead of up Tôn Đức Thắng; 03 runs out along Điện Biên Phủ past Hàng Xanh and back along Xô Viết Nghệ Tĩnh (Bình Thạnh), and returns to
+ * the terminus along Lê Lai. Every line comes into the terminus up Đề Thám from the south (the last via point, a
+ * straight run in to its bays). Via points after the same stop are passed in list order.
+ */
+/** After the line's last stop of today (back to its first: the terminus), and up Đề Thám from the south into its bays. */
+const LAST = 99, INTO_TERMINUS: Via = { x: 324, z: 405, ...NORTH };
+const EXTENSIONS: Record<string, { name: string; via: { after: number; slice: string; at: Via; replace?: boolean }[] }> = {
+  '03': { name: 'CÔNG VIÊN 23/9 – VÒNG AN HÒA', via: [
+    { after: 1, slice: 'binh-thanh', at: { x: -520, z: 0, ...WEST } }, { after: 1, slice: 'binh-thanh', at: { x: -500, z: 57.3, hx: 0.979, hz: -0.203 } },
+    { after: 3, slice: 'quan-1-south', at: { x: 300, z: 300, ...EAST } },
+    { after: LAST, slice: 'quan-1-south', at: INTO_TERMINUS },
+  ] },
+  '08': { name: 'CÔNG VIÊN 23/9 – BẠCH ĐẰNG – AN HÒA', via: [
+    { after: 1, slice: 'quan-4', replace: true, at: { x: 200, z: -54, ...EAST } }, { after: 1, slice: 'quan-4', at: { x: 620, z: 125, ...SOUTH } },
+    { after: 1, slice: 'quan-4', at: { x: 420, z: 300, ...WEST } },
+    { after: 1, slice: 'quan-4', at: { x: 372, z: 225, ...NORTH } },
+    { after: 4, slice: 'quan-1-south', at: { x: 250, z: 385, ...EAST } },
+    { after: LAST, slice: 'quan-1-south', at: INTO_TERMINUS },
+  ] },
+  '15': { name: 'CÔNG VIÊN 23/9 – HÀM NGHI – AN HÒA', via: [{ after: -1, slice: 'quan-1-south', at: { x: 270, z: 230, ...NORTH } }, { after: LAST, slice: 'quan-1-south', at: INTO_TERMINUS }] },
+};
+/** A bus shelter of a wired slice (or the terminus) as a stop. */
+const shelterSpec = (s: { id: string; name: string; x: number; z: number; yaw: number }): StopSpec => ({ id: s.id, name: s.name, mode: 'bus', wait: { x: s.x, z: s.z }, yaw: s.yaw, fit: true });
+
+/**
+ * Transit on the live map (map/world-types.ts). Until Quận 1 south and its 23/9 terminus are wired: today's lines and
+ * stops, exactly (on the live roads). Then the bus lines run from the terminus and on as EXTENSIONS says, routed with a
+ * fixed heading at every stop and via point and never along a street with closing hours, and each calls at the
+ * slices' shelters it passes on the side they serve (40 m or more from its other calls). The river bus is today's.
+ */
+export function worldNetwork(world: WorldRoads = worldRoads()): TransitNetwork {
+  // Until the terminus is built (WIRING-PLAN step 17) the lines run as today, on the live roads.
+  if (!world.terminus || !world.slices.includes('quan-1-south')) return buildNetwork(world.roads);
+  const graph = world.roads, wired = new Set(world.slices);
+  // Never along a street with closing hours, nor into one too narrow for a 12 m bus to turn into (a 9 m R2).
+  const avoid = (e: RoadEdge) => !!world.edges[e.id]?.closed || (e.cls !== 'R1' && e.half < 5);
+  // A bus bay (the terminus's) on the stop's side round where the bus stands.
+  const bay = (edge: number, s: number, dir: 1 | -1) => (world.edges[edge]?.bays ?? []).some((b) => b.kind === 'bus' && b.side === dir && s > b.s0 - 2 && s < b.s1 + 2);
+  const terminus = world.terminus;
+  const stopSpecs: StopSpec[] = [...STOP_SPECS, ...(terminus ? [shelterSpec(terminus)] : [])];
+  const specs: LineSpec[] = LINE_SPECS.map((l) => {
+    const ext = EXTENSIONS[l.id];
+    if (l.mode !== 'bus' || !ext) return l;
+    const head = terminus && terminus.lines.includes(l.id) ? [terminus.id] : [];
+    const via: Record<number, Via[]> = {};
+    // Today's via points (their stop indices move on by the terminus), then the slices' in order.
+    for (const [k, list] of Object.entries(l.via ?? {})) via[Number(k) + head.length] = list.slice();
+    for (const v of ext.via) {
+      if (!wired.has(v.slice) || (v.after < 0 && !head.length)) continue;
+      const k = v.after === LAST ? head.length + l.stops.length - 1 : v.after + head.length;
+      if (v.replace) via[k] = (via[k] ?? []).filter((p) => p.hx !== undefined);
+      (via[k] ??= []).push(v.at);
+    }
+    return { ...l, name: head.length ? ext.name : l.name, stops: [...head, ...l.stops], via, directed: true };
+  });
+  // First the lines through their main stops; then each calls at the shelters it passes.
+  const first = buildNetwork(graph, specs, stopSpecs, { avoid, bay });
+  const shelters = world.shelters.map(shelterSpec), probe = buildNetwork(graph, [], shelters, { avoid, bay });
+  const extra: StopSpec[] = [];
+  const out = specs.map((spec) => {
+    const line = first.lines.find((l) => l.id === spec.id);
+    if (!line || spec.mode !== 'bus') return spec;
+    // Every way in path order: the stops (their visits' arcs) and the via points (where the path passes them).
+    type Way = { s: number; stop?: string; via?: Via };
+    const ways: Way[] = [];
+    spec.stops.forEach((id, k) => {
+      ways.push({ s: line.visits[k].s, stop: id });
+      for (const v of spec.via?.[k] ?? []) ways.push({ s: pathProject(line.path, v.x, v.z).s, via: v });
+    });
+    const calls = ways.filter((w) => w.stop).map((w) => w.s);
+    const served = new Set(line.plan.map((p) => `${p.edge}:${p.dir}`));
+    for (const sh of shelters) {
+      const st = probe.stops.get(sh.id);
+      if (!st || !served.has(`${st.edge}:${st.dir}`)) continue;
+      const p = graph.pointAt(graph.edges[st.edge], st.s), hit = pathProject(line.path, p.x, p.z);
+      if (hit.d > graph.edges[st.edge].half || calls.some((c) => Math.min(Math.abs(c - hit.s), line.path.len - Math.abs(c - hit.s)) < 40)) continue;
+      ways.push({ s: hit.s, stop: sh.id });
+      calls.push(hit.s);
+      if (!extra.includes(sh)) extra.push(sh);
+    }
+    // In path order from the first stop (the start of the path).
+    const s0 = ways[0].s, len = line.path.len, at = (w: Way) => (((w.s - s0) % len) + len) % len;
+    const ordered = [ways[0], ...ways.slice(1).sort((a, b) => at(a) - at(b))];
+    const stopsOut: string[] = [], viaOut: Record<number, Via[]> = {};
+    for (const w of ordered) {
+      if (w.stop) stopsOut.push(w.stop);
+      else (viaOut[stopsOut.length - 1] ??= []).push(w.via!);
+    }
+    return { ...spec, stops: stopsOut, via: viaOut };
+  });
+  const net = buildNetwork(graph, out, [...stopSpecs, ...extra], { avoid, bay });
+  // A line that no longer builds with its shelters runs as it did without them.
+  for (const spec of specs) {
+    if (net.lines.some((l) => l.id === spec.id)) continue;
+    const fallback = first.lines.find((l) => l.id === spec.id);
+    if (fallback) {
+      net.lines.push(fallback);
+      for (const v of fallback.visits) if (!net.stops.has(v.stop.id)) net.stops.set(v.stop.id, v.stop);
+    }
+  }
+  for (const i of first.issues) if (!net.issues.includes(i)) net.issues.push(i);
+  return net;
 }
 
 // ---- Timetables, positions and riders ---------------------------------------------------------------------
@@ -449,8 +686,10 @@ export function createTransit(network: TransitNetwork = buildNetwork(), opts: { 
   const sph = opts.secondsPerHour ?? SECONDS_PER_HOUR, seed = opts.seed ?? 1;
   const lines = new Map(network.lines.map((l) => [l.id, l]));
   const order = new Map(network.lines.map((l, i) => [l.id, i]));
-  type Day = { trips: Trip[]; fleet: number };
-  const dayCache = new Map<string, Day>();
+  /** One service day of a line: its trips in departure order, the same trips by vehicle (in order), and its fleet size. */
+  type Day = { trips: Trip[]; fleet: number; byVehicle: Trip[][] };
+  /** Days built so far, per line by day number (a few kept per line). */
+  const dayCache = new Map<string, Map<number, Day>>();
   /** Departures for one service day in whole minutes after midnight, and the vehicle each runs on. */
   const base = new Map<string, { m: number; vehicle: number }[]>();
   for (const line of network.lines) {
@@ -472,13 +711,17 @@ export function createTransit(network: TransitNetwork = buildNetwork(), opts: { 
     base.set(line.id, out);
   }
   function day(lineId: string, d: number): Day {
-    const key = `${lineId}:${d}`;
-    let got = dayCache.get(key);
+    let days = dayCache.get(lineId);
+    if (!days) dayCache.set(lineId, (days = new Map()));
+    let got = days.get(d);
     if (!got) {
       const line = lines.get(lineId)!, runH = line.run / sph, list = base.get(lineId)!;
-      got = { trips: list.map((t, index) => ({ line: lineId, day: d, index, vehicle: t.vehicle, depart: d * 24 + t.m / 60, end: d * 24 + t.m / 60 + runH })), fleet: Math.max(0, ...list.map((t) => t.vehicle + 1)) };
-      dayCache.set(key, got);
-      if (dayCache.size > 64) dayCache.delete(dayCache.keys().next().value!);
+      const trips = list.map((t, index) => ({ line: lineId, day: d, index, vehicle: t.vehicle, depart: d * 24 + t.m / 60, end: d * 24 + t.m / 60 + runH }));
+      const fleet = Math.max(0, ...list.map((t) => t.vehicle + 1)), byVehicle: Trip[][] = Array.from({ length: fleet }, () => []);
+      for (const trip of trips) byVehicle[trip.vehicle].push(trip);
+      got = { trips, fleet, byVehicle };
+      days.set(d, got);
+      if (days.size > 8) days.delete(days.keys().next().value!);
     }
     return got;
   }
@@ -487,7 +730,7 @@ export function createTransit(network: TransitNetwork = buildNetwork(), opts: { 
   const maxWait = (line: TransitLine) => (3 * line.spec.layover) / sph;
   /** The vehicle's next trip, when it stays at the terminus for it (same day, within the longest wait). */
   const continues = (trip: Trip) => {
-    const next = day(trip.line, trip.day).trips.find((o) => o.vehicle === trip.vehicle && o.depart >= trip.end - 1e-9);
+    const next = day(trip.line, trip.day).byVehicle[trip.vehicle]?.find((o) => o.depart >= trip.end - 1e-9);
     return next && next.depart - trip.end <= maxWait(lines.get(trip.line)!) + 1e-9 ? next : null;
   };
   const visitTime = (trip: Trip, line: TransitLine, k: number, which: 'arrive' | 'depart') => trip.depart + line.visits[k][which] / sph;
@@ -520,22 +763,29 @@ export function createTransit(network: TransitNetwork = buildNetwork(), opts: { 
   const accepts = (r: Rider, line: TransitLine, here: string) => (!r.lines || r.lines.includes(line.id)) && serves(line, r.to) && r.to !== here;
   /** The vehicle's state at t, or null when it is out of service (at the depot). */
   function vehicleAt(lineId: string, vehicle: number, t: number): VehicleState | null {
-    const line = lines.get(lineId)!, trips = tripsAround(lineId, t).filter((tr) => tr.vehicle === vehicle);
+    const line = lines.get(lineId)!, d0 = Math.floor(t / 24);
     const key = keyOf(lineId, vehicle), riding = aboard.get(key)?.size ?? 0;
     const mk = (trip: Trip | null, phase: VehicleState['phase'], s: number, speed: number, visit: number, crowdVisit: number): VehicleState => {
       const p = pathPoint(line.path, s);
       return { key, line: lineId, vehicle, trip, phase, s: ((s % line.path.len) + line.path.len) % line.path.len, x: p.x, z: p.z, hx: p.hx, hz: p.hz, speed, visit, load: (trip ? crowd(line, trip, crowdVisit) : 0) + riding };
     };
-    for (let i = 0; i < trips.length; i++) {
-      const trip = trips[i];
-      if (t >= trip.depart && t < trip.end) {
-        const at = onTrip(line, trip, t);
-        return mk(trip, at.phase, at.s, at.speed, at.visit, at.phase === 'dwell' ? at.visit : (at.visit + line.visits.length - 1) % line.visits.length);
+    // Its trips of yesterday, today and tomorrow in order (each day's own list: nothing is copied or filtered per frame).
+    let last: Trip | null = null;
+    for (let d = d0 - 1; d <= d0 + 1; d++) {
+      const trips = day(lineId, d).byVehicle[vehicle];
+      if (!trips) continue;
+      for (let i = 0; i < trips.length; i++) {
+        const trip = trips[i];
+        if (t >= trip.depart && t < trip.end) {
+          const at = onTrip(line, trip, t);
+          return mk(trip, at.phase, at.s, at.speed, at.visit, at.phase === 'dwell' ? at.visit : (at.visit + line.visits.length - 1) % line.visits.length);
+        }
+        // Waiting at the terminus for this trip: since the last one ended, or come from the depot a layover before it.
+        const prev = last && last.day === trip.day ? last : null;
+        const before = prev && continues(prev) === trip ? prev.end : trip.depart - line.spec.layover / sph;
+        if (t >= before && t < trip.depart) return mk(trip, 'layover', 0, 0, 0, 0);
+        last = trip;
       }
-      // Waiting at the terminus for this trip: since the last one ended, or come from the depot a layover before it.
-      const prev = i > 0 && trips[i - 1].day === trip.day ? trips[i - 1] : null;
-      const before = prev && continues(prev) === trip ? prev.end : trip.depart - line.spec.layover / sph;
-      if (t >= before && t < trip.depart) return mk(trip, 'layover', 0, 0, 0, 0);
     }
     return null;
   }
@@ -868,17 +1118,44 @@ export function busCourse(line: TransitLine, graph: RoadGraph = LEGACY_ROADS) {
   if (Math.hypot(pts[0] - pts[pts.length - 2], pts[1] - pts[pts.length - 1]) > 1e-6) pts.push(pts[0], pts[1]);
   const path = makePath(pts);
   const nose = (s: number) => { const b = busPose(path, s); return { x: b.x + b.hx * BUS_GEOMETRY.NOSE, z: b.z + b.hz * BUS_GEOMETRY.NOSE, hx: b.hx, hz: b.hz }; };
-  // Line arc -> rear arc, every metre (the centre of a bus at line arc s has its rear axle REAR behind it).
-  const map = new Float32Array(n + 1);
+  // Line arc -> rear arc, every metre (the centre of a bus at line arc s has its rear axle REAR behind it). Each metre
+  // follows the last one's hit along the rear path (a window of segments round it, wider if that misses, the whole
+  // path only as a last resort): a line that passes the same street twice (03 and 08 in the districts) never jumps
+  // to the other pass, and the table costs milliseconds, not seconds.
+  const map = new Float32Array(n + 1), segs = path.pts.length / 2 - 1;
+  let near = -1;
+  const hit = { best: Infinity, at: 0, k: -1 };
+  const scan = (x: number, z: number, from: number, to: number) => {
+    hit.best = Infinity; hit.at = 0; hit.k = -1;
+    for (let w = from; w <= to; w++) {
+      const k = (((near + w) % segs) + segs) % segs, j = k * 2;
+      const ax = path.pts[j], az = path.pts[j + 1], dx = path.pts[j + 2] - ax, dz = path.pts[j + 3] - az, l2 = dx * dx + dz * dz;
+      const t = l2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / l2)) : 0, d = Math.hypot(x - ax - dx * t, z - az - dz * t);
+      if (d < hit.best - 1e-9) { hit.best = d; hit.at = path.cum[k] + t * Math.sqrt(l2); hit.k = k; }
+    }
+  };
   for (let i = 0; i <= n; i++) {
-    const c = pathPoint(p, i);
-    map[i] = pathProject(path, c.x - c.hx * BUS_GEOMETRY.REAR, c.z - c.hz * BUS_GEOMETRY.REAR).s;
+    const c = pathPoint(p, i), x = c.x - c.hx * BUS_GEOMETRY.REAR, z = c.z - c.hz * BUS_GEOMETRY.REAR;
+    if (near >= 0) { scan(x, z, -6, 12); if (hit.best > 1) scan(x, z, -40, 80); }
+    if (near < 0 || hit.best > 4) {
+      const g = pathProject(path, x, z);
+      let lo = 0, hi = segs - 1;
+      while (lo < hi) { const m = (lo + hi + 1) >> 1; if (path.cum[m] <= g.s) lo = m; else hi = m - 1; }
+      hit.best = g.d; hit.at = g.s; hit.k = lo;
+    }
+    map[i] = hit.at;
+    near = hit.k;
   }
-  const docks = line.visits.map((v) => { const c = pathPoint(p, v.s); return pathProject(path, c.x - c.hx * BUS_GEOMETRY.REAR, c.z - c.hz * BUS_GEOMETRY.REAR).s; });
+  const rearOf = (s: number) => { const w = ((s % p.len) + p.len) % p.len, i = Math.floor(w), a = map[i], b = map[Math.min(n, i + 1)]; return b >= a ? a + (b - a) * (w - i) : a; };
+  // A berth's rear arc: its own projection, unless that lands on the other pass of a doubled street (then the table's).
+  const docks = line.visits.map((v) => {
+    const c = pathPoint(p, v.s), g = pathProject(path, c.x - c.hx * BUS_GEOMETRY.REAR, c.z - c.hz * BUS_GEOMETRY.REAR).s, t = rearOf(v.s);
+    return Math.abs(g - t) > 5 && Math.abs(Math.abs(g - t) - path.len) > 5 ? t : g;
+  });
   return {
     path, docks, signals: signalPoints(line, graph, path, nose), guide,
     /** The rear-path arc of a bus whose centre the timetable puts at line arc s. */
-    rearOf(s: number) { const w = ((s % p.len) + p.len) % p.len, i = Math.floor(w), a = map[i], b = map[Math.min(n, i + 1)]; return b >= a ? a + (b - a) * (w - i) : a; },
+    rearOf,
   };
 }
 export type BusCourse = ReturnType<typeof busCourse>;

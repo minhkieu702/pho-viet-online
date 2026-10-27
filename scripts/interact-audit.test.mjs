@@ -17,6 +17,11 @@
 //     handled when an entry covering its kind lies within r of it. A thing that stays decorative on purpose (a
 //     shutter that is down, a reworded sign) gets an entry too, with the prompt that says so (design-real C3).
 // Facade points: a building's door, a prop's centre, a bench or table, a dock's pier-end ring.
+// The wired districts (WIRING-PLAN §2, app/game/district-life.ts) are audited the same way: every door that is not a
+// home, the chung cư kiosks, carts, market stalls, the EXTRA stalls (Bến Thành's night market, the book street), every
+// seat, every parked bike and car, the bus shelters. Twice: the live wiring step (world-map.ts, against the registry's
+// live tables) and the whole of P1 (every slice and seam, against districtPlaces/districtSpots of that world), so a
+// slice has no dead facade before it is wired.
 import test from 'node:test';
 import module from 'node:module';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
@@ -82,6 +87,42 @@ for (const d of SCENERY.docks) {
 // Moored sampans are hard-coded in world.ts (the loop after "sampans moored"); boats.ts takes them over in step 6.
 const sampans = worldSrc.match(/sampans? moored[^\n]*\n[^\n]*?of (\[\[[^\n]*?\]\])\)/);
 if (sampans) for (const [x, z] of JSON.parse(sampans[1])) add('sampan', 'boat', x, z, 'ghe neo');
+
+// ---- District facades ----
+const life = await import('../app/game/district-life.ts');
+const countersMod = await import('../app/game/counters.ts');
+const parkingMod = await import('../app/game/parking.ts');
+/** Everything in a district view that looks interactable. */
+function districtFacades(v, tag) {
+  const out = [];
+  const put = (group, kind, x, z, label, building = false) => out.push({ group: `${tag}${group}`, kind, x, z, label, building });
+  const COUNTER_KINDS = new Set(['cafe', 'food', 'shop']);
+  for (const b of v.buildings) {
+    if (b.kind === 'home') continue;
+    if (COUNTER_KINDS.has(b.kind)) put(b.kind, 'counter', b.door.x, b.door.z, b.name, true);
+    else put(`door:${b.kind}`, 'door', b.door.x, b.door.z, b.name, true);
+  }
+  for (const k of v.kiosks) put('kiosk', 'counter', k.x, k.z, k.name);
+  for (const p of v.props) {
+    if (p.kind === 'cart') put('cart', 'counter', p.x, p.z, 'xe đẩy');
+    if (p.kind === 'stall') put('market-stall', 'counter', p.x, p.z, 'sạp chợ');
+    if (p.kind === 'shelter' && /TUYẾN\s+\d/.test(allSrc)) put('bus-route-sign', 'transit', p.x, p.z, 'trạm xe buýt');
+  }
+  for (const p of v.pois) if (p.seat && p.kind !== 'perch') put(p.kind === 'bench' ? 'bench' : p.kind === 'bus-stop' ? 'bus-stop-seat' : 'stool', 'seat', p.x, p.z, p.kind);
+  // A quán table: sat at on its stools, or ordered at when there is no room for one.
+  for (const e of v.eateries) put('eatery-table', e.seats.length ? 'seat' : 'counter', e.x, e.z, e.name || 'bàn quán');
+  for (const p of v.parked) put('parked-bike', 'vehicle', p.x, p.z, 'xe máy đậu');
+  if (v.keys.has('quan-1-south')) {
+    const { QUAN_1_SOUTH_EXTRA } = q1Extra;
+    for (const st of QUAN_1_SOUTH_EXTRA.market.night.stalls) put('night-market', 'counter', st.x, st.z, 'chợ đêm');
+    for (const st of QUAN_1_SOUTH_EXTRA.market.day.stalls) put('market-stall', 'counter', st.x, st.z, 'sạp chợ Bến Thành');
+    for (const st of QUAN_1_SOUTH_EXTRA.bookstalls.stalls) put('bookstall', 'counter', st.x, st.z, 'đường sách');
+  }
+  return out;
+}
+const q1Extra = await import('../app/game/map/layout/quan-1-south.ts');
+const liveView = life.district();
+for (const f of districtFacades(liveView, 'live ')) facades.push(f);
 
 // ---- Handlers: legacy branches of game.ts action() ----
 function body(src, head) {
@@ -158,6 +199,19 @@ for (const h of handlers) {
 }
 const dead = facades.filter((f) => !f.handler);
 
+// ---- The whole of P1, each slice audited before it is wired ----
+const fullView = life.viewOf(life.buildWorld());
+const fullFacades = districtFacades(fullView, 'P1 ');
+const fullSpots = parkingMod.districtSpots(fullView, 0, 0).spots;
+const fullHandlers = (await import('../app/game/interact.ts')).auditEntries(countersMod.districtPlaces(fullView), fullSpots).map((e) => ({ id: e.id, covers: [e.covers].flat(), x: e.x, z: e.z, r: e.r }));
+for (const f of fullFacades) f.handler = fullHandlers.find((h) => !f.building && h.covers.includes(f.kind) && near(h, f) <= h.r)?.id ?? null;
+for (const h of fullHandlers) {
+  let best = null;
+  for (const f of fullFacades) if (f.building && h.covers.includes(f.kind) && near(h, f) <= h.r + DOOR_REACH && (!best || near(h, f) < near(h, best))) best = f;
+  if (best) best.handler ??= h.id;
+}
+for (const f of fullFacades) { f.mission = null; facades.push(f); if (!f.handler) dead.push(f); }
+
 function report() {
   const groups = new Map();
   for (const f of facades) {
@@ -169,13 +223,14 @@ function report() {
   const at = (f) => `${f.label} (${f.x.toFixed(1)}, ${f.z.toFixed(1)})${f.mission ? ` [mission ${f.mission} only]` : ''}`;
   const lines = [
     `interact-audit: ${facades.length} things look interactable, ${facades.length - dead.length} have a handler, ${dead.length} are dead facades${process.env.STRICT === '1' ? '' : ' (report only; STRICT=1 fails on any)'}`,
-    `  ${'group'.padEnd(18)}${'kind'.padEnd(9)}${'total'.padStart(6)}${'ok'.padStart(5)}${'dead'.padStart(6)}  handled by / first dead`,
+    `  ${'group'.padEnd(26)}${'kind'.padEnd(9)}${'total'.padStart(6)}${'ok'.padStart(5)}${'dead'.padStart(6)}  handled by / first dead`,
   ];
   for (const [name, g] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
     const by = [...g.by];
     const note = g.example ? at(g.example) : `${by.slice(0, 3).join(', ')}${by.length > 3 ? ` +${by.length - 3} more` : ''}`;
-    lines.push(`  ${name.padEnd(18)}${g.kind.padEnd(9)}${String(g.total).padStart(6)}${String(g.handled).padStart(5)}${String(g.total - g.handled).padStart(6)}  ${note}`);
+    lines.push(`  ${name.padEnd(26)}${g.kind.padEnd(9)}${String(g.total).padStart(6)}${String(g.handled).padStart(5)}${String(g.total - g.handled).padStart(6)}  ${note}`);
   }
+  lines.push(`  districts: live ${[...liveView.keys].join(', ') || 'none wired'} (${liveView.buildings.length} buildings); P1 audited whole: ${[...fullView.keys].join(', ')} (${fullView.buildings.length} buildings)`);
   lines.push(`  not counted: ${homes} house doors (residences stay shut), traffic cars and the player's bike (dynamic), mission rings and side-job offers (temporary)`);
   lines.push(`  handlers: game.ts action(): ${legacyFound.join(', ') || 'none'}; registry: ${registry}`);
   if (legacyGone.length) lines.push(`  legacy branches no longer in action(): ${legacyGone.join(', ')} (the registry must cover them now)`);

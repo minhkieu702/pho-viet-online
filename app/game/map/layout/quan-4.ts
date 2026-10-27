@@ -146,7 +146,8 @@ export const QUAN_4: DistrictLayout = {
     { id: 'khanh-hoi', name: 'ĐƯỜNG KHÁNH HỘI', cls: 'R1', pts: [520, -60, 520, 425] },
     // Vĩnh Khánh at z 0, not design 1's z 20: 20 m off Hoàng Diệu's houses left a 12 m strip with no room for a row on
     // either street. A narrow two-lane street, but classed R1 so its frontage rows come first and line it end to end.
-    { id: 'vinh-khanh', name: 'ĐƯỜNG VĨNH KHÁNH', cls: 'R1', pts: [450, 0, 620, 0], half: 5, sidewalk: 4.5, lanes: 1, speed: 8, trees: 'round', closedHours: [18, 24], mix: 'oc' },
+    // Closed to traffic 17:00–01:00 (districts-hcmc D5): the ốc restaurants' tables cover the carriageway (EXTRA.nightSeats).
+    { id: 'vinh-khanh', name: 'ĐƯỜNG VĨNH KHÁNH', cls: 'R1', pts: [450, 0, 620, 0], half: 5, sidewalk: 4.5, lanes: 1, speed: 8, trees: 'round', closedHours: [17, 1], mix: 'oc' },
     { id: 'hoang-dieu', name: 'ĐƯỜNG HOÀNG DIỆU', cls: 'R1', pts: [450, 54, 620, 54] },
     { id: 'doan-van-bo', name: 'ĐƯỜNG ĐOÀN VĂN BƠ', cls: 'R2', pts: [450, 108, 620, 108], sidewalk: 4.5 },
     { id: 'ton-dan', name: 'ĐƯỜNG TÔN ĐẢN', cls: 'R1', pts: [450, 162, 620, 162], bus: true },
@@ -208,11 +209,31 @@ export const QUAN_4: DistrictLayout = {
 };
 
 /**
+ * Vĩnh Khánh's night seating (17–01, while it is closed to traffic): the ốc restaurants' stool tables out on the 10 m
+ * carriageway in a row 1.4 m off each curb, every 3 m from Bến Vân Đồn to the street's east end, facing the lane down
+ * the middle (5 m stays clear between the rows' lane-side stools); none at the crossings (Bến Vân Đồn x 450, Khánh Hội
+ * x 520, the east end x 620) or in front of a hẻm mouth (HẺM 17 x 485 and HẺM 53 x 556 north, HẺM 38 x 572 south).
+ */
+const VK_ROWS: [number, number[]][] = [[-3.6, [485, 556]], [3.6, [572]]];
+const vkSeats = () => VK_ROWS.flatMap(([z, skip]) => {
+  const out: { x: number; z: number; yaw: number; stools: number }[] = [];
+  for (let x = 460; x <= 610 + 1e-6; x += 3) {
+    if (Math.abs(x - 520) < 10 || skip.some((s) => Math.abs(x - s) < 3.2)) continue;
+    out.push({ x, z, yaw: z < 0 ? 0 : Math.PI, stools: 3 });
+  }
+  return out;
+});
+
+/**
  * What the layout format has no field for yet, for step 14: curb hours (bays carry none), the gantry cranes above
- * their legs (the legs, the container stacks and the rest of the port gear are QUAN_4.fixtures) and the cargo
- * ship's berth with its moorings.
+ * their legs (the legs, the container stacks and the rest of the port gear are QUAN_4.fixtures), the cargo ship's
+ * berth with its moorings, and Vĩnh Khánh's night tables.
  */
 export const QUAN_4_EXTRA = {
+  /** Vĩnh Khánh's ốc night market on its closed carriageway (as Bùi Viện's QUAN_1_SOUTH_EXTRA.nightSeats): who eats there and what. */
+  nightSeats: { road: 'vinh-khanh', hours: [17, 1] as [number, number], lane: 2.6, table: { w: 0.8, d: 0.6 }, stool: { along: 0.85, lane: 0.75, r: 0.25 }, tables: vkSeats(), name: 'VĨNH KHÁNH', dish: 'oc' as const, district: 'D5' as const,
+    /** Its neon gateways over the carriageway inside each end, the posts just behind the curbs (lit after dark). */
+    arches: [{ ax: 458.5, az: -5.45, bx: 458.5, bz: 5.45, text: 'PHỐ ẨM THỰC VĨNH KHÁNH', sub: 'ỐC • HẢI SẢN • NƯỚNG' }, { ax: 612.5, az: -5.45, bx: 612.5, bz: 5.45, text: 'PHỐ ẨM THỰC VĨNH KHÁNH', sub: 'ỐC • HẢI SẢN • NƯỚNG' }] },
   /** Loading bays per arterial side are live in these hours (design 1 §10: market curb lanes 22:00–05:00; the port all day). */
   curbHours: { 'xom-chieu': { loading: [22, 5] as [number, number] }, 'nguyen-tat-thanh': { loading: [0, 24] as [number, number] } },
   /** Ship-to-shore gantries: legs `gauge` apart across the quay and `span` along it, the boom reaching out over the water at `yaw`. */

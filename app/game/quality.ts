@@ -23,6 +23,11 @@ export function isSoftwareGpu(name: string) {
   return /swiftshader|llvmpipe|software|basic render|microsoft basic/i.test(name);
 }
 
+/** An integrated GPU (shares the CPU's memory and power: Intel UHD / Iris, AMD APU graphics, base Apple M). */
+export function isIntegratedGpu(name: string) {
+  return /intel|uhd|iris|radeon\(tm\) graphics|vega \d+ graphics|apple m\d(?! (pro|max|ultra))/i.test(name) && !/nvidia|geforce|rtx|gtx|radeon rx|radeon pro/i.test(name);
+}
+
 /** Reads the GPU name the browser exposes for a WebGL context. */
 export function gpuName(gl: WebGLRenderingContext | WebGL2RenderingContext) {
   const info = gl.getExtension('WEBGL_debug_renderer_info');

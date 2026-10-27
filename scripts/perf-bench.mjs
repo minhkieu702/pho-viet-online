@@ -10,6 +10,13 @@
 //   overview  the camera 420 m out over the whole map
 //   drive     the sport bike (bought in the bike shop) held at full throttle along the riverside road, about 25 m/s
 //   night     downtown plaza at 21:00
+//   district  on foot at 19:00 in a street of the newest wired P1 slice (--district=<slice key> picks another), the
+//             default camera (skipped when nothing is wired)
+//   ddrive    the sport bike at full throttle along a long street of that slice (Bến Vân Đồn, Điện Biên Phủ, Võ Văn
+//             Kiệt, Trần Hưng Đạo, Vòng Cung)
+// With districts wired, the frames from the start of a solo game until every district tile is built are recorded too
+// ("build": max frame, frames over 50 ms), and --gate checks no frame over 50 ms there and draw calls <= 250 (median,
+// every scene).
 // Per scene: in-page fps from requestAnimationFrame deltas, p50/p95/p99/max frame time, draw calls and triangles
 // (renderer.info.render, median), JS heap. Per run: textures referenced by the scene (count, estimated MB with
 // mips, sign/plate textures separately), render targets, page-load long tasks. Writes <out>/<label>.json and a
@@ -33,7 +40,7 @@ const LABEL = String(flag('label', `bench-${new Date().toISOString().slice(0, 16
 const GATE = flag('gate', false) === true;
 const RUNS = String(flag('runs', 'default,high')).split(',');
 const QUALITY = String(flag('quality', 'gpu'));
-const SCENES = String(flag('scenes', 'spawn,overview,drive,night')).split(',');
+const SCENES = String(flag('scenes', 'spawn,overview,drive,night,district,ddrive')).split(',');
 const SECONDS = Number(flag('seconds', 10));
 const OUT = String(flag('out', process.env.PVO_BENCH_OUT ?? (existsSync('E:/pvo-work') ? 'E:/pvo-work/engine/bench' : join(tmpdir(), 'pvo-bench'))));
 const PORTS = String(flag('ports', '9470,9471')).split(',').map(Number);
@@ -43,7 +50,16 @@ const SHOTS = !flag('no-shots', false);
 const FREEZE = !flag('no-freeze', false);
 const NOTE = flag('note', '');
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const GATES = { discreteFps: 120, intelLowFps: 38, driveP95: 33, signMB: 10 };
+const GATES = { discreteFps: 120, intelLowFps: 38, driveP95: 33, signMB: 10, buildMax: 50, calls: 250 };
+const DISTRICT = flag('district', '');
+/** Per P1 slice: a street to stand in at 19:00 (x, z, camera yaw) and a straight run to ride (x, z, heading). */
+const DISTRICT_SPOTS = {
+  'quan-4': { name: 'Vĩnh Khánh', stand: [535, 6, -2.4], ride: [446.5, -95, 0] },
+  'binh-thanh': { name: 'Hàng Xanh', stand: [-390, 12, 2.2], ride: [-235, -5.5, -Math.PI / 2] },
+  'quan-3': { name: 'Võ Thị Sáu', stand: [-120, 168, 1.2], ride: [-370, 430.5, Math.PI / 2] },
+  'quan-1-south': { name: 'Bùi Viện', stand: [320, 262, 1.6], ride: [-100, 390.5, Math.PI / 2] },
+  'thu-thiem': { name: 'Thủ Thiêm', stand: [20, -262, 2.8], ride: [-400, -314.5, Math.PI / 2] },
+};
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // ---- Chrome over CDP ----
@@ -229,6 +245,30 @@ async function runOne(run, port) {
     result.load = { readyMs: Date.now() - t0, ...(await page.evaluate(`({ longTasks: __bench.longTasks.slice().sort((a, b) => b - a).slice(0, 6), longTaskTotal: __bench.longTasks.reduce((s, x) => s + x, 0) })`)) };
     await page.evaluate(`${solo}.click(); window.__benchToken = 1`);
     for (let i = 0; i < 40 && !(await page.evaluate('!!window.__pvo')); i++) await sleep(250);
+    // The district build after the start: every frame until the last tile is up (and 2 s more).
+    const wired = await page.evaluate('window.__pvo.world.districts().wired').catch(() => []);
+    result.wired = wired;
+    if (wired.length) {
+      // The window opens when the builder starts (world.ts holds it for the first drawn frames: today's street compiling
+      // and uploading, measured apart as "startup").
+      result.build = await page.evaluate(`new Promise((resolve) => {
+        const pvo = window.__pvo, dt = [], pre = []; let last = 0, start = 0, readyAt = 0, began = 0;
+        const step = (t) => {
+          const d = pvo.world.districts();
+          if (!began) { if (last) pre.push(t - last); last = t; if (d.ms > 0) { began = t; start = t; } requestAnimationFrame(step); return; }
+          dt.push(t - last); last = t;
+          if (d.ready && !readyAt) readyAt = t;
+          if ((readyAt && t - readyAt > 2000) || t - start > 30000) {
+            const s = [...dt].sort((a, b) => a - b);
+            resolve({ frames: dt.length, seconds: Math.round((t - start) / 100) / 10, ready: !!readyAt, buildMs: d.ms, longestStepMs: d.longestStepMs, longestStep: d.longestStep, tiles: d.tiles,
+              startup: { frames: pre.length, max: Math.round(Math.max(0, ...pre)) },
+              p95: Math.round((s[Math.floor(s.length * 0.95)] ?? 0) * 10) / 10, max: Math.round((s.at(-1) ?? 0) * 10) / 10, over50: dt.filter((x) => x > 50).length });
+          } else requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+      })`);
+      console.log(`  ${run.padEnd(8)}build    ${result.build.tiles} tiles in ${result.build.seconds} s (${result.build.buildMs} ms of work, longest step ${result.build.longestStepMs} ms): frames p95 ${result.build.p95} ms, max ${result.build.max} ms, ${result.build.over50} over 50 ms (startup before it: ${result.build.startup.frames} frames, max ${result.build.startup.max} ms)`);
+    }
     result.gpu = await page.evaluate(GPU_NAME);
     if (result.gpu !== probe) result.warnings.push(`GPU probe on about:blank said ${probe}`);
     const P = 'window.__pvo';
@@ -295,6 +335,38 @@ async function runOne(run, port) {
       await sleep(4000);
       await measure('night');
     }
+    // The newest wired slice (or --district): a street at 19:00 on foot, then a straight run on the sport bike.
+    const slice = DISTRICT || result.wired?.at(-1);
+    const spot = slice ? DISTRICT_SPOTS[slice] : null;
+    if (spot) result.district = { slice, name: spot.name };
+    if (spot && SCENES.includes('district')) {
+      const [x, z, yaw] = spot.stand;
+      await page.evaluate(`${P}.police.reset(); ${P}.hours(19); ${P}.tp(${x}, ${z}, ${yaw}); ${P}.view(${yaw} + Math.PI, 0.32, 12)`);
+      await sleep(5000);
+      await measure('district');
+    }
+    if (spot && SCENES.includes('ddrive')) {
+      const [x, z, heading] = spot.ride;
+      await page.evaluate(`${P}.police.reset(); ${P}.hours(10); ${P}.ride(${x}, ${z}, ${heading}); ${P}.view(${heading} - Math.PI, 0.22, 9);
+        window.__benchClear = true;
+        (function clear() {
+          if (!window.__benchClear) return;
+          const p = ${P}.info(), hx = Math.sin(${heading}), hz = Math.cos(${heading});
+          for (const c of ${P}.vehicles.cars) {
+            if (c.mode === 'off' || c.mode === 'player') continue;
+            const ax = c.x - p.x, az = c.z - p.z, ahead = ax * hx + az * hz, side = Math.abs(-ax * hz + az * hx);
+            if (ahead > -4 && ahead < 70 && side < 6) c.mode = 'off';
+          }
+          requestAnimationFrame(clear);
+        })();`);
+      await sleep(800);
+      await page.key('keyDown', 'w', 'KeyW', 87);
+      await sleep(4500);
+      await measure('ddrive');
+      await page.key('keyUp', 'w', 'KeyW', 87);
+      await page.evaluate(`window.__benchClear = false; ${P}.police.reset()`);
+      if (result.scenes.ddrive.speed < 20) result.warnings.push(`district drive averaged ${result.scenes.ddrive.speed} m/s (crash or blocked?)`);
+    }
     result.textures = await page.evaluate(TEXTURES);
   } catch (e) {
     result.failed = e.message;
@@ -316,6 +388,9 @@ function gates(runs) {
     if (!integrated(r.gpu)) out.push({ gate: `${r.run}: discrete GPU (${r.gpu}) >= ${GATES.discreteFps} fps in every scene`, ok: minFps >= GATES.discreteFps, value: `${minFps} fps (${worst}), quality ${r.quality}` });
     else if (/intel/i.test(r.gpu) && r.quality === 'low') out.push({ gate: `${r.run}: Intel at Low (${r.gpu}) >= ${GATES.intelLowFps} fps in every scene`, ok: minFps >= GATES.intelLowFps, value: `${minFps} fps (${worst})` });
     if (r.scenes.drive) out.push({ gate: `${r.run}: p95 <= ${GATES.driveP95} ms while driving`, ok: r.scenes.drive.p95 <= GATES.driveP95, value: `${r.scenes.drive.p95} ms at ${r.scenes.drive.speed} m/s` });
+    if (r.scenes.ddrive) out.push({ gate: `${r.run}: p95 <= ${GATES.driveP95} ms while driving in ${r.district?.name}`, ok: r.scenes.ddrive.p95 <= GATES.driveP95, value: `${r.scenes.ddrive.p95} ms at ${r.scenes.ddrive.speed} m/s` });
+    if (r.build) out.push({ gate: `${r.run}: no frame over ${GATES.buildMax} ms while the districts build`, ok: r.build.max <= GATES.buildMax && r.build.ready, value: `max ${r.build.max} ms, ${r.build.over50} over 50 ms${r.build.ready ? '' : ', NOT finished in 30 s'}` });
+    if (scenes.length) { const most = Math.max(...scenes.map(([, s]) => s.calls)), at = scenes.find(([, s]) => s.calls === most)[0]; out.push({ gate: `${r.run}: draw calls <= ${GATES.calls} (median, every scene)`, ok: most <= GATES.calls, value: `${most} (${at})` }); }
     if (r.textures) out.push({ gate: `${r.run}: sign textures <= ${GATES.signMB} MB`, ok: r.textures.signMB <= GATES.signMB, value: `${r.textures.signMB} MB in ${r.textures.signs} textures` });
   }
   return out;

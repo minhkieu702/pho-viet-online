@@ -35,7 +35,8 @@ export type PoiKind = 'park' | 'square' | 'market' | 'cafe-seat' | 'bench' | 'bu
 export type Poi = { id: number; kind: PoiKind; x: number; z: number; yaw: number; curb: Point; seat: boolean; group?: number; slot?: number; seatH?: number; via?: Point };
 
 /** Render-only details of a building, parallel to BUILDINGS (same id). */
-export type PlotStyle = 'legacy' | 'home' | 'shop' | 'kiosk' | 'hospital' | 'police' | 'school' | 'pagoda' | 'office' | 'tower' | 'midrise';
+/** 'church' is the districts' (gen/buildings.ts: typology church); today's plots never use it. */
+export type PlotStyle = 'legacy' | 'home' | 'shop' | 'kiosk' | 'hospital' | 'police' | 'school' | 'pagoda' | 'office' | 'tower' | 'midrise' | 'church';
 /** Downtown building shapes (see skyline.ts). */
 export type TowerForm = 'glass' | 'stepped' | 'tapered' | 'bundle' | 'twin' | 'apartment' | 'hotel' | 'mall' | 'colonial' | 'midrise';
 export type TowerCrown = 'flat' | 'spire' | 'helipad' | 'crown' | 'garden' | 'sign' | 'dome';

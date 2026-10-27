@@ -171,3 +171,24 @@ test('a few minutes of the live city: buses dock with their doors open, keep to 
   void placed;
   buses.dispose(); boats.dispose(); vehicles.dispose();
 });
+
+test("on the wired map each bus line's rear axle follows its course and never jumps to another pass of the same street", async () => {
+  // (last in the file: it installs the wired map for the rest of this process)
+  await import('../app/game/map/world-map.ts');
+  const { worldRoads } = await import('../app/game/map/world-types.ts');
+  const lines = T.worldNetwork().lines.filter((l) => l.mode === 'bus');
+  assert.ok(lines.length >= 3);
+  for (const line of lines) {
+    const t0 = performance.now(), c = busCourse(line, worldRoads().roads), ms = performance.now() - t0, n = Math.ceil(line.path.len);
+    assert.ok(ms < 1500, `${line.id}: the course takes ${ms.toFixed(0)} ms`);
+    let prev = c.rearOf(0);
+    for (let i = 1; i < n; i++) {
+      const r = c.rearOf(i);
+      let step = r - prev;
+      if (step < -c.path.len / 2) step += c.path.len;
+      if (step > c.path.len / 2) step -= c.path.len;
+      assert.ok(Math.abs(step) < 5, `${line.id}: the rear arc jumps ${step.toFixed(1)} m at line metre ${i}`);
+      prev = r;
+    }
+  }
+});

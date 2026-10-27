@@ -54,7 +54,7 @@ export type ArterialSpec = {
   mix?: StreetMix;
 };
 /** A street's business mix: 'oc', the ốc and seafood night street (Vĩnh Khánh). */
-export type StreetMix = 'oc';
+export type StreetMix = 'oc' | 'pho-tay';
 
 /** Control at the node nearest (x, z) (within 4 m). 'roundabout' is kept as data until roads.ts can expand it. */
 export type JunctionHint = { x: number; z: number; control: Control | 'roundabout'; radius?: number };

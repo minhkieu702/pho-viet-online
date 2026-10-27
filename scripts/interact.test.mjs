@@ -129,6 +129,9 @@ test('opening hours wrap past midnight and name the next opening', () => {
 test('one clock: every quán sells exactly while street life has its stools, cook and diners out', async () => {
   const { LIFE, POIS } = await import('../app/game/city.ts');
   const L = await import('../app/game/street-life.ts');
+  // District seats have POI ids after today's POIS (map/world-map.ts WORLD_POIS, then district-life.ts's extra stools).
+  const { district, poiById } = await import('../app/game/district-life.ts');
+  const view = district();
   let groups = 0;
   for (const g of LIFE.groups) {
     if ((g.kind !== 'eatery' && g.kind !== 'beer') || !g.dish) continue;
@@ -143,8 +146,12 @@ test('one clock: every quán sells exactly while street life has its stools, coo
   // Every stool and café chair of an eatery orders from its own building's counter, never a neighbour's.
   for (const p of C.PLACES) {
     if (p.kind !== 'seat' || p.poi === undefined) continue;
-    const poi = POIS[p.poi], g = poi.group !== undefined ? LIFE.groups[poi.group] : null;
-    if (!(g && (g.kind === 'eatery' || g.kind === 'beer')) && p.key !== 'cafe-seat') continue;
+    const poi = p.poi < POIS.length ? POIS[p.poi] : poiById(view, p.poi);
+    assert.ok(poi, `${p.id}: no POI ${p.poi}`);
+    const g = poi.group !== undefined ? LIFE.groups[poi.group] : null;
+    // A district quán's stool (district-life.ts: the eatery it belongs to) counts like one of today's eatery groups.
+    const districtStool = p.poi >= POIS.length && poi.eatery >= 0;
+    if (!(g && (g.kind === 'eatery' || g.kind === 'beer')) && !districtStool && p.key !== 'cafe-seat') continue;
     assert.ok(C.PLACES.some((q) => q.kind === 'counter' && q.building === p.building && p.building >= 0 && C.COUNTERS[q.key].eatIn), `${p.id} has no eat-in counter of its own`);
   }
   // Every roaming hawker's goods are on sale.
