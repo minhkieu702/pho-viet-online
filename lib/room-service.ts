@@ -1,9 +1,34 @@
-import { ClientError, newCode, readPayload, reply, roomCode, sameOrigin } from './room-validation.ts';
+import { ClientError, MAX_BODY_BYTES, newCode, readPayload, reply, roomCode, sameOrigin } from './room-validation.ts';
+
+/** Finish small rejected uploads before returning their response. In unbundled
+ * Workers, an unread HTTP body can stall the next WebSocket upgrade on the
+ * development proxy. Do not let an oversized or stalled upload delay rejection.
+ */
+async function discardRejectedBody(request: Request): Promise<void> {
+  if (!request.body || request.bodyUsed || request.body.locked) return;
+  const reader = request.body.getReader();
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  const timeout = setTimeout(cancel, 250);
+  let bytes = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      bytes += value.byteLength;
+      if (bytes > MAX_BODY_BYTES) { cancel(); return; }
+    }
+  } catch { /* Keep the original origin rejection if the upload fails. */ }
+  finally { clearTimeout(timeout); reader.releaseLock(); }
+}
 
 /** The namespace owns room routing; movement never passes through D1. */
 export async function handleRoom(request: Request, rooms?: DurableObjectNamespace): Promise<Response> {
   try {
-    sameOrigin(request);
+    try { sameOrigin(request); }
+    catch (error) {
+      await discardRejectedBody(request);
+      throw error;
+    }
     const body = await readPayload(request);
     if (!['create', 'join', 'leave'].includes(String(body.action))) {
       throw new ClientError('Thao tác phòng không hợp lệ. Hãy tải lại trò chơi.');

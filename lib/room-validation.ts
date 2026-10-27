@@ -67,13 +67,26 @@ export function playerState(value: unknown): PlayerState {
   const state = payload(value);
   if (typeof state.riding !== 'boolean') throw new ClientError('Trạng thái phương tiện không hợp lệ.');
   const angle = numberIn(state.angle, -1_000_000, 1_000_000);
+  const x = numberIn(state.x, PEER_BOUNDS.minX, PEER_BOUNDS.maxX), z = numberIn(state.z, PEER_BOUNDS.minZ, PEER_BOUNDS.maxZ);
+  const hero = oneOf(state.hero, ['none', 'ironman', 'thor', 'hulk', 'captain'] as const, 'none');
+  const vehicle = oneOf(state.vehicle, ['foot', 'scooter', 'car', 'police', 'boat', 'swim'] as const, state.riding ? 'scooter' : 'foot');
+  const down = state.down === true;
+  const canFly = hero === 'ironman' && !state.riding && vehicle === 'foot' && !down;
+  const altitude = state.altitude === undefined ? 0 : numberIn(state.altitude, 0, 8);
+  const powerSeq = state.powerSeq === undefined ? 0 : state.powerSeq;
+  if (!Number.isSafeInteger(powerSeq) || (powerSeq as number) < 0) throw new ClientError('Số thứ tự sức mạnh không hợp lệ.');
   return {
-    x: numberIn(state.x, PEER_BOUNDS.minX, PEER_BOUNDS.maxX), z: numberIn(state.z, PEER_BOUNDS.minZ, PEER_BOUNDS.maxZ),
+    x, z,
     angle: ((angle + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI,
     riding: state.riding, speed: numberIn(state.speed, -36, 36), score: Math.floor(numberIn(state.score, 0, 1_000_000)),
     health: integer(state.health, 0, 100, 100), weapon: oneOf(state.weapon, ['fists', 'pistol', 'shotgun', 'smg', 'grenade', 'rpg'] as const, 'fists'),
-    vehicle: oneOf(state.vehicle, ['foot', 'scooter', 'car', 'police', 'boat', 'swim'] as const, state.riding ? 'scooter' : 'foot'),
-    down: state.down === true, firing: state.firing === true, wanted: integer(state.wanted, 0, 5, 0),
+    vehicle, down, firing: state.firing === true, wanted: integer(state.wanted, 0, 5, 0),
+    hero, altitude: canFly ? altitude : 0, flying: canFly && state.flying === true,
+    powerSeq: powerSeq as number,
+    powerKind: oneOf(state.powerKind, ['none', 'ironman', 'thor', 'hulk', 'captain'] as const, 'none'),
+    powerX: state.powerX === undefined ? x : numberIn(state.powerX, PEER_BOUNDS.minX, PEER_BOUNDS.maxX),
+    powerY: state.powerY === undefined ? 1.1 : numberIn(state.powerY, -32, 48),
+    powerZ: state.powerZ === undefined ? z : numberIn(state.powerZ, PEER_BOUNDS.minZ, PEER_BOUNDS.maxZ),
   };
 }
 /** The layout version a client sent on create or join (lib/world-bounds.ts WORLD_VERSION); clients from before it was sent build version 1. */

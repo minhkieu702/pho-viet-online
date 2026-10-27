@@ -160,7 +160,19 @@ test('a few minutes of the live city: buses dock with their doors open, keep to 
     }
     for (const b of boats.waterbuses) if (b.mode === 'docked' && b.run?.service) piers.add(b.run.stop);
     // Board the first bus that docks at the police shelter and ride it a stop.
-    if (!boarded && i < 120 / dt) boarded = buses.boardNearest(player.x, player.z);
+    if (!boarded && i < 120 / dt) {
+      boarded = buses.boardNearest(player.x, player.z);
+      if (boarded) {
+        const drawn = () => { let count = 0; scene.traverse((mesh) => { if (mesh.isInstancedMesh && mesh.visible) count += mesh.count; }); return count; };
+        const visible = drawn(), snapshot = buses.stats(), passenger = ride;
+        buses.setFirstPersonRideHidden(true);
+        assert.equal(drawn(), visible - 5, 'first person hides the boarded bus body and four wheels only');
+        assert.deepEqual(buses.stats(), snapshot, 'hiding the cabin does not change routes, timing or physics');
+        assert.equal(ride, passenger, 'the passenger remains aboard');
+        buses.setFirstPersonRideHidden(false);
+        assert.equal(drawn(), visible, 'third person restores the boarded bus');
+      }
+    }
   }
   assert.ok(docked > 0, 'a bus stood at the CÔNG AN shelter with its doors open');
   assert.equal(redRuns, 0, 'no bus ran a red light');

@@ -1,5 +1,5 @@
 // Build and start the local Wrangler worker before running:
-// node --test scripts/realtime.test.mjs
+// node --experimental-transform-types --test scripts/realtime.test.mjs
 // TEST_BASE_URL may select another local port (default: http://127.0.0.1:8787).
 // These tests use real HTTP upgrades and the Durable Object runtime, not mocks.
 import { test } from 'node:test';
@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
-import { PEER_BOUNDS } from '../lib/world-bounds.ts';
+import { PEER_BOUNDS, WORLD_VERSION } from '../lib/world-bounds.ts';
 
 const base = new URL(process.env.TEST_BASE_URL ?? 'http://127.0.0.1:8787');
 assert.ok(['localhost', '127.0.0.1', '[::1]'].includes(base.hostname),
@@ -19,15 +19,27 @@ const initialState = {
   firing: true, wanted: 2,
 };
 
-async function room(body) {
-  const response = await fetch(new URL('/api/room', base), {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body), signal: AbortSignal.timeout(5_000),
+async function room(body, headers = {}) {
+  const payload = JSON.stringify(body.action === 'create' || body.action === 'join' ? { world: WORLD_VERSION, ...body } : body);
+  // Use a fresh HTTP connection for each lifecycle call so response completion
+  // and request timeouts are independent of the WebSocket client's transport.
+  const response = await new Promise((resolve, reject) => {
+    const request = (base.protocol === 'https:' ? httpsRequest : httpRequest)(new URL('/api/room', base), {
+      method: 'POST', agent: false, signal: AbortSignal.timeout(5_000),
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload), ...headers },
+    }, (incoming) => {
+      let text = '';
+      incoming.setEncoding('utf8');
+      incoming.on('data', (chunk) => { text += chunk; });
+      incoming.once('end', () => resolve({ status: incoming.statusCode, text }));
+      incoming.once('error', reject);
+    });
+    request.once('error', reject);
+    request.end(payload);
   });
-  const text = await response.text();
   let data;
-  try { data = JSON.parse(text); }
-  catch { assert.fail(`Room endpoint returned non-JSON (${response.status}): ${text.slice(0, 500)}`); }
+  try { data = JSON.parse(response.text); }
+  catch { assert.fail(`Room endpoint returned non-JSON (${response.status}): ${response.text.slice(0, 500)}`); }
   return { status: response.status, data };
 }
 
@@ -70,7 +82,8 @@ class SocketClient {
         this.socket.removeEventListener('open', opened);
         this.socket.removeEventListener('error', failed);
         this.socket.removeEventListener('close', failed);
-        error ? reject(error) : resolve();
+        if (error) reject(error);
+        else resolve();
       };
       this.socket.addEventListener('open', opened);
       this.socket.addEventListener('error', failed);
@@ -93,7 +106,8 @@ class SocketClient {
       const finish = (error, value) => {
         clearTimeout(timer);
         this.listeners.delete(check);
-        error ? reject(error) : resolve(value);
+        if (error) reject(error);
+        else resolve(value);
       };
       this.listeners.add(check);
       check();
@@ -108,7 +122,8 @@ class SocketClient {
       const finish = (error, value) => {
         clearTimeout(timer);
         this.listeners.delete(check);
-        error ? reject(error) : resolve(value);
+        if (error) reject(error);
+        else resolve(value);
       };
       this.listeners.add(check);
       check();
@@ -216,6 +231,43 @@ test('stale or malformed state cannot overwrite the last accepted state; coordin
   await second.waitFor(peerSnapshot(a.id, (peer) => peer.x === 20), { after });
 });
 
+test('real sockets relay hero casts and flight with safe bounds while retaining legacy clients', { timeout: 20_000 }, async (t) => {
+  const { a, b, first, second } = await fixture(t).pair();
+  const powers = { hero: 'ironman', altitude: 4.5, flying: true, powerSeq: 7, powerKind: 'ironman', powerX: 600, powerY: 34.75, powerZ: -400 };
+  const flight = { ...initialState, riding: false, vehicle: 'foot', ...powers };
+  first.send({ type: 'state', seq: 1, state: flight });
+  const snapshot = await second.waitFor(peerSnapshot(a.id, (peer) => peer.powerSeq === 7));
+  const peer = snapshot.peers.find(item => item.id === a.id);
+  for (const [key, value] of Object.entries(powers)) assert.equal(peer[key], value, key);
+
+  // An older client can still join and use its original state shape.
+  second.send({ type: 'state', seq: 1, state: initialState });
+  const legacy = (await first.waitFor(peerSnapshot(b.id))).peers.find(item => item.id === b.id);
+  assert.equal(legacy.hero, 'none');
+  assert.equal(legacy.altitude, 0);
+  assert.equal(legacy.powerSeq, 0);
+  assert.equal(legacy.powerY, 1.1);
+  let seq = 2;
+  for (const hero of ['thor', 'hulk', 'captain']) {
+    const powerY = hero === 'hulk' ? -1000 : 1000;
+    first.send({ type: 'state', seq: seq++, state: { ...flight, hero, powerKind: hero, powerSeq: seq + 10, powerX: 1000, powerY, powerZ: -1000 } });
+    const received = (await second.waitFor(peerSnapshot(a.id, item => item.hero === hero))).peers.find(item => item.id === a.id);
+    assert.equal(received.powerKind, hero);
+    assert.equal(received.powerX, PEER_BOUNDS.maxX);
+    assert.equal(received.powerY, hero === 'hulk' ? -32 : 48);
+    assert.equal(received.powerZ, PEER_BOUNDS.minZ);
+    assert.equal(received.altitude, 0);
+    assert.equal(received.flying, false);
+  }
+  const errorAfter = first.messages.length;
+  first.send({ type: 'state', seq: seq++, state: { ...flight, powerSeq: -1 } });
+  const error = await first.waitFor(item => item.type === 'error', { after: errorAfter });
+  assert.equal(error.fatal, false);
+  first.send({ type: 'state', seq: seq++, state: { ...flight, altitude: 900, powerSeq: 99 } });
+  const bounded = (await second.waitFor(peerSnapshot(a.id, item => item.powerSeq === 99))).peers.find(item => item.id === a.id);
+  assert.equal(bounded.altitude, 8);
+});
+
 test('untrusted sockets cannot impersonate another session or read a different room', { timeout: 20_000 }, async (t) => {
   const f = fixture(t);
   const a = await f.create('Phòng A');
@@ -275,21 +327,8 @@ test('malformed, oversized and binary socket frames are rejected', { timeout: 20
 test('cross-origin room writes are blocked without revoking the session', { timeout: 20_000 }, async (t) => {
   const f = fixture(t);
   const session = await f.create();
-  const body = JSON.stringify({ action: 'leave', ...credentials(session) });
-  // Isolate this deliberately rejected request from Node's shared fetch/WS pool.
-  const status = await new Promise((resolve, reject) => {
-    const request = (base.protocol === 'https:' ? httpsRequest : httpRequest)(new URL('/api/room', base), {
-      method: 'POST', agent: false, signal: AbortSignal.timeout(5_000),
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), Origin: 'https://unrelated.invalid' },
-    }, (response) => {
-      response.resume();
-      response.once('end', () => resolve(response.statusCode));
-      response.once('error', reject);
-    });
-    request.once('error', reject);
-    request.end(body);
-  });
-  assert.equal(status, 403);
+  const rejected = await room({ action: 'leave', ...credentials(session) }, { Origin: 'https://unrelated.invalid' });
+  assert.equal(rejected.status, 403);
   await f.connect(session);
 });
 

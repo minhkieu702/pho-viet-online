@@ -35,6 +35,9 @@ import { worldRoads } from './map/world-types';
 import { WEAPONS, weaponById, type WeaponId } from './weapons';
 import { MISSION_DEFS, createMissions, type MissionEvent, type MissionId, type MissionView } from './missions';
 import { createPeerInterpolator, createSnapshotClock } from './peer-interpolation';
+import { createPowerState, HEROES, POWER_RANGE, POWER_HEIGHT_BOUNDS, SHIELD_DURATION, clipPowerTarget, distanceToPowerSegment, resolvePowerTarget, shieldPosition, type HeroId, type HeroPower, type PowerHud, type PowerPoint } from './powers';
+import { createHeroLook, createPowerEffects } from './power-effects';
+import { createCameraMode, firstPersonAllowed, firstPersonPose, type CameraMode, type EyeKind } from './camera-mode';
 import type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
 import { BIKES, CAR_STATS, MOTO_STATS, POLICE_CAR_STATS, bikeById, repairCost, type BikeId } from './bikes';
 import { createVehicles, makeCarMesh, seatOf, vehicleLabel, vehicleStyle, CAR_HEALTH, MASS, MOTO_HEALTH, POLICE_CAR_HEALTH, type Body, type Car, type Crash } from './vehicles';
@@ -61,6 +64,7 @@ export type Hud = {
   vehicleName: string;
   bike: BikeId; bikeHealth: number; bikeBroken: boolean; bikeX: number; bikeZ: number;
   targetX: number; targetZ: number; targetName: string; police: { x: number; z: number }[];
+  powers: PowerHud; cameraMode: CameraMode;
   clock: string; ammo: { mag: number; reserve: number; reloading: boolean } | null; side: SideMissionView; offers: { x: number; z: number }[];
   gangs: { name: string; anger: number; x: number; z: number }[]; hospital: { x: number; z: number }; policeStation: { x: number; z: number };
   healCost: number; respawnIn: number; arsenal: { id: WeaponId; mag: number; reserve: number }[]; stunned: boolean; flatTires: boolean;
@@ -834,6 +838,8 @@ type Peer = {
   flashAt: number;
   hurtAt: number;
   predicted: number;
+  heroLook: ReturnType<typeof createHeroLook>;
+  powerSeq: number;
 };
 type Down = 'crash' | 'wasted' | 'busted' | null;
 
@@ -914,6 +920,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   // Bodies hit the shared index of static solids, plus the seats and tables it leaves out.
   const ragdolls = createRagdolls(scene, world.seats, groundHeight, { solids });
   const effects = createEffects(scene, groundHeight);
+  const powerEffects = createPowerEffects(scene);
+  const powers = createPowerState();
   const explosives = createExplosives(scene, groundHeight);
   const pickups = createPickups(scene, groundHeight);
   const sayAt = (key: string, text: string, at: () => { x: number; y: number; z: number } | null, shout = false) => bubbles.say(key, text, performance.now(), at, shout ? 2600 : 3400, shout ? 'shout' : 'say');
@@ -969,6 +977,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const receivers = RECEIVERS.map((r) => ({ ...r, ...reachable(r) }));
 
   const walker = makePerson();
+  const heroLook = createHeroLook(walker.group);
   // The player's ragdoll is dressed exactly like the standing player.
   setStyle(PLAYER_LOOK, walker.style);
   scene.add(walker.group);
@@ -1266,6 +1275,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   let triggerQueued = false;
   let mouseHeld = false;
   let pointerInside = false;
+  let pointerLockFailed = false;
   let shake = 0;
   let bagOpen = false;
   let manualCameraAt = -99;
@@ -1307,6 +1317,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const wrecks = new Set<Car>();
   const pendingBlasts: { car: Car; at: number }[] = [];
   const pendingHits: OutgoingHit[] = [];
+  const lastPower: { kind: HeroId; x: number; y: number; z: number; seq: number } = { kind: 'none', x: START.x, y: 1.1, z: START.z, seq: 0 };
+  let shieldFlight: { from: PowerPoint; to: PowerPoint; previous: PowerPoint; started: number; hits: Set<unknown> } | null = null;
   const keys = new Set<string>();
   const cameraTarget = new THREE.Vector3(state.x, 0.7, state.z);
   const desiredTarget = new THREE.Vector3();
@@ -1314,6 +1326,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const cameraOffset = new THREE.Vector3();
   const view = { ...CAMERA_DEFAULT };
   const smoothView = { ...CAMERA_DEFAULT };
+  const cameraMode = createCameraMode();
+  const firstLookAt = new THREE.Vector3();
+  const restoredVisibility: { object: THREE.Object3D; visible: boolean }[] = [];
   const pointerNdc = new THREE.Vector2();
   const raycaster = new THREE.Raycaster();
   const rayOrigin = new THREE.Vector3();
@@ -1336,6 +1351,35 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   function offsetFor(yaw: number, pitch: number, dist: number, out: THREE.Vector3) {
     return out.set(Math.sin(yaw) * Math.cos(pitch) * dist, Math.sin(pitch) * dist, Math.cos(yaw) * Math.cos(pitch) * dist);
+  }
+  function firstPerson() {
+    return firstPersonAllowed(cameraMode.mode, { running: active || started, interior: !!interior, counter: !!menu?.anchor, down: !!down });
+  }
+  function exitLookLock() { if (document.pointerLockElement === renderer.domElement) document.exitPointerLock?.(); }
+  function toggleCameraMode() {
+    cameraMode.toggle(state.angle); exitLookLock();
+    triggerQueued = false; mouseHeld = false;
+    notify(cameraMode.mode === 'first-person' ? 'Góc nhìn thứ nhất · nhấp vào phố để giữ chuột, Esc thả chuột · B đổi góc nhìn' : 'Góc nhìn thứ ba · giữ chuột phải để xoay · B đổi góc nhìn', 3500);
+    emitHud(performance.now());
+  }
+  function eyePose() {
+    let x = state.x, y = bodyY + jumpY + powers.altitude, z = state.z, kind: EyeKind = 'foot';
+    if (ride) { const s = ride.seat(); x = s.x; y = s.y; z = s.z; kind = 'passenger'; }
+    else if (seat) { y = groundHeight(seat.x, seat.z) + seat.top; kind = 'seat'; }
+    else if (state.riding && playerCar) {
+      const hip = playerCar.kind === 'moto' ? MOTO_HIP : seatOf(playerCar), c = Math.cos(state.angle), s = Math.sin(state.angle);
+      x += hip[0] * c + hip[2] * s; z += -hip[0] * s + hip[2] * c;
+      y = groundHeight(state.x, state.z) + hip[1]; kind = playerCar.kind === 'moto' ? 'scooter' : 'car';
+    } else if (state.riding) { y = groundHeight(state.x, state.z) + (bikeId === 'horse' ? 1.6 : 0.72); kind = 'scooter'; }
+    else if (boat) { y = waterLevel(state.x, state.z); kind = 'boat'; }
+    else if (swimming) { y = waterLevel(state.x, state.z); kind = 'swim'; }
+    else if (glide) { y = glide.y; kind = 'glide'; }
+    return firstPersonPose({ x, y, z, kind }, cameraMode.yaw, cameraMode.pitch);
+  }
+  function centerAim(range: number, out: THREE.Vector3) {
+    const pose = eyePose();
+    rayOrigin.set(pose.eye.x, pose.eye.y, pose.eye.z); rayDir.set(pose.direction.x, pose.direction.y, pose.direction.z);
+    return out.copy(rayOrigin).addScaledVector(rayDir, Math.max(0.1, wallDistance(rayOrigin, rayDir, range)));
   }
   camera.position.copy(cameraTarget).add(offsetFor(view.yaw, view.pitch, view.dist, cameraOffset));
   camera.lookAt(cameraTarget);
@@ -1585,7 +1629,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   function missionPlayer() {
-    return { x: state.x, z: state.z, riding: missions.view().requiresBike ? isMotorbike() : state.riding, down: down !== null };
+    return { x: state.x, z: state.z, riding: missions.view().requiresBike ? isMotorbike() : state.riding, down: down !== null || powers.altitude > 0.05 };
   }
 
   function interruptRace(message: string) {
@@ -1664,7 +1708,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     motion.hitAt = now;
     shake = Math.max(shake, 0.25);
     const dx = from ? state.x - from.x : 0, dz = from ? state.z - from.z : 0, d = Math.hypot(dx, dz) || 1;
-    effects.blood(hitPoint.set(state.x, inCar() ? 1.3 : 1.1, state.z), rayDir.set(dx / d, 0, dz / d), inCar() ? 2 : 5);
+    effects.blood(hitPoint.set(state.x, bodyY + jumpY + powers.altitude + (inCar() ? 1.3 : 1.1), state.z), rayDir.set(dx / d, 0, dz / d), inCar() ? 2 : 5);
     if (health <= 0) wasted(now, by);
   }
 
@@ -1717,6 +1761,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
    * struck them. Knocked down they throw their hands out; wasted they fall limp. The body is never evicted.
    */
   function knockPlayer(vx: number, vy: number, vz: number, now: number, reason: Down = 'crash', hit?: THREE.Vector3 | null, kind?: HitKind) {
+    powers.land(); shieldFlight = null;
     closeMenu(true);
     leaveVehicleNow();
     if (playerBody) ragdolls.remove(playerBody);
@@ -1789,6 +1834,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   function respawn(now: number) {
+    powers.land(); shieldFlight = null;
     if (playerBody) ragdolls.remove(playerBody);
     playerBody = null;
     down = null;
@@ -1810,6 +1856,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   function busted(now: number) {
+    powers.land(); shieldFlight = null;
     if (down === 'wasted' || down === 'busted') return;
     interruptRace('Bạn đã bị bắt. Nhấn M để thử lại vòng đua.');
     closeMenu(true);
@@ -1911,7 +1958,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   function missionContext(time: number) {
     return {
-      x: state.x, z: state.z, inVehicle: state.riding, down: down === 'wasted' || down === 'busted', time,
+      x: state.x, z: state.z, inVehicle: state.riding, down: down === 'wasted' || down === 'busted' || powers.altitude > 0.05, time,
       spend: (amount: number) => { if (cash < amount) return false; cash -= amount; return true; },
       spawnThief: (x: number, z: number) => { thief = npcs.spawnThief(x, z, state.x, state.z); return !!thief; },
       thiefDown: () => (!thief ? null : thief.state === 'down' || thief.state === 'away' ? true : thief.state === 'inside' ? null : false),
@@ -2785,7 +2832,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       }
     }
     // Nothing to use at speed: the registry is only asked on foot, or riding slowly (a stop, a parking lot).
-    const canFocus = active && !down && !playerBody && !glide && !boat && !heist && !menu && !hold && !ride && !seat && !interior && !surrendered && (!state.riding || Math.abs(velocity) < 2);
+    const canFocus = active && powers.altitude <= 0.05 && !down && !playerBody && !glide && !boat && !heist && !menu && !hold && !ride && !seat && !interior && !surrendered && (!state.riding || Math.abs(velocity) < 2);
     focus = canFocus ? registry.best(ctx) : null;
     // The day's lottery draw at 16:15 (numbers from services.ts, so everyone in a room gets the same).
     const day = atmosphere.clock.day;
@@ -2839,6 +2886,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   ];
 
   function action() {
+    if (powers.altitude > 0.05 || powers.flying) { notify('Nhấn G để hạ cánh trước khi tương tác.'); return; }
     if (!active || down) return;
     const now = performance.now();
     const time = now / 1000;
@@ -2880,6 +2928,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   function spaceAction() {
     const now = performance.now();
     if (!active) return;
+    if (powers.altitude > 0.05 || powers.flying) return;
     if (glide) { if (glide.phase === 'deck') jumpFromDeck(now); else if (glide.phase === 'fall') openChute(now); return; }
     if (state.riding || boat) return;
     if (swimming) { climbOut(); return; }
@@ -3081,12 +3130,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   function deckWalk(dt: number, vertical: number, horizontal: number) {
     const f = WORLD_PLOTS[deckTower.id].full;
     const tube = (Math.min(f.maxX - f.minX, f.maxZ - f.minZ) - 2) / 3, cx = (f.minX + f.maxX) / 2, cz = (f.minZ + f.maxZ) / 2;
-    const fx = -Math.sin(smoothView.yaw), fz = -Math.cos(smoothView.yaw);
+    const fx = firstPerson() ? Math.sin(cameraMode.yaw) : -Math.sin(smoothView.yaw), fz = firstPerson() ? Math.cos(cameraMode.yaw) : -Math.cos(smoothView.yaw);
     const dx = fx * vertical - fz * horizontal, dz = fz * vertical + fx * horizontal;
     const moving = dx !== 0 || dz !== 0;
     velocity = moving ? 2.4 : 0;
+    if (firstPerson()) state.angle = cameraMode.yaw;
     if (!moving) return false;
-    state.angle = angleLerp(state.angle, Math.atan2(dx, dz), 1 - Math.exp(-dt * 10));
+    if (!firstPerson()) state.angle = angleLerp(state.angle, Math.atan2(dx, dz), 1 - Math.exp(-dt * 10));
     const len = Math.hypot(dx, dz);
     const nx = state.x + (dx / len) * velocity * dt, nz = state.z + (dz / len) * velocity * dt;
     const inside = (x: number, z: number) => Math.abs(x - cx) < tube / 2 - 0.5 && Math.abs(z - cz) < tube / 2 - 0.5 && Math.hypot(x - cx, z - cz) > 1.3;
@@ -3250,7 +3300,11 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       else if (normalized === 'f') { triggerQueued = true; unlockAudio(); }
       if (normalized === 'q') cycleWeapon();
       if (normalized === 'r') startReload(performance.now());
-      if (normalized === 'v') Object.assign(view, CAMERA_DEFAULT);
+      if (normalized === 'j') selectHero(HEROES[(HEROES.findIndex((hero) => hero.id === powers.hero) + 1) % HEROES.length].id);
+      if (normalized === 'k') castPower();
+      if (normalized === 'g') toggleFlight();
+      if (normalized === 'b') toggleCameraMode();
+      if (normalized === 'v') { Object.assign(view, CAMERA_DEFAULT); cameraMode.reset(state.angle); }
       if (normalized === 'tab') setBag(true);
       // H puts the hands up for the police (or lowers them again).
       if (normalized === 'h') {
@@ -3321,11 +3375,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const touches = new Map<number, { x: number; y: number }>();
   let rotating: { id: number; x: number; y: number } | null = null;
   function rotateBy(dx: number, dy: number) {
+    if (firstPerson()) { cameraMode.rotate(dx, dy); manualCameraAt = performance.now(); return; }
     view.yaw -= dx * 0.0058;
     view.pitch = THREE.MathUtils.clamp(view.pitch + dy * 0.004, 0.16, 1.4);
     manualCameraAt = performance.now();
   }
   function zoomBy(factor: number) {
+    if (firstPerson()) return;
     view.dist = THREE.MathUtils.clamp(view.dist * factor, 8, 90);
   }
   function capture(pointerId: number) {
@@ -3361,6 +3417,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     trackPointer(event);
     pointerInside = true;
+    if (firstPerson() && event.button === 0 && document.pointerLockElement !== canvas && canvas.requestPointerLock && !pointerLockFailed) {
+      try { const request = canvas.requestPointerLock(); request?.catch(() => { pointerLockFailed = true; }); } catch { pointerLockFailed = true; }
+      return;
+    }
     if (event.button === 1 || event.button === 2) {
       rotating = { id: event.pointerId, x: event.clientX, y: event.clientY };
       capture(event.pointerId);
@@ -3372,6 +3432,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
   }
   function onPointerMove(event: PointerEvent) {
+    if (document.pointerLockElement === canvas && firstPerson() && active) { rotateBy(event.movementX, event.movementY); return; }
     if (interior && event.pointerType !== 'touch') {
       productHover = productAt(event);
       interiors.setHovered(productHover ?? productFocus);
@@ -3410,6 +3471,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     zoomBy(Math.exp(event.deltaY * 0.0012));
   }
   function onContextMenu(event: Event) { event.preventDefault(); }
+  function onLookLockChanged() { if (document.pointerLockElement !== canvas) { mouseHeld = false; triggerQueued = false; clearKeys(); } }
+  function onLookLockError() { pointerLockFailed = true; }
+  document.addEventListener('pointerlockchange', onLookLockChanged);
+  document.addEventListener('pointerlockerror', onLookLockError);
   canvas.addEventListener('pointerdown', onPointerDown);
   canvas.addEventListener('pointermove', onPointerMove);
   canvas.addEventListener('pointerup', onPointerUp);
@@ -3448,6 +3513,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         const group = new THREE.Group();
         const color = /^#[0-9a-f]{6}$/i.test(peer.color) ? peer.color : '#5b86b7';
         const foot = makePerson(color);
+        const peerHeroLook = createHeroLook(foot.group);
         const peerBike = makeBike('scooter', color, color);
         const label = makeLabel(peer.name.slice(0, 20), '#23493f');
         label.position.y = 2.9;
@@ -3464,10 +3530,20 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         peerBike.group.rotation.y = peer.angle;
         group.traverse((o) => { o.castShadow = false; });
         scene.add(group);
-        existing = { group, foot, bike: peerBike, car: null, carKind: 'foot', boat: null, guns: peerGuns, label, target: { ...peer }, motion: createPeerInterpolator(), name: peer.name, color: peer.color, body: null, flashAt: 0, hurtAt: -99, predicted: 0 };
+        existing = { group, foot, bike: peerBike, car: null, carKind: 'foot', boat: null, guns: peerGuns, label, target: { ...peer }, motion: createPeerInterpolator(), name: peer.name, color: peer.color, body: null, flashAt: 0, hurtAt: -99, predicted: 0, heroLook: peerHeroLook, powerSeq: peer.powerSeq ?? 0 };
         peers.set(peer.id, existing);
       }
       if (!existing.motion.push(peer, snapshotTime)) continue;
+      const sequence = peer.powerSeq ?? 0;
+      if (sequence < existing.powerSeq) existing.powerSeq = sequence;
+      if (sequence > existing.powerSeq) {
+        existing.powerSeq = sequence;
+        if (!peer.down && peer.powerKind && peer.powerKind !== 'none' && peer.powerX !== undefined && peer.powerZ !== undefined) {
+          const origin = { x: peer.x, y: groundHeight(peer.x, peer.z) + 1.1 + (peer.altitude ?? 0), z: peer.z };
+          const target = { x: peer.powerX, y: peer.powerY ?? groundHeight(peer.powerX, peer.powerZ) + 1.1, z: peer.powerZ };
+          powerEffects.cast(peer.powerKind, origin, target, receivedAt, peer.powerKind === 'captain' ? () => ({ x: existing!.group.position.x, y: existing!.group.position.y + 1.1, z: existing!.group.position.z }) : undefined);
+        }
+      }
       // A fresh health report replaces our local damage prediction.
       if (existing.target.health !== peer.health) existing.predicted = 0;
       existing.target = { ...peer };
@@ -3481,6 +3557,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   /** Attacking another player is a crime too. */
   function hitPeer(id: string, peer: Peer, damage: number, dx: number, dz: number, now: number) {
     if (peer.target.down) return;
+    if (pendingHits.length >= 128) return;
     pendingHits.push({ target: id, damage: Math.round(damage), dx, dz });
     peer.hurtAt = now / 1000;
     peer.predicted += damage;
@@ -3541,7 +3618,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   function forEachTarget(callback: (x: number, z: number, y0: number, y1: number, radius: number) => void) {
     npcs.forEachStanding((x, z, npc) => callback(x, z, npc.y, npc.y + 1.8, 0.38));
     police.forEachUnit((x, z, onFoot) => { if (onFoot) callback(x, z, 0.1, 1.9, 0.38); });
-    for (const peer of peers.values()) if (!peer.target.down && peerVehicle(peer) === 'foot') callback(peer.group.position.x, peer.group.position.z, 0.1, 1.9, 0.4);
+    for (const peer of peers.values()) if (!peer.target.down && peerVehicle(peer) === 'foot') callback(peer.group.position.x, peer.group.position.z, peer.group.position.y + 0.1, peer.group.position.y + 1.9, 0.4);
     animals.forEachShadow((x, z, size) => callback(x, z, 0.05, 0.1 + size * 0.6, Math.max(0.2, size * 0.45)));
     ragdolls.forEach((body) => { if (body !== playerBody) { ragdolls.center(body, scratch); callback(scratch.x, scratch.z, scratch.y - 0.3, scratch.y + 0.3, 0.45); } });
     if (zombieMode) zombies.forEachStanding(callback);
@@ -3549,6 +3626,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   /** Without a mouse (F key, touch): straight ahead where the player faces, at chest height. No auto-aim. */
   function aimAhead(range: number, out: THREE.Vector3) {
+    if (firstPerson()) return centerAim(range, out);
     return out.set(state.x + Math.sin(state.angle) * range, groundHeight(state.x, state.z) + 1.2, state.z + Math.cos(state.angle) * range);
   }
 
@@ -3557,6 +3635,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
    * so a click on a head is a head shot; otherwise the cursor at chest height. True when on a target.
    */
   function pointerAim(range: number, out: THREE.Vector3) {
+    if (firstPerson()) { centerAim(range, out); return false; }
     raycaster.setFromCamera(pointerNdc, camera);
     const ray = raycaster.ray;
     const { origin, direction } = ray;
@@ -3593,7 +3672,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (!show) { if (reticle.style.display !== 'none') reticle.style.display = 'none'; return; }
     reticle.style.display = '';
     let x = pointerPx.x, y = pointerPx.y;
-    if (!onPointer) {
+    if (firstPerson()) { x = canvas.clientWidth / 2 + canvas.offsetLeft; y = canvas.clientHeight / 2 + canvas.offsetTop; }
+    else if (!onPointer) {
       aimProbe.copy(reticlePoint).project(camera);
       x = (aimProbe.x + 1) / 2 * canvas.clientWidth + canvas.offsetLeft;
       y = (1 - aimProbe.y) / 2 * canvas.clientHeight + canvas.offsetTop;
@@ -3609,14 +3689,178 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     reticleHit.style.color = headMark ? '#ff5648' : '#fff';
   }
 
+  function powerBlocked() { return !active || !!down || state.riding || bagOpen || swimming || !!boat || !!glide || !!interior || activityBusy() || surrendered || performance.now() < stunUntil; }
+
+  function selectHero(id: HeroId) {
+    if (powerBlocked()) return;
+    if (!powers.select(id)) { notify('Hạ cánh bằng G trước khi đổi anh hùng.'); return; }
+    notify(id === 'none' ? 'Đã trở lại chế độ người dân.' : `${HEROES.find((hero) => hero.id === id)!.name} · K dùng sức mạnh${id === 'ironman' ? ' · G bay / hạ cánh' : ''}`, 3500);
+    emitHud(performance.now());
+  }
+
+  function toggleFlight() {
+    if (!powers.toggleFlight(powerBlocked())) {
+      if (!powerBlocked()) notify(powers.hero !== 'ironman' ? 'Chỉ Iron Man có thể bay. Nhấn J để đổi anh hùng.' : 'Cần ít nhất 15 năng lượng để cất cánh.');
+      return;
+    }
+    notify(powers.flying ? 'Đang cất cánh · WASD di chuyển · Shift tăng tốc · G hạ cánh' : 'Đang hạ cánh…', 2600);
+    emitHud(performance.now());
+  }
+
+  /** All casts share collision/visibility checks and the normal PvP hit queue. */
+  function damageWithPower(kind: HeroPower, from: PowerPoint, to: PowerPoint, now: number, alreadyHit = new Set<unknown>()) {
+    const time = now / 1000;
+    const radial = kind === 'hulk' || kind === 'thor';
+    const radius = kind === 'hulk' ? 7 : kind === 'thor' ? 3.8 : kind === 'captain' ? 1.05 : 1.1;
+    const cx = radial ? to.x : (from.x + to.x) / 2, cz = radial ? to.z : (from.z + to.z) / 2;
+    const search = radial ? radius : Math.hypot(to.x - from.x, to.z - from.z) / 2 + radius;
+    const damage = kind === 'hulk' ? 75 : kind === 'thor' ? 60 : kind === 'captain' ? 44 : 46;
+    const force = kind === 'hulk' ? 18 : 10;
+    const hits = (key: unknown, x: number, y: number, z: number) => {
+      if (alreadyHit.has(key)) return false;
+      if (radial ? Math.hypot(x - to.x, z - to.z) > radius || Math.abs(y - to.y) > 2.3 : distanceToPowerSegment({ x, y, z }, from, to) > radius) return false;
+      const origin = radial ? to : from;
+      if (!lineOfSight(origin.x, origin.z, x, z)) return false;
+      if (kind === 'captain' && !lineOfSight(state.x, state.z, x, z)) return false;
+      alreadyHit.add(key); return true;
+    };
+    const impulse = (x: number, z: number) => {
+      const dx = x - from.x, dz = z - from.z, length = Math.hypot(dx, dz) || 1;
+      return { x: dx / length, z: dz / length };
+    };
+    npcs.near(cx, cz, search, (npc, x, z) => {
+      if (!hits(npc, x, npc.y + 1, z)) return;
+      const d = impulse(x, z); hurtNpc(npc, damage, d.x * force, kind === 'hulk' ? 7 : 4, d.z * force, now, true, 0, null, 'blast');
+    });
+    if (zombieMode) zombies.near(cx, cz, search, (zb) => {
+      if (!hits(zb, zb.x, groundHeight(zb.x, zb.z) + 1, zb.z)) return;
+      const d = impulse(zb.x, zb.z); hurtZombie(zb, damage, d.x * force, kind === 'hulk' ? 7 : 4, d.z * force, now, true, 0, null, 'blast');
+    });
+    police.near(cx, cz, search, (officer) => {
+      if (!hits(officer, officer.x, groundHeight(officer.x, officer.z) + 1, officer.z)) return;
+      const d = impulse(officer.x, officer.z); police.damage(officer, damage, d.x * force, 5, d.z * force, time, true);
+    });
+    for (const [id, peer] of peers) {
+      const p = peer.group.position;
+      if (peer.target.down || !hits(id, p.x, p.y + 1.0, p.z)) continue;
+      const d = impulse(p.x, p.z); hitPeer(id, peer, damage, d.x, d.z, now);
+    }
+    for (const car of vehicles.cars) {
+      if (car.mode === 'off' || car === playerCar || !hits(car, car.x, groundHeight(car.x, car.z) + 1, car.z)) continue;
+      damageCar(car, damage * 0.8, now);
+      if (car.kind === 'police') police.crime(2, time);
+      effects.puff(hitPoint.set(car.x, 1.1, car.z), now);
+    }
+  }
+
+  function powerHome(): PowerPoint { return { x: state.x, y: bodyY + jumpY + powers.altitude + 1.1, z: state.z }; }
+
+  function castPower() {
+    if (powerBlocked()) return;
+    const kind = powers.cast();
+    if (!kind) {
+      const info = powers.hud();
+      notify(info.hero === 'none' ? 'Nhấn J để chọn anh hùng trước.' : info.cooldown > 0 ? `Sức mạnh hồi sau ${info.cooldown.toFixed(1)} giây.` : 'Chưa đủ năng lượng. Hãy chờ hồi phục hoặc hạ cánh.', 1600);
+      return;
+    }
+    const now = performance.now();
+    const from = powerHome();
+    const direct = kind === 'ironman' || kind === 'captain';
+    let targetX = state.x + Math.sin(state.angle) * POWER_RANGE[kind], targetZ = state.z + Math.cos(state.angle) * POWER_RANGE[kind];
+    let targetY = groundHeight(targetX, targetZ) + 1.1;
+    if (kind !== 'hulk' && autoAim(POWER_RANGE[kind], aimPoint)) { targetX = aimPoint.x; targetZ = aimPoint.z; targetY = direct ? aimPoint.y : groundHeight(targetX, targetZ) + 1.1; }
+    if (kind !== 'hulk' && firstPerson()) {
+      centerAim(POWER_RANGE[kind], aimPoint); targetX = aimPoint.x; targetY = aimPoint.y; targetZ = aimPoint.z;
+    } else if (kind !== 'hulk' && pointerInside) {
+      raycaster.setFromCamera(pointerNdc, camera);
+      const ray = raycaster.ray;
+      if (ray.direction.y < -0.01) {
+        const distance = (0.3 - ray.origin.y) / ray.direction.y;
+        targetX = ray.origin.x + ray.direction.x * distance; targetZ = ray.origin.z + ray.direction.z * distance;
+        targetY = groundHeight(targetX, targetZ) + 1.1;
+      }
+      // Mouse aiming at a flying peer uses their body, rather than the road behind them.
+      if (direct) {
+        const sphere = new THREE.Sphere(new THREE.Vector3(), 0.85);
+        let nearest = Infinity;
+        for (const peer of peers.values()) {
+          if (peer.target.down) continue;
+          sphere.center.copy(peer.group.position); sphere.center.y += 1.0;
+          if (!ray.intersectSphere(sphere, scratch)) continue;
+          const distance = ray.origin.distanceToSquared(scratch);
+          if (distance >= nearest) continue;
+          nearest = distance; targetX = sphere.center.x; targetY = sphere.center.y; targetZ = sphere.center.z;
+        }
+      }
+    }
+    const dx = targetX - state.x, dz = targetZ - state.z;
+    const traced = kind === 'hulk' ? { ...from } : resolvePowerTarget(from, { x: targetX, y: targetY, z: targetZ }, POWER_RANGE[kind], (direction, distance) => {
+      rayOrigin.set(from.x, from.y, from.z); rayDir.set(direction.x, direction.y, direction.z);
+      const wall = wallDistance(rayOrigin, rayDir, distance);
+      return wall < distance ? wall - 0.15 : distance;
+    });
+    const to = clipPowerTarget(from, traced,
+      { x: bounds.minX + 0.5, y: POWER_HEIGHT_BOUNDS.min, z: bounds.minZ + 0.5 },
+      { x: bounds.maxX - 0.5, y: POWER_HEIGHT_BOUNDS.max, z: bounds.maxZ - 0.5 });
+    if (kind !== 'hulk') state.angle = Math.atan2(dx, dz);
+    aimUntil = now + 450; punchUntil = now + 300;
+    lastPower.kind = kind; lastPower.x = to.x; lastPower.y = to.y; lastPower.z = to.z; lastPower.seq++;
+    powerEffects.cast(kind, from, to, now, kind === 'captain' ? powerHome : undefined);
+    if (kind === 'captain') shieldFlight = { from, to, previous: from, started: now, hits: new Set() };
+    else damageWithPower(kind, from, to, now);
+    npcs.alarm(state.x, state.z, 30, now / 1000);
+    playThud(); unlockAudio(); shake = Math.max(shake, kind === 'hulk' ? 0.55 : 0.16);
+    emitHud(now);
+  }
+
+  function updatePowers(seconds: number, now: number) {
+    if (powers.altitude > 0 && !powers.flying && !clearAt(state.x, state.z, 0.5)) {
+      // A traffic car may have moved under us. Move to the nearest clear patch before descending.
+      let found = false;
+      for (let radius = 1; radius <= 10 && !found; radius++) for (let i = 0; i < 16; i++) {
+        const x = state.x + Math.sin(i * Math.PI / 8) * radius, z = state.z + Math.cos(i * Math.PI / 8) * radius;
+        if (clearAt(x, z, 0.5) && lineOfSight(state.x, state.z, x, z)) { state.x = x; state.z = z; found = true; break; }
+      }
+    }
+    powers.step(seconds, clearAt(state.x, state.z, 0.5));
+    if (shieldFlight) {
+      const shield = shieldFlight;
+      const age = (now - shield.started) / 1000;
+      const point = shieldPosition(shield.from, shield.to, age, powerHome());
+      damageWithPower('captain', shield.previous, point, now, shield.hits);
+      shield.previous = point;
+      if (age >= SHIELD_DURATION) shieldFlight = null;
+    }
+  }
+
+  /** Picks the pedestrian, officer, player or body closest to the facing direction, for keyboard and touch aiming. */
+  function autoAim(range: number, out: THREE.Vector3) {
+    let bestGap = 0.42;
+    let found = false;
+    const consider = (x: number, y: number, z: number) => {
+      const d = Math.hypot(x - state.x, z - state.z);
+      if (d < 0.5 || d > range) return;
+      const angle = Math.atan2(x - state.x, z - state.z) - state.angle;
+      const gap = Math.abs(Math.atan2(Math.sin(angle), Math.cos(angle)));
+      if (gap < bestGap) { bestGap = gap; out.set(x, y, z); found = true; }
+    };
+    npcs.forEachStanding((x, z, npc) => consider(x, npc.y + 1.0, z));
+    police.forEachUnit((x, z, onFoot) => { if (onFoot) consider(x, groundHeight(x, z) + 1.0, z); });
+    if (zombieMode) zombies.forEachStanding((x, z, y0, y1) => consider(x, (y0 + y1) / 2, z));
+    for (const peer of peers.values()) if (!peer.target.down) consider(peer.group.position.x, peer.group.position.y + 1.0, peer.group.position.z);
+    ragdolls.forEach((body) => { if (body !== playerBody) { ragdolls.center(body, scratch); consider(scratch.x, scratch.y, scratch.z); } });
+    return found;
+  }
+
   function muzzle(out: THREE.Vector3) {
+    if (firstPerson()) { const pose = eyePose(); return out.set(pose.eye.x, pose.eye.y - 0.05, pose.eye.z); }
     if (state.riding) {
       // Firing from a vehicle: out of the passenger window, or from the rider's right hand (at -x).
       const side = inCar() ? 1.1 : -0.55;
       const c = Math.cos(state.angle), s = Math.sin(state.angle);
       return out.set(state.x + c * side + Math.sin(aimYaw) * 0.6, groundHeight(state.x, state.z) + (inCar() ? 1.45 : 1.4), state.z - s * side + Math.cos(aimYaw) * 0.6);
     }
-    walker.group.position.set(state.x, groundHeight(state.x, state.z), state.z);
+    walker.group.position.set(state.x, bodyY + jumpY + powers.altitude, state.z);
     walker.group.rotation.y = state.angle;
     walker.group.updateMatrixWorld(true);
     const gun = guns.get(weapon);
@@ -3629,35 +3873,36 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const def = weaponById('fists');
     const fx = Math.sin(state.angle), fz = Math.cos(state.angle);
     const cx = state.x + fx * 0.8, cz = state.z + fz * 0.8;
+    const baseY = bodyY + jumpY + powers.altitude;
     let hit = false;
     npcs.near(cx, cz, 0.9, (npc, nx, nz) => {
-      if (hit) return;
+      if (hit || Math.abs(npc.y - baseY) > 1.3) return;
       hit = true;
       hurtNpc(npc, def.damage, fx * def.force * PUNCH_PUSH, 1.8, fz * def.force * PUNCH_PUSH, now, false, 0, null, 'melee', hitPoint.set(nx - fx * 0.15, npc.y + 1.3, nz - fz * 0.15));
-      effects.blood(hitPoint.set(nx, 1.4, nz), rayDir.set(fx, 0, fz), 4);
+      effects.blood(hitPoint.set(nx, npc.y + 1.4, nz), rayDir.set(fx, 0, fz), 4);
     });
     if (!hit) police.near(cx, cz, 0.9, (o) => {
-      if (hit) return;
+      if (hit || Math.abs(groundHeight(o.x, o.z) - baseY) > 1.3) return;
       hit = true;
       police.damage(o, def.damage, fx * def.force * PUNCH_PUSH, 1.8, fz * def.force * PUNCH_PUSH, time, false, hitPoint.set(o.x - fx * 0.15, groundHeight(o.x, o.z) + 1.3, o.z - fz * 0.15), 'melee');
-      effects.blood(hitPoint.set(o.x, 1.4, o.z), rayDir.set(fx, 0, fz), 4);
+      effects.blood(hitPoint.set(o.x, groundHeight(o.x, o.z) + 1.4, o.z), rayDir.set(fx, 0, fz), 4);
     });
     if (!hit) for (const [id, peer] of peers) {
-      if (hit || peer.target.down || peerVehicle(peer) !== 'foot') continue;
+      if (hit || peer.target.down || peerVehicle(peer) !== 'foot' || Math.abs(peer.group.position.y - baseY) > 1.3) continue;
       if (Math.hypot(peer.group.position.x - cx, peer.group.position.z - cz) < 0.9) {
         hit = true;
         hitPeer(id, peer, def.damage, fx, fz, now);
-        effects.blood(hitPoint.set(peer.group.position.x, 1.4, peer.group.position.z), rayDir.set(fx, 0, fz), 4);
+        effects.blood(hitPoint.set(peer.group.position.x, peer.group.position.y + 1.4, peer.group.position.z), rayDir.set(fx, 0, fz), 4);
       }
     }
     if (!hit && zombieMode) zombies.near(cx, cz, 0.95, (zb) => {
-      if (hit) return;
+      if (hit || Math.abs(groundHeight(zb.x, zb.z) - baseY) > 1.3) return;
       hit = true;
       hurtZombie(zb, def.damage, fx * def.force * PUNCH_PUSH, 1.8, fz * def.force * PUNCH_PUSH, now, false, 0, null, 'melee', hitPoint.set(zb.x - fx * 0.15, groundHeight(zb.x, zb.z) + 1.2, zb.z - fz * 0.15));
-      effects.blood(hitPoint.set(zb.x, 1.4, zb.z), rayDir.set(fx, 0, fz), 4);
+      effects.blood(hitPoint.set(zb.x, groundHeight(zb.x, zb.z) + 1.4, zb.z), rayDir.set(fx, 0, fz), 4);
     });
-    if (!hit) animals.near(cx, cz, 0.9, (index) => { if (!hit) { hit = true; animals.hit(index, fx * 6, 3, fz * 6); } });
-    if (!hit) hit = ragdolls.push(cx, cz, 0.9, fx * 3.5, 1.5, fz * 3.5) > 0;
+    if (!hit && powers.altitude <= 1.3) animals.near(cx, cz, 0.9, (index) => { if (!hit) { hit = true; animals.hit(index, fx * 6, 3, fz * 6); } });
+    if (!hit && powers.altitude <= 1.3) hit = ragdolls.push(cx, cz, 0.9, fx * 3.5, 1.5, fz * 3.5) > 0;
     if (hit) { playThud(); shake = Math.max(shake, 0.15); npcs.notice(cx, cz, 'fight', time); }
   }
 
@@ -3665,7 +3910,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const time = now / 1000;
     blastPoint.set(b.x, b.y, b.z);
     playBoom();
-    const dPlayer = Math.hypot(state.x - b.x, state.z - b.z);
+    const dPlayer = Math.hypot(state.x - b.x, bodyY + jumpY + powers.altitude + 1 - b.y, state.z - b.z);
     shake = Math.max(shake, Math.max(0.15, 1.2 - dPlayer / 40));
     npcs.alarm(b.x, b.z, 70, time);
     npcs.notice(b.x, b.z, 'fire', time);
@@ -3692,7 +3937,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       });
     }
     for (const [id, peer] of peers) {
-      const d = Math.hypot(peer.group.position.x - b.x, peer.group.position.z - b.z);
+      const d = Math.hypot(peer.group.position.x - b.x, peer.group.position.y + 1 - b.y, peer.group.position.z - b.z);
       if (d < b.radius && byPlayer) hitPeer(id, peer, Math.min(100, b.damage * (1 - d / b.radius) + 10), (peer.group.position.x - b.x) / (d || 1), (peer.group.position.z - b.z) / (d || 1), now);
     }
     // Parked vehicles that are only drawn wake up first, so the blast reaches them too.
@@ -3772,7 +4017,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     for (let pellet = 0; pellet < def.pellets; pellet++) {
       rayDir.set(aimDir.x + (Math.random() - 0.5) * 2 * spread, aimDir.y + (Math.random() - 0.5) * spread, aimDir.z + (Math.random() - 0.5) * 2 * spread).normalize();
       let maxT = wallDistance(rayOrigin, rayDir, def.range);
-      if (rayDir.y < 0) maxT = Math.min(maxT, (groundHeight(rayOrigin.x, rayOrigin.z) + 0.02 - rayOrigin.y) / rayDir.y);
+      if (rayDir.y < 0) {
+        const groundT = (groundHeight(rayOrigin.x, rayOrigin.z, rayOrigin.y) + 0.02 - rayOrigin.y) / rayDir.y;
+        if (groundT >= 0) maxT = Math.min(maxT, groundT);
+      }
       // Every target type is tested and the nearest one along the ray takes the bullet.
       let best: { t: number; apply: () => void } | null = null;
       const consider = (t: number, apply: () => void) => { if (t < maxT && (!best || t < best.t)) best = { t, apply }; };
@@ -3833,7 +4081,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         if (disc < 0 || a < 1e-6) continue;
         const t = (-b - Math.sqrt(disc)) / (2 * a);
         const y = rayOrigin.y + rayDir.y * t;
-        if (t > 0 && y > 0 && y < 1.9) consider(t, () => {
+        if (t > 0 && y > peer.group.position.y && y < peer.group.position.y + 1.9) consider(t, () => {
           hitPeer(id, peer, def.damage * (kind === 'foot' ? 1 : 0.6), rayDir.x, rayDir.z, now);
           effects.blood(hitPoint, rayDir, 5);
           hitMarkAt = now;
@@ -3934,7 +4182,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     });
     for (const [id, peer] of peers) {
       const kind = peerVehicle(peer);
-      if (peer.target.down || kind === 'car' || kind === 'police') continue;
+      if (peer.target.down || (peer.target.altitude ?? 0) > 1.3 || kind === 'car' || kind === 'police') continue;
       if (Math.hypot(peer.group.position.x - cx, peer.group.position.z - cz) < radius + (kind === 'scooter' ? 0.6 : 0) && now - peer.hurtAt * 1000 > 800) {
         hitPeer(id, peer, Math.min(90, speed * (kind === 'scooter' ? 3 : 4)), fx, fz, now);
         thrown(peer.group.position.x, peer.group.position.z);
@@ -3945,6 +4193,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   /** Traffic and police vehicles knock down a player on foot; cruisers ram the player's vehicle. */
   function vehicleImpacts(now: number) {
+    if (powers.altitude > 1.3) return;
     if (down) return;
     for (const car of vehicles.live) {
       if (car === playerCar || car.mode === 'off' || Math.abs(car.speed) < 4.5) continue;
@@ -3984,6 +4233,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       : down === 'busted' ? 'Đang bị còng tay, áp giải về đồn…'
       : surrendered ? 'Đang đầu hàng · Nhấn H để hạ tay xuống'
       : playerBody ? 'Đang đứng dậy…'
+      : powers.altitude > 0.05 ? 'WASD bay · Shift tăng tốc · K tia phản lực · G hạ cánh · B đổi góc nhìn'
       : glide?.phase === 'deck' ? `Đài quan sát tầng ${deckTower.floor} · WASD đi dạo · Space nhảy dù · E đi thang máy xuống`
       : glide?.phase === 'fall' ? 'Rơi tự do · Space bung dù · A/D lượn · W lao nhanh'
       : glide ? `Dù lượn · cao ${Math.round(glide.y)} m · A/D lái · W lao xuống · S hãm`
@@ -4012,6 +4262,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const vehicle = vehicleKind();
     const vehicleHealth = playerCar ? playerCar.health / carMax(playerCar) : state.riding ? bikeHealth / bikeById(bikeId).health : -1;
     const hud: Hud = {
+      powers: powers.hud(powerBlocked()), cameraMode: cameraMode.mode,
       speed: Math.round(velocity * 10) / 10, riding: state.riding, score: state.score,
       mission: missionInfo.objective, missionStep: missionInfo.step, missionInfo, hint: hint === focusText ? '' : hint,
       prompt, pins: mapPins(), ride: ride ? ride.card?.() ?? { title: ride.label, next: '', hint: 'E hoặc F · xin xuống ở trạm tới', stops: [] } : null,
@@ -4052,7 +4303,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const reach = playerCar ? (playerCar.kind === 'moto' ? 0.9 : 1.6) : state.riding ? 0.9 : 0;
     const result = zombies.update(dt, time, { x: state.x, z: state.z, down: down !== null, inVehicle: state.riding, reach, night: atmosphere.night });
     for (const strike of result.strikes) {
-      if (down) break;
+      if (down || powers.altitude > 1.3) break;
       const d = Math.hypot(state.x - strike.x, state.z - strike.z) || 1;
       const dx = (state.x - strike.x) / d, dz = (state.z - strike.z) / d;
       playThud();
@@ -4369,14 +4620,16 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   function walk(dt: number, now: number, vertical: number, horizontal: number) {
     // On foot, movement is relative to where the camera is looking.
-    const forwardX = -Math.sin(smoothView.yaw), forwardZ = -Math.cos(smoothView.yaw);
+    const fp = firstPerson(), airborne = powers.altitude > 0.05 || powers.flying;
+    const forwardX = fp ? Math.sin(cameraMode.yaw) : -Math.sin(smoothView.yaw), forwardZ = fp ? Math.cos(cameraMode.yaw) : -Math.cos(smoothView.yaw);
     const dirX = forwardX * vertical - forwardZ * horizontal;
     const dirZ = forwardZ * vertical + forwardX * horizontal;
     const moving = horizontal !== 0 || vertical !== 0;
-    const aiming = now < aimUntil;
+    const aiming = fp || now < aimUntil;
+    if (fp) state.angle = cameraMode.yaw;
     if (moving && !aiming) state.angle = angleLerp(state.angle, Math.atan2(dirX, dirZ), 1 - Math.exp(-dt * 12));
     // Tear gas makes it hard to run; swimming is slow (Shift for a faster crawl).
-    const topSpeed = swimming ? (keys.has('shift') ? 2.9 : 1.8) : (keys.has('shift') ? 6.8 : aiming ? 3.4 : 4.2) * (performance.now() < gassedUntil ? 0.55 : 1) * footSpeed(buffOn('mat'));
+    const topSpeed = airborne ? (keys.has('shift') ? 24 : 16) : swimming ? (keys.has('shift') ? 2.9 : 1.8) : (keys.has('shift') ? 6.8 : now < aimUntil ? 3.4 : 4.2) * (performance.now() < gassedUntil ? 0.55 : 1) * footSpeed(buffOn('mat'));
     velocity = THREE.MathUtils.damp(velocity, moving ? topSpeed : 0, 9, dt);
     if (velocity < 0.025) velocity = 0;
     // While aiming the player strafes in the input direction instead of turning.
@@ -4387,8 +4640,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const tipsy = Math.max(0, Math.min(1, (drunkUntil - now) / 20000));
     const weave = tipsy * Math.sin(now / 420) * 0.55;
     const dx = (headingX * Math.cos(weave) + headingZ * Math.sin(weave)) * velocity * dt, dz = (headingZ * Math.cos(weave) - headingX * Math.sin(weave)) * velocity * dt;
-    if (footClear(state.x + dx, state.z)) state.x += dx;
-    if (footClear(state.x, state.z + dz)) state.z += dz;
+    if (airborne ? clearAt(state.x + dx, state.z, 0.4) : footClear(state.x + dx, state.z)) state.x += dx;
+    if (airborne ? clearAt(state.x, state.z + dz, 0.4) : footClear(state.x, state.z + dz)) state.z += dz;
     if (swimming) {
       // A passing boat shoves a swimmer aside (and hurts if it was going fast).
       const pushed = boats.pushOut(state, 0.45);
@@ -4398,7 +4651,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         splash(state.x, state.z, now, 1);
         notify('Bị thuyền va phải! Tránh xa luồng tàu.', 2000);
       }
-    } else if (velocity > 0.5) ragdolls.push(state.x, state.z, 0.45, headingX * velocity * 1.1, 0.4, headingZ * velocity * 1.1);
+    } else if (!airborne && velocity > 0.5) ragdolls.push(state.x, state.z, 0.45, headingX * velocity * 1.1, 0.4, headingZ * velocity * 1.1);
     return moving;
   }
 
@@ -4453,7 +4706,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       peer.group.position.z = pose.z;
       const { x, z } = peer.group.position;
       const kind = peerVehicle(peer);
-      peer.group.position.y = kind === 'swim' ? WATER_LEVEL - 1.5 : kind === 'boat' ? WATER_LEVEL : groundHeight(x, z) - 0.02;
+      peer.group.position.y = kind === 'swim' ? WATER_LEVEL - 1.5 : kind === 'boat' ? WATER_LEVEL : groundHeight(x, z) - 0.02 + pose.altitude;
+      peer.heroLook.update(target.hero ?? 'none', !!target.flying, time);
       peer.foot.group.rotation.y = pose.angle;
       peer.bike.group.rotation.y = peer.foot.group.rotation.y;
       if (kind === 'boat' && !peer.boat) { peer.boat = makeBoatMesh(); peer.group.add(peer.boat); }
@@ -4486,7 +4740,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       peer.label.position.y = kind === 'car' || kind === 'police' ? 3.1 : kind === 'swim' ? 3.6 : 2.6;
       const gun = target.weapon && target.weapon !== 'fists' ? target.weapon : null;
       for (const [id, model] of peer.guns) model.visible = id === gun;
-      if (peer.foot.group.visible) posePeer(peer.foot, kind === 'swim', pose.speed, gun, dt, time);
+      if (peer.foot.group.visible) posePeer(peer.foot, kind === 'swim', pose.altitude > 0.05 ? 0 : pose.speed, gun, dt, time);
       if (target.firing && now - peer.flashAt > 160) {
         peer.flashAt = now;
         // The muzzle of a gun held out at shoulder height.
@@ -4504,6 +4758,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
   function update(now: number) {
     if (disposed) return;
+    for (const item of restoredVisibility) item.object.visible = item.visible;
+    restoredVisibility.length = 0;
     const interval = now - previousTime;
     // Holding Tab for the weapon bag slows the street down, like a weapon wheel.
     const dt = Math.min(interval / 1000, 0.05) * (bagOpen ? 0.25 : 1);
@@ -4512,6 +4768,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     adaptQuality(now, covered ? 0 : interval);
     const time = now / 1000;
     const street = active || started;
+    updatePowers(Math.min(0.1, Math.max(0, interval / 1000)), now);
+    if (!firstPerson() || !active) exitLookLock();
     let moving = false;
     const def = weaponById(weapon);
 
@@ -4537,8 +4795,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         if (keys.has('d') || keys.has('arrowright')) horizontal += 1;
         if (keys.has('a') || keys.has('arrowleft')) horizontal -= 1;
         horizontalInput = horizontal;
-        if (keys.has('z')) { view.yaw += dt * 1.9; manualCameraAt = now; }
-        if (keys.has('c')) { view.yaw -= dt * 1.9; manualCameraAt = now; }
+        if (keys.has('z')) { if (firstPerson()) cameraMode.rotate(-dt * 400, 0); else view.yaw += dt * 1.9; manualCameraAt = now; }
+        if (keys.has('c')) { if (firstPerson()) cameraMode.rotate(dt * 400, 0); else view.yaw -= dt * 1.9; manualCameraAt = now; }
       }
       const braking = keys.has(' ') || keys.has('space');
       if (ride || seat) {
@@ -4554,6 +4812,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         moving = velocity !== 0;
       } else if (glide) moving = glideMove(dt, now, vertical, horizontal);
       else moving = walk(dt, now, vertical, horizontal);
+      if (firstPerson()) cameraMode.followCarrier(state.riding ? 'vehicle' : boat ? 'boat' : ride ? 'passenger' : glide && glide.phase !== 'deck' ? 'glide' : null, state.angle);
       const wantsShot = triggerQueued || (def.auto && (mouseHeld || keys.has('f')));
       if (wantsShot && !bagOpen && !ride && !seat && now - lastShot >= 1000 / def.fireRate) {
         triggerQueued = false;
@@ -4565,7 +4824,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         const rate = regenRate(health, { zombie: zombieMode, full: buffOn('no'), seated: !!seat });
         if (rate) health = Math.min(MAX_HEALTH, health + dt * rate);
       }
-      if (!seat && !ride) unstick(dt);
+      if (!seat && !ride && powers.altitude <= 0.05) unstick(dt);
     } else {
       if (!state.riding) velocity = 0;
       state.speed = velocity;
@@ -4573,7 +4832,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
 
     // Deep water under someone on foot means swimming (weapons away); back in the shallows they walk.
-    const deep = !state.riding && !boat && !glide && !playerBody && !ride && deepWater(state.x, state.z, bodyY);
+    const deep = !state.riding && !boat && !glide && !playerBody && !ride && powers.altitude <= 0.05 && deepWater(state.x, state.z, bodyY);
     if (deep && !swimming) {
       swimming = true;
       jumpY = jumpV = 0;
@@ -4626,13 +4885,16 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (state.riding && !playerCar) vehicles.clearObstacle('own-bike');
     else if (bikeId === 'horse') vehicles.registerObstacle('own-bike', bikeX, bikeZ, 0.45, 1.2, bikeAngle);
     else vehicles.registerObstacle('own-bike', bikeX, bikeZ, 0.4, 1, bikeAngle);
+    vehicles.setHiddenVehicle(firstPerson() ? playerCar : null);
     for (const crash of vehicles.update(dt, time, { x: state.x, z: state.z, car: playerCar, wanted: police.wanted }, crossing)) handleCrash(crash, now, time, false);
+    buses.setFirstPersonRideHidden(firstPerson());
     buses.update(dt, time, { x: state.x, z: state.z, car: playerCar, riding: state.riding, zombie: zombieMode, hours: atmosphere.hours, day: atmosphere.clock.day }, crossing, viewFrustum);
     buses.setNight(atmosphere.night);
     checkRedLight(time);
     vehicleImpacts(now);
     const policeResult = police.update(dt, time, {
       x: state.x, z: state.z, car: playerCar, riding: state.riding, heading: state.angle, speed: Math.abs(velocity), down: down !== null, stunned: now < stunUntil,
+      altitude: powers.altitude,
       armed: weapon !== 'fists' && !inCar(), surrendered, pinned: down === 'crash' && now < pinnedUntil, night: atmosphere.night,
     });
     if (policeResult.called) notify('Có người đã báo công an! Cảnh sát đang trên đường tới, tranh thủ chuồn đi.', 4000);
@@ -4668,7 +4930,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         const a = Math.random() * Math.PI * 2, r = Math.random() * 3.6;
         effects.smoke(cloud.x + Math.cos(a) * r, groundHeight(cloud.x, cloud.z) + 0.4, cloud.z + Math.sin(a) * r, now, false, '#cdd5ae');
       }
-      if (!inCar() && down !== 'wasted' && Math.hypot(state.x - cloud.x, state.z - cloud.z) < 4.2) {
+      if (!inCar() && down !== 'wasted' && powers.altitude < 2 && Math.hypot(state.x - cloud.x, state.z - cloud.z) < 4.2) {
         gassedUntil = now + 1500;
         damagePlayer(2.5 * dt, now);
         if (now > coughAt) { coughAt = now + 2500; bubbles.say('player', 'Khụ khụ… cay mắt quá!', now, () => ({ x: state.x, y: groundHeight(state.x, state.z) + 2, z: state.z }), 1800, 'shout'); }
@@ -4686,7 +4948,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     flatTires = !!playerCar && flatCars.has(playerCar);
     if (policeResult.shots.some((shot) => shot.kind !== 'taser')) npcs.notice(state.x, state.z, 'shots', time);
     for (const shot of policeResult.shots) {
-      playerPoint.set(state.x, 1.1, state.z);
+      playerPoint.set(state.x, bodyY + jumpY + 1.1 + powers.altitude, state.z);
       if (!shot.hit) playerPoint.add(scratch.set((Math.random() - 0.5) * 2.5, Math.random() * 0.8, (Math.random() - 0.5) * 2.5));
       if (shot.kind === 'taser') {
         // A taser dart: a short spark line, and a hit stuns a player on foot.
@@ -4726,7 +4988,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (now > aimUntil) aimYaw = state.angle;
       if (armed && !down) aimAhead(9, reticlePoint);
     }
-    updateReticle(active && armed && !down && !bagOpen, locked, pointerInside, now);
+    updateReticle(active && (armed || firstPerson()) && !down && !bagOpen, locked, pointerInside, now);
     gangKnocks = 0;
     if (zombieMode) updateZombies(dt, now, time);
     const npcEvents = zombieMode ? NO_NPC_EVENTS : npcs.update(dt, time, atmosphere.hours, atmosphere.rain > 0.4, { x: state.x, z: state.z, aimYaw, armed: armed && !inCar(), aiming, inVehicle: state.riding, down: down !== null }, state.x, state.z, groundHeight);
@@ -4748,10 +5010,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         : at?.def.kind === 'mart' ? `Cướp mini mart! Camera đã ghi hình · nhặt ${formatThousands(amount)}`
         : robbery.shop ? `Cướp tiệm! Nhặt ${formatThousands(amount)} rơi trước mặt` : `Cướp được ${formatThousands(amount)}, nhặt tiền đi!`, 2500);
     }
-    for (let i = 0; i < npcEvents.strikes; i++) { damagePlayer(6, now, undefined, 'Băng đảng'); playThud(); }
+    if (powers.altitude <= 1.3) for (let i = 0; i < npcEvents.strikes; i++) { damagePlayer(6, now, undefined, 'Băng đảng'); playThud(); }
     if (npcEvents.shots.length) npcs.notice(state.x, state.z, 'shots', time);
     for (const shot of npcEvents.shots) {
-      playerPoint.set(state.x, 1.1, state.z);
+      playerPoint.set(state.x, bodyY + jumpY + powers.altitude + 1.1, state.z);
       if (!shot.hit) playerPoint.add(scratch.set((Math.random() - 0.5) * 3, Math.random() * 0.8, (Math.random() - 0.5) * 3));
       effects.tracer(shot.from, playerPoint, now);
       effects.flash(shot.from, now, 0.7);
@@ -4771,7 +5033,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (car === playerCar) { damagePlayer(70, now); exitVehicle(); }
       applyBlast({ x: car.x, y: 1, z: car.z, radius: 6, damage: 120 }, now, false);
     }
-    const collected = pickups.update(now, state.x, state.z, !down && !inCar());
+    const collected = pickups.update(now, state.x, state.z, !down && !inCar() && powers.altitude <= 1.3);
     if (collected) { cash += collected; notify(`+${formatThousands(collected)}`, 1500); }
     for (let i = looseBodies.length - 1; i >= 0; i--) {
       if (time > looseBodies[i].until || looseBodies[i].body.removed) {
@@ -4806,8 +5068,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       bodyY = Math.max(surface, bodyY + fallV * dt);
       if (bodyY === surface && swimming) splash(state.x, state.z, now, Math.min(2, -fallV / 6));
     } else { bodyY = surface; fallV = 0; }
-    walker.group.position.set(state.x, bodyY + jumpY + (swimming ? Math.sin(time * 2.3) * 0.04 : 0), state.z);
+    walker.group.position.set(state.x, bodyY + jumpY + powers.altitude + (swimming ? Math.sin(time * 2.3) * 0.04 : 0), state.z);
     walker.group.rotation.y = state.angle;
+    heroLook.update(powers.hero, powers.flying, time);
     canopy.visible = glide?.phase === 'chute';
     if (glide?.phase === 'chute') {
       const open = Math.min(1, (now - glide.since) / 600);
@@ -4844,7 +5107,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         walker.group.rotation.y = s.yaw;
       }
     } else {
-      animateWalker(dt, now, time, moving && active && !state.riding, {
+      animateWalker(dt, now, time, moving && active && !state.riding && powers.altitude <= 0.05, {
         gun: weapon === 'fists' ? null : weapon, kneeling, handsUp, armed: armed && now < aimUntil + 600 && !swimming && !glide,
         swim: swimming ? 0.25 + swimPace * 0.75 : 0, sky: glide ? glide.phase : null, look: aimTurn,
       });
@@ -4912,7 +5175,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     if (playerBody) ragdolls.center(playerBody, scratch);
     else scratch.set(state.x, 0, state.z);
-    youLabel.position.set(scratch.x, glide ? glide.y + 2.3 : swimming ? WATER_LEVEL + 1.2 : boat ? WATER_LEVEL + 2.4 : inCar() ? 3.1 : state.riding ? 2.6 : 2.3, scratch.z);
+    youLabel.position.set(scratch.x, glide ? glide.y + 2.3 : swimming ? WATER_LEVEL + 1.2 : boat ? WATER_LEVEL + 2.4 : inCar() ? 3.1 : state.riding ? 2.6 : 2.3 + powers.altitude, scratch.z);
     youLabel.visible = street && !menu;
 
     // Mission marker, shopkeeper and receiver.
@@ -5015,7 +5278,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
 
     const cameraBlend = 1 - Math.exp(-dt * 4.5);
     const follow = playerBody ? scratch : null;
-    desiredTarget.set(street ? (follow ? follow.x : state.x) : -3, glide && street ? glide.y + 1.2 : 1, street ? (follow ? follow.z : state.z) : -5);
+    desiredTarget.set(street ? (follow ? follow.x : state.x) : -3, glide && street ? glide.y + 1.2 : 1 + powers.altitude * 0.8, street ? (follow ? follow.z : state.z) : -5);
     cameraTarget.lerp(desiredTarget, cameraBlend);
     const viewBlend = 1 - Math.exp(-dt * 14);
     // The camera closes in on an arrest.
@@ -5025,6 +5288,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     // Sitting down the camera comes in closer.
     smoothView.dist += ((seat ? Math.min(view.dist, 12) : view.dist) - smoothView.dist) * viewBlend;
     const counterShot = !interior && street && menu?.anchor ? menu.anchor : null;
+    const fp = firstPerson();
     if (interior) {
       const shot = interiors.view(interior, productFocus);
       const glide = 1 - Math.exp(-dt * 4);
@@ -5038,6 +5302,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       camDesired.set(a.x + fx * 7.6 + rx * 3.2, g + 3.6, a.z + fz * 7.6 + rz * 3.2);
       camera.position.lerp(camDesired, blend);
       interiorLook.lerp(scratch.set(a.x + fx * 1.2 + rx * 2.4, g + 1.0, a.z + fz * 1.2 + rz * 2.4), blend);
+    } else if (fp) {
+      const pose = eyePose();
+      camera.position.set(pose.eye.x, pose.eye.y, pose.eye.z);
+      firstLookAt.set(pose.eye.x + pose.direction.x * 20, pose.eye.y + pose.direction.y * 20, pose.eye.z + pose.direction.z * 20);
     } else if (street) {
       camDesired.copy(cameraTarget).add(offsetFor(smoothView.yaw, smoothView.pitch, smoothView.dist, cameraOffset));
       camera.position.lerp(camDesired, 1 - Math.exp(-dt * 10));
@@ -5048,11 +5316,11 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       camDesired.z += 12;
       camera.position.lerp(camDesired, cameraBlend);
     }
-    camera.lookAt(interior || counterShot ? interiorLook : cameraTarget);
+    camera.lookAt(interior || counterShot ? interiorLook : fp ? firstLookAt : cameraTarget);
     if (!counterShot && !interior) interiorLook.copy(cameraTarget);
     const sway = !interior && now < drunkUntil ? Math.min(1, (drunkUntil - now) / 20000) : 0;
     if (sway > 0) camera.rotateZ(Math.sin(now / 900) * 0.06 * sway);
-    const fov = interior ? 52 : 42 + (state.riding ? Math.min(1, Math.abs(velocity) / 26) * 10 : 0);
+    const fov = interior ? 52 : fp ? 76 + Math.min(4, Math.abs(velocity) / 8) : 42 + (state.riding ? Math.min(1, Math.abs(velocity) / 26) * 10 : 0);
     if (Math.abs(camera.fov - fov) > 0.05) { camera.fov += (fov - camera.fov) * (1 - Math.exp(-dt * 3)); camera.updateProjectionMatrix(); }
     if (shake > 0.001) {
       camera.position.x += (Math.random() - 0.5) * shake;
@@ -5061,7 +5329,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     camera.updateMatrixWorld();
     // Buildings between the camera and the player open up around them.
-    world.focus(camera, desiredTarget.x, glide ? glide.y + 1.1 : groundHeight(desiredTarget.x, desiredTarget.z) + 1.1, desiredTarget.z, dt, street && !interior);
+    world.focus(camera, desiredTarget.x, glide ? glide.y + 1.1 : groundHeight(desiredTarget.x, desiredTarget.z) + 1.1, desiredTarget.z, dt, street && !interior && !fp);
 
     // Floating health bars over anyone hurt recently, and speech bubbles.
     effects.beginBars(camera);
@@ -5070,12 +5338,20 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     police.forEachHurt(time, (x, y, z, f) => effects.bar(x, y, z, f));
     for (const peer of peers.values()) {
       const peerHealth = Math.max(0, (peer.target.health ?? MAX_HEALTH) - peer.predicted);
-      if (!peer.target.down && (peerHealth < MAX_HEALTH || time - peer.hurtAt < 4)) effects.bar(peer.group.position.x, 2.25, peer.group.position.z, peerHealth / MAX_HEALTH);
+      if (!peer.target.down && (peerHealth < MAX_HEALTH || time - peer.hurtAt < 4)) effects.bar(peer.group.position.x, 2.25 + peer.group.position.y, peer.group.position.z, peerHealth / MAX_HEALTH);
     }
     effects.endBars();
     bubbles.update(now, cameraTarget.x, cameraTarget.z);
     effects.update(now, dt);
-    canvas.style.cursor = interior ? (productHover ? 'pointer' : '') : !active ? '' : rotating ? 'grabbing' : armed ? 'none' : '';
+    powerEffects.update(now);
+    if (fp) {
+      const hidden: THREE.Object3D[] = [walker.group, rider.group, seatHolder, helm.group, youLabel, canopy];
+      if (state.riding && !playerCar) hidden.push(bike.group);
+      if (boat) hidden.push(boat.group);
+      if (buses.firstPersonOccluder) hidden.push(buses.firstPersonOccluder);
+      for (const object of hidden) { restoredVisibility.push({ object, visible: object.visible }); object.visible = false; }
+    }
+    canvas.style.cursor = interior ? (productHover ? 'pointer' : '') : !active ? '' : rotating ? 'grabbing' : fp || armed ? 'none' : '';
     if (!covered && compiled) {
       world.update(time);
       sky.update(camera, time, atmosphere.sunDirection, atmosphere.tint, atmosphere.cover, 1 - atmosphere.night);
@@ -5222,6 +5498,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   return {
     /** Opens (or closes, with null) a shop interior: the camera cuts inside and the player stands at the door. */
     setInterior(kind: InteriorKind | null) {
+      exitLookLock();
       if (kind === interior) return;
       interior = kind;
       productFocus = productHover = null;
@@ -5269,7 +5546,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       productFocus = id;
       interiors.setHovered(id ?? productHover);
     },
-    setActive(value: boolean) { active = value; previousTime = performance.now(); clearKeys(); rotating = null; touches.clear(); if (!value && !state.riding) velocity = 0; },
+    setActive(value: boolean) { active = value; previousTime = performance.now(); clearKeys(); rotating = null; touches.clear(); if (!value) { exitLookLock(); powers.stopFlight(); shieldFlight = null; if (!state.riding) velocity = 0; } },
     /** A game is running (true from the start of a session until it is left), whatever overlay is open. */
     setStarted(value: boolean) { started = value; },
     /** An opaque overlay covers the whole street (the big map): skips drawing until it closes. */
@@ -5278,6 +5555,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       return {
         ...state, health: Math.ceil(health), weapon, vehicle: vehicleKind(), down: down === 'wasted',
         firing: performance.now() < firingUntil, wanted: police.wanted,
+        hero: powers.hero, altitude: powers.altitude, flying: powers.flying, powerSeq: lastPower.seq, powerKind: lastPower.kind, powerX: lastPower.x, powerY: lastPower.y, powerZ: lastPower.z,
       };
     },
     /** Hits this player dealt since the last sync, at most eight. */
@@ -5293,6 +5571,10 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     setPeers,
     action,
     setInput,
+    selectHero,
+    usePower: castPower,
+    toggleFlight,
+    toggleCameraMode,
     selectMission(id: MissionId) {
       missions.select(id, id === 'coffee' ? receivers[Math.floor(Math.random() * receivers.length)] : undefined);
       receiverHappyUntil = 0;
@@ -5372,6 +5654,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       emitHud(performance.now());
     },
     reset(mode: GameMode = 'city') {
+      powers.reset(); shieldFlight = null; powerEffects.clear(); lastPower.kind = 'none'; exitLookLock(); cameraMode.reset(Math.PI / 2);
       if (playerCar) { playerCar.mode = 'parked'; playerCar = null; }
       if (seat?.claim != null) nx.releaseSeat?.(seat.claim);
       seat = null; ride = null; hold = null; focus = null; menu = null; parkedWith = null; playerLastCar = null;
@@ -5426,6 +5709,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     dispose() {
       if (disposed) return;
       disposed = true;
+      exitLookLock();
+      document.removeEventListener('pointerlockchange', onLookLockChanged);
+      document.removeEventListener('pointerlockerror', onLookLockError);
       cancelAnimationFrame(frame);
       resizeObserver.disconnect();
       setRain(0);
@@ -5453,6 +5739,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       vehicles.dispose();
       ragdolls.dispose();
       effects.dispose();
+      powerEffects.dispose();
       explosives.dispose();
       pickups.dispose();
       bubbles.dispose();

@@ -139,3 +139,44 @@ test('invalid reports are rejected and unreasonable velocity cannot escape the c
   track.push(peer(0, 0, { vx: 10000, vz: 0 }), 0);
   close(track.sample(100).x, 5);
 });
+
+test('flight altitude interpolates during ascent and landing, then holds through packet loss', () => {
+  const track = createPeerInterpolator();
+  track.push(peer(0, 0, { hero: 'ironman', flying: true, altitude: 2 }), 0);
+  track.push(peer(1, 100, { hero: 'ironman', flying: true, altitude: 4 }), 100);
+  close(track.sample(50).altitude, 3);
+  close(track.sample(5000).altitude, 4);
+  track.push(peer(1, 200, { hero: 'ironman', flying: false, altitude: 2 }), 200);
+  close(track.sample(150).altitude, 3);
+  track.push(peer(1, 300, { hero: 'ironman', flying: false, altitude: 0 }), 300);
+  close(track.sample(250).altitude, 1);
+  close(track.sample(10000).altitude, 0);
+});
+
+test('legacy and incompatible flight poses remain grounded; invalid altitude cannot corrupt history', () => {
+  const track = createPeerInterpolator();
+  track.push(peer(0, 0), 0);
+  close(track.sample(0).altitude, 0);
+  track.push(peer(0, 50, { hero: 'ironman', altitude: 99 }), 50);
+  close(track.sample(50).altitude, 8);
+  assert.equal(track.push(peer(0, 100, { hero: 'ironman', altitude: NaN }), 100), false);
+  close(track.sample(100).altitude, 8);
+  track.push(peer(0, 150, { hero: 'ironman', altitude: 4, down: true }), 150);
+  close(track.sample(100).altitude, 0);
+  track.push(peer(0, 200, { hero: 'ironman', altitude: 4, riding: true, vehicle: 'car' }), 200);
+  close(track.sample(200).altitude, 0);
+  track.push(peer(0, 250, { hero: 'hulk', altitude: 4 }), 250);
+  close(track.sample(250).altitude, 0);
+});
+
+test('boat and swimming transitions ground flight poses throughout the expanded world', () => {
+  const track = createPeerInterpolator();
+  track.push(peer(600, 0, { z: -400, hero: 'ironman', altitude: 5 }), 0);
+  close(track.sample(0).altitude, 5);
+  track.push(peer(601, 100, { z: -400, hero: 'ironman', altitude: 5, vehicle: 'boat', riding: true }), 100);
+  close(track.sample(50).x, 601);
+  close(track.sample(50).altitude, 0);
+  track.push(peer(602, 200, { z: -400, hero: 'ironman', altitude: 5, vehicle: 'swim' }), 200);
+  close(track.sample(150).x, 602);
+  close(track.sample(150).altitude, 0);
+});

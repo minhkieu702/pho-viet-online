@@ -568,7 +568,7 @@ test('world terrain: installTerrain switches every exported query to the wired m
 test('timing: the wired terrain\'s hot queries', () => {
   const W = world(5), r = rng(9), pts = [];
   for (let i = 0; i < 1e5; i++) pts.push([-720 + r() * 1420, -440 + r() * 885]);
-  const time = (f) => { let s = 0; const t0 = performance.now(); for (let k = 0; k < 3; k++) for (const [x, z] of pts) s += +f(x, z); return (performance.now() - t0) / (3 * pts.length) * 1e3; };
+  const time = (f) => { let s = 0; const t0 = performance.now(); for (let k = 0; k < 3; k++) for (const [x, z] of pts) s += +f(x, z); const elapsed = performance.now() - t0; assert.ok(Number.isFinite(s), 'terrain queries return finite results'); return elapsed / (3 * pts.length) * 1e3; };
   time((x, z) => W.groundHeight(x, z)); time((x, z) => W.walkable(x, z, 0.4));
   const g = time((x, z) => W.groundHeight(x, z)), gh = time((x, z) => W.groundHeight(x, z, 0.3)), w = time((x, z) => W.walkable(x, z, 0.4)), n = time((x, z) => W.navigable(x, z, 1.15));
   console.log(`  wired map (5 slices): groundHeight ${g.toFixed(3)} µs, with yHint ${gh.toFixed(3)} µs, walkable(0.4) ${w.toFixed(3)} µs, navigable ${n.toFixed(3)} µs per call`);
