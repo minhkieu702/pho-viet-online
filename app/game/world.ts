@@ -2287,6 +2287,8 @@ export function buildWorld(scene: THREE.Scene) {
     solid: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.88, vertexColors: true }),
     wall: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.93, vertexColors: true }),
     water: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.22, metalness: 0.08, vertexColors: true }),
+    // Paint and hẻm concrete a few millimetres above the asphalt: the offset keeps them on top at any distance.
+    mark: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.9, vertexColors: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 }),
   };
   patchTiles(surfMats.paving, surfNoise, 'surf-paving', false);
   patchWall(surfMats.wall, surfNoise);
@@ -2297,7 +2299,7 @@ export function buildWorld(scene: THREE.Scene) {
   let surfTarget: Map<SurfRole, SurfBuf> | null = null;
   const surfBuf = (role: SurfRole) => { let b = surfTarget!.get(role); if (!b) { b = { pos: new Floats(3072), nrm: new Floats(3072), col: new Floats(3072) }; surfTarget!.set(role, b); } return b; };
   /** Surfaces share three materials (fewer draw calls a tile): kerbs, beds and bank walls go with the ground. */
-  const SURF_MERGE: Record<SurfRole, SurfRole> = { ground: 'ground', solid: 'ground', wall: 'ground', paving: 'paving', water: 'water' };
+  const SURF_MERGE: Record<SurfRole, SurfRole> = { ground: 'ground', solid: 'ground', wall: 'ground', paving: 'paving', water: 'water', mark: 'mark' };
   function surfTri(role0: SurfRole, color: ColorLike, a: number[], b: number[], c: number[], face?: 'down') {
     if (dry || !surfTarget) return;
     const role = SURF_MERGE[role0];
@@ -2484,7 +2486,7 @@ export function buildWorld(scene: THREE.Scene) {
   // Cutaway: when a building stands between the camera and the player, everything in front of the player
   // inside a soft circle around them on screen is discarded (dithered at the rim), so they stay visible.
   const cut = { center: { value: new THREE.Vector2() }, depth: { value: 0 }, radius: { value: 0 }, aspect: { value: 1 } };
-  const uncut = new Set<THREE.Material>([roles.ground, roles.paving, surfMats.ground, surfMats.paving, poolMaterial, neonPoolMaterial, shopPoolMaterial, districtPoolMaterial, puddleMaterial, waveMaterial]);
+  const uncut = new Set<THREE.Material>([roles.ground, roles.paving, surfMats.ground, surfMats.paving, surfMats.mark, poolMaterial, neonPoolMaterial, shopPoolMaterial, districtPoolMaterial, puddleMaterial, waveMaterial]);
   for (const material of materials) {
     if (uncut.has(material)) continue;
     const previous = material.onBeforeCompile.bind(material);

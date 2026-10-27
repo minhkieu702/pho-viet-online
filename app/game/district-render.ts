@@ -43,7 +43,8 @@ const WATER = '#5f9f98', BED = '#4f8a84', BANK = '#bbaf96', RAIL = '#e2cfaa';
 // ---------------------------------------------------------------------------------------------------------------
 
 /** Vertex-coloured surfaces (merged per tile and role): roads, sidewalks, ground, water, walls. */
-export type SurfRole = 'ground' | 'paving' | 'solid' | 'wall' | 'water';
+/** 'mark': paint and hẻm concrete laid on the asphalt, drawn with a depth offset so it never fights the road under it. */
+export type SurfRole = 'ground' | 'paving' | 'solid' | 'wall' | 'water' | 'mark';
 export type Surf = {
   /** A triangle (x,y,z points). A face that lies mostly flat is turned to face up; a wall keeps its winding (CCW = front). */
   tri(role: SurfRole, color: ColorLike, a: number[], b: number[], c: number[]): void;
@@ -713,7 +714,7 @@ function drawEdge(k: DistrictKit, e: RoadEdge, s0: number, s1: number, start: Si
   const a0 = Math.max(s0, trimA), a1 = Math.min(s1, e.len - trimB);
   const decked = DECKS.has(e.id), step = decked ? 2 : 0;
   const yAt = (s: number) => deckLift(e.id, s);
-  if (a1 - a0 > 0.05) ribbon(surf, 'ground', hem ? HEM : ASPHALT, e, a0, a1, -e.half, e.half, (s) => Y_ROAD + yAt(s) + (hem ? 0.004 : 0), step);
+  if (a1 - a0 > 0.05) ribbon(surf, hem ? 'mark' : 'ground', hem ? HEM : ASPHALT, e, a0, a1, -e.half, e.half, (s) => Y_ROAD + yAt(s) + (hem ? 0.004 : 0), step);
   if (!hem && e.sidewalk > 0) {
     for (const side of [1, -1] as const) {
       const lo = Math.max(s0, start.get(`${e.id}:0:${side}`) ?? 0), hi = Math.min(s1, e.len - (start.get(`${e.id}:1:${side}`) ?? 0));
@@ -730,7 +731,7 @@ function drawEdge(k: DistrictKit, e: RoadEdge, s0: number, s1: number, start: Si
     const lo = Math.max(s0, b.s0), hi = Math.min(s1, b.s1);
     if (hi - lo < 1 || b.kind === 'moto') continue;
     const off = b.side * (e.half - b.depth), color = b.kind === 'loading' || b.kind === 'bus' ? '#e8c84a' : WHITE_LINE;
-    ribbon(surf, 'ground', color, e, lo, hi, off - 0.06, off + 0.06, (s) => Y_ROAD + 0.006 + yAt(s), step);
+    ribbon(surf, 'mark', color, e, lo, hi, off - 0.06, off + 0.06, (s) => Y_ROAD + 0.006 + yAt(s), step);
   }
 }
 /** How far a hẻm's concrete stays off the node at its end `end`: the half-width of the widest street there. */
@@ -773,7 +774,7 @@ function markings(surf: Surf, e: RoadEdge, s0: number, s1: number, yAt: (s: numb
   const dash = (off: number, color: string, len: number, gap: number, w: number) => {
     for (let s = Math.ceil(lo / gap) * gap; s + len <= hi; s += gap) {
       const a = along(e.pts, e.cum, s), b = along(e.pts, e.cum, s + len), rx = -a.hz, rz = a.hx, ya = Y_ROAD + 0.005 + yAt(s), yb = Y_ROAD + 0.005 + yAt(s + len);
-      surf.quad('ground', color, [a.x + rx * (off - w), ya, a.z + rz * (off - w)], [a.x + rx * (off + w), ya, a.z + rz * (off + w)], [b.x + rx * (off + w), yb, b.z + rz * (off + w)], [b.x + rx * (off - w), yb, b.z + rz * (off - w)]);
+      surf.quad('mark', color, [a.x + rx * (off - w), ya, a.z + rz * (off - w)], [a.x + rx * (off + w), ya, a.z + rz * (off + w)], [b.x + rx * (off + w), yb, b.z + rz * (off + w)], [b.x + rx * (off - w), yb, b.z + rz * (off - w)]);
     }
   };
   if (twoWay) dash(0, MARK, 3.2, 9, 0.085);
@@ -791,7 +792,7 @@ function zebra(surf: Surf, ax: number, az: number, bx: number, bz: number, lift:
   const ux = (bx - ax) / len, uz = (bz - az) / len, vx = -uz, vz = ux, y = Y_ROAD + 0.006 + lift;
   for (let t = 0.9; t < len - 0.5; t += 1.375) {
     const cx = ax + ux * t, cz = az + uz * t;
-    surf.quad('ground', ZEBRA, [cx - ux * 0.35 - vx * 1.3, y, cz - uz * 0.35 - vz * 1.3], [cx + ux * 0.35 - vx * 1.3, y, cz + uz * 0.35 - vz * 1.3], [cx + ux * 0.35 + vx * 1.3, y, cz + uz * 0.35 + vz * 1.3], [cx - ux * 0.35 + vx * 1.3, y, cz - uz * 0.35 + vz * 1.3]);
+    surf.quad('mark', ZEBRA, [cx - ux * 0.35 - vx * 1.3, y, cz - uz * 0.35 - vz * 1.3], [cx + ux * 0.35 - vx * 1.3, y, cz + uz * 0.35 - vz * 1.3], [cx + ux * 0.35 + vx * 1.3, y, cz + uz * 0.35 + vz * 1.3], [cx - ux * 0.35 + vx * 1.3, y, cz - uz * 0.35 + vz * 1.3]);
   }
 }
 /** A signal pole at a district approach: arm over the lanes, two heads facing the arriving traffic, the street's name plate. */
