@@ -8,16 +8,22 @@
  * - planRuins(input, seed): a pure, deterministic function of the map (roads, plots, trees, poles, lamps, greens,
  *   stalls, keep-clear spots, existing solids). Every client with the same WORLD_VERSION/ZOMBIE_VERSION gets the
  *   same items, colliders and hash. It never imports today's map (apocalypse-inputs.ts builds the input from
- *   city.ts; the wired districts pass their own lists), never reads a clock, Math.random, the player or the quality
- *   level, and never branches on Math.sin/cos/exp/pow/hypot/atan2 (engines may differ in the last bit): yaws are
- *   quantised to k·π/32 with a sine table built from + − × ÷, distances use Math.sqrt. A global pass over the road
+ *   city.ts, ruinInputsFromWorld() from the wired districts too), never reads a clock, Math.random, the player or
+ *   the quality level, and never branches on Math.sin/cos/exp/pow/hypot/atan2 (engines may differ in the last bit):
+ *   yaws are quantised to k·π/32 with a sine table built from + − × ÷ (the districts' rotated buildings and oriented
+ *   solids to k·π/2048, a finer table built the same way), distances use Math.sqrt. A global pass over the road
  *   graph (pile-ups, full blocks with a car-connectivity check, bus crashes, the fleet wreck spots) is followed by
  *   one detail pass per 128 m chunk, seeded per (chunk, layer), so planning order never changes a chunk.
- * - createApocalypse(scene, solids, opts): draws a plan (one merged opaque mesh per chunk, built off the frame and
- *   time-sliced; one BatchedMesh for every vehicle wreck with a full model near the focus and a cheap hull further
- *   out), puts its colliders into the shared collision index under RUIN_OWNER, and takes them out again when zombie
- *   mode ends. Mutants crush (code 0..7) or throw (RUIN_THROWN) wrecks through smash(); only those changes are
- *   networked (zev smash, zdir.ruins).
+ *   Optional inputs (the wired city's): `land` keeps colliders and ruined shells on dry land or a bridge, `lane`
+ *   keeps a drive lane clear down every traffic road that is not fully blocked (no road is closed by accident, a
+ *   junction keeps at least two open arms), plots with a `box` (rotated buildings) get their collapses, signs,
+ *   windows, vines and moss along that box and their rubble within RUBBLE_MARGIN of it.
+ * - createApocalypse(scene, solids, opts): draws a plan (one merged opaque geometry per chunk, built off the frame and
+ *   time-sliced, the chunks within the fog's reach in a few fixed-size BatchedMesh pages: a draw call a page, each
+ *   chunk culled on its own; one BatchedMesh for every vehicle wreck with a full model near the focus and a cheap hull
+ *   further out), puts its colliders into the shared collision index under RUIN_OWNER, and takes them out again when
+ *   zombie mode ends. Mutants crush (code 0..7) or throw (RUIN_THROWN) wrecks through smash(); only those changes are
+ *   networked (zev smash, zdir.ruins). Plans cross to and from ruin-worker.ts packed (ruin-pack.ts).
  *
  * Conventions as map/collision.ts: ground plane x/z, yaw 0 faces +z, forward = (sin yaw, cos yaw); a box's half size
  * hx runs along (cos yaw, −sin yaw) and hz along forward. Heights in a plan are above the ground; the runtime adds
@@ -37,12 +43,26 @@ export const RUIN_OWNER = 3;
 export const CHUNK = 128;
 
 type Box2 = { minX: number; minZ: number; maxX: number; maxZ: number };
+/** An oriented box (map/collision.ts conventions); the planner turns its yaw into a multiple of π/2048. */
+export type RuinBox = { cx: number; cz: number; hx: number; hz: number; yaw: number };
+/** A solid already in the world: an axis-aligned rect (today's colliders) or an oriented box (the districts'). */
+export type RuinSolid = Box2 | RuinBox;
 export type RuinRoad = { id: number; pts: readonly number[]; half: number; sidewalk: number; walk: number; cls: 'R1' | 'R2' | 'hem'; traffic: boolean; bridge?: boolean };
 export type RuinPlotInput = Box2 & {
   id: number; h: number; facing: number; style: string; sign: boolean; keep: boolean;
   /** The ground-floor footprint when it is smaller than the upper floors (an arcade); moss grows on it. */
   ground?: Box2;
+  /**
+   * The footprint as an oriented box (the districts' buildings, rotated ones included; Box2 is then its axis box):
+   * its front is the box's forward face, and collapses, rubble, signs, windows, vines and moss follow the box, the
+   * rubble kept within RUBBLE_MARGIN of it (no axis-aligned heap poking into the street).
+   */
+  box?: RuinBox;
 };
+/** A park, square or yard gone wild: its rect, or a polygon (x,z pairs) with that rect as its bounds. */
+export type RuinGreen = Box2 & { poly?: readonly number[] };
+/** Dry land: the union of `polys` less `holes` (x,z pairs each); bridges (roads flagged `bridge`) count as land. */
+export type RuinLand = { polys: readonly (readonly number[])[]; holes?: readonly (readonly number[])[] };
 export type RuinInput = {
   bounds: Box2;
   roads: readonly RuinRoad[];
@@ -52,18 +72,26 @@ export type RuinInput = {
   trees: readonly { x: number; z: number; size: number; species: string }[];
   poles: readonly { x: number; z: number; yaw: number; line: string }[];
   lamps: readonly { x: number; z: number; hx: number; hz: number }[];
-  greens: readonly Box2[];
+  greens: readonly RuinGreen[];
   stalls: readonly { x: number; z: number; yaw: number; kind: string }[];
   /** Spots kept clear by r; `major` ones (the spawn, the doors players need) also keep full road blocks 60 m away (default: r ≥ 10). */
   keepClear: readonly { x: number; z: number; r: number; major?: boolean }[];
-  /** Solid boxes already in the world (colliders), so ruins never overlap them. */
-  solids: readonly Box2[];
+  /** Solids already in the world (colliders), so ruins never overlap them. */
+  solids: readonly RuinSolid[];
   /** Every walking leg (sidewalk lines, hẻm centre lines, crosswalks, door and seat paths); derived from the roads when absent. */
   walks?: readonly { ax: number; az: number; bx: number; bz: number }[];
   /** Quarantine checkpoints (white tents) near a hospital, facing the street. */
   checkpoints?: readonly { x: number; z: number; yaw: number }[];
   /** How many fleet wreck spots to plan (vehicles.ts' traffic cars and motorbikes). */
   fleet?: { cars: number; motos: number };
+  /** Where colliders and ruined shells may stand (the land, not the river or a canal); everywhere in `bounds` when absent. */
+  land?: RuinLand;
+  /**
+   * Width (m) of a drive lane kept clear of every collider (wrecks, pile-ups, barricades, fallen trees and poles)
+   * down the centre line of every traffic road that is not deliberately blocked; full blocks also leave every
+   * junction at least two open arms. Absent: today's rules only.
+   */
+  lane?: number;
 };
 export type RuinKind = 'car' | 'carBurnt' | 'moto' | 'bus' | 'pile' | 'rubble' | 'slab' | 'shell' | 'rebar' | 'sign' | 'tree' | 'stump' | 'pole'
   | 'cable' | 'vine' | 'moss' | 'weeds' | 'grass' | 'crack' | 'scorch' | 'litter' | 'barricade' | 'stall' | 'window' | 'barrel'
@@ -117,6 +145,28 @@ export const SIN = new Float64Array(64), COS = new Float64Array(64);
   }
 }
 const wrap = (k: number) => ((k % 64) + 64) % 64;
+/** Fine yaw steps per STEP: the districts' rotated buildings and oriented solids keep their yaw to π/2048 (0.09°). */
+const SUB = 64;
+const FSTEP = STEP / SUB;
+/** sin and cos of k·π/2048 for k = 0..4095, built as SIN/COS are (FSIN[k·64] === SIN[k]). */
+export const FSIN = new Float64Array(64 * SUB), FCOS = new Float64Array(64 * SUB);
+{
+  const Q = 16 * SUB, s = new Float64Array(Q + 1), c = new Float64Array(Q + 1);
+  for (let k = 0; k <= Q; k++) {
+    const x = k * FSTEP, x2 = x * x;
+    let ts = x, ss = x, tc = 1, cc = 1;
+    for (let n = 1; n < 14; n++) { ts *= -x2 / ((2 * n) * (2 * n + 1)); ss += ts; tc *= -x2 / ((2 * n - 1) * (2 * n)); cc += tc; }
+    s[k] = k === 0 ? 0 : k === Q ? 1 : ss; c[k] = k === 0 ? 1 : k === Q ? 0 : cc;
+  }
+  for (let k = 0; k < 4 * Q; k++) {
+    const q = Math.floor(k / Q), r = k % Q;
+    FSIN[k] = q === 0 ? s[r] : q === 1 ? c[r] : q === 2 ? -s[r] : -c[r];
+    FCOS[k] = q === 0 ? c[r] : q === 1 ? -s[r] : q === 2 ? -c[r] : s[r];
+  }
+}
+const wrapF = (k: number) => ((k % (64 * SUB)) + 64 * SUB) % (64 * SUB);
+/** The fine yaw index (π/2048 steps) nearest a yaw in radians: + − × ÷ and rounding only. */
+export const fineOf = (yaw: number) => wrapF(Math.round(yaw / FSTEP));
 /** The yaw index whose forward (sin, cos) points most along (dx, dz); ties keep the lower index. */
 export function yawIndexOf(dx: number, dz: number) {
   let best = 0, bestDot = -Infinity;
@@ -158,7 +208,34 @@ function obb(cx: number, cz: number, hx: number, hz: number, k: number): OBB {
   const c = COS[wrap(k)], s = SIN[wrap(k)], ac = Math.abs(c), as = Math.abs(s);
   return { cx, cz, hx, hz, c, s, ex: ac * hx + as * hz, ez: as * hx + ac * hz };
 }
+/** A box turned by fine yaw index kf (k·64 is obb's k: the same box). */
+function obbF(cx: number, cz: number, hx: number, hz: number, kf: number): OBB {
+  const c = FCOS[wrapF(kf)], s = FSIN[wrapF(kf)], ac = Math.abs(c), as = Math.abs(s);
+  return { cx, cz, hx, hz, c, s, ex: ac * hx + as * hz, ez: as * hx + ac * hz };
+}
 const rectObb = (r: Box2) => obb((r.minX + r.maxX) / 2, (r.minZ + r.maxZ) / 2, (r.maxX - r.minX) / 2, (r.maxZ - r.minZ) / 2, 0);
+const isRuinBox = (s: RuinSolid): s is RuinBox => (s as RuinBox).cx !== undefined;
+/** A solid as a planner box: a rect as is, an oriented box at its fine yaw. */
+const solidObb = (s: RuinSolid) => (isRuinBox(s) ? obbF(s.cx, s.cz, s.hx, s.hz, fineOf(s.yaw)) : rectObb(s));
+/** A plan collider's box (a coarse yaw k·π/32 is the fine index 64k exactly). */
+const colliderObb = (c: { cx: number; cz: number; hx: number; hz: number; yaw: number }) => obbF(c.cx, c.cz, c.hx, c.hz, Math.round(c.yaw / FSTEP));
+/** Every corner of b lies within tol of box P. */
+function insideObb(b: OBB, P: OBB, tol: number) {
+  for (const [u, v] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+    const x = b.cx + b.c * b.hx * u + b.s * b.hz * v, z = b.cz - b.s * b.hx * u + b.c * b.hz * v;
+    if (dist2(P, x, z) > tol * tol) return false;
+  }
+  return true;
+}
+/** Even-odd point in polygon (x,z pairs). */
+function inPoly(p: readonly number[], x: number, z: number) {
+  let hit = false;
+  for (let i = 0, j = p.length - 2; i < p.length; j = i, i += 2) {
+    const xi = p[i], zi = p[i + 1], xj = p[j], zj = p[j + 1];
+    if ((zi > z) !== (zj > z) && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) hit = !hit;
+  }
+  return hit;
+}
 /** a and b grown by pad overlap (open boxes: touching is not overlapping). */
 function overlap(a: OBB, b: OBB, pad: number) {
   const dx = b.cx - a.cx, dz = b.cz - a.cz;
@@ -284,6 +361,60 @@ class SegGrid {
   }
 }
 
+/**
+ * Dry land on a 2 m grid over the bounds (cell centres): the land's polygons, less its holes, plus the bridges'
+ * asphalt and sidewalks. Scanline fill with + − × ÷ only, so every engine marks the same cells.
+ */
+function landGrid(land: RuinLand, bounds: Box2, bridges: readonly { pts: readonly number[]; half: number; sidewalk: number }[]) {
+  const C = 2, x0 = bounds.minX, z0 = bounds.minZ;
+  const nx = Math.max(1, Math.ceil((bounds.maxX - x0) / C)), nz = Math.max(1, Math.ceil((bounds.maxZ - z0) / C));
+  const cells = new Uint8Array(nx * nz);
+  const xs: number[] = [];
+  const fill = (poly: readonly number[], value: number) => {
+    for (let j = 0; j < nz; j++) {
+      const z = z0 + (j + 0.5) * C;
+      xs.length = 0;
+      for (let i = 0, k = poly.length - 2; i < poly.length; k = i, i += 2) {
+        const xi = poly[i], zi = poly[i + 1], xk = poly[k], zk = poly[k + 1];
+        if ((zi > z) !== (zk > z)) xs.push(xi + ((z - zi) * (xk - xi)) / (zk - zi));
+      }
+      xs.sort((a, b) => a - b);
+      for (let m = 0; m + 1 < xs.length; m += 2) {
+        const i0 = Math.max(0, Math.ceil((xs[m] - x0) / C - 0.5)), i1 = Math.min(nx - 1, Math.ceil((xs[m + 1] - x0) / C - 0.5) - 1);
+        for (let i = i0; i <= i1; i++) cells[j * nx + i] = value;
+      }
+    }
+  };
+  for (const p of land.polys) fill(p, 1);
+  for (const p of land.holes ?? []) fill(p, 0);
+  for (const r of bridges) {
+    const w = r.half + r.sidewalk;
+    for (let k = 2; k < r.pts.length; k += 2) {
+      const ax = r.pts[k - 2], az = r.pts[k - 1], vx = r.pts[k] - ax, vz = r.pts[k + 1] - az, l2 = vx * vx + vz * vz;
+      const i0 = Math.max(0, Math.floor((Math.min(ax, ax + vx) - w - x0) / C)), i1 = Math.min(nx - 1, Math.floor((Math.max(ax, ax + vx) + w - x0) / C));
+      const j0 = Math.max(0, Math.floor((Math.min(az, az + vz) - w - z0) / C)), j1 = Math.min(nz - 1, Math.floor((Math.max(az, az + vz) + w - z0) / C));
+      for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+        const x = x0 + (i + 0.5) * C, z = z0 + (j + 0.5) * C, t = l2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * vx + (z - az) * vz) / l2)) : 0;
+        const dx = x - ax - vx * t, dz = z - az - vz * t;
+        if (dx * dx + dz * dz <= w * w) cells[j * nx + i] = 1;
+      }
+    }
+  }
+  const has = (x: number, z: number) => {
+    const i = Math.floor((x - x0) / C), j = Math.floor((z - z0) / C);
+    return i >= 0 && j >= 0 && i < nx && j < nz && cells[j * nx + i] === 1;
+  };
+  return {
+    has,
+    /** The box's centre and its four corners stand on land. */
+    box(b: OBB) {
+      if (!has(b.cx, b.cz)) return false;
+      for (const [u, v] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) if (!has(b.cx + b.c * b.hx * u + b.s * b.hz * v, b.cz - b.s * b.hx * u + b.c * b.hz * v)) return false;
+      return true;
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------------------------------------
 // Vehicle sizes for footprints (the wreck models are vehicle-models.ts' own).
 // ---------------------------------------------------------------------------------------------------------
@@ -310,14 +441,32 @@ function rolled(kind: RuinKind, v: number, roll: number) {
 // The planner.
 // ---------------------------------------------------------------------------------------------------------
 
-type ColDraft = { cx: number; cz: number; hx: number; hz: number; k: number; top: number; idx: number; item: Draft | null; grid: BoxGrid | null; gid: number };
-type Draft = { kind: RuinKind; x: number; z: number; y: number; k: number; roll: number; s: number; v: number; ext: number[] | null; col: ColDraft | null; smash: boolean; dead: boolean; id: number; idx: number };
+/** fy: a fine yaw index (π/2048 steps) when the yaw is not a multiple of π/32 (a rotated building's face), else -1. */
+type ColDraft = { cx: number; cz: number; hx: number; hz: number; k: number; fy: number; top: number; idx: number; item: Draft | null; grid: BoxGrid | null; gid: number };
+type Draft = { kind: RuinKind; x: number; z: number; y: number; k: number; fy: number; roll: number; s: number; v: number; ext: number[] | null; col: ColDraft | null; smash: boolean; dead: boolean; id: number; idx: number };
+/** A plot's street front: start corner (x0, z0), unit along (t) and outward normal (n), width and depth, its yaw (k coarse, fk fine or -1). */
+type Face = { q: number; k: number; fk: number; x0: number; z0: number; tx: number; tz: number; nx: number; nz: number; w: number; depth: number };
 type Cluster = { cols: ColDraft[] };
 type ChunkOut = { key: number; items: Draft[]; clusters: Cluster[]; fires: { x: number; z: number; y: number }[]; columns: { x: number; z: number; h: number }[]; holes: { x: number; z: number }[]; craters: { x: number; z: number }[]; hash: number };
 type RoadC = { id: number; pts: number[]; cum: number[]; segK: number[]; len: number; clearA: number; clearB: number; half: number; walk: number; sidewalk: number; cls: 'R1' | 'R2' | 'hem'; traffic: boolean; bridge: boolean; a: number; b: number };
 
 const byXZ = (a: { x: number; z: number }, b: { x: number; z: number }) => a.x - b.x || a.z - b.z;
 const byBox = (a: Box2, b: Box2) => a.minX - b.minX || a.minZ - b.minZ || a.maxX - b.maxX || a.maxZ - b.maxZ;
+/** Rects first (by box), then oriented boxes (by centre, size, yaw). */
+const bySolid = (a: RuinSolid, b: RuinSolid) => {
+  const oa = isRuinBox(a), ob = isRuinBox(b);
+  if (oa !== ob) return oa ? 1 : -1;
+  if (!oa || !ob) return byBox(a as Box2, b as Box2);
+  return a.cx - b.cx || a.cz - b.cz || a.hx - b.hx || a.hz - b.hz || a.yaw - b.yaw;
+};
+const byPoly = (a: readonly number[] | undefined, b: readonly number[] | undefined) => {
+  const la = a?.length ?? 0, lb = b?.length ?? 0;
+  if (la !== lb) return la - lb;
+  for (let i = 0; i < la; i++) if (a![i] !== b![i]) return a![i] - b![i];
+  return 0;
+};
+/** How far a district plot's rubble (its drawn extent) and corner collider may reach beyond its footprint (m). */
+export const RUBBLE_MARGIN = 1.2;
 
 /** Per class: [cars, motorbikes] per 100 m of road (§6c.1). */
 const WRECKS_PER_100: Record<'R1' | 'R2' | 'hem', [number, number]> = { R1: [2.5, 3], R2: [1.5, 2.5], hem: [0, 1.5] };
@@ -325,6 +474,10 @@ const CELL_LEN = 12.5;
 /** Layers of the chunk detail pass (their RNG streams). */
 const L = { wreck: 0, corner: 1, shell: 2, tower: 3, sign: 4, window: 5, tree: 6, pole: 7, vine: 8, moss: 9, curb: 10, crackTuft: 11, crack: 12, green: 13, litter: 14, stall: 15, barricade: 16, checkpoint: 17, crater: 18, tangle: 20 } as const;
 const MAX_ITEMS = 4096;
+/** Grass clump candidates the polygon greens (the districts' parks) share in one chunk (a fully green chunk would have 2700). */
+const GRASS_CAP = 900;
+/** Clumps in one polygon-green strip item at most (about 2,600 triangles: the runtime builds a chunk an item at a time between frames). */
+const GRASS_PIECE = 120;
 
 /** Puts the input in a canonical order, so a shuffled input plans identically. */
 function canonical(input: RuinInput): RuinInput {
@@ -337,13 +490,16 @@ function canonical(input: RuinInput): RuinInput {
     trees: [...input.trees].sort((a, b) => byXZ(a, b) || a.size - b.size),
     poles: [...input.poles].sort((a, b) => (a.line < b.line ? -1 : a.line > b.line ? 1 : 0) || byXZ(a, b)),
     lamps: [...input.lamps].sort(byXZ),
-    greens: [...input.greens].sort(byBox),
+    greens: [...input.greens].sort((a, b) => byBox(a, b) || byPoly(a.poly, b.poly)),
     stalls: [...input.stalls].sort((a, b) => byXZ(a, b) || (a.kind < b.kind ? -1 : a.kind > b.kind ? 1 : 0)),
     keepClear: [...input.keepClear].sort((a, b) => byXZ(a, b) || a.r - b.r || Number(!!a.major) - Number(!!b.major)),
-    solids: [...input.solids].sort(byBox),
+    solids: [...input.solids].sort(bySolid),
     walks: input.walks ? [...input.walks].sort((a, b) => a.ax - b.ax || a.az - b.az || a.bx - b.bx || a.bz - b.bz) : undefined,
     checkpoints: input.checkpoints ? [...input.checkpoints].sort(byXZ) : undefined,
     fleet: input.fleet,
+    // (the land is a union of polygons less holes: their order never matters)
+    land: input.land,
+    lane: input.lane,
   };
 }
 
@@ -418,16 +574,34 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
     return best as { r: RoadC; s: number; off: number; d: number } | null;
   }
   const solids = new BoxGrid();
-  for (const s of input.solids) solids.add(rectObb(s), -1);
+  for (const s of input.solids) solids.add(solidObb(s), -1);
+  // A plot with an oriented box (the districts'): its box at its fine yaw, its front face along it.
+  const plotObb = new Map<RuinPlotInput, OBB>();
+  for (const p of input.plots) if (p.box) plotObb.set(p, obbF(p.box.cx, p.box.cz, p.box.hx, p.box.hz, fineOf(p.box.yaw)));
   const plotGrid = new BoxGrid();
-  for (const p of input.plots) plotGrid.add(rectObb(p), p.id);
+  for (const p of input.plots) plotGrid.add(plotObb.get(p) ?? rectObb(p), p.id);
+  /** A plot's middle (its box's centre, else its rect's): which chunk plans it. */
+  const middle = (p: RuinPlotInput) => (p.box ? [p.box.cx, p.box.cz] : [(p.minX + p.maxX) / 2, (p.minZ + p.maxZ) / 2]);
+  /** The front face of a plot: today's rect plots by `facing` (or quadrant q), box plots along their box. */
+  const faceOf = (p: RuinPlotInput, q?: number): Face => {
+    const B = plotObb.get(p);
+    if (!B || !p.box) return face(q === undefined ? p : p.ground ?? p, q);
+    const kf = fineOf(p.box.yaw);
+    return { q: -1, k: wrap(Math.round(kf / SUB)), fk: kf % SUB ? kf : -1, x0: B.cx + B.s * B.hz - B.c * B.hx, z0: B.cz + B.c * B.hz + B.s * B.hx, tx: B.c, tz: -B.s, nx: B.s, nz: B.c, w: B.hx * 2, depth: B.hz * 2 };
+  };
+  /** The solid lies inside the plot (its own building's collider, which ruins against its wall may touch). */
+  const ownSolid = (p: RuinPlotInput) => {
+    const B = plotObb.get(p);
+    return B ? (b: OBB) => insideObb(b, B, 0.05) : (b: OBB) => insideRect(b, p);
+  };
+  const landAt = input.land ? landGrid(input.land, input.bounds, roads.filter((r) => r.bridge)) : null;
   const keep = input.keepClear;
   const keepGrid = new SegGrid();
   keep.forEach((k, i) => keepGrid.add(k.x, k.z, k.x, k.z, i));
   /** The box comes within the keep-clear radius (+ extra) of some spot. */
   const keepHit = (b: OBB, extra = 0) => keepGrid.some(b.cx - b.ex - 70, b.cz - b.ez - 70, b.cx + b.ex + 70, b.cz + b.ez + 70, (id) => {
     const k = keep[keepGrid.segs[id * 5 + 4]], r = k.r + extra;
-    return dist2(b, k.x, k.z) < r * r;
+    return r > 0 && dist2(b, k.x, k.z) < r * r;
   });
   const juncs = input.junctions;
   const juncGrid = new SegGrid();
@@ -444,31 +618,37 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
     juncGrid.some(x - maxJr - 2, z - maxJr - 2, x + maxJr + 2, z + maxJr + 2, (id) => { const j = juncs[juncGrid.segs[id * 5 + 4]], dx = x - j.x, dz = z - j.z; if (dx * dx + dz * dz <= (j.r + 2) * (j.r + 2)) clear = Math.max(clear, j.r + 0.5); return false; });
     if (end) r.clearB = clear; else r.clearA = clear;
   }
-  const inGreen = (x: number, z: number) => input.greens.some((g) => x > g.minX && x < g.maxX && z > g.minZ && z < g.maxZ);
+  const inGreen = (x: number, z: number) => input.greens.some((g) => x > g.minX && x < g.maxX && z > g.minZ && z < g.maxZ && (!g.poly || inPoly(g.poly, x, z)));
 
   // ---- Global pass over the road graph. ----
   const global = new BoxGrid();          // global colliders (tag = cluster) and reserved fleet spots (tag −2)
   const globalDrafts: Draft[] = [], globalClusters: Cluster[] = [];
   let clusterSeq = 0;
   const draft = (kind: RuinKind, x: number, z: number, k: number, extra: Partial<Draft> = {}): Draft =>
-    ({ kind, x, z, y: 0, k: wrap(k), roll: 0, s: 1, v: 0, ext: null, col: null, smash: false, dead: false, id: -1, idx: -1, ...extra });
+    ({ kind, x, z, y: 0, k: wrap(k), fy: -1, roll: 0, s: 1, v: 0, ext: null, col: null, smash: false, dead: false, id: -1, idx: -1, ...extra });
+  /** Half the drive lane (input.lane) and its centre lines: every traffic road not fully blocked (set after the full blocks). */
+  const laneHalf = input.lane && input.lane > 0 ? input.lane / 2 : 0;
+  let drives: SegGrid | null = null;
 
   /**
    * Gives d a collider (cx, cz, hx, hz, k, top) when the box keeps 1 m from every walking leg, overlaps no solid (pad
    * apart), no other ruin collider (pad apart; padSame inside the same cluster), no keep-clear spot and stays inside
-   * `within` (a chunk, less 0.6 m). Returns false and leaves d without one otherwise.
+   * `within` (a chunk, less 0.6 m), on land and out of the drive lanes when the input has them. `fy` turns the box by
+   * a fine yaw instead (a rotated building's face). Returns false and leaves d without one otherwise.
    */
-  function place(d: Draft, cx: number, cz: number, hx: number, hz: number, k: number, top: number, grids: BoxGrid[], o: { pad?: number; padSame?: number; cluster?: number; within?: Box2 | null; keepExtra?: number; ignoreSolid?: (b: OBB) => boolean } = {}) {
-    const b = obb(cx, cz, hx, hz, k), pad = o.pad ?? 1.1, cluster = o.cluster ?? -1;
+  function place(d: Draft, cx: number, cz: number, hx: number, hz: number, k: number, top: number, grids: BoxGrid[], o: { pad?: number; padSame?: number; cluster?: number; within?: Box2 | null; keepExtra?: number; ignoreSolid?: (b: OBB) => boolean; fy?: number } = {}) {
+    const fy = o.fy ?? -1, b = fy >= 0 ? obbF(cx, cz, hx, hz, fy) : obb(cx, cz, hx, hz, k), pad = o.pad ?? 1.1, cluster = o.cluster ?? -1;
     if (o.within && (b.cx - b.ex < o.within.minX + 0.6 || b.cx + b.ex > o.within.maxX - 0.6 || b.cz - b.ez < o.within.minZ + 0.6 || b.cz + b.ez > o.within.maxZ - 0.6)) return false;
     if (b.cx - b.ex < input.bounds.minX || b.cx + b.ex > input.bounds.maxX || b.cz - b.ez < input.bounds.minZ || b.cz + b.ez > input.bounds.maxZ) return false;
+    if (landAt && !landAt.box(b)) return false;
     if (walks.near(b, 1.0)) return false;
+    if (drives && drives.near(b, laneHalf)) return false;
     if (keepHit(b, o.keepExtra ?? 0)) return false;
     const ignore = o.ignoreSolid;
     if (solids.some(b.cx - b.ex - pad, b.cz - b.ez - pad, b.cx + b.ex + pad, b.cz + b.ez + pad, (id) => !(ignore && ignore(solids.boxes[id])) && overlap(b, solids.boxes[id], pad))) return false;
     for (const g of grids) if (g.hits(b, pad, cluster, o.padSame ?? pad)) return false;
     const grid = grids[grids.length - 1];
-    d.col = { cx, cz, hx, hz, k: wrap(k), top, idx: -1, item: d, grid, gid: grid.add(b, cluster) };
+    d.col = { cx, cz, hx, hz, k: wrap(k), fy, top, idx: -1, item: d, grid, gid: grid.add(b, cluster) };
     return true;
   }
 
@@ -521,16 +701,21 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
     return roots.size;
   }
   const baseComponents = components(blockedEdges);
+  // Traffic arms per node, and how many of them are fully blocked (with a drive lane: a junction keeps two open).
+  const armsAt = new Map<number, number>(), blockedAt = new Map<number, number>();
+  for (const r of traffic) for (const n of [r.a, r.b]) armsAt.set(n, (armsAt.get(n) ?? 0) + 1);
+  const keepsTwoOpen = (n: number) => { const arms = armsAt.get(n) ?? 0; return arms < 3 || arms - (blockedAt.get(n) ?? 0) - 1 >= 2; };
 
   {
     // Full carriageway blocks: a wall of wrecks across ≤ 10% of R1/R2 edges, never on bridges, never within 60 m of a
-    // keep-clear spot, never disconnecting the car graph.
+    // keep-clear spot, never disconnecting the car graph (with a drive lane, never leaving a junction one open arm).
     const eligible = roads.filter((r) => r.traffic && r.cls !== 'hem' && !r.bridge && r.len >= 40);
     eligible.forEach((r, rank) => {
       if (!weyl(rank, 0.08, 11)) return;
       const R = rngFor(1, r.id);
       const p = at(r, r.len * (0.35 + R() * 0.3));
       if (keep.some((k) => (k.major ?? k.r >= 10) && (k.x - p.x) * (k.x - p.x) + (k.z - p.z) * (k.z - p.z) < (k.r + 60) * (k.r + 60)) || junctionNear(p.x, p.z, 14)) return;
+      if (laneHalf && (!keepsTwoOpen(r.a) || !keepsTwoOpen(r.b))) return;
       const trial = new Set(blockedEdges); trial.add(r.id);
       if (components(trial) !== baseComponents) return;
       const cluster = clusterSeq++, cl: Cluster = { cols: [] };
@@ -551,23 +736,34 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
         made.push(draft('moto', q.x + (R() - 0.5) * 3, q.z + (R() - 0.5) * 3, Math.floor(R() * 64), { roll: R() < 0.5 ? 15 : -15, v: Math.floor(R() * 3) + 8 * Math.floor(R() * 16), smash: true }));
       }
       blockedEdges.add(r.id);
+      blockedAt.set(r.a, (blockedAt.get(r.a) ?? 0) + 1); blockedAt.set(r.b, (blockedAt.get(r.b) ?? 0) + 1);
       globalDrafts.push(...made); globalClusters.push(cl);
     });
   }
+  if (laneHalf) {
+    // The drive lanes: down the centre line of every traffic road that is not fully blocked (hẻm wrecks are walk-over).
+    const lanes = new SegGrid();
+    for (const r of roads) {
+      if (!r.traffic || r.cls === 'hem' || blockedEdges.has(r.id)) continue;
+      for (let i = 2; i < r.pts.length; i += 2) lanes.add(r.pts[i - 2], r.pts[i - 1], r.pts[i], r.pts[i + 1]);
+    }
+    drives = lanes;
+  }
   {
     // Pile-ups (3–6 vehicles, sometimes a motorbike on a car's roof) at 15% of junction approaches; a quarter of them
-    // block the inbound side.
+    // block the inbound side (with a drive lane: up to it, on roads wide enough).
     approaches.forEach((ap, rank) => {
       const r = ap.r;
       if (!r.traffic || r.bridge || r.len < 36 || !weyl(rank, 0.15, 23)) return;
       const R = rngFor(2, ap.j, r.id, ap.end), j = juncs[ap.j];
       const along = j.r + 9 + R() * 9, s = ap.end ? r.len - along : along;
-      const p = at(r, s), side = R() < 0.5 ? -1 : 1, block = R() < 0.25;
+      const p = at(r, s), side = R() < 0.5 ? -1 : 1, block = R() < 0.25 && (!laneHalf || r.half >= 6);
       const cluster = clusterSeq++, cl: Cluster = { cols: [] }, made: Draft[] = [];
       const n = 3 + Math.floor(R() * 4);
       for (let i = 0; i < n * 3 && made.length < n; i++) {
         const first = made.length === 0;
-        const lat = block && made.length < 2 ? side * (r.half * (made.length ? 0.72 : 0.3)) : side * (0.6 + R() * (r.half - 1.6));
+        const lat = block && made.length < 2 ? side * Math.max(r.half * (made.length ? 0.72 : 0.3), laneHalf ? laneHalf + (made.length ? 3.4 : 2.45) : 0)
+          : side * (laneHalf ? laneHalf + 1 + R() * Math.max(0, r.half - laneHalf - 2) : 0.6 + R() * (r.half - 1.6));
         const q = beside(p, lat), ds = (R() - 0.5) * 9;
         const x = q.x + p.hx * ds, z = q.z + p.hz * ds;
         const kind: 'car' | 'moto' | 'bus' = R() < 0.18 ? 'moto' : 'car';
@@ -603,7 +799,10 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
         const p = at(road, s);
         if (junctionNear(p.x, p.z, 10)) continue;
         const kind = Math.floor(R() * 3), side = R() < 0.5 ? -1 : 1, onSide = R() < 0.5;
-        const roll = onSide ? (side > 0 ? 16 : -16) : 0, k = wrap(p.k + (R() < 0.5 ? 0 : 32) + (onSide ? Math.floor(R() * 3) - 1 : side * (2 + Math.floor(R() * 4))));
+        const flip = R() < 0.5 ? 0 : 32;
+        // (beside a drive lane on a 7 m road, a skewed bus turns at most two steps)
+        const turn = onSide ? Math.floor(R() * 3) - 1 : side * (laneHalf && road.half < 9 ? 1 + (Math.floor(R() * 4) & 1) : 2 + Math.floor(R() * 4));
+        const roll = onSide ? (side > 0 ? 16 : -16) : 0, k = wrap(p.k + flip + turn);
         const f = rolled('bus', kind, roll);
         const q = beside(p, side * Math.max(0, road.half - f.hx - 0.6 - (onSide ? 0 : 1.6)));
         const d = draft('bus', q.x, q.z, k, { roll, v: kind + 8 * Math.floor(R() * 16) + (R() < 0.35 ? 256 : 0), smash: true });
@@ -629,10 +828,13 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
       for (const r of lanes) { if (target <= r.len) { road = r; break; } target -= r.len; }
       const p = at(road, target);
       if (junctionNear(p.x, p.z, 6)) continue;
-      const side = R() < 0.5 ? -1 : 1, q = beside(p, side * road.half * (kind === 'car' ? 0.43 : 0.77) + (R() - 0.5));
+      // (a car beside a drive lane keeps its whole turned footprint out of it)
+      const lat = kind === 'car' ? (laneHalf ? Math.max(road.half * 0.43, laneHalf + 2.75) : road.half * 0.43) : road.half * 0.77;
+      const side = R() < 0.5 ? -1 : 1, q = beside(p, side * lat + (R() - 0.5));
       const k = wrap(p.k + (side > 0 ? 0 : 32) + Math.floor(R() * 9) - 4);
       const b = obb(q.x, q.z, kind === 'car' ? 1.3 : 0.6, kind === 'car' ? 2.7 : 1.3, k);
       if (walks.near(b, 0.6) || keepHit(b) || global.hits(b, 2.0) || solids.hits(b, 0.8)) continue;
+      if ((drives && drives.near(b, laneHalf)) || (landAt && !landAt.box(b))) continue;
       global.add(b, -2);
       fleetSpots.push({ x: r2(q.x), z: r2(q.z), yaw: k * STEP, kind });
       i++;
@@ -719,9 +921,9 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
     let localCluster = 1_000_000 + key * 64;
     const push = (d: Draft) => { if (items.length < MAX_ITEMS) items.push(d); return d; };
     /** A lone collider kept closer to its neighbours (pad), checked for pockets as a cluster of one. */
-    const solo = (d: Draft, x: number, z: number, hx: number, hz: number, k: number, top: number, pad: number, ignoreSolid?: (b: OBB) => boolean) => {
+    const solo = (d: Draft, x: number, z: number, hx: number, hz: number, k: number, top: number, pad: number, ignoreSolid?: (b: OBB) => boolean, fy = -1) => {
       const cluster = localCluster++;
-      if (!place(d, x, z, hx, hz, k, top, grids, { within: box, pad, cluster, ignoreSolid })) return false;
+      if (!place(d, x, z, hx, hz, k, top, grids, { within: box, pad, cluster, ignoreSolid, fy })) return false;
       clusters.push({ cols: [d.col!] });
       return true;
     };
@@ -750,7 +952,9 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
       for (let attempt = 0; attempt < 12 && !cl.cols.length; attempt++) {
         const ap = arms[(first + attempt) % arms.length], r = ap.r, along = jn.r + 4 + (Math.floor(attempt / arms.length) % 3) * 2.5, s = ap.end ? r.len - along : along;
         if (s < 4 || s > r.len - 4) continue;
-        const p = at(r, s), side = attempt % 2 ? -side0 : side0, l = Math.min(r.half * 1.1, len);
+        // (with a drive lane the bags stop short of it)
+        const p = at(r, s), side = attempt % 2 ? -side0 : side0, l = laneHalf ? Math.min(r.half * 1.1, len, r.half - laneHalf - 0.3) : Math.min(r.half * 1.1, len);
+        if (l < 1) continue;
         // Every piece runs across the road: its long axis is the box's side axis, so the yaw is the road's.
         const c = beside(p, side * (r.half - l / 2 - 0.3)), k = p.k, back = ap.end ? 1 : -1;
         const bags = draft('barricade', c.x, c.z, k, { s: r2(l), v: 0 + 4 * Math.floor(R() * 1000) });
@@ -788,13 +992,18 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
             for (let attempt = 0; attempt < 6 && !placed; attempt++) {
               const s = j * CELL_LEN + R() * cellLen, p = at(r, s);
               if (junctionNear(p.x, p.z, 3)) continue;
-              const side = R() < 0.5 ? -1 : 1, lane = kind === 'car' ? 0.43 : 0.77;
+              // (beside a drive lane a car keeps to the outer part of its half, and on a boulevard a motorbike keeps
+              // inside the curb bays)
+              const side = R() < 0.5 ? -1 : 1, lane = kind === 'car' ? (laneHalf && r.cls !== 'hem' ? Math.max(0.43, (laneHalf + 1.15) / r.half) : 0.43) : laneHalf && r.half >= 9 ? 7 / r.half : 0.77;
               const q = beside(p, side * (r.half * lane + (R() - 0.5) * 1.0));
               const pose = vehiclePose(R, kind, p.k, 1);
               const d = vehicleDraft(R, kind, q.x, q.z, pose.k, pose.roll, kind === 'car' ? 0.35 : 0.15);
               const f = rolled(d.kind, d.v & 7, pose.roll);
-              // A hẻm is too narrow for a collider 1 m off its centre line: its fallen bikes are walk-over.
-              if (r.cls === 'hem') { d.smash = true; push(d); placed = true; break; }
+              // A hẻm is too narrow for a collider 1 m off its centre line: its fallen bikes are walk-over (never at a door).
+              if (r.cls === 'hem') {
+                if (keepHit(obb(q.x, q.z, f.hx, f.hz, pose.k))) continue;
+                d.smash = true; push(d); placed = true; break;
+              }
               if (!place(d, q.x, q.z, f.hx, f.hz, pose.k, f.top, grids, { within: box, pad: 1.0 })) continue;
               push(d); placed = true;
               if (isBurnt(d) && d.kind !== 'moto') push(draft('scorch', q.x, q.z, d.k, { s: r2(1.3 + R() * 0.5), v: Math.floor(R() * 1000) }));
@@ -812,19 +1021,45 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
     }
     // Half-collapsed corners: a breach painted on the corner, slabs and rebar, a rubble slope with a collider core.
     for (const p of cornerPlots) {
-      const mx = (p.minX + p.maxX) / 2, mz = (p.minZ + p.maxZ) / 2;
+      const [mx, mz] = middle(p);
       if (!inChunk(mx, mz) || !weyl(cornerRank.get(p)!, 0.06, 31)) continue;
       const R = rngFor(5, cx, cz, L.corner, p.id);
-      const f = face(p), end = R() < 0.5, cxp = end ? f.x0 + f.tx * f.w : f.x0, czp = end ? f.z0 + f.tz * f.w : f.z0;
+      const f = faceOf(p), end = R() < 0.5, cxp = end ? f.x0 + f.tx * f.w : f.x0, czp = end ? f.z0 + f.tz * f.w : f.z0;
       const wFront = Math.min(f.w * 0.6, 2.5 + R() * 2), frac = 0.3 + R() * 0.2;
       const sideW = Math.min(f.depth * 0.6, 2 + R() * 1.5);
+      if (p.box) {
+        // A district building (its box, rotated or not): the rubble heaps against the corner, inside the footprint
+        // but for RUBBLE_MARGIN in front and to the side, on the end (and at the size, smaller near a door) whose heap
+        // keeps a metre off the doors and off the walking lines and door paths.
+        const M = RUBBLE_MARGIN, vBreach = Math.floor(R() * 1000), sRaw = 2.2 + R() * 1.4, vHeap = Math.floor(R() * 1000), H = 1.2 + R() * 0.6;
+        const burn = R() < 0.35, colH = 40 + R() * 30;
+        const tries: [boolean, number][] = [];
+        for (const e of end ? [true, false] : [false, true]) for (const size of [sRaw, sRaw * 0.75, 1.6, 1.3]) tries.push([e, size]);
+        for (const [e, size] of tries) {
+          const ex = e ? f.x0 + f.tx * f.w : f.x0, ez = e ? f.z0 + f.tz * f.w : f.z0, inward = e ? -1 : 1;
+          const s = Math.min(size, f.w / 2 + M, f.depth / 2 + M), bx = ex + f.tx * inward * (s - M) + f.nx * (M - s), bz = ez + f.tz * inward * (s - M) + f.nz * (M - s);
+          const disc = f.fk >= 0 ? obbF(bx, bz, s, s, f.fk) : obb(bx, bz, s, s, f.k);
+          if (keepHit(disc, -1.5) || walks.near(disc, 0.2)) continue;
+          push(draft('breach', ex, ez, f.k, { fy: f.fk, s: p.h, v: (vBreach << 1) | (e ? 1 : 0), ext: [r2(frac), r2(wFront), r2(sideW), M] }));
+          const heap = push(draft('rubble', bx, bz, f.k, { fy: f.fk, s: r2(s), v: vHeap, ext: [r2(H), 1, 1] }));
+          const along = wFront * 0.5;
+          solo(heap, ex + f.tx * inward * along + f.nx * 0.6, ez + f.tz * inward * along + f.nz * 0.6, along, 0.6, f.k, 1.4, 0.3, ownSolid(p), f.fk);
+          holes.push({ x: r2(ex + f.nx * 2.2 + f.tx * inward * along), z: r2(ez + f.nz * 2.2 + f.tz * inward * along) });
+          if (burn) {
+            fires.push({ x: r2(ex + f.tx * inward + f.nx * 0.5), z: r2(ez + f.tz * inward + f.nz * 0.5), y: 0.4 });
+            if (columns.length < 1) columns.push({ x: r2(ex), z: r2(ez), h: r2(colH) });
+          }
+          break;
+        }
+        continue;
+      }
       push(draft('breach', cxp, czp, f.k, { s: p.h, v: (Math.floor(R() * 1000) << 1) | (end ? 1 : 0), ext: [r2(frac), r2(wFront), r2(sideW)] }));
       // The slope spills from the corner over the sidewalk; its high core hugs the wall (inside the plot + 1.2 m).
       const inward = end ? -1 : 1, along = wFront * 0.5;
       const bx = cxp + f.tx * inward * along + f.nx * 1.6, bz = czp + f.tz * inward * along + f.nz * 1.6;
       const heap = push(draft('rubble', bx, bz, f.k, { s: 2.2 + R() * 1.4, v: Math.floor(R() * 1000), ext: [r2(1.2 + R() * 0.6), 1] }));
       const ccx = cxp + f.tx * inward * along + f.nx * 0.6, ccz = czp + f.tz * inward * along + f.nz * 0.6;
-      solo(heap, ccx, ccz, wFront * 0.5, 0.6, f.k, 1.4, 0.3, (b) => insideRect(b, p));
+      solo(heap, ccx, ccz, wFront * 0.5, 0.6, f.k, 1.4, 0.3, ownSolid(p));
       holes.push({ x: r2(cxp + f.nx * 2.2 + f.tx * inward * along), z: r2(czp + f.nz * 2.2 + f.tz * inward * along) });
       if (R() < 0.35) {
         fires.push({ x: r2(bx), z: r2(bz), y: 0.4 });
@@ -846,6 +1081,7 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
         const k = wrap(p.k + (side > 0 ? 16 : 48));            // faces the road
         const gap = obb(c.x, c.z, (w + 4) / 2, depth / 2 + 0.6, k);
         if (solids.hits(gap, 1.1) || plotGrid.hits(gap, 0.4) || global.hits(gap, 1.1) || local.hits(gap, 1.1) || keepHit(gap) || walks.near(gap, 1.0) || inGreen(c.x, c.z)) continue;
+        if (landAt && !landAt.box(gap)) continue;
         const cluster = localCluster++, cl: Cluster = { cols: [] };
         const fx = SIN[k], fz = COS[k];                       // toward the road
         const tx = COS[k], tz = -SIN[k];                      // along the road
@@ -867,35 +1103,35 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
     }
     // Towers: blown-out dark windows on a few lower floors with scorch streaks, glass on the ground.
     for (const p of towers) {
-      const mx = (p.minX + p.maxX) / 2, mz = (p.minZ + p.maxZ) / 2;
+      const [mx, mz] = middle(p);
       if (!inChunk(mx, mz) || !weyl(towerRank.get(p)!, 0.3, 37)) continue;
-      const R = rngFor(5, cx, cz, L.tower, p.id), f = face(p);
+      const R = rngFor(5, cx, cz, L.tower, p.id), f = faceOf(p);
       const n = 2 + Math.floor(R() * 3);
       for (let i = 0; i < n; i++) {
         const a = 0.15 + R() * 0.7, x = f.x0 + f.tx * f.w * a, z = f.z0 + f.tz * f.w * a;
-        push(draft('patch', x, z, f.k, { y: r2(4 + R() * Math.min(12, p.h - 8)), s: r2(2 + R() * 3), v: Math.floor(R() * 1000), ext: [r2(1.4 + R() * 1.6)] }));
+        push(draft('patch', x, z, f.k, { fy: f.fk, y: r2(4 + R() * Math.min(12, p.h - 8)), s: r2(2 + R() * 3), v: Math.floor(R() * 1000), ext: [r2(1.4 + R() * 1.6)] }));
       }
-      push(draft('shards', f.x0 + f.tx * f.w * 0.5 + f.nx * 2.5, f.z0 + f.tz * f.w * 0.5 + f.nz * 2.5, f.k, { s: Math.min(6, f.w * 0.4), v: Math.floor(R() * 1000) }));
+      push(draft('shards', f.x0 + f.tx * f.w * 0.5 + f.nx * 2.5, f.z0 + f.tz * f.w * 0.5 + f.nz * 2.5, f.k, { fy: f.fk, s: Math.min(6, f.w * 0.4), v: Math.floor(R() * 1000) }));
     }
     // Fallen shop signs lying tilted at the facade base (a low collider).
     for (const p of signPlots) {
-      const mx = (p.minX + p.maxX) / 2, mz = (p.minZ + p.maxZ) / 2;
+      const [mx, mz] = middle(p);
       if (!inChunk(mx, mz) || !weyl(signRank.get(p)!, 0.2, 41)) continue;
-      const R = rngFor(5, cx, cz, L.sign, p.id), f = face(p);
+      const R = rngFor(5, cx, cz, L.sign, p.id), f = faceOf(p);
       const w = Math.min(f.w - 1, 1.8 + R() * 1.6), a = 0.2 + R() * 0.6;
       const x = f.x0 + f.tx * f.w * a + f.nx * 0.55, z = f.z0 + f.tz * f.w * a + f.nz * 0.55;
-      const d = push(draft('sign', x, z, f.k, { s: r2(w), v: Math.floor(R() * 1000), roll: Math.floor(R() * 4) }));
-      solo(d, x, z, w / 2, 0.5, f.k, 0.6, 0.3, (b) => insideRect(b, p));
+      const d = push(draft('sign', x, z, f.k, { fy: f.fk, s: r2(w), v: Math.floor(R() * 1000), roll: Math.floor(R() * 4) }));
+      solo(d, x, z, w / 2, 0.5, f.k, 0.6, 0.3, ownSolid(p), f.fk);
     }
     // Broken and boarded windows: one per 6 m of frontage on 40% of the plots.
     for (const p of lowPlots) {
-      const mx = (p.minX + p.maxX) / 2, mz = (p.minZ + p.maxZ) / 2;
+      const [mx, mz] = middle(p);
       if (!inChunk(mx, mz) || !weyl(lowRank.get(p)!, 0.4, 43)) continue;
-      const R = rngFor(5, cx, cz, L.window, p.id), f = face(p), n = Math.max(1, Math.floor(f.w / 6));
+      const R = rngFor(5, cx, cz, L.window, p.id), f = faceOf(p), n = Math.max(1, Math.floor(f.w / 6));
       for (let i = 0; i < n; i++) {
         const a = (i + 0.2 + R() * 0.6) / n, ground = p.h < 6 || (R() < 0.3 && (p.style === 'home' || p.style === 'legacy'));
         const y = ground ? 1.3 + R() * 0.6 : 4.2 + R() * Math.min(1.2, p.h - 5.4);
-        push(draft('window', f.x0 + f.tx * f.w * a, f.z0 + f.tz * f.w * a, f.k, { y: r2(y), s: r2(0.9 + R() * 0.8), v: Math.floor(R() * 1000) * 2 + (R() < 0.1 ? 1 : 0), ext: [r2(0.8 + R() * 0.5)] }));
+        push(draft('window', f.x0 + f.tx * f.w * a, f.z0 + f.tz * f.w * a, f.k, { fy: f.fk, y: r2(y), s: r2(0.9 + R() * 0.8), v: Math.floor(R() * 1000) * 2 + (R() < 0.1 ? 1 : 0), ext: [r2(0.8 + R() * 0.5)] }));
       }
     }
     // Fallen street trees in 8% of the gaps between consecutive ones, across the sidewalk into the carriageway.
@@ -910,9 +1146,17 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
       d.ext!.push(g.species === 'palm' ? 1 : g.species === 'bamboo' ? 2 : 0);
       // Collider: the trunk and crown beyond 1 m from the walking line, over the carriageway (the part over the
       // walking line is walk-over).
-      const reach = Math.max(0, Math.abs(g.off) - (g.r.walk - 1.0)) + 0.3;
-      const usable = len + 1.2 - reach;                                // the crown reaches ~1.2 m past the tip
-      if (usable > 1.5) { const mid = reach + usable / 2; solo(d, base.x + SIN[k] * mid, base.z + COS[k] * mid, 1.0, usable / 2, k, 1.3, 0.6); }
+      // (beside a drive lane the collider starts half a metre further out: a metre off the walking line however the
+      // tree turned; a tree that then finds no room (the lane, a wreck) lies shorter, down to 3 m, or is not felled)
+      const reach = Math.max(0, Math.abs(g.off) - (g.r.walk - 1.0)) + 0.3 + (laneHalf ? 0.45 : 0);
+      for (let l = len; ; l -= 1.5) {
+        const usable = l + 1.2 - reach;                                // the crown reaches ~1.2 m past the tip
+        if (usable <= 1.5) { d.s = r2(l); break; }
+        const mid = reach + usable / 2;
+        if (solo(d, base.x + SIN[k] * mid, base.z + COS[k] * mid, 1.0, usable / 2, k, 1.3, 0.6)) { d.s = r2(l); break; }
+        if (!laneHalf) break;
+        if (l - 1.5 < 3) { kill(d); break; }
+      }
     });
     // Fallen power poles mid-span, with snapped cables drooping from the poles either side.
     spans.forEach((sp, rank) => {
@@ -922,11 +1166,13 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
       if (!n) return;
       const rp = at(n.r, n.s), toward = n.off > 0 ? -1 : 1;           // side −1 of the road is (hz, −hx)
       const k = wrap(yawIndexOf(-rp.hz * toward, rp.hx * toward) + Math.floor(R() * 7) - 3);
-      const flat = R() < 0.7, lean = flat ? 16 : 6 + Math.floor(R() * 7), len = 7.5;
+      let flat = R() < 0.7, lean = flat ? 16 : 6 + Math.floor(R() * 7);
+      const len = 7.5;
       const d = push(draft('pole', mx, mz, k, { roll: lean, s: len, v: Math.floor(R() * 1000) }));
       if (flat) {
         const reach = Math.abs(n.off) - (n.r.walk - 1.0), usable = len - reach;
-        if (usable > 1.2) solo(d, mx + SIN[k] * (reach + usable / 2), mz + COS[k] * (reach + usable / 2), 0.25, usable / 2, k, 0.45, 0.6);
+        // With a drive lane a pole with no room to lie (the lane, a wreck) leans over the street instead (no collider).
+        if (usable > 1.2 && !solo(d, mx + SIN[k] * (reach + usable / 2), mz + COS[k] * (reach + usable / 2), 0.25, usable / 2, k, 0.45, 0.6) && laneHalf) { flat = false; lean = 10; d.roll = lean; }
       }
       const tipH = flat ? 0.3 : COS[lean] * len, tipD = flat ? len : SIN[lean] * len;
       const tx = mx + SIN[k] * tipD, tz = mz + COS[k] * tipD;
@@ -937,16 +1183,16 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
     });
     // Vines down 35% of the street fronts, moss along 60% of the wall bases.
     for (const p of lowPlots) {
-      const mx = (p.minX + p.maxX) / 2, mz = (p.minZ + p.maxZ) / 2;
+      const [mx, mz] = middle(p);
       if (!inChunk(mx, mz)) continue;
-      const rank = lowRank.get(p)!, f = face(p);
+      const rank = lowRank.get(p)!, f = faceOf(p);
       if (weyl(rank, 0.35, 59)) {
         const R = rngFor(5, cx, cz, L.vine, p.id);
-        push(draft('vine', f.x0 + f.tx * f.w / 2, f.z0 + f.tz * f.w / 2, f.k, { s: r2(f.w), v: Math.floor(R() * 1000), ext: [p.h, r2(0.3 + R() * 0.4)] }));
+        push(draft('vine', f.x0 + f.tx * f.w / 2, f.z0 + f.tz * f.w / 2, f.k, { fy: f.fk, s: r2(f.w), v: Math.floor(R() * 1000), ext: [p.h, r2(0.3 + R() * 0.4)] }));
       }
       if (weyl(rank, 0.6, 61)) {
-        const R = rngFor(5, cx, cz, L.moss, p.id), g = face(p.ground ?? p, f.q);
-        push(draft('moss', g.x0 + g.tx * g.w / 2, g.z0 + g.tz * g.w / 2, g.k, { s: r2(g.w), v: Math.floor(R() * 1000), ext: [r2(0.3 + R() * 0.6)] }));
+        const R = rngFor(5, cx, cz, L.moss, p.id), g = faceOf(p, f.q);
+        push(draft('moss', g.x0 + g.tx * g.w / 2, g.z0 + g.tz * g.w / 2, g.k, { fy: g.fk, s: r2(g.w), v: Math.floor(R() * 1000), ext: [r2(0.3 + R() * 0.6)] }));
       }
     }
     // Weeds along the curbs (0.35 per metre of curb) and through cracks (1 per 30 m² of lane), cracks (1 per 20 m²):
@@ -970,9 +1216,26 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
     // Parks and squares gone wild: a clump of tall grass or a shrub per 6 m².
     {
       const R = rngFor(5, cx, cz, L.green);
+      // Polygon greens (the districts' parks and lawns) share GRASS_CAP clumps a chunk, in proportion to their areas
+      // here: their big lawns would otherwise fill the chunk's triangle budget many times over (and the plan with items).
+      let polyArea = 0;
+      for (const g of input.greens) if (g.poly) polyArea += Math.max(0, Math.min(g.maxX, box.maxX) - Math.max(g.minX, box.minX)) * Math.max(0, Math.min(g.maxZ, box.maxZ) - Math.max(g.minZ, box.minZ));
+      const polyShare = Math.min(1, GRASS_CAP * 6 / Math.max(1, polyArea));
       for (const g of input.greens) {
         const x0 = Math.max(g.minX, box.minX), x1 = Math.min(g.maxX, box.maxX), z0 = Math.max(g.minZ, box.minZ), z1 = Math.min(g.maxZ, box.maxZ);
         if (x1 <= x0 || z1 <= z0) continue;
+        if (g.poly) {
+          // A polygon's clumps here are strip items (as the weeds and cracks are), the builder scattering them in
+          // its bounds and keeping them to it: one per 6 m² of the polygon, less over GRASS_CAP, GRASS_PIECE at most
+          // an item. ext = [count, x0, z0, x1, z1, ...polygon].
+          const n = Math.floor((x1 - x0) * (z1 - z0) / 6 * polyShare + R());
+          for (let left = n, k = Math.ceil(n / GRASS_PIECE); k > 0; k--) {
+            const m = Math.ceil(left / k);
+            left -= m;
+            push(draft('grass', (x0 + x1) / 2, (z0 + z1) / 2, 0, { s: 1, v: Math.floor(R() * 1000) * 2, ext: [m, x0, z0, x1, z1, ...g.poly] }));
+          }
+          continue;
+        }
         const n = Math.floor((x1 - x0) * (z1 - z0) / 6 + R());
         for (let i = 0; i < n; i++) {
           const x = x0 + R() * (x1 - x0), z = z0 + R() * (z1 - z0), u = R(), sz = R();
@@ -1010,8 +1273,10 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
       const Rt = rngFor(5, cx, cz, L.tangle);
       const spots: { x: number; z: number; k: number }[] = [];
       for (const p of input.plots) {
-        if (p.style !== 'school' || !inChunk((p.minX + p.maxX) / 2, (p.minZ + p.maxZ) / 2)) continue;
-        const f = face(p), a = Rt() < 0.5 ? 0.22 : 0.78;
+        if (p.style !== 'school') continue;
+        const [mx, mz] = middle(p);
+        if (!inChunk(mx, mz)) continue;
+        const f = faceOf(p), a = Rt() < 0.5 ? 0.22 : 0.78;
         spots.push({ x: f.x0 + f.tx * f.w * a + f.nx * 1.9, z: f.z0 + f.tz * f.w * a + f.nz * 1.9, k: f.k + 16 });
       }
       const market = here.filter((s) => s.kind === 'stall');
@@ -1092,9 +1357,13 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
     c.items.forEach((d) => { if (d.col) localCol.set(d.col, localCol.size); });
     for (const d of c.items) {
       h = fnv(h, KIND_INDEX.get(d.kind)!); h = fnv(h, q100(d.x)); h = fnv(h, q100(d.z)); h = fnv(h, q100(d.y)); h = fnv(h, d.k); h = fnv(h, wrap(d.roll));
+      if (d.fy >= 0) h = fnv(h, 0x10000 + d.fy);
       h = fnv(h, q100(d.s)); h = fnv(h, d.v); h = fnv(h, d.smash ? 1 : 0);
       if (d.ext) for (const e of d.ext) h = fnv(h, q100(e));
-      if (d.col) { const k = d.col; h = fnv(h, q100(k.cx)); h = fnv(h, q100(k.cz)); h = fnv(h, q100(k.hx)); h = fnv(h, q100(k.hz)); h = fnv(h, k.k); h = fnv(h, q100(k.top)); }
+      if (d.col) {
+        const k = d.col; h = fnv(h, q100(k.cx)); h = fnv(h, q100(k.cz)); h = fnv(h, q100(k.hx)); h = fnv(h, q100(k.hz)); h = fnv(h, k.k); h = fnv(h, q100(k.top));
+        if (k.fy >= 0) h = fnv(h, 0x10000 + k.fy);
+      }
     }
     for (const f of c.fires) { h = fnv(h, q100(f.x)); h = fnv(h, q100(f.z)); }
     for (const f of c.holes) { h = fnv(h, q100(f.x)); h = fnv(h, q100(f.z)); }
@@ -1126,12 +1395,12 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
       if (!c.items.length) continue;
       const list: number[] = [];
       c.items.forEach((d, i) => {
-        const idx = out.items.length, item: RuinItem = { id: key * 4096 + i, kind: d.kind, x: r2(d.x), z: r2(d.z), y: r2(d.y), yaw: d.k * STEP, roll: wrap(d.roll) * STEP, s: r2(d.s), v: d.v, collider: -1, smash: d.smash };
+        const idx = out.items.length, item: RuinItem = { id: key * 4096 + i, kind: d.kind, x: r2(d.x), z: r2(d.z), y: r2(d.y), yaw: d.fy >= 0 ? d.fy * FSTEP : d.k * STEP, roll: wrap(d.roll) * STEP, s: r2(d.s), v: d.v, collider: -1, smash: d.smash };
         if (d.ext) item.ext = d.ext.map(r2);
         if (d.col) {
           item.collider = out.colliders.length;
           colIndex.set(d.col, out.colliders.length);
-          out.colliders.push({ cx: r2(d.col.cx), cz: r2(d.col.cz), hx: r2(d.col.hx), hz: r2(d.col.hz), yaw: d.col.k * STEP, top: r2(d.col.top), item: idx });
+          out.colliders.push({ cx: r2(d.col.cx), cz: r2(d.col.cz), hx: r2(d.col.hx), hz: r2(d.col.hz), yaw: d.col.fy >= 0 ? d.col.fy * FSTEP : d.col.k * STEP, top: r2(d.col.top), item: idx });
         }
         out.items.push(item); list.push(idx);
         out.stats.byKind[d.kind] = (out.stats.byKind[d.kind] ?? 0) + 1;
@@ -1146,7 +1415,7 @@ export function createRuinPlanner(rawInput: RuinInput, seed = APOCALYPSE_SEED) {
       const cols = cl.cols.map((c) => colIndex.get(c)).filter((i): i is number => i !== undefined);
       if (!cols.length) continue;
       let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
-      for (const i of cols) { const b = obb(out.colliders[i].cx, out.colliders[i].cz, out.colliders[i].hx, out.colliders[i].hz, Math.round(out.colliders[i].yaw / STEP)); minX = Math.min(minX, b.cx - b.ex); maxX = Math.max(maxX, b.cx + b.ex); minZ = Math.min(minZ, b.cz - b.ez); maxZ = Math.max(maxZ, b.cz + b.ez); }
+      for (const i of cols) { const b = colliderObb(out.colliders[i]); minX = Math.min(minX, b.cx - b.ex); maxX = Math.max(maxX, b.cx + b.ex); minZ = Math.min(minZ, b.cz - b.ez); maxZ = Math.max(maxZ, b.cz + b.ez); }
       out.clusters.push({ minX: r2(minX), minZ: r2(minZ), maxX: r2(maxX), maxZ: r2(maxZ), colliders: cols });
     }
     out.hash = h >>> 0;
@@ -1163,7 +1432,7 @@ export function planRuins(input: RuinInput, seed = APOCALYPSE_SEED): RuinPlan {
 }
 
 /** The face of an axis-aligned plot facing `facing` (or quadrant q): start corner, unit along (t), outward normal (n). */
-function face(p: Box2 & { facing?: number }, q?: number) {
+function face(p: Box2 & { facing?: number }, q?: number): Face {
   if (q === undefined) {
     const a = (((p.facing ?? 0) % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
     q = Math.round(a / (Math.PI / 2)) % 4;
@@ -1171,7 +1440,7 @@ function face(p: Box2 & { facing?: number }, q?: number) {
   const w = q % 2 ? p.maxZ - p.minZ : p.maxX - p.minX, depth = q % 2 ? p.maxX - p.minX : p.maxZ - p.minZ;
   const nx = q === 1 ? 1 : q === 3 ? -1 : 0, nz = q === 0 ? 1 : q === 2 ? -1 : 0;
   const x0 = q === 0 || q === 3 ? p.minX : p.maxX, z0 = q === 0 || q === 1 ? p.maxZ : p.minZ;
-  return { q, k: q * 16, x0, z0, tx: nz, tz: -nx, nx, nz, w, depth };
+  return { q, k: q * 16, fk: -1, x0, z0, tx: nz, tz: -nx, nx, nz, w, depth };
 }
 /** The box lies inside the rectangle (a plot's own ground collider, which ruins against its wall may touch). */
 const insideRect = (b: OBB, r: Box2) => b.cx - b.ex >= r.minX - 0.01 && b.cx + b.ex <= r.maxX + 0.01 && b.cz - b.ez >= r.minZ - 0.01 && b.cz + b.ez <= r.maxZ + 0.01;
@@ -1181,9 +1450,9 @@ const sameBox = (b: OBB, c: { cx: number; cz: number; hx: number; hz: number }) 
  * A cell where a person can stand (0.3 m from every box) that no path 1.0 m wide from outside the cluster's box
  * (+3 m) comes within 1 m of, or null. `gather` lists every box near the area; `own` says which belong to the cluster.
  */
-function pocketIn(cols: readonly { cx: number; cz: number; hx: number; hz: number; k: number }[], gather: (minX: number, minZ: number, maxX: number, maxZ: number, cb: (b: OBB) => void) => void, own: (b: OBB) => boolean) {
+function pocketIn(cols: readonly { cx: number; cz: number; hx: number; hz: number; k: number; fy: number }[], gather: (minX: number, minZ: number, maxX: number, maxZ: number, cb: (b: OBB) => void) => void, own: (b: OBB) => boolean) {
   let minX = Infinity, minZ = Infinity, maxX = -Infinity, maxZ = -Infinity;
-  for (const c of cols) { const b = obb(c.cx, c.cz, c.hx, c.hz, c.k); minX = Math.min(minX, b.cx - b.ex); maxX = Math.max(maxX, b.cx + b.ex); minZ = Math.min(minZ, b.cz - b.ez); maxZ = Math.max(maxZ, b.cz + b.ez); }
+  for (const c of cols) { const b = c.fy >= 0 ? obbF(c.cx, c.cz, c.hx, c.hz, c.fy) : obb(c.cx, c.cz, c.hx, c.hz, c.k); minX = Math.min(minX, b.cx - b.ex); maxX = Math.max(maxX, b.cx + b.ex); minZ = Math.min(minZ, b.cz - b.ez); maxZ = Math.max(maxZ, b.cz + b.ez); }
   return pocketScan(minX, minZ, maxX, maxZ, gather, own);
 }
 function pocketScan(minX: number, minZ: number, maxX: number, maxZ: number, gather: (minX: number, minZ: number, maxX: number, maxZ: number, cb: (b: OBB) => void) => void, own: ((b: OBB) => boolean) | null) {
@@ -1233,8 +1502,8 @@ function pocketScan(minX: number, minZ: number, maxX: number, maxZ: number, gath
  */
 export function findPockets(plan: RuinPlan, input: RuinInput) {
   const all = new BoxGrid();
-  for (const s of input.solids) all.add(rectObb(s), -1);
-  for (const c of plan.colliders) all.add(obb(c.cx, c.cz, c.hx, c.hz, Math.round(c.yaw / STEP)), -1);
+  for (const s of input.solids) all.add(solidObb(s), -1);
+  for (const c of plan.colliders) all.add(colliderObb(c), -1);
   const out: { cluster: number; x: number; z: number }[] = [];
   plan.clusters.forEach((cl, i) => {
     const p = pocketScan(cl.minX, cl.minZ, cl.maxX, cl.maxZ, (minX, minZ, maxX, maxZ, cb) => { all.some(minX, minZ, maxX, maxZ, (id) => { cb(all.boxes[id]); return false; }); }, null);
@@ -1387,10 +1656,10 @@ const FINE = new Set<RuinKind>(['vine', 'window', 'weeds', 'litter', 'grass', 'c
 const LOW_SKIP = new Set<RuinKind>(['vine', 'window', 'weeds', 'litter', 'shards', 'stall']);
 /** Triangles per chunk mesh: High (levels 0-3) and Low (4-5). */
 export const CHUNK_TRIS = { high: 30_000, low: 12_000 } as const;
-const skipLow = (it: RuinItem) => LOW_SKIP.has(it.kind) || (it.kind === 'grass' && (it.v & 1) === 0 && it.id % 3 !== 0);
+const skipLow = (it: RuinItem) => LOW_SKIP.has(it.kind) || (it.kind === 'grass' && !it.ext && (it.v & 1) === 0 && it.id % 3 !== 0);
 
 /** Appends one item's pieces (vehicles are drawn by the wreck pool, not here). */
-function buildItem(g: Geo, it: RuinItem, ground: Ground, low: boolean) {
+function buildItem(g: Geo, it: RuinItem, ground: Ground, low: boolean, budget = 0) {
   const C = pal(), T = tpl(), seed = it.v * 7 + (it.id % 100003);
   const R = mulberry32(hash32(it.id, it.v));
   const y0 = ground(it.x, it.z), yaw = it.yaw;
@@ -1400,21 +1669,26 @@ function buildItem(g: Geo, it: RuinItem, ground: Ground, low: boolean) {
     case 'rubble': {
       // A mound of broken concrete, plaster and brick, the biggest blocks in the middle; slabs and rebar where a wall
       // came down; moss on the old ones.
-      const s = it.s, H = it.ext?.[0] ?? 0.5, wall = (it.ext?.[1] ?? 0) > 0;
+      // ext[2] > 0: a district building's heap, every piece kept within s of its middle (planRuins' RUBBLE_MARGIN).
+      const s = it.s, H = it.ext?.[0] ?? 0.5, wall = (it.ext?.[1] ?? 0) > 0, held = (it.ext?.[2] ?? 0) > 0;
       const n = Math.min(low ? 10 : 20, 5 + Math.round(s * 5));
       for (let i = 0; i < n; i++) {
-        const a = R() * Math.PI * 2, d = i === 0 ? 0 : s * Math.sqrt(R()) * 0.92, r = s * (i < 3 ? 0.2 + R() * 0.12 : 0.08 + R() * 0.14);
+        const a = R() * Math.PI * 2, d0 = i === 0 ? 0 : s * Math.sqrt(R()) * 0.92, r = s * (i < 3 ? 0.2 + R() * 0.12 : 0.08 + R() * 0.14);
+        // (a rock is at most 1.4 r across its scale and 1.225 its jitter: 1.75 r from its middle)
+        const d = held ? Math.min(d0, Math.max(0, s - r * 1.75)) : d0;
         const mound = H * (1 - (d / (s + 0.01)) * (d / (s + 0.01)));
         const u = R(), col = u < 0.55 ? (R() < 0.5 ? C.concrete : C.concrete2) : u < 0.7 ? C.plaster : u < 0.92 ? (R() < 0.5 ? C.brick : C.brick2) : C.dark;
         g.shape(R() < 0.5 ? T.rock : T.dodec, it.x + Math.sin(a) * d, y0 + Math.max(r * 0.35, mound - r * 0.4), it.z + Math.cos(a) * d, R() * 6, (R() - 0.5) * 0.8, (R() - 0.5) * 0.8,
           r * (0.9 + R() * 0.5), r * (0.6 + R() * 0.4), r * (0.8 + R() * 0.5), col, { vary: 0.16, seed: seed + i, jitter: 0.45, y0, moss: 0.3 });
       }
+      // (slabs and rebar reach 0.8 m from their middles)
+      const reach = held ? Math.max(0, s - 0.8) : Infinity;
       if (wall || s > 1.6) for (let i = 0; i < (low ? 2 : 4); i++) {
-        const a = R() * Math.PI * 2, d = s * R() * 0.6;
+        const a = R() * Math.PI * 2, d = Math.min(reach, s * R() * 0.6);
         g.shape(T.box, it.x + Math.sin(a) * d, y0 + H * (0.25 + R() * 0.35), it.z + Math.cos(a) * d, R() * 6, (R() - 0.5) * 1.0, (R() - 0.5) * 0.6, 0.6 + R() * 0.7, 0.12, 0.4 + R() * 0.5, C.slab, { seed: seed + 50 + i, y0 });
       }
       if (wall) for (let i = 0; i < (low ? 3 : 8); i++) {
-        const a = R() * Math.PI * 2, d = s * R() * 0.6;
+        const a = R() * Math.PI * 2, d = Math.min(reach, s * R() * 0.6);
         g.shape(T.box, it.x + Math.sin(a) * d, y0 + 0.3 + R() * H * 0.6, it.z + Math.cos(a) * d, R() * 6, (R() - 0.5) * 2.2, (R() - 0.5) * 1.6, 0.035, 0.035, 0.7 + R() * 0.9, C.rust, { vary: 0.2, seed: seed + 80 + i });
       }
       break;
@@ -1465,7 +1739,8 @@ function buildItem(g: Geo, it: RuinItem, ground: Ground, low: boolean) {
       g.shape(T.box, it.x - sv * ttx * sagU + nx * (0.15 + Math.sin(ang) * 0.9), yLow + 0.2 - Math.cos(ang) * 0.9, it.z - sv * ttz * sagU + nz * (0.15 + Math.sin(ang) * 0.9), yaw, ang, (R() - 0.5) * 0.3, wF * 0.6, 0.18, 1.9, C.slab, { seed: seed + 9 });
       // The wall that came off: the storey's facade hinged down from the bottom of the hole, its far end on the rubble
       // out on the sidewalk, windows dark, top edge broken, rebar out of its sides.
-      const out = 2.6 + R() * 0.8, pu = wF * (0.45 + R() * 0.15), bx = it.x - sv * ttx * pu + nx * out, bz = it.z - sv * ttz * pu + nz * out, by = y0 + 1.0;
+      // (ext[3]: how far out it may reach, a district building's RUBBLE_MARGIN; it then leans on the wall)
+      const out = Math.min(2.6 + R() * 0.8, it.ext?.[3] ?? Infinity), pu = wF * (0.45 + R() * 0.15), bx = it.x - sv * ttx * pu + nx * out, bz = it.z - sv * ttz * pu + nz * out, by = y0 + 1.0;
       const topY = yLow + 0.1, dn = OFF + 0.15 - out, dy = topY - by, len = Math.sqrt(dn * dn + dy * dy), tilt = Math.atan2(dn, dy);
       const pw = Math.min(wF * 0.85, 3.6), mx = bx + nx * dn / 2, my = by + dy / 2, mz = bz + nz * dn / 2, twist = (R() - 0.5) * 0.25;
       const wallCol = mix(pick([C.plaster, C.concrete2, C.plaster]), C.soot, 0.22);
@@ -1613,15 +1888,30 @@ function buildItem(g: Geo, it: RuinItem, ground: Ground, low: boolean) {
       break;
     }
     case 'grass': {
-      if (it.v & 1) {
-        // A shrub run wild.
-        for (let i = 0; i < 3; i++) g.shape(T.rock, it.x + (R() - 0.5) * it.s * 0.6, y0 + it.s * 0.35, it.z + (R() - 0.5) * it.s * 0.6, R() * 6, 0, 0, it.s * (0.45 + R() * 0.25), it.s * (0.38 + R() * 0.2), it.s * (0.45 + R() * 0.25), pick([C.leaf, C.leaf2, C.leafDry]), { seed: seed + i, jitter: 0.5, y0, vary: 0.25 });
-      } else {
-        for (let i = 0; i < (low ? 4 : 7); i++) {
-          const a = R() * Math.PI * 2, h = it.s * (0.7 + R() * 0.6), r = it.s * 0.35, w = 0.07, col = pick([C.weed, C.weed2, C.weedDry, C.leafDry]);
-          g.tri(it.x - Math.cos(a) * w, y0, it.z + Math.sin(a) * w, it.x + Math.cos(a) * w, y0, it.z - Math.sin(a) * w, it.x + Math.sin(a) * r, y0 + h, it.z + Math.cos(a) * r, scale3(col, 0.55), scale3(col, 0.55), col);
+      const clump = (x: number, gy: number, z: number, s: number, shrub: boolean, sd: number) => {
+        if (shrub) {
+          // A shrub run wild.
+          for (let i = 0; i < 3; i++) g.shape(T.rock, x + (R() - 0.5) * s * 0.6, gy + s * 0.35, z + (R() - 0.5) * s * 0.6, R() * 6, 0, 0, s * (0.45 + R() * 0.25), s * (0.38 + R() * 0.2), s * (0.45 + R() * 0.25), pick([C.leaf, C.leaf2, C.leafDry]), { seed: sd + i, jitter: 0.5, y0: gy, vary: 0.25 });
+        } else {
+          for (let i = 0; i < (low ? 4 : 7); i++) {
+            const a = R() * Math.PI * 2, h = s * (0.7 + R() * 0.6), r = s * 0.35, w = 0.07, col = pick([C.weed, C.weed2, C.weedDry, C.leafDry]);
+            g.tri(x - Math.cos(a) * w, gy, z + Math.sin(a) * w, x + Math.cos(a) * w, gy, z - Math.sin(a) * w, x + Math.sin(a) * r, gy + h, z + Math.cos(a) * r, scale3(col, 0.55), scale3(col, 0.55), col);
+          }
         }
+      };
+      if (it.ext) {
+        // A polygon green's clumps in this chunk (ext = [count, x0, z0, x1, z1, ...polygon]): scattered in the bounds,
+        // kept to the polygon, a third of the tufts at Low, no more than the chunk's triangle budget allows.
+        const [count, x0, z0, x1, z1] = it.ext, poly = it.ext.slice(5);
+        for (let i = 0; i < count; i++) {
+          if (budget && g.tris > budget - 400) break;
+          const x = x0 + R() * (x1 - x0), z = z0 + R() * (z1 - z0), shrub = R() < 0.28, s = 0.6 + R() * 0.9;
+          if (!inPoly(poly, x, z) || (low && !shrub && i % 3 !== 0)) continue;
+          clump(x, ground(x, z), z, s, shrub, seed + i * 7);
+        }
+        break;
       }
+      clump(it.x, y0, it.z, it.s, (it.v & 1) === 1, seed);
       break;
     }
     case 'crack': {
@@ -1788,15 +2078,18 @@ function buildItem(g: Geo, it: RuinItem, ground: Ground, low: boolean) {
   }
 }
 
+/** Build order within a chunk: everything else, then the small kinds, the overgrown parks' grass last (the first dropped). */
+const phaseOf = (kind: RuinKind) => (!FINE.has(kind) ? 0 : kind === 'grass' ? 2 : 1);
+
 /** Builds one chunk's mesh geometry at once (tests and tools; the runtime builds it in time slices). */
 export function buildChunkGeometry(plan: RuinPlan, key: number, ground: Ground, level = 0) {
   const g = new Geo(), low = level >= 4, budget = low ? CHUNK_TRIS.low : CHUNK_TRIS.high;
   const list = plan.chunks.get(key) ?? [];
-  for (let phase = 0; phase < 2; phase++) for (const i of list) {
+  for (let phase = 0; phase < 3; phase++) for (const i of list) {
     const it = plan.items[i];
-    if (VEHICLES.has(it.kind) || FINE.has(it.kind) !== (phase === 1) || (low && skipLow(it))) continue;
-    if (phase === 1 && g.tris > budget - 400) break;
-    buildItem(g, it, ground, low);
+    if (VEHICLES.has(it.kind) || phaseOf(it.kind) !== phase || (low && skipLow(it))) continue;
+    if (phase > 0 && g.tris > budget - 400) break;
+    buildItem(g, it, ground, low, budget);
   }
   return { geometry: geometryOf(g), triangles: g.tris };
 }
@@ -1806,6 +2099,37 @@ function geometryOf(g: Geo) {
   geometry.setAttribute('normal', new THREE.BufferAttribute(g.n.slice(0, g.v * 3), 3));
   geometry.setAttribute('color', new THREE.BufferAttribute(g.c.slice(0, g.v * 3), 3));
   geometry.computeBoundingSphere();
+  return geometry;
+}
+/**
+ * A builder's triangles in the chunk pages' compact form: positions, normals as 8-bit signed and colours as 16-bit
+ * unsigned normalized quads (24 bytes a vertex instead of 36; 16 bits keep the dark soot and voids from banding as 8
+ * would), padded with degenerate zero vertices to `count` (a page slot's size: copied whole with one typed-array set,
+ * where three.js would zero the rest of the slot a component at a time), its bounding sphere that of its own vertices.
+ */
+function compactGeometry(g: Geo, count = g.v) {
+  const n = g.v, position = new Float32Array(count * 3), normal = new Int8Array(count * 4), color = new Uint16Array(count * 4), P = g.p, N = g.n, Cc = g.c;
+  position.set(P.subarray(0, n * 3));
+  let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+  for (let i = 0, j = 0, k = 0; i < n; i++, j += 3, k += 4) {
+    const x = P[j], y = P[j + 1], z = P[j + 2];
+    x0 = Math.min(x0, x); y0 = Math.min(y0, y); z0 = Math.min(z0, z); x1 = Math.max(x1, x); y1 = Math.max(y1, y); z1 = Math.max(z1, z);
+    normal[k] = Math.round(N[j] * 127); normal[k + 1] = Math.round(N[j + 1] * 127); normal[k + 2] = Math.round(N[j + 2] * 127);
+    color[k] = Math.round(Math.min(1, Math.max(0, Cc[j])) * 65535); color[k + 1] = Math.round(Math.min(1, Math.max(0, Cc[j + 1])) * 65535);
+    color[k + 2] = Math.round(Math.min(1, Math.max(0, Cc[j + 2])) * 65535); color[k + 3] = 65535;
+  }
+  // The bounding sphere as three.js computes it (the box's middle, the farthest vertex), straight off the array.
+  const cx = n ? (x0 + x1) / 2 : 0, cy = n ? (y0 + y1) / 2 : 0, cz = n ? (z0 + z1) / 2 : 0;
+  let r2 = 0;
+  for (let j = 0; j < n * 3; j += 3) {
+    const dx = P[j] - cx, dy = P[j + 1] - cy, dz = P[j + 2] - cz;
+    r2 = Math.max(r2, dx * dx + dy * dy + dz * dz);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(position, 3));
+  geometry.setAttribute('normal', new THREE.BufferAttribute(normal, 4, true));
+  geometry.setAttribute('color', new THREE.BufferAttribute(color, 4, true));
+  geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(cx, cy, cz), Math.sqrt(r2));
   return geometry;
 }
 
@@ -1919,7 +2243,17 @@ export function createApocalypse(scene: THREE.Scene, solids: CollisionIndex, opt
   let plan: RuinPlan | null = null, enabled = false, level = opts.level ?? 0, disposeTimer: ReturnType<typeof setTimeout> | null = null;
   let solidIds = new Int32Array(0), colliderCount = 0, lastBuildMs = 0, lastBuildAt = 0, lastNow = 0, lruTick = 0;
   const frames: number[] = [];
-  type ChunkState = { key: number; list: number[]; minX: number; minZ: number; maxX: number; maxZ: number; mesh: THREE.Mesh | null; tris: number; seen: number; work: { g: Geo; phase: number; i: number; ms: number } | null };
+  /**
+   * A built chunk is a range of a page (its slot: a geometry and its instance in one of the chunk pages, BatchedMeshes),
+   * so all the chunks in view are a multi-draw call or two, each chunk still culled on its own. Slots are reused (best
+   * fit) once their chunk is dropped.
+   */
+  type Page = { mesh: THREE.BatchedMesh; used: number; slots: number };
+  type Slot = { page: Page; geo: number; inst: number; reserve: number; st: ChunkState | null };
+  type ChunkState = { key: number; list: number[]; minX: number; minZ: number; maxX: number; maxZ: number; built: boolean; slot: Slot | null; shown: boolean; tris: number; seen: number; work: { g: Geo; phase: number; i: number; ms: number } | null };
+  const pages: Page[] = [], slots: Slot[] = [];
+  /** Where update() last looked from and how far the ruins showed (a chunk built out of view is dropped first). */
+  let lookX = 0, lookZ = 0, viewNow = Infinity;
   const chunks = new Map<number, ChunkState>();
   const idIndex = new Map<number, number>();
 
@@ -1972,9 +2306,9 @@ export function createApocalypse(scene: THREE.Scene, solids: CollisionIndex, opt
   }
   function ensurePoolGeometry() { buildPoolGeometry(); return poolGeoms!; }
 
-  // Shader warm-up: one-triangle stand-ins of a chunk and of the wreck pool (a BatchedMesh with instance colours is its
-  // own program variant), hidden; game.ts' startup prewarm draws hidden objects once, so both programs are compiled and
-  // linked at load instead of on the first zombie frame.
+  // Shader warm-up: one-triangle stand-ins of a chunk page and of the wreck pool (a BatchedMesh, with instance colours
+  // for the pool, is its own program variant), hidden; game.ts' startup prewarm draws hidden objects once, so both
+  // programs are compiled and linked at load instead of on the first zombie frame.
   const warmTri = new THREE.BufferGeometry();
   warmTri.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, -50, 0, 0.01, -50, 0, 0, -50, 0.01]), 3));
   warmTri.setAttribute('normal', new THREE.BufferAttribute(new Float32Array([0, 1, 0, 0, 1, 0, 0, 1, 0]), 3));
@@ -1984,7 +2318,13 @@ export function createApocalypse(scene: THREE.Scene, solids: CollisionIndex, opt
   const warmPool = new THREE.BatchedMesh(1, 3, 0, material);
   warmPool.setColorAt(warmPool.addInstance(warmPool.addGeometry(warmWreck)), new THREE.Color('#808080'));
   warmPool.perObjectFrustumCulled = false; // really drawn (ANGLE finishes a program at its first draw)
-  for (const o of [new THREE.Mesh(warmTri, chunkMaterial), warmPool]) { o.name = 'Ruin warm-up'; o.visible = false; o.frustumCulled = false; o.receiveShadow = true; o.castShadow = true; group.add(o); }
+  const warmChunks = new THREE.BatchedMesh(1, 3, 0, chunkMaterial), warmCompact = new Geo(3);
+  warmCompact.tri(0, -50, 0, 0.01, -50, 0, 0, -50, 0.01, [0.5, 0.5, 0.5]);
+  const warmChunk = compactGeometry(warmCompact);
+  warmChunks.addInstance(warmChunks.addGeometry(warmChunk));
+  warmChunk.dispose();
+  warmChunks.perObjectFrustumCulled = false;
+  for (const o of [warmChunks, warmPool]) { o.name = 'Ruin warm-up'; o.visible = false; o.frustumCulled = false; o.receiveShadow = true; o.castShadow = true; group.add(o); }
   function buildPool() {
     disposePool();
     if (!plan) return;
@@ -2078,40 +2418,101 @@ export function createApocalypse(scene: THREE.Scene, solids: CollisionIndex, opt
   }
 
   // ---- Chunks ----
+  /**
+   * Chunk pages: BatchedMeshes of PAGE_VERTICES compact vertices each (positions, 8-bit normals, 16-bit colours: 24
+   * bytes, 9.4 MB a page), a dozen chunks or so a page. A page is uploaded once, when first drawn; chunks that do not fit
+   * take the slots of chunks past the build margin or a new page, so nothing is ever uploaded whole again. Pages are
+   * made as the first chunks are built and freed 30 s after zombie mode ends.
+   */
+  const PAGE_VERTICES = 393216, PAGE_SLOTS = 32;
+  /** How far round the player zombie mode's prep phase builds ahead (the fog's 169 m in zombie mode, + 20, + the 40 m build margin). */
+  const PREBUILD_REACH = 230;
+  /** Chunks are built this far past the view, ready before they come into it. */
+  const BUILD_MARGIN = 40;
+  const inView = (st: ChunkState) => rectDist(st, lookX, lookZ) <= viewNow;
+  /** Puts a built chunk's triangles in a page: the free slot that fits them best, else the end of a page with room, else a new page. */
+  function store(st: ChunkState, g: Geo) {
+    // A slot is drawn whole, its padding past the chunk's own vertices too (degenerate, but vertex work): slots come in
+    // steps of 1,024 vertices, and a loose fit is taken only when no page has room at its end.
+    const n = g.v, reserve = Math.max(1024, Math.ceil(n / 1024) * 1024);
+    const fit = () => { let best: Slot | null = null; for (const s of slots) if (!s.st && s.reserve >= n && (!best || s.reserve < best.reserve)) best = s; return best; };
+    const roomy = () => pages.find((p) => p.used + reserve <= PAGE_VERTICES && p.slots < PAGE_SLOTS) ?? null;
+    let slot = fit();
+    if (slot && slot.reserve - n > 8192 && roomy()) slot = null;
+    if (!slot && !roomy()) {
+      // Every page full: the least recently seen chunks past the build margin give up their slots first (one within it
+      // would only be built again at once, and take another's slot back).
+      const idle = [...chunks.values()].filter((c) => c.slot && rectDist(c, lookX, lookZ) > viewNow + BUILD_MARGIN).sort((a, b) => a.seen - b.seen);
+      for (const c of idle) { release(c); c.built = false; if ((slot = fit())) break; }
+    }
+    // The geometry fills its whole slot (degenerate zero vertices past the chunk's own), so the page copies it in one set.
+    const geometry = compactGeometry(g, slot ? slot.reserve : reserve);
+    if (slot) slot.page.mesh.setGeometryAt(slot.geo, geometry);
+    else {
+      let page = roomy();
+      if (!page) {
+        const mesh = new THREE.BatchedMesh(PAGE_SLOTS, PAGE_VERTICES, 0, chunkMaterial);
+        mesh.name = 'Ruin chunks';
+        mesh.frustumCulled = false;
+        mesh.receiveShadow = true; mesh.castShadow = level <= 2;
+        mesh.matrixAutoUpdate = false;
+        mesh.visible = true;
+        group.add(mesh);
+        pages.push(page = { mesh, used: 0, slots: 0 });
+      }
+      const geo = page.mesh.addGeometry(geometry, reserve);
+      slot = { page, geo, inst: page.mesh.addInstance(geo), reserve, st: null };
+      slots.push(slot);
+      page.used += reserve; page.slots++;
+    }
+    geometry.dispose();
+    slot.st = st; st.slot = slot; st.shown = inView(st);
+    slot.page.mesh.setVisibleAt(slot.inst, st.shown);
+  }
+  /** Takes a chunk out of its page (its slot is free for another). */
+  function release(st: ChunkState) {
+    if (st.slot) { st.slot.page.mesh.setVisibleAt(st.slot.inst, false); st.slot.st = null; st.slot = null; }
+    st.shown = false;
+  }
+  /** Drops every built chunk (and with `free` the pages themselves and their memory). */
+  function dropChunks(free: boolean) {
+    for (const st of chunks.values()) { st.work = null; release(st); st.built = false; }
+    if (!free) return;
+    for (const p of pages) { group.remove(p.mesh); p.mesh.dispose(); }
+    pages.length = 0; slots.length = 0;
+  }
   function resetChunks() {
-    for (const st of chunks.values()) if (st.mesh) { group.remove(st.mesh); st.mesh.geometry.dispose(); st.mesh = null; }
+    dropChunks(false);
     chunks.clear();
     if (!plan) return;
     for (const [key, list] of plan.chunks) {
       const own = list.filter((i) => !VEHICLES.has(plan!.items[i].kind));
       if (!own.length) continue;
       const cx = keyX(key) * CHUNK, cz = keyZ(key) * CHUNK;
-      chunks.set(key, { key, list: own, minX: cx - 16, minZ: cz - 16, maxX: cx + CHUNK + 16, maxZ: cz + CHUNK + 16, mesh: null, tris: 0, seen: 0, work: null });
+      chunks.set(key, { key, list: own, minX: cx - 16, minZ: cz - 16, maxX: cx + CHUNK + 16, maxZ: cz + CHUNK + 16, built: false, slot: null, shown: false, tris: 0, seen: 0, work: null });
     }
   }
-  /** Continues building a chunk for up to `ms`; true once its mesh is in the scene. */
+  /** Continues building a chunk for up to `ms`; true once it is in a page. */
   function buildStep(st: ChunkState, ms: number) {
-    if (st.mesh) return true;
+    if (st.built) return true;
     const start = performance.now(), low = level >= 4, budget = low ? CHUNK_TRIS.low : CHUNK_TRIS.high;
     const work = st.work ??= { g: new Geo(8192), phase: 0, i: 0, ms: 0 };
     const items = plan!.items;
-    while (work.phase < 2) {
+    while (work.phase < 3) {
       if (work.i >= st.list.length) { work.phase++; work.i = 0; continue; }
       const it = items[st.list[work.i++]];
-      if (FINE.has(it.kind) !== (work.phase === 1) || (low && skipLow(it))) continue;
-      if (work.phase === 1 && work.g.tris > budget - 400) { work.phase = 2; break; }
-      buildItem(work.g, it, ground, low);
-      if ((work.i & 7) === 0 && performance.now() - start > ms) { work.ms += performance.now() - start; return false; }
+      if (phaseOf(it.kind) !== work.phase || (low && skipLow(it))) continue;
+      if (work.phase > 0 && work.g.tris > budget - 400) { work.phase = 3; break; }
+      buildItem(work.g, it, ground, low, budget);
+      if (performance.now() - start > ms) { work.ms += performance.now() - start; return false; }
     }
-    const mesh = new THREE.Mesh(geometryOf(work.g), chunkMaterial);
-    mesh.name = `Ruin chunk ${st.key}`;
-    mesh.receiveShadow = true; mesh.castShadow = level <= 2;
-    mesh.matrixAutoUpdate = false; mesh.updateMatrix();
-    st.mesh = mesh; st.tris = work.g.tris;
+    // Into a page (up to 90k vertices converted and copied) in a frame of its own when this one has had half its share.
+    if (work.g.tris && performance.now() - start > ms / 2) { work.ms += performance.now() - start; return false; }
+    if (work.g.tris) store(st, work.g);
+    st.built = true; st.tris = work.g.tris;
     work.ms += performance.now() - start;
     lastBuildMs = work.ms;
     st.work = null;
-    group.add(mesh);
     return true;
   }
   const rectDist = (st: { minX: number; minZ: number; maxX: number; maxZ: number }, x: number, z: number) => {
@@ -2156,9 +2557,7 @@ export function createApocalypse(scene: THREE.Scene, solids: CollisionIndex, opt
     buildPool();
     smashes.length = 0;
   }
-  function disposeChunks() {
-    for (const st of chunks.values()) { st.work = null; if (st.mesh) { group.remove(st.mesh); st.mesh.geometry.dispose(); st.mesh = null; } }
-  }
+  function disposeChunks() { dropChunks(true); }
   /** Applies a smash at once or animated (code 0..7 crushed toward k·45°, RUIN_THROWN gone). */
   function applySmash(id: number, code: number, now: number, instant: boolean) {
     const wi = wreckOf.get(id);
@@ -2201,16 +2600,18 @@ export function createApocalypse(scene: THREE.Scene, solids: CollisionIndex, opt
       frames.push(dt);
       if (frames.length > 30) frames.shift();
       const view = viewDistance();
+      lookX = focusX; lookZ = focusZ; viewNow = view;
       camera.updateMatrixWorld();
       projView.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
       frustum.setFromProjectionMatrix(projView);
       let nearest: ChunkState | null = null, nd = Infinity;
       for (const st of chunks.values()) {
         const d = rectDist(st, focusX, focusZ);
-        if (st.mesh) {
-          st.mesh.visible = d <= view;
-          if (st.mesh.visible) st.seen = now;
-        } else if (d <= view + 40 && d < nd) { nd = d; nearest = st; }
+        if (st.built) {
+          const show = d <= view;
+          if (st.slot && show !== st.shown) { st.slot.page.mesh.setVisibleAt(st.slot.inst, show); st.shown = show; }
+          if (show) st.seen = now;
+        } else if (d <= view + BUILD_MARGIN && d < nd) { nd = d; nearest = st; }
       }
       // Build when this frame was not slow (≤ 1.25 × the median of the last 30), or nothing was built for 250 ms.
       const sorted = [...frames].sort((a, b) => a - b), median = sorted[sorted.length >> 1] ?? 1 / 60;
@@ -2219,13 +2620,13 @@ export function createApocalypse(scene: THREE.Scene, solids: CollisionIndex, opt
         else lastBuildAt = now;
       }
       // Least recently seen chunks beyond 400 m go first; never more than 30 kept (checked twice a second).
-      const built = ++lruTick % 30 ? [] : [...chunks.values()].filter((s) => s.mesh);
+      const built = ++lruTick % 30 ? [] : [...chunks.values()].filter((s) => s.built);
       if (built.length > 30 || built.some((s) => rectDist(s, focusX, focusZ) > 400)) {
         built.sort((a, b) => a.seen - b.seen);
         for (let i = 0; i < built.length; i++) {
           const st = built[i];
           if (built.length - i <= 30 && rectDist(st, focusX, focusZ) <= 400) continue;
-          group.remove(st.mesh!); st.mesh!.geometry.dispose(); st.mesh = null;
+          release(st); st.built = false;
         }
       }
       if (pool) {
@@ -2250,13 +2651,14 @@ export function createApocalypse(scene: THREE.Scene, solids: CollisionIndex, opt
     },
     /** Every wreck model is built (prepare's last step, the pool, may still be due). */
     get modelsReady() { return poolGeoms !== null; },
-    /** Builds every chunk within radius of (x, z) (zombie mode's prep phase), yielding between slices. */
+    /** Builds every chunk within radius of (x, z) (zombie mode's prep phase; no further than the ruins show), yielding between slices. */
     async prebuild(x: number, z: number, radius: number) {
       if (!plan) return;
-      const list = [...chunks.values()].filter((s) => !s.mesh && rectDist(s, x, z) <= radius).sort((a, b) => rectDist(a, x, z) - rectDist(b, x, z));
+      const reach = Math.min(radius, PREBUILD_REACH);
+      if (!Number.isFinite(viewNow)) { lookX = x; lookZ = z; viewNow = reach; }
+      const list = [...chunks.values()].filter((s) => !s.built && rectDist(s, x, z) <= reach).sort((a, b) => rectDist(a, x, z) - rectDist(b, x, z));
       for (const st of list) {
-        while (plan && !buildStep(st, 8)) await new Promise((r) => setTimeout(r, 0));
-        if (st.mesh) st.mesh.visible = enabled;
+        while (plan && !st.built && !buildStep(st, 8)) await new Promise((r) => setTimeout(r, 0));
         await new Promise((r) => setTimeout(r, 0));
       }
       lastBuildAt = lastNow;
@@ -2289,13 +2691,13 @@ export function createApocalypse(scene: THREE.Scene, solids: CollisionIndex, opt
     item(id: number) { const i = idIndex.get(id); return i === undefined || !plan ? null : plan.items[i]; },
     stats(): ApocalypseStats {
       let chunksBuilt = 0, drawn = 0, triangles = 0;
+      const drawnPages = new Set<Page>();
       for (const st of chunks.values()) {
-        if (!st.mesh) continue;
+        if (!st.built) continue;
         chunksBuilt++;
-        if (!enabled || !st.mesh.visible) continue;
-        const s = st.mesh.geometry.boundingSphere;
-        if (s && !frustum.intersectsSphere(sphere.copy(s))) continue;
-        drawn++; triangles += st.tris;
+        if (!enabled || !st.shown || !st.slot) continue;
+        if (!frustum.intersectsSphere(st.slot.page.mesh.getBoundingSphereAt(st.slot.geo, sphere) ?? sphere)) continue;
+        drawn++; triangles += st.tris; drawnPages.add(st.slot.page);
       }
       let poolOn = false;
       if (pool && enabled) for (let i = 0; i < wrecks.length; i++) {
@@ -2306,15 +2708,16 @@ export function createApocalypse(scene: THREE.Scene, solids: CollisionIndex, opt
         if (!frustum.intersectsSphere(sphere.set(tmpC, w.kind === 2 ? 7 : 3))) continue;
         poolOn = true; triangles += w.shown === w.full ? w.tris[0] : w.tris[1];
       }
-      return { chunks: chunksBuilt, drawn, calls: drawn + (poolOn ? 1 : 0), triangles, colliders: colliderCount, buildMs: Math.round(lastBuildMs * 10) / 10 };
+      // The chunks in view are a multi-draw call per page they are in; the wrecks one more.
+      return { chunks: chunksBuilt, drawn, calls: drawnPages.size + (poolOn ? 1 : 0), triangles, colliders: colliderCount, buildMs: Math.round(lastBuildMs * 10) / 10 };
     },
     /** Quality level 0-5: from 4 the chunks drop vines, tufts, litter and window patches (rebuilt) and fewer full wrecks show. */
     setDetail(next: number) {
       const band = next >= 4, was = level >= 4;
       level = next;
-      for (const st of chunks.values()) if (st.mesh) st.mesh.castShadow = level <= 2;
+      for (const p of pages) p.mesh.castShadow = level <= 2;
       if (pool) pool.castShadow = level <= 2;
-      if (band !== was) for (const st of chunks.values()) { st.work = null; if (st.mesh) { group.remove(st.mesh); st.mesh.geometry.dispose(); st.mesh = null; } }
+      if (band !== was) dropChunks(false);
       poolDirty = true;
     },
     dispose() {
@@ -2325,7 +2728,7 @@ export function createApocalypse(scene: THREE.Scene, solids: CollisionIndex, opt
       chunkMaterial.dispose(); material.dispose();
       for (const e of poolBuilt) e.g.dispose();
       poolBuilt.length = 0; poolGeoms = null; poolBuilders = null;
-      warmPool.dispose(); warmTri.dispose(); warmWreck.dispose();
+      warmPool.dispose(); warmChunks.dispose(); warmTri.dispose(); warmWreck.dispose();
       plan = null; enabled = false;
     },
   };

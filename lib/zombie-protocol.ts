@@ -4,7 +4,8 @@
  * and the SSR bundle. Bump ZOMBIE_VERSION with any change both sides must agree on (wire format, codes, rules,
  * planRuins output).
  */
-export const ZOMBIE_VERSION = 1;
+/** 2: the ruins cover the wired districts (apocalypse-inputs.ts ruinInputsFromWorld), so the live plan and its hash changed. */
+export const ZOMBIE_VERSION = 2;
 export type RoomMode = 'city' | 'zombie';
 
 export const ZOMBIE_SNAP_MS = 100;          // host snapshot cadence (10 Hz)

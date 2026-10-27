@@ -3,7 +3,11 @@
 // shuffled inputs, chunk order, without transcendental functions, a frozen hash for today's map), keeps its colliders
 // off walking lines, solids and keep-clear spots, never disconnects the car graph or blocks a bridge, leaves no pocket,
 // meets the densities and budgets, and the runtime puts its colliders in and takes them out again under its own owner
-// tag with ragdoll-readable refs. A synthetic district (no city.ts) plans and builds too.
+// tag with ragdoll-readable refs. A synthetic district (no city.ts) plans and builds too. The wired city
+// (apocalypse-inputs.ts ruinInputsFromWorld: today's map and the P1 districts) plans deterministically (the worker's
+// packed round trip included), gives every district ruins in proportion to its size, never collapses a KEEP building,
+// keeps doors, places and story sites open, a drive lane down every road and two open arms at every junction, keeps a
+// rotated building's rubble within its footprint and margin, stays on land, in budget and streams in chunk pages.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import module from 'node:module';
@@ -449,4 +453,320 @@ test('district readiness: a generated map with no city.ts plans and builds; apoc
   const src = readFileSync(new URL('../app/game/apocalypse.ts', import.meta.url), 'utf8');
   assert.equal(/from ['"]\.\/city/.test(src), false);
   assert.equal(/Math\.random\(|Date\.now\(/.test(src.slice(0, src.indexOf('// The runtime.'))), false, 'no clock or Math.random in the planner');
+});
+
+// ---- The wired city (map/world-map.ts): today's map and every wired district in one input (apocalypse-inputs.ts). ----
+const W = await import('../app/game/map/world-map.ts');
+const { ruinInputsFromWorld, RUIN_LANE } = await import('../app/game/apocalypse-inputs.ts');
+const { liveTerrain } = await import('../app/game/map/terrain.ts');
+const { SCENERY } = await import('../app/game/city.ts');
+const worldInput = ruinInputsFromWorld();
+const worldPlan = A.planRuins(worldInput);
+const districtOf = (x, z) => W.sliceAt(x, z)?.key ?? null;
+const VEHICLE = new Set(['car', 'carBurnt', 'moto', 'bus']);
+/** Segments (x,z pairs and anything after) filed in 16 m cells: those near an area. */
+function segIndex(list) {
+  const cells = new Map();
+  list.forEach((s, i) => {
+    for (let x = Math.floor(Math.min(s[0], s[2]) / 16); x <= Math.floor(Math.max(s[0], s[2]) / 16); x++) for (let z = Math.floor(Math.min(s[1], s[3]) / 16); z <= Math.floor(Math.max(s[1], s[3]) / 16); z++) {
+      const k = `${x},${z}`; if (!cells.has(k)) cells.set(k, []); cells.get(k).push(i);
+    }
+  });
+  return (x0, z0, x1, z1) => {
+    const out = new Set();
+    for (let x = Math.floor(x0 / 16); x <= Math.floor(x1 / 16); x++) for (let z = Math.floor(z0 / 16); z <= Math.floor(z1 / 16); z++) for (const i of cells.get(`${x},${z}`) ?? []) out.add(i);
+    return [...out].map((i) => list[i]);
+  };
+}
+/** A plot's footprint with its axes (a district plot's oriented box; Math trig is fine in tests). */
+const plotBox = (p) => (p.box ? box(p.box) : { cx: (p.minX + p.maxX) / 2, cz: (p.minZ + p.maxZ) / 2, hx: (p.maxX - p.minX) / 2, hz: (p.maxZ - p.minZ) / 2, c: 1, s: 0 });
+const angleGap = (a, b) => Math.abs(((((a - b) % (2 * Math.PI)) + 3 * Math.PI) % (2 * Math.PI)) - Math.PI);
+
+test('the wired city plans deterministically: twice, shuffled, structured-cloned (the worker), without engine trig, any chunk order', () => {
+  assert.ok(W.SLICES.length >= 1, 'districts are wired');
+  for (let k = 0; k < 64; k++) { assert.equal(A.FSIN[k * 64], A.SIN[k]); assert.equal(A.FCOS[k * 64], A.COS[k]); }
+  const again = A.planRuins(ruinInputsFromWorld());
+  assert.equal(again.hash, worldPlan.hash);
+  assert.deepEqual(again.items, worldPlan.items);
+  assert.deepEqual(again.colliders, worldPlan.colliders);
+  assert.deepEqual(again.fleetSpots, worldPlan.fleetSpots);
+  const r = rng(9);
+  const mixed = Object.fromEntries(Object.entries(worldInput).map(([k, v]) => [k, Array.isArray(v) ? shuffled(v, r) : v]));
+  const shuffledPlan = A.planRuins(mixed);
+  assert.equal(shuffledPlan.hash, worldPlan.hash, 'a shuffled input plans the same ruins');
+  assert.deepEqual(shuffledPlan.items, worldPlan.items);
+  assert.equal(A.planRuins(structuredClone(worldInput)).hash, worldPlan.hash, 'what the worker receives plans the same');
+  const saved = {};
+  for (const f of ['sin', 'cos', 'exp', 'pow', 'hypot', 'atan2', 'tan', 'asin', 'acos', 'log']) { saved[f] = Math[f]; Math[f] = () => { throw new Error(`Math.${f} in planRuins`); }; }
+  let stubbed;
+  try { stubbed = A.planRuins(worldInput); } finally { Object.assign(Math, saved); }
+  assert.equal(stubbed.hash, worldPlan.hash, 'no engine-dependent maths in the plan');
+  const backward = A.createRuinPlanner(worldInput);
+  for (const k of [...backward.keys()].reverse()) backward.chunk(k);
+  assert.equal(backward.plan().hash, worldPlan.hash, 'chunk order never matters');
+  console.log(`# wired city: ${worldPlan.items.length} items, ${worldPlan.colliders.length} colliders, ${worldPlan.chunks.size} chunks, ${worldPlan.stats.blockedEdges} full blocks, hash ${worldPlan.hash}`);
+});
+
+test('every wired district gets ruins in proportion to its size, today\'s map keeps its own', () => {
+  const road = {}, plots = {}, tally = {};
+  const add = (o, k, v = 1) => { if (k) o[k] = (o[k] ?? 0) + v; };
+  for (const rd of worldInput.roads) for (let i = 2; i < rd.pts.length; i += 2) add(road, districtOf((rd.pts[i] + rd.pts[i - 2]) / 2, (rd.pts[i + 1] + rd.pts[i - 1]) / 2), Math.hypot(rd.pts[i] - rd.pts[i - 2], rd.pts[i + 1] - rd.pts[i - 1]) / 1000);
+  for (const p of worldInput.plots) if (p.box) add(plots, districtOf(p.box.cx, p.box.cz));
+  for (const it of worldPlan.items) {
+    const d = districtOf(it.x, it.z);
+    if (!d) continue;
+    tally[d] ??= { wrecks: 0, colliders: 0, facades: 0, barricades: 0, road: 0, collapses: 0, trees: 0 };
+    const t = tally[d];
+    if (VEHICLE.has(it.kind)) t.wrecks++;
+    if (it.collider >= 0) t.colliders++;
+    if (it.kind === 'vine' || it.kind === 'moss' || it.kind === 'window' || it.kind === 'sign') t.facades++;
+    if (it.kind === 'barricade' && (it.v & 3) === 0) t.barricades++;
+    if (it.kind === 'crack' || it.kind === 'weeds' || it.kind === 'litter') t.road++;
+    if (it.kind === 'breach') t.collapses++;
+    if (it.kind === 'tree' || it.kind === 'pole') t.trees++;
+  }
+  const rows = W.SLICES.map((s) => ({ key: s.key, km: road[s.key], plots: plots[s.key], ...tally[s.key] }));
+  console.log(`# per district: ${rows.map((r) => `${r.key} ${r.km.toFixed(1)} km, ${r.plots} plots: ${r.wrecks} wrecks, ${r.colliders} colliders, ${r.collapses} collapses, ${r.facades} facade, ${r.barricades} barricades, ${r.trees} trees/poles`).join(' | ')}`);
+  const median = (f) => [...rows.map(f)].sort((a, b) => a - b)[rows.length >> 1];
+  const wreckRate = median((r) => r.wrecks / r.km), colliderRate = median((r) => r.colliders / r.km), facadeRate = median((r) => r.facades / r.plots), roadRate = median((r) => r.road / r.km);
+  for (const r of rows) {
+    assert.ok(r.wrecks > 0 && r.colliders > 0 && r.facades > 0 && r.barricades > 0 && r.collapses > 0 && r.trees > 0, `${r.key} gets every kind of ruin`);
+    for (const [label, value, mid] of [['wrecks per km', r.wrecks / r.km, wreckRate], ['colliders per km', r.colliders / r.km, colliderRate], ['facade ruins per plot', r.facades / r.plots, facadeRate], ['road strips per km', r.road / r.km, roadRate]])
+      assert.ok(value >= mid * 0.5 && value <= mid * 2, `${r.key}: ${label} ${value.toFixed(2)} (the districts' median ${mid.toFixed(2)})`);
+  }
+  // Today's map still gets its ruins (the wired city's input keeps it whole).
+  const today = worldPlan.items.filter((it) => it.x >= LAND.minX && it.x <= LAND.maxX && it.z >= LAND.minZ && it.z <= LAND.maxZ);
+  assert.ok(today.filter((it) => VEHICLE.has(it.kind)).length >= plan.items.filter((it) => VEHICLE.has(it.kind)).length * 0.6, 'today\'s land keeps its wrecks');
+  assert.ok(today.filter((it) => it.kind === 'breach').length >= 3);
+});
+
+test('KEEP buildings never collapse: landmarks, worship, markets, hospitals, police, story stamps, heritage', () => {
+  const byId = new Map(worldInput.plots.map((p) => [p.id, p]));
+  for (const s of W.DISTRICT_STAMPS) if (s.building >= 0) assert.equal(byId.get(s.building).keep, true, `stamp ${s.id} keeps`);
+  for (const id of ['cho-ben-thanh', 'nha-tho-duc-ba', 'buu-dien-thanh-pho', 'dinh-doc-lap', 'ubnd-thanh-pho', 'lang-ong', 'chua-vinh-nghiem', 'benh-vien-binh-thanh', 'kho7'])
+    assert.ok(W.DISTRICT_STAMPS.some((s) => s.id === id && byId.get(s.building)?.keep), `${id} keeps`);
+  W.DISTRICT_PLOTS.forEach((p, i) => { if (['pagoda', 'church', 'market-hall', 'hospital', 'police'].includes(p.typology) || W.DISTRICT_BUILDINGS[i].kind === 'hospital') assert.equal(byId.get(p.id).keep, true, `${p.typology} ${p.id} keeps`); });
+  // Every collapse is at a front corner of a plot that may collapse (a shared corner may also be a KEEP neighbour's).
+  let checked = 0;
+  for (const it of worldPlan.items) {
+    if (it.kind !== 'breach') continue;
+    const owners = worldInput.plots.filter((p) => {
+      const b = plotBox(p), dx = it.x - b.cx, dz = it.z - b.cz, lx = dx * b.c - dz * b.s, lz = dx * b.s + dz * b.c;
+      if (!p.box) return Math.abs(Math.abs(dx) - b.hx) < 0.05 && Math.abs(Math.abs(dz) - b.hz) < 0.05;
+      return Math.abs(Math.abs(lx) - b.hx) < 0.05 && Math.abs(lz - b.hz) < 0.05 && angleGap(it.yaw, p.box.yaw) < 0.002;
+    });
+    assert.ok(owners.length > 0, `breach at ${it.x},${it.z} belongs to a plot`);
+    assert.ok(owners.some((p) => !p.keep), `breach at ${it.x},${it.z} only on KEEP plots`);
+    checked++;
+  }
+  assert.ok(checked > 20, `${checked} collapses checked`);
+  // No district heap inside a KEEP building.
+  const keepBoxes = worldInput.plots.filter((p) => p.keep && p.box).map(plotBox);
+  for (const it of worldPlan.items) if (it.kind === 'rubble' && it.ext?.[2]) for (const b of keepBoxes) assert.ok(dist2(b, it.x, it.z) > 0, `rubble at ${it.x},${it.z} inside a KEEP building`);
+});
+
+test('no ruin on a keep-clear spot or on a walking line: doors, places, story sites and heritage entrances stay open', () => {
+  const near = segIndex(worldInput.walks.map((w) => [w.ax, w.az, w.bx, w.bz]));
+  const keep = worldInput.keepClear;
+  const keepNear = segIndex(keep.map((k) => [k.x, k.z, k.x, k.z, k]));
+  let checked = 0;
+  for (const c of worldPlan.colliders) {
+    const b = box(c), reach = Math.hypot(c.hx, c.hz) + 2;
+    for (const [ax, az, bx, bz] of near(c.cx - reach, c.cz - reach, c.cx + reach, c.cz + reach)) {
+      const d = segDist(b, ax, az, bx, bz);
+      assert.ok(d >= 0.99, `${worldPlan.items[c.item].kind} collider at ${c.cx},${c.cz} is ${d.toFixed(2)} m from a walking leg`);
+      checked++;
+    }
+    for (const s of keepNear(c.cx - reach - 13, c.cz - reach - 13, c.cx + reach + 13, c.cz + reach + 13)) {
+      const k = s[4];
+      assert.ok(Math.sqrt(dist2(b, k.x, k.z)) >= k.r - 0.02, `${worldPlan.items[c.item].kind} collider at ${c.cx},${c.cz} inside the keep-clear spot ${k.x},${k.z} (r ${k.r})`);
+    }
+  }
+  assert.ok(checked > 1000, `${checked} collider-leg pairs checked`);
+  // No wreck (walk-over ones included), heap, felled tree, tangle or tent on a keep-clear spot itself (1 m round it).
+  for (const it of worldPlan.items) {
+    if (!(VEHICLE.has(it.kind) && it.y === 0) && it.kind !== 'rubble' && it.kind !== 'tree' && it.kind !== 'tangle' && it.kind !== 'tent') continue;
+    for (const s of keepNear(it.x - 13, it.z - 13, it.x + 13, it.z + 13)) {
+      const k = s[4];
+      assert.ok(Math.hypot(it.x - k.x, it.z - k.z) >= Math.min(k.r, 1.0), `${it.kind} at ${it.x},${it.z} on the keep-clear spot ${k.x},${k.z}`);
+    }
+  }
+  // The doors players need and the heritage entrances keep a wide circle; the P1 story sites are kept clear.
+  const doorOf = (id) => W.DISTRICT_DOORS.find((d) => d.building === W.DISTRICT_STAMPS.find((s) => s.id === id)?.building);
+  let wide = 0;
+  for (const id of ['benh-vien-binh-thanh', 'tram-y-te-thu-thiem', 'nha-tho-duc-ba', 'dinh-doc-lap', 'cho-ben-thanh', 'buu-dien-thanh-pho']) {
+    const d = doorOf(id);
+    if (!d) continue;
+    assert.ok(keep.some((k) => k.major && Math.hypot(k.x - d.door.x, k.z - d.door.z) < 0.01 && k.r >= 6), `${id}'s door is kept wide open`);
+    wide++;
+  }
+  assert.ok(wide >= 4, `${wide} wide doors`);
+  assert.ok(keep.some((k) => Math.hypot(k.x - 580, k.z + 106) < 0.5), 'KHO 7 (a P1 story site) is kept clear');
+});
+
+test('a drive lane through every district and round every junction: the car graph whole, no ruin in the lanes', () => {
+  const planner = A.createRuinPlanner(worldInput);
+  const blocked = new Set(planner.blockedEdges()), edges = planner.traffic();
+  const components = (skip) => {
+    const parent = new Map(), find = (a) => { while (parent.get(a) !== a) { parent.set(a, parent.get(parent.get(a))); a = parent.get(a); } return a; };
+    for (const e of edges) { if (!parent.has(e.a)) parent.set(e.a, e.a); if (!parent.has(e.b)) parent.set(e.b, e.b); }
+    for (const e of edges) if (!skip.has(e.id)) { const a = find(e.a), b = find(e.b); if (a !== b) parent.set(a, b); }
+    return new Set([...parent.keys()].map(find)).size;
+  };
+  assert.equal(components(blocked), components(new Set()), 'blocking never disconnects the car graph');
+  // Round every junction: at least two of its arms stay open.
+  const arms = new Map(), shut = new Map();
+  for (const e of edges) for (const n of [e.a, e.b]) { arms.set(n, (arms.get(n) ?? 0) + 1); if (blocked.has(e.id)) shut.set(n, (shut.get(n) ?? 0) + 1); }
+  for (const [n, count] of arms) if (count >= 3) assert.ok(count - (shut.get(n) ?? 0) >= 2, `junction node ${n}: ${shut.get(n)} of ${count} arms blocked`);
+  // Every traffic road not deliberately blocked keeps its lane: no ruin collider, no fleet wreck within RUIN_LANE / 2 of its centre line.
+  const roads = new Map(worldInput.roads.map((r) => [r.id, r]));
+  const boxes = [...worldPlan.colliders.map((c) => box(c)), ...worldPlan.fleetSpots.map((s) => box({ cx: s.x, cz: s.z, hx: s.kind === 'car' ? 1.3 : 0.6, hz: s.kind === 'car' ? 2.7 : 1.3, yaw: s.yaw }))];
+  const cells = new Map();
+  boxes.forEach((b, i) => { const e = Math.hypot(b.hx, b.hz) + 2; for (let x = Math.floor((b.cx - e) / 8); x <= Math.floor((b.cx + e) / 8); x++) for (let z = Math.floor((b.cz - e) / 8); z <= Math.floor((b.cz + e) / 8); z++) { const k = `${x},${z}`; if (!cells.has(k)) cells.set(k, []); cells.get(k).push(i); } });
+  const open = {};
+  let samples = 0;
+  for (const e of edges) {
+    const r = roads.get(e.id);
+    if (r.cls === 'hem' || blocked.has(e.id)) continue;
+    for (let i = 2; i < r.pts.length; i += 2) {
+      const ax = r.pts[i - 2], az = r.pts[i - 1], len = Math.hypot(r.pts[i] - ax, r.pts[i + 1] - az);
+      for (let t = 0; t <= len; t += 0.5) {
+        const x = ax + (r.pts[i] - ax) * (t / len), z = az + (r.pts[i + 1] - az) * (t / len);
+        samples++;
+        for (const j of cells.get(`${Math.floor(x / 8)},${Math.floor(z / 8)}`) ?? []) {
+          const d = Math.sqrt(dist2(boxes[j], x, z));
+          assert.ok(d >= RUIN_LANE / 2 - 0.05, `road ${r.id} (${districtOf(x, z) ?? 'today'}) is shut at ${x.toFixed(1)},${z.toFixed(1)}: a ${j < worldPlan.colliders.length ? worldPlan.items[worldPlan.colliders[j].item].kind : 'fleet wreck'} ${d.toFixed(2)} m from its centre line`);
+        }
+      }
+      const d = districtOf((ax + r.pts[i]) / 2, (az + r.pts[i + 1]) / 2) ?? 'today';
+      open[d] = (open[d] ?? 0) + len;
+    }
+  }
+  for (const s of W.SLICES) assert.ok((open[s.key] ?? 0) > 500, `${s.key} has open traffic roads (${Math.round(open[s.key] ?? 0)} m)`);
+  assert.ok(samples > 20000, `${samples} lane samples`);
+  assert.ok(blocked.size >= 1 && worldPlan.items.some((it) => it.kind === 'bus') && worldPlan.clusters.length > 50, 'the boulevards still get full blocks, bus crashes and pile-ups');
+});
+
+test('rotated buildings: collapses, signs, windows, vines and moss follow the box; rubble stays within its footprint plus a margin', () => {
+  const rotated = worldInput.plots.filter((p) => p.box && angleGap(p.box.yaw * 4, 0) > 0.01);
+  assert.ok(rotated.length > 50, `${rotated.length} rotated plots`);
+  const margin = A.RUBBLE_MARGIN + 0.3;
+  let heaps = 0, onRotated = 0, aligned = 0;
+  for (const it of worldPlan.items) {
+    if (it.kind === 'rubble' && it.ext?.[2]) {
+      // A district heap: its middle inside its building, its whole disc within the footprint plus the margin.
+      const host = worldInput.plots.find((p) => p.box && dist2(box(p.box), it.x, it.z) === 0);
+      assert.ok(host, `heap at ${it.x},${it.z} inside its building`);
+      const b = box(host.box), dx = it.x - b.cx, dz = it.z - b.cz, lx = Math.abs(dx * b.c - dz * b.s), lz = Math.abs(dx * b.s + dz * b.c);
+      assert.ok(lx + it.s <= b.hx + margin && lz + it.s <= b.hz + margin, `heap at ${it.x},${it.z} (s ${it.s}) reaches past its footprint + ${margin} m`);
+      if (it.collider >= 0) {
+        const c = worldPlan.colliders[it.collider], cb = box(c);
+        for (const [u, v] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+          const x = cb.cx + cb.c * cb.hx * u + cb.s * cb.hz * v, z = cb.cz - cb.s * cb.hx * u + cb.c * cb.hz * v;
+          assert.ok(Math.sqrt(dist2(b, x, z)) <= margin, `heap collider at ${c.cx},${c.cz} reaches past its footprint`);
+        }
+      }
+      heaps++;
+      if (rotated.includes(host)) onRotated++;
+    }
+    if (['breach', 'window', 'vine', 'moss', 'sign', 'patch'].includes(it.kind)) {
+      // On a rotated plot's front: the item turns with the plot, to the fine step (π/2048).
+      const host = rotated.find((p) => Math.sqrt(dist2(box(p.box), it.x, it.z)) < 1.2 && angleGap(it.yaw, p.box.yaw) < 0.01);
+      if (host) { assert.ok(angleGap(it.yaw, host.box.yaw) <= Math.PI / 2048 + 1e-9, `${it.kind} at ${it.x},${it.z} off its wall by ${angleGap(it.yaw, host.box.yaw)}`); aligned++; }
+    }
+  }
+  assert.ok(heaps > 20, `${heaps} district heaps`);
+  assert.ok(onRotated > 0, 'a rotated building collapsed');
+  assert.ok(aligned > 100, `${aligned} facade items aligned with rotated walls`);
+  // Today's spilling heaps stay on today's land: no district building gets one.
+  for (const it of worldPlan.items) if (it.kind === 'rubble' && !it.ext?.[2]) assert.ok(it.x >= LAND.minX - 6 && it.x <= LAND.maxX + 6 && it.z >= LAND.minZ - 6 && it.z <= LAND.maxZ + 6, `a spilling heap at ${it.x},${it.z} outside today's land`);
+});
+
+test('the wired city\'s ruins stand on land, leave LEGACY_HIDDEN scenery alone, stay in budget and leave no pocket', () => {
+  // On land or a bridge: no collider or fleet wreck in the river or a canal.
+  const T = liveTerrain();
+  for (const c of worldPlan.colliders) assert.ok(T.landAt(c.cx, c.cz), `${worldPlan.items[c.item].kind} collider at ${c.cx},${c.cz} is not on land`);
+  for (const s of worldPlan.fleetSpots) assert.ok(T.landAt(s.x, s.z), `fleet spot ${s.x},${s.z} is not on land`);
+  // Today's scenery hidden under wired land feeds nothing.
+  const hiddenTrees = new Set([...W.LEGACY_HIDDEN.trees].map((i) => `${SCENERY.trees[i].x},${SCENERY.trees[i].z}`));
+  assert.equal(worldInput.trees.filter((t) => hiddenTrees.has(`${t.x},${t.z}`)).length, 0, 'no hidden tree falls');
+  assert.equal(worldInput.trees.length, SCENERY.trees.length - W.LEGACY_HIDDEN.trees.size + W.DISTRICT_SCENERY.trees.length);
+  assert.equal(worldInput.poles.length, SCENERY.poles.length - W.LEGACY_HIDDEN.poles.size + W.DISTRICT_SCENERY.poles.length);
+  // Chunks: items within the id space, triangles in budget at High and Low.
+  let most = 0, mostLow = 0;
+  for (const [key, list] of worldPlan.chunks) {
+    assert.ok(list.length < 4096, `chunk ${key}: ${list.length} items`);
+    const hi = A.buildChunkGeometry(worldPlan, key, groundHeight, 0), lo = A.buildChunkGeometry(worldPlan, key, groundHeight, 4);
+    most = Math.max(most, hi.triangles); mostLow = Math.max(mostLow, lo.triangles);
+    assert.ok(hi.triangles <= A.CHUNK_TRIS.high && lo.triangles <= A.CHUNK_TRIS.low, `chunk ${key}: ${hi.triangles} / ${lo.triangles} triangles`);
+    hi.geometry.dispose(); lo.geometry.dispose();
+  }
+  console.log(`# wired city: biggest chunk ${most} triangles at High, ${mostLow} at Low`);
+  assert.deepEqual(A.findPockets(worldPlan, worldInput), []);
+  // Planning stays a worker's job of well under a second.
+  const times = [];
+  for (let i = 0; i < 3; i++) { const t = performance.now(); A.planRuins(worldInput); times.push(performance.now() - t); }
+  const best = Math.min(...times);
+  console.log(`# planRuins wired city: best ${best.toFixed(0)} ms of ${times.length}`);
+  assert.ok(best <= (process.env.PVO_PERF_STRICT ? 600 : 1500), `planning the wired city took ${best.toFixed(0)} ms`);
+});
+
+test('the wired city\'s ruins stream: chunks build a few ms at a time into a few pages (a draw call each), far ones are dropped, all freed', () => {
+  const index = createCollisionIndex();
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.Fog('#000000', 48, 169);                  // zombie mode's fog: the ruins draw to 189 m
+  const apo = A.createApocalypse(scene, index, { ground: groundHeight });
+  apo.setEnabled(true, worldPlan);
+  assert.equal(apo.stats().colliders, worldPlan.colliders.length);
+  const camera = new THREE.PerspectiveCamera(42, 16 / 9, 0.1, 900);
+  let t = 0, worst = 0, steps = 0;
+  const run = (x, z, yaw, frames) => {
+    for (let i = 0; i < frames; i++) {
+      camera.position.set(x - Math.sin(yaw) * 14, 7, z - Math.cos(yaw) * 14); camera.lookAt(x, 1, z); camera.updateMatrixWorld();
+      const s = performance.now(); apo.update(camera, x, z, t += 1 / 60); const ms = performance.now() - s;
+      worst = Math.max(worst, ms); steps++;
+    }
+  };
+  const pages = () => apo.group.children.filter((o) => o.name === 'Ruin chunks').length;
+  // Standing still, the chunks round the player settle: none is dropped for another one and built again.
+  const setGeometryAt = THREE.BatchedMesh.prototype.setGeometryAt;
+  let stores = 0;
+  THREE.BatchedMesh.prototype.setGeometryAt = function (...a) { stores++; return setGeometryAt.apply(this, a); };
+  const settled = (x, z, yaw, where) => { const before = stores; run(x, z, yaw, 300); assert.equal(stores, before, `${where}: chunks built again while standing still`); };
+  try {
+    run(545, 4, -Math.PI / 2, 500);                                  // Vĩnh Khánh, Quận 4
+    settled(545, 4, -Math.PI / 2, 'Vĩnh Khánh');
+    const near = apo.stats(), nearPages = pages();
+    assert.ok(near.chunks >= 6 && near.drawn >= 2 && near.drawn < near.chunks, `${near.chunks} built, ${near.drawn} drawn (each culled on its own)`);
+    assert.ok(nearPages >= 1 && nearPages <= 3 && near.calls <= nearPages + 1 && near.drawn >= near.calls, `${near.calls} draw calls for ${near.drawn} chunks in ${nearPages} pages (and the wrecks)`);
+    run(-405, 14, Math.PI / 2, 700);                                 // Hàng Xanh, Bình Thạnh
+    settled(-405, 14, Math.PI / 2, 'Hàng Xanh');
+    run(-250, -262, 0, 700);                                         // the Thủ Thiêm riverside park
+    settled(-250, -262, 0, 'Thủ Thiêm');
+    const far = apo.stats(), farPages = pages();
+    assert.ok(far.chunks <= 30 && far.drawn >= 1 && farPages <= 4 && far.calls <= farPages + 1, `after crossing the city: ${far.chunks} built, ${far.drawn} drawn, ${far.calls} calls, ${farPages} pages`);
+    console.log(`# ruin streaming: ${steps} updates, the slowest ${worst.toFixed(1)} ms; Vĩnh Khánh ${near.drawn}/${near.chunks} chunks drawn in ${near.calls} calls (${nearPages} pages), ${near.triangles} triangles; after crossing the city ${farPages} pages, ${stores} chunks built in all`);
+  } finally { THREE.BatchedMesh.prototype.setGeometryAt = setGeometryAt; }
+  assert.ok(worst < 50, `the slowest ruin update took ${worst.toFixed(1)} ms`);
+  apo.setEnabled(false);
+  assert.equal(apo.stats().colliders, 0);
+  apo.dispose();
+  assert.equal(scene.children.length, 0);
+});
+
+test('the worker round trip (ruin-pack.ts) moves the wired city\'s input and plan unchanged: the same ruins, the same hash', async () => {
+  const K = await import('../app/game/ruin-pack.ts');
+  const packed = K.packInput(worldInput);
+  const moved = structuredClone(packed, { transfer: K.inputTransfer(packed) });
+  assert.equal(packed.roads.data.length, 0, 'the input buffers are moved, not copied');
+  const input2 = K.unpackInput(moved);
+  const plan2 = A.planRuins(input2);
+  assert.equal(plan2.hash, worldPlan.hash, 'the worker plans the same ruins');
+  assert.deepEqual(plan2.items, worldPlan.items);
+  const out = K.packPlan(plan2);
+  const back = K.unpackPlan(structuredClone(out, { transfer: K.planTransfer(out) }));
+  assert.deepEqual(back, plan2, 'the plan the main thread gets is the plan made');
+  // Today's input (no oriented boxes, no land, no lane) round-trips too.
+  const city = K.unpackInput(structuredClone(K.packInput(input)));
+  assert.equal(A.planRuins(city).hash, plan.hash);
 });

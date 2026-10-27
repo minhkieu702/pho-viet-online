@@ -44,7 +44,8 @@ import { createZombieCoop, type ZombieHudView } from './zombie-coop';
 import { createZombieWorld } from './zombie-world';
 import { createApocalypse, createRuinPlanner, planRuins, type RuinInput, type RuinPlan, type RuinPlanner } from './apocalypse';
 import RuinWorker from './ruin-worker.ts?worker';
-import { ruinInputsFromCity } from './apocalypse-inputs';
+import { inputTransfer, packInput, unpackPlan, type PackedPlan } from './ruin-pack';
+import { ruinInputsFromWorld } from './apocalypse-inputs';
 import type { RoomMode, ZombieClientMessage, ZombieServerMessage } from '../../lib/zombie-protocol';
 import type { DogCommand } from './companion';
 // ---- end zombie co-op ----
@@ -1971,7 +1972,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
    */
   let zombiePrep = false, ruinInput: RuinInput | null = null, planner: RuinPlanner | null = null, plannerKeys: number[] = [];
   let planWorker: Worker | null = null;
-  const planNow = () => ruinPlan ??= planner ? planner.plan() : planRuins(ruinInput ?? ruinInputsFromCity({ solids: world.colliders, roads: nav.roads }));
+  // The live map's ruins: today's and the wired districts' (apocalypse-inputs.ts; today's alone when nothing is wired).
+  const ruinInputs = () => ruinInputsFromWorld({ solids: world.colliders, districtSolids: world.districtColliders, roads: nav.roads });
+  const planNow = () => ruinPlan ??= planner ? planner.plan() : planRuins(ruinInput ?? ruinInputs());
   /** Plans `input` in a worker; false when there is none (the slices take over). */
   function planOffThread(input: RuinInput) {
     if (typeof Worker !== 'function') return false;
@@ -1985,9 +1988,11 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         zombiePrep = false;
         if (!disposed && !zombieMode) prepareZombie();
       };
-      worker.onmessage = (event: MessageEvent<RuinPlan>) => done(event.data);
+      // Packed both ways (ruin-pack.ts): cloning the wired city's input and plan took ~100 ms of this thread.
+      worker.onmessage = (event: MessageEvent<PackedPlan>) => done(unpackPlan(event.data));
       worker.onerror = (event) => { event.preventDefault(); done(null); };
-      worker.postMessage(input);
+      const packed = packInput(input);
+      worker.postMessage(packed, inputTransfer(packed));
       return true;
     } catch (error) { planWorker = null; console.warn('Zombie ruins: no planning worker;', error); return false; }
   }
@@ -2005,7 +2010,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const step = (deadline: { timeRemaining(): number }) => {
       if (disposed || zombieMode) { zombiePrep = false; return; }
       if (!ruinPlan && !ruinInput) {
-        ruinInput = ruinInputsFromCity({ solids: world.colliders, roads: nav.roads });
+        ruinInput = ruinInputs();
         if (planOffThread(ruinInput)) { zombiePrep = false; return; } // the worker's answer restarts the slices
         idle(step);
         return;
