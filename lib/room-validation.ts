@@ -1,5 +1,9 @@
 import type { IncomingHit, OutgoingHit, PlayerState } from './multiplayer-protocol.ts';
 import { PEER_BOUNDS } from './world-bounds.ts';
+// ---- zombie co-op (design.md §5, NET) ----
+import type { RoomMode } from './zombie-protocol.ts';
+import { zombiePlayerFields } from './zombie-validation.ts';
+// ---- end zombie co-op ----
 
 export const ACTIVE_MS = 15_000;
 export const SESSION_MS = 30 * 60_000;
@@ -63,7 +67,8 @@ function numberIn(value: unknown, min: number, max: number) {
 }
 function integer(value: unknown, min: number, max: number, fallback: number) { return finite(value) ? Math.round(clamp(value, min, max)) : fallback; }
 function oneOf<T extends string>(value: unknown, options: readonly T[], fallback: T): T { return options.includes(value as T) ? value as T : fallback; }
-export function playerState(value: unknown): PlayerState {
+/** `mode` 'zombie' also keeps the bounded zombie-room fields (lib/zombie-validation.ts); city rooms keep exactly today's output. */
+export function playerState(value: unknown, mode: RoomMode = 'city'): PlayerState {
   const state = payload(value);
   if (typeof state.riding !== 'boolean') throw new ClientError('Trạng thái phương tiện không hợp lệ.');
   const angle = numberIn(state.angle, -1_000_000, 1_000_000);
@@ -74,6 +79,7 @@ export function playerState(value: unknown): PlayerState {
     health: integer(state.health, 0, 100, 100), weapon: oneOf(state.weapon, ['fists', 'pistol', 'shotgun', 'smg', 'grenade', 'rpg'] as const, 'fists'),
     vehicle: oneOf(state.vehicle, ['foot', 'scooter', 'car', 'police', 'boat', 'swim'] as const, state.riding ? 'scooter' : 'foot'),
     down: state.down === true, firing: state.firing === true, wanted: integer(state.wanted, 0, 5, 0),
+    ...(mode === 'zombie' ? zombiePlayerFields(state) : {}), // zombie co-op (NET)
   };
 }
 /** The layout version a client sent on create or join (lib/world-bounds.ts WORLD_VERSION); clients from before it was sent build version 1. */

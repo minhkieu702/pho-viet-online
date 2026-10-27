@@ -1,0 +1,123 @@
+/* Zombie mode HUD (app/zombie-hud.tsx, design.md §4). The old zombie card in page.tsx is replaced by .zhud-card. */
+.app-shell .zombie-card:not(.zhud-card){display:none}
+.zombie-coop-start{background:#2a2226;box-shadow:inset 0 0 0 1px #8a3a3a}
+.zombie-coop-start:hover:not(:disabled){background:#35292d}
+.zombie-coop-start svg:first-child{color:#e07a5f}
+.zhud-card{z-index:4}
+.zhud-boss-chip{display:flex;align-items:center;gap:6px;margin:0 12px 6px;padding:4px 8px;border-radius:5px;background:#5a1f1a;color:#ffd2c4;font-size:10px;font-weight:800;letter-spacing:1px;animation:zhud-pulse 1.2s ease-in-out infinite}
+.zhud-boss-chip svg{color:#ff8a6a}
+@keyframes zhud-pulse{50%{background:#7a2a20}}
+.zombie-stats span{display:flex;align-items:center;gap:3px}
+.zombie-stats button{display:flex;align-items:center;gap:4px}
+.zhud-team{display:flex;flex-direction:column;gap:2px;padding:6px 10px 8px;border-top:1px solid #ffffff1a}
+.zhud-mate{display:flex;align-items:center;gap:6px;font-size:11px;color:#dfe8cb;min-height:20px}
+.zhud-mate>i{width:8px;height:8px;flex-shrink:0;border-radius:50%}
+.zhud-mate-name{display:flex;align-items:center;gap:3px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:700}
+.zhud-mate .zhud-bar{width:64px;flex-shrink:0}
+.zhud-host{flex-shrink:0;color:#f2c84b}
+.zhud-bar{display:block;height:6px;border-radius:3px;background:#ffffff22;overflow:hidden}
+.zhud-bar i{display:block;height:100%;border-radius:3px;transition:width .2s}
+.zhud-badge{flex-shrink:1;min-width:0;font-size:9px;font-weight:800;letter-spacing:.3px;padding:2px 5px;border-radius:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.zhud-badge.blink{background:#7a1f18;color:#ffd9cf;animation:zhud-blink .8s steps(2) infinite}
+.zhud-badge.dead{background:#2b2b2b;color:#bdbdbd}
+@keyframes zhud-blink{50%{opacity:.45}}
+.zhud-paw{display:flex;align-items:center;gap:2px;font-size:9px;color:#e8cf9a;font-variant-numeric:tabular-nums}
+.zhud-dist{display:inline-block;flex-shrink:0;width:12px;font-size:11px;color:#c3cfa8;text-align:center}
+.zhud-mate small{flex-shrink:0;min-width:30px;font-size:9px;color:#a9b691;text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.zhud-mate.down{color:#ffd9cf}
+.zhud-mate.dead{opacity:.6}
+/* Boss bars: one 20 px row per giant (skull, name, a thin bar with 25% ticks, weak-point pips), docked in the top bar's
+   middle (the mode chip makes way); at 950 px and less, one row under the top bar with the giants side by side and the
+   HUD below it moved down by the row. Never over the middle of the screen, the giants' wind-ups or the reticle. */
+.zhud-bosses{position:absolute;top:10px;left:50%;transform:translateX(-50%);display:flex;flex-direction:column;gap:3px;width:min(420px,calc(100% - 640px));min-width:240px;z-index:5;pointer-events:none}
+.app-shell:has(.zhud-bosses) .top-center{visibility:hidden}
+.zhud-bossbar{display:flex;align-items:center;gap:6px;height:20px;padding:0 8px;border-radius:6px;background:#1c1614e0;border:1px solid #8a2a2a;box-shadow:0 0 10px #8a1a1a44;color:#ffe3d6;font-size:10px;letter-spacing:1px}
+.zhud-bossbar>svg{flex-shrink:0;color:#ff6a4a}
+.zhud-bossbar>b{flex-shrink:0;white-space:nowrap}
+.zhud-boss-hp{position:relative;flex:1;min-width:28px;height:7px;border-radius:4px;background:#3a1a16;overflow:hidden}
+.zhud-boss-hp i{display:block;height:100%;background:linear-gradient(90deg,#b8261c,#e85a2e);transition:width .25s}
+.zhud-boss-hp em{position:absolute;top:0;bottom:0;width:1px;background:#00000066}
+.zhud-weak{display:flex;align-items:center;gap:3px;flex-shrink:0}
+.zhud-weak span{width:7px;height:7px;border-radius:50%;background:#3a2a26;border:1px solid #6a4a40}
+.zhud-weak span.on{background:#ffd34a;border-color:#fff1a0;box-shadow:0 0 5px #ffd34a}
+@media(max-width:950px){
+  .zhud-bosses{top:calc(var(--hud-top) - 28px);flex-direction:row;gap:4px;width:calc(100% - 2 * var(--hud-x));min-width:0}
+  .zhud-bossbar{flex:1;min-width:0;gap:4px;padding:0 6px;letter-spacing:.3px}
+  .zhud-bossbar>b{flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+  .app-shell:has(.zhud-bosses){--hud-top:116px}
+}
+@media(max-width:700px){.app-shell:has(.zhud-bosses){--hud-top:94px}.zhud-bossbar>svg{display:none}}
+/* The waiting room of a new online room: the code to share and "Bắt đầu". */
+.zhud-wait{display:flex;align-items:center;gap:8px;margin:0 12px 6px;padding:6px 8px;border-radius:6px;background:#2b3a2a;color:#eef3df}
+.zhud-wait>span{display:flex;flex-direction:column;flex:1;min-width:0;font-size:11px}
+.zhud-wait small{font-size:10px;color:#c3cfa8}
+.zhud-wait em{font-style:normal;font-weight:800;letter-spacing:2px;color:#ffe9a8}
+.zhud-wait button{display:flex;align-items:center;gap:4px;flex-shrink:0;padding:6px 10px;border-radius:6px;background:#b3261e;color:#fff;font-size:11px;font-weight:700}
+.zhud-feed{position:absolute;top:calc(var(--hud-top) + 150px);right:var(--hud-x);display:flex;flex-direction:column;align-items:flex-end;gap:4px;margin:0;padding:0;list-style:none;z-index:3;pointer-events:none}
+.zhud-feed li{padding:4px 9px;border-radius:6px;background:#1d221bd9;color:#eef3df;font-size:11px;font-weight:600;animation:zhud-feed 4.5s ease-out forwards;max-width:300px}
+.zhud-feed li.tone-boss{background:#5a1f1ae6;color:#ffe3d6;font-weight:800}
+.zhud-feed li.tone-revive{background:#244a32e6}
+.zhud-feed li.tone-dog{background:#4a3a1ee6}
+@keyframes zhud-feed{0%{opacity:0;transform:translateX(12px)}6%{opacity:1;transform:none}80%{opacity:1}100%{opacity:0}}
+.zhud-dog{position:absolute;left:var(--hud-x);bottom:calc(24px + var(--map-w) + 92px);width:var(--map-w);padding:7px 9px 8px;border-radius:10px;background:#232b20f2;border:1px solid #5d7a3a80;color:#eef3df;box-shadow:var(--hud-shadow);z-index:3}
+.zhud-dog-head{display:flex;align-items:center;gap:6px;font-size:11px}
+.zhud-dog-head b{white-space:nowrap}
+.zhud-dog-head span{margin-left:auto;font-size:9px;color:#c3cfa8;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.zhud-bar.dog{height:7px;margin:6px 0 5px}
+.zhud-dog-keys{display:flex;align-items:center;gap:6px}
+.zhud-dog-keys small{font-size:9px;color:#a9b691;line-height:1.3}
+.zhud-dog-touch{display:none;margin-left:auto;gap:4px}
+.zhud-dog-touch button{min-width:30px;height:28px;padding:0 6px;border-radius:6px;background:#ffffff1f;color:#eef3df;font-size:10px;display:grid;place-items:center}
+@media(pointer:coarse){.zhud-dog-touch{display:flex}}
+.zhud-dog.state-down,.zhud-dog.state-hurt{border-color:#c8352b}
+.zhud-dog.state-down .zhud-dog-head span{color:#ffb3a3;animation:zhud-blink .8s steps(2) infinite}
+.zhud-threat{position:absolute;z-index:3;display:grid;place-items:center;width:30px;height:30px;border-radius:50%;pointer-events:none;color:#fff;animation:zhud-throb 0.9s ease-in-out infinite}
+.zhud-threat.mutant{background:#b3261ecc;box-shadow:0 0 12px #ff3a2a}
+.zhud-threat.screamer{background:#c9a21ecc}
+.zhud-threat.bark{background:#ffffffd9;color:#2b2622;width:24px;height:24px}
+@keyframes zhud-throb{50%{scale:1.15}}
+.zhud-self{position:absolute;left:50%;top:36%;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;gap:5px;padding:14px 20px;border-radius:12px;background:#1a0f0de0;color:#ffe3d6;text-align:center;z-index:6;pointer-events:none}
+.zhud-self b{font-size:22px;letter-spacing:3px}
+.zhud-self span{font-size:12px}
+.zhud-self small{font-size:10px;color:#d9a99a}
+.zhud-self em{font-style:normal;font-size:12px;color:#a8f0a0}
+.zhud-self.down svg{color:#ff5a3a;animation:zhud-blink 1s steps(2) infinite}
+.zhud-self.dead{top:22%;background:#141414d0}
+.zhud-vignette{position:absolute;inset:0;z-index:2;pointer-events:none;transition:opacity .4s}
+.zhud-vignette.tint-none,.zhud-vignette.tint-stalk{background:radial-gradient(ellipse at center,transparent 45%,#000000d0 100%)}
+.zhud-vignette.tint-blood{background:radial-gradient(ellipse at center,transparent 40%,#7a0a06cc 100%);animation:zhud-blood 1.1s ease-in-out infinite}
+.zhud-vignette.tint-toxic{background:radial-gradient(ellipse at center,#6a9a2a1a 30%,#4a7a1acc 100%)}
+@keyframes zhud-blood{50%{opacity:.55}}
+@media(prefers-reduced-motion:reduce){.zhud-vignette.tint-blood,.zhud-threat,.zhud-boss-chip{animation:none}}
+.zhud-over{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(440px,calc(100% - 32px));padding:18px 20px;border-radius:12px;background:#1c1614f2;border:1px solid #8a2a2a;color:#ffe3d6;z-index:11}
+.zhud-over-head{display:flex;align-items:center;gap:8px;font-size:15px;letter-spacing:1px;margin-bottom:10px}
+.zhud-over-head svg{color:#ff6a4a}
+.zhud-over table{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
+.zhud-over th{font-size:10px;font-weight:600;color:#d9a99a;text-align:right;padding:4px 6px}
+.zhud-over td{text-align:right;padding:4px 6px;border-top:1px solid #ffffff14}
+.zhud-over th:first-child,.zhud-over td:first-child{text-align:left}
+.zhud-over-foot{display:flex;align-items:center;gap:12px;margin-top:12px}
+.zhud-over-foot button{display:flex;align-items:center;gap:6px;padding:9px 14px;border-radius:7px;background:#b3261e;color:#fff;font-size:12px;font-weight:700}
+.zhud-over-foot small{font-size:11px;color:#d9a99a}
+@media(max-width:700px){
+  .zhud-feed{top:auto;bottom:calc(var(--map-w) + 160px);right:16px}
+  .zhud-mate .zhud-bar{width:48px}
+  .zhud-dog{bottom:calc(24px + var(--map-w) + 80px)}
+}
+/* The lobby with the co-op zombie button: a compact second zombie button, the column lifted on short screens. */
+.zombie-coop-start{margin-top:6px;padding:8px 13px}
+.zombie-coop-start small{font-size:10px}
+@media(max-height:860px) and (min-width:701px){.welcome:has(.zombie-coop-start){top:12%}.welcome:has(.zombie-coop-start) h1{font-size:50px;margin:14px 0 12px}.welcome:has(.zombie-coop-start) .intro{margin-bottom:16px}}
+@media(max-height:700px) and (min-width:701px){.welcome:has(.zombie-coop-start) .feature-row{display:none}}
+/* Zombie mode's banners (boss names, waves) fit the screen instead of wrapping word by word. */
+.app-shell:has(.zhud-card) .banner{width:max-content;max-width:94vw;text-align:center;font-size:clamp(26px,5.2vw,58px);line-height:1.12}
+@media(max-width:700px){
+  .zhud-dog{left:auto;right:16px;bottom:calc(var(--map-w) + 176px);width:150px}
+  .zhud-dog-keys small{display:none}
+}
+/* Minimap marks (ZombieMapMarks) */
+.zmap-pulse{transform-box:fill-box;transform-origin:center;animation:zmap-pulse 1.2s ease-out infinite}
+.zmap-pulse.slow{animation-duration:2s}
+@keyframes zmap-pulse{0%{scale:.55;opacity:1}100%{scale:1.45;opacity:0}}
+.zmap-blink{animation:zhud-blink .8s steps(2) infinite}
+@media (prefers-reduced-motion:reduce){.zmap-pulse,.zmap-blink{animation:none}}

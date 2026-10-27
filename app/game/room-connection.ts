@@ -3,12 +3,23 @@ import {
   type ClientMessage, type IncomingHit, type OutgoingHit, type PeerState,
   type PlayerState, type ServerMessage, type Session,
 } from '../../lib/multiplayer-protocol.ts';
+// ---- zombie co-op (design.md §5.2, NET) ----
+import { MAX_FRAME_BYTES, type RoomMode, type ZombieClientMessage, type ZombieServerMessage } from '../../lib/zombie-protocol.ts';
+/** Zombie frames are drained only while the socket's send buffer is below this (§5.2). */
+const ZOMBIE_BUFFER_BYTES = 16 * 1024;
+const utf8 = typeof TextEncoder === 'undefined' ? null : new TextEncoder();
+const visible = () => typeof document === 'undefined' || document.visibilityState === 'visible';
+// ---- end zombie co-op ----
 
 const MAX_BUFFERED_BYTES = 32 * 1024;
 const RETRY_HIT_MS = 750;
 const HEARTBEAT_MS = 2000;
 const CONNECTION_TIMEOUT_MS = 10_000;
 const FATAL_CLOSE_CODES = new Set([4001, 4401, 4403, 4404, 4409]);
+// ---- zombie co-op (NET): a 4403 for the send rate follows a backlog in the room (its queue released late frames at
+// once), not this client: reconnect with backoff instead of ending the session (malformed JSON stays fatal).
+const RATE_REASON = 'Gửi dữ liệu quá nhanh.';
+// ---- end zombie co-op ----
 
 // A narrow socket interface also lets tests exercise reconnects without a server.
 export interface RoomSocket {
@@ -16,7 +27,7 @@ export interface RoomSocket {
   bufferedAmount: number;
   onopen: (() => void) | null;
   onmessage: ((event: { data: unknown }) => void) | null;
-  onclose: ((event: { code: number }) => void) | null;
+  onclose: ((event: { code: number; reason?: string }) => void) | null;
   onerror: (() => void) | null;
   send(data: string): void;
   close(code?: number, reason?: string): void;
@@ -30,6 +41,19 @@ export type RoomCallbacks = {
   onStatus(status: 'connected' | 'reconnecting'): void;
   onLatency(milliseconds: number): void;
   onFatal(message: string): void;
+  // ---- zombie co-op (NET) ----
+  /** Zombie frames to send this tick (≤ maxBytes in total, each ≤ MAX_FRAME_BYTES); drained every tick while the buffer is below 16 KB. */
+  takeZombie?(maxBytes: number): ZombieClientMessage[];
+  /** Every z* message from the room, in order (after `ready`). */
+  onZombie?(message: ZombieServerMessage): void;
+  /** Each `ready` (the first and every reconnect): the room's mode and this session's slot, which may change after a long idle. */
+  onReady?(info: { mode?: RoomMode; slot?: number; serverTime: number; reconnect: boolean }): void;
+  /** Frames per second over the last 2 s, reported with each ping (host election, §1.7). */
+  fps?(): number;
+  /** Server time of every ready/snapshot/pong, so clocks work even when no zombie frame arrives (a lone host). */
+  onServerTime?(serverTime: number): void;
+  /** A socket closed with this code (diagnostics: reconnects and 1009/4403 closes). */
+  onClose?(code: number): void;
 };
 
 type Options = {
@@ -63,11 +87,28 @@ export function connectRoom(session: Session, baseUrl: string, callbacks: RoomCa
   let pendingPing: number | null = null;
   let hitBudget = 8;
   let budgetTime = now();
+  let readies = 0;
+  let lastRtt: number | undefined;
 
   function send(message: ClientMessage) {
     if (!socket || socket.readyState !== 1 || socket.bufferedAmount > MAX_BUFFERED_BYTES) return false;
     try { socket.send(JSON.stringify(message)); return true; } catch { return false; }
   }
+
+  function sendText(text: string) {
+    if (!socket || socket.readyState !== 1 || socket.bufferedAmount > MAX_BUFFERED_BYTES) return false;
+    try { socket.send(text); return true; } catch { return false; }
+  }
+
+  function ping(time: number) {
+    if (send({ type: 'ping', sentAt: time, rtt: lastRtt, vis: visible(), fps: callbacks.fps ? Math.round(callbacks.fps()) : undefined })) {
+      lastPing = time;
+      pendingPing = time;
+    }
+  }
+  // A hidden tab stops the game loop at once: tell the room now, not at the next heartbeat (a hidden zombie host is replaced, §9 A6).
+  const onVisibility = () => { if (!disposed && ready) ping(now()); };
+  if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
 
   function detach() {
     const old = socket;
@@ -83,6 +124,7 @@ export function connectRoom(session: Session, baseUrl: string, callbacks: RoomCa
     disposed = true;
     clearInterval(tick);
     clearTimeout(retry);
+    if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
     detach();
     pending.clear();
     received.clear();
@@ -122,17 +164,26 @@ export function connectRoom(session: Session, baseUrl: string, callbacks: RoomCa
       pendingPing = null;
       for (const hit of pending.values()) hit.sentAt = -Infinity;
       callbacks.onStatus('connected');
+      if (Number.isFinite(message.serverTime)) callbacks.onServerTime?.(message.serverTime);
+      callbacks.onReady?.({ mode: message.mode, slot: message.slot, serverTime: message.serverTime, reconnect: readies++ > 0 });
       return;
     }
     if (!ready) return;
+    if (typeof message.type === 'string' && message.type.charCodeAt(0) === 122 /* z */) {
+      callbacks.onZombie?.(message as ZombieServerMessage);
+      return;
+    }
     if (message.type === 'snapshot') {
       if (!Number.isSafeInteger(message.seq) || message.seq <= snapshotSequence ||
           !Number.isFinite(message.serverTime) || !Array.isArray(message.peers) || message.peers.length > 8) return;
       snapshotSequence = message.seq;
+      callbacks.onServerTime?.(message.serverTime);
       callbacks.onPeers(message.peers, message.serverTime);
     } else if (message.type === 'pong') {
+      if (Number.isFinite(message.serverTime)) callbacks.onServerTime?.(message.serverTime);
       if (message.sentAt === pendingPing) {
-        callbacks.onLatency(Math.round(Math.max(0, now() - message.sentAt)));
+        lastRtt = Math.round(Math.max(0, now() - message.sentAt));
+        callbacks.onLatency(lastRtt);
         pendingPing = null;
       }
     } else if (message.type === 'hitAck') {
@@ -165,7 +216,8 @@ export function connectRoom(session: Session, baseUrl: string, callbacks: RoomCa
       next.onmessage = event => { if (socket === next && !disposed) onMessage(event.data); };
       next.onclose = event => {
         if (socket !== next || disposed) return;
-        if (FATAL_CLOSE_CODES.has(event.code)) {
+        callbacks.onClose?.(event.code);
+        if (FATAL_CLOSE_CODES.has(event.code) && !(event.code === 4403 && event.reason === RATE_REASON)) {
           fatal(event.code === 4001 ? 'Phiên chơi đã được mở ở kết nối khác.' : 'Phiên chơi không còn khả dụng. Hãy vào lại phòng.');
         } else reconnect();
       };
@@ -197,10 +249,15 @@ export function connectRoom(session: Session, baseUrl: string, callbacks: RoomCa
         hitBudget--;
       }
     }
-    if (time - lastPing >= HEARTBEAT_MS && send({ type: 'ping', sentAt: time })) {
-      lastPing = time;
-      pendingPing = time;
+    if (callbacks.takeZombie && socket && socket.bufferedAmount < ZOMBIE_BUFFER_BYTES) {
+      // After `state`, in the same tick; zombie-net already split every frame by bytes (the room closes > 4096 with 1009).
+      for (const message of callbacks.takeZombie(ZOMBIE_BUFFER_BYTES - socket.bufferedAmount)) {
+        const text = JSON.stringify(message);
+        if ((utf8 ? utf8.encode(text).byteLength : text.length) > MAX_FRAME_BYTES) continue;
+        sendText(text);
+      }
     }
+    if (time - lastPing >= HEARTBEAT_MS) ping(time);
   }, SYNC_INTERVAL_MS);
 
   callbacks.onStatus('reconnecting');

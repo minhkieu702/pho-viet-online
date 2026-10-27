@@ -42,10 +42,11 @@ const localBindingConfig = {
 };
 
 /**
- * The P1 map worker (app/game/map/world-map-worker.ts, the client's `?worker` import in world-map-start.ts) is bundled
- * once, and Vite emits its script into every environment's output, the server's (rsc, ssr) too, where wrangler would
- * attach it to the Worker as two unused modules. Map generation must not ship in or run on the Worker (WIRING-PLAN §2):
- * the server bundles drop it; the client keeps it at /_next/static/.
+ * The P1 map worker (app/game/map/world-map-worker.ts, the client's `?worker` import in world-map-start.ts) and zombie
+ * mode's ruin planner (app/game/ruin-worker.ts) are each bundled once, and Vite emits their scripts into every
+ * environment's output, the server's (rsc, ssr) too, where wrangler would attach them to the Worker as unused modules.
+ * Map and ruin generation must not ship in or run on the Worker (WIRING-PLAN §2): the server bundles drop them; the
+ * client keeps them at /_next/static/.
  */
 function clientOnlyMapWorker(): Plugin {
   return {
@@ -54,7 +55,7 @@ function clientOnlyMapWorker(): Plugin {
     applyToEnvironment: (environment) => environment.name !== "client",
     generateBundle(_options, bundle) {
       for (const file of Object.keys(bundle)) {
-        if (/(^|\/)world-map-worker-[\w-]+\.js$/.test(file)) delete bundle[file];
+        if (/(^|\/)(world-map|ruin)-worker-[\w-]+\.js$/.test(file)) delete bundle[file];
       }
     },
   };

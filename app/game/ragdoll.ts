@@ -13,6 +13,9 @@ import {
   sleep, solverOptions, step, strike as strikeBody, sweep as sweepBody, wake,
   type BodyPart, type FallMode, type HitKind, type Mover, type RagdollState, type RagdollWorld, type RayHit, type Skeleton,
 } from './ragdoll-solver';
+// ---- zombie co-op (design.md §5, MUTANTS) ----
+import { zombieGeometry } from './zombie-looks';
+// ---- end zombie co-op ----
 
 /**
  * Ragdolls: the physics of ragdoll-solver.ts (20 anatomical particles per body, joint limits, friction, buoyancy,
@@ -51,6 +54,10 @@ export type SpawnOptions = {
   build?: { width: number; height: number };
   /** 'sit': fall from a seat (riders, drivers) instead of from standing; `y` is then the seat, where the hips rest. */
   from?: 'stand' | 'sit';
+  // ---- zombie co-op (design.md §5, MUTANTS) ----
+  /** Drawn with the zombie variant geometry (its own lazily made batches); the face keeps its look (a jawless zombie stays jawless). */
+  variant?: 'zombie';
+  // ---- end zombie co-op ----
 };
 export type RagdollHit = { body: RagdollBody; t: number; index: number; part: BodyPart | null; point: THREE.Vector3 };
 
@@ -156,6 +163,9 @@ export class RagdollBody {
   /** Steps at 120 Hz (else 60 Hz), the tick of its latest substep, and whether its instances are up to date. */
   full = true; lastTick = 0; synced = false;
   bornAt = 0; bornFrame = 0; focus = 0;
+  // ---- zombie co-op (design.md §5, MUTANTS) ----
+  variant: 'zombie' | null = null;
+  // ---- end zombie co-op ----
   constructor(
     readonly slot: number, readonly state: RagdollState, readonly look: RagdollLook, readonly style: FigureStyle,
     readonly keep: boolean, readonly limp: boolean,
@@ -542,33 +552,62 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     }
   }
 
-  /** Writes every body into the batches: torsos then loose heads, arms, legs (two per body). */
+  // ---- zombie co-op (design.md §5, MUTANTS): zombie bodies draw from their own batches, made on first use ----
+  type BatchSet = { body: FigureBatch; armL: FigureBatch; armR: FigureBatch; leg: FigureBatch; all: FigureBatch[] };
+  const humanSet: BatchSet = { body: bodyBatch, armL: armBatchL, armR: armBatchR, leg: legBatch, all: batches };
+  let zombieSet: BatchSet | null = null;
+  function zombieBatches() {
+    if (zombieSet) return zombieSet;
+    const body = new FigureBatch(zombieGeometry('body', detail), materials.body, MAX_BODIES * 2);
+    const armL = new FigureBatch(zombieGeometry('armL', detail), materials.arm, MAX_BODIES);
+    const armR = new FigureBatch(zombieGeometry('armR', detail), materials.arm, MAX_BODIES);
+    const leg = new FigureBatch(zombieGeometry('leg', detail), materials.leg, MAX_BODIES * 2);
+    zombieSet = { body, armL, armR, leg, all: [body, armL, armR, leg] };
+    for (const batch of zombieSet.all) { batch.end(0); batch.mesh.visible = false; scene.add(batch.mesh); }
+    return zombieSet;
+  }
+  /** A zombie's corpse keeps its face (the variant's BLINK is a missing jaw, not closed lids); its eyes go dark when limp. */
+  function zombieFace(body: RagdollBody) {
+    const face = body.style.head & (HEAD.MOUTH | HEAD.BLINK | HEAD.EYES);
+    for (const look of [body.looks.body, body.looks.head]) {
+      setBits(look, 0, HEAD.EYES | HEAD.MOUTH | HEAD.BLINK, false);
+      setBits(look, 0, body.limp ? face & ~HEAD.EYES : face, true);
+    }
+  }
+  // ---- end zombie co-op ----
+
+  /** Writes every body into the batches: torsos then loose heads, arms, legs (two per body); zombie bodies into theirs. */
   function flush() {
     dirty = false;
-    const n = bodies.length;
     const put = (batch: FigureBatch, index: number, body: RagdollBody, inst: number, look: Float32Array) => {
       (batch.mesh.instanceMatrix.array as Float32Array).set(body.matrixOf[inst], index * 16);
       batch.setLook(index, look);
       batch.setPose(index, body.poseOf[inst]);
     };
-    let heads = n;
-    for (let i = 0; i < n; i++) {
-      const b = bodies[i];
-      put(bodyBatch, i, b, TORSO_I, b.looks.body);
-      put(armBatchL, i, b, ARM_L, b.looks.armL);
-      put(armBatchR, i, b, ARM_R, b.looks.armR);
-      put(legBatch, i * 2, b, LEG_L, b.looks.legs);
-      put(legBatch, i * 2 + 1, b, LEG_R, b.looks.legs);
-    }
-    for (const b of bodies) if (b.state.cut & 1) put(bodyBatch, heads++, b, HEAD_I, b.looks.head);
-    for (const b of bodies) {
-      if (!b.hat) continue;
-      (bodyBatch.mesh.instanceMatrix.array as Float32Array).set(b.hatMatrix, heads * 16);
-      bodyBatch.setLook(heads, b.hatLook);
-      bodyBatch.setPose(heads++, HAT_POSE);
-    }
-    bodyBatch.end(heads); armBatchL.end(n); armBatchR.end(n); legBatch.end(n * 2);
-    for (const batch of batches) batch.mesh.visible = batch.mesh.count > 0;
+    const fill = (set: BatchSet, zombie: boolean) => {
+      let n = 0;
+      for (const b of bodies) {
+        if ((b.variant === 'zombie') !== zombie) continue;
+        put(set.body, n, b, TORSO_I, b.looks.body);
+        put(set.armL, n, b, ARM_L, b.looks.armL);
+        put(set.armR, n, b, ARM_R, b.looks.armR);
+        put(set.leg, n * 2, b, LEG_L, b.looks.legs);
+        put(set.leg, n * 2 + 1, b, LEG_R, b.looks.legs);
+        n++;
+      }
+      let heads = n;
+      for (const b of bodies) if ((b.variant === 'zombie') === zombie && b.state.cut & 1) put(set.body, heads++, b, HEAD_I, b.looks.head);
+      for (const b of bodies) {
+        if (!b.hat || (b.variant === 'zombie') !== zombie) continue;
+        (set.body.mesh.instanceMatrix.array as Float32Array).set(b.hatMatrix, heads * 16);
+        set.body.setLook(heads, b.hatLook);
+        set.body.setPose(heads++, HAT_POSE);
+      }
+      set.body.end(heads); set.armL.end(n); set.armR.end(n); set.leg.end(n * 2);
+      for (const batch of set.all) batch.mesh.visible = batch.mesh.count > 0;
+    };
+    fill(humanSet, false);
+    if (zombieSet) fill(zombieSet, true);
   }
 
   // ---- Pool -------------------------------------------------------------------------------------------------
@@ -616,6 +655,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     // Hinge axes for the first frame (the solver refreshes them on every step).
     hingeAngles(state);
     const body = new RagdollBody(freeSlots.pop()!, state, look, style, !!options.keep, mode === 'limp');
+    if (options.variant === 'zombie') { body.variant = 'zombie'; zombieBatches(); zombieFace(body); }
     body.bornAt = clock;
     body.bornFrame = frame;
     body.lastTick = tick;
@@ -833,6 +873,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
       armBatchL.setGeometry(figureGeometry('armL', next));
       armBatchR.setGeometry(figureGeometry('armR', next));
       legBatch.setGeometry(figureGeometry('leg', next));
+      if (zombieSet) for (const [batch, piece] of [[zombieSet.body, 'body'], [zombieSet.armL, 'armL'], [zombieSet.armR, 'armR'], [zombieSet.leg, 'leg']] as const) batch.setGeometry(zombieGeometry(piece, next));
     },
     /** Bodies in the pool, awake, and stepping at full rate (for the debug handle). */
     stats() {
@@ -843,6 +884,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     dispose() {
       stopBounds?.();
       for (const batch of batches) { scene.remove(batch.mesh); batch.dispose(); }
+      if (zombieSet) for (const batch of zombieSet.all) { scene.remove(batch.mesh); batch.dispose(); }
       for (const m of Object.values(materials)) m.dispose();
       bodies.length = 0;
       stumps.length = 0;
