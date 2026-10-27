@@ -5,11 +5,60 @@
 // and the river, including exact edge values. Decks: nothing below a deck ever snaps onto it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import module from 'node:module';
+
+// The map modules import './x' without an extension (Vite style): a resolve hook retries those as .ts.
+const tsFallback = (specifier) => /^\.\.?\//.test(specifier) && !/\.[cm]?[jt]sx?$/.test(specifier);
+if (module.registerHooks) {
+  module.registerHooks({
+    resolve(specifier, context, next) {
+      try { return next(specifier, context); } catch (e) {
+        if (e?.code === 'ERR_MODULE_NOT_FOUND' && tsFallback(specifier)) return next(`${specifier}.ts`, context);
+        throw e;
+      }
+    },
+  });
+} else {
+  module.register(`data:text/javascript,${encodeURIComponent(`export async function resolve(s, c, n) {
+    try { return await n(s, c); } catch (e) {
+      if (e?.code === 'ERR_MODULE_NOT_FOUND' && /^\\.\\.?\\//.test(s) && !/\\.[cm]?[jt]sx?$/.test(s)) return n(s + '.ts', c);
+      throw e;
+    }
+  }`)}`);
+}
 
 const C = await import('../app/game/map/consts.ts');
 const T = await import('../app/game/map/terrain.ts');
-const { WORLD_BOUNDS, PEER_BOUNDS, WORLD_VERSION } = await import('../lib/world-bounds.ts');
+const { WORLD_BOUNDS, PEER_BOUNDS, WORLD_VERSION, worldBoundsFor } = await import('../lib/world-bounds.ts');
 const { DOCKS, LAND, RIVER, RIVER_BED, ROADS_X, ROADS_Z, PLAY, WATER_LEVEL } = C;
+const { buildP1, P1_LAYOUTS } = await import('../app/game/map/p1.ts');
+const { liveInput } = await import('../app/game/map/stack.ts');
+const { createRoadGraph } = await import('../app/game/map/roads.ts');
+const { LEGACY_ROADS } = await import('../app/game/map/roads-legacy.ts');
+const EXTRA = {
+  'quan-4': (await import('../app/game/map/layout/quan-4.ts')).QUAN_4_EXTRA,
+  'binh-thanh': (await import('../app/game/map/layout/binh-thanh.ts')).BINH_THANH_EXTRA,
+  'quan-3': (await import('../app/game/map/layout/quan-3.ts')).QUAN_3_EXTRA,
+  'quan-1-south': (await import('../app/game/map/layout/quan-1-south.ts')).QUAN_1_SOUTH_EXTRA,
+  'thu-thiem': (await import('../app/game/map/layout/thu-thiem.ts')).THU_THIEM_EXTRA,
+};
+/**
+ * The world terrain with the first n P1 slices wired, built as world-map.ts builds it: the slices (bounds, waters,
+ * decks, EXTRA) and every road edge of the live graph that is not today's.
+ */
+const worlds = new Map();
+function worldInput(n) {
+  const p1 = buildP1(LEGACY_ROADS, { idBase: 164, layouts: P1_LAYOUTS.slice(0, n) });
+  const live = liveInput(p1.stack, LEGACY_ROADS), g = createRoadGraph(live.input);
+  return {
+    slices: p1.slices.map((s) => ({ key: s.key, bounds: s.layout.bounds, waters: s.data.waters, decks: s.data.decks, extra: EXTRA[s.key] })),
+    roads: g.edges.filter((_, i) => live.edgeOf[i].slice !== 'legacy'), graph: g, p1,
+  };
+}
+function world(n) {
+  if (!worlds.has(n)) { const input = worldInput(n); const t = T.createTerrain(T.worldTerrain(input)); t.input = input; worlds.set(n, t); }
+  return worlds.get(n);
+}
 
 // ---- Frozen legacy code (world.ts before the terrain module; SCENERY.docks is DOCKS). ----
 const inRect = (r, x, z, margin = 0) => x >= r.minX + margin && x <= r.maxX - margin && z >= r.minZ + margin && z <= r.maxZ - margin;
@@ -169,12 +218,16 @@ test('banks: the promenade, far wall and steps give the legacy climb, vault and 
   assert.equal(t.bankNear(12, 15, 5), null);
 });
 
-test('bounds are today\'s PLAY rectangle; the server accepts them with 2 m of slack', () => {
+test('bounds: today\'s terrain is the PLAY rectangle; the wired map\'s follow lib/world-bounds.ts; the server accepts them with 2 m of slack', () => {
   assert.deepEqual({ ...T.bounds }, { ...PLAY });
-  assert.deepEqual(WORLD_BOUNDS, { minX: PLAY.minX, maxX: PLAY.maxX, minZ: PLAY.minZ, maxZ: PLAY.maxZ });
+  assert.deepEqual({ ...T.LEGACY_TERRAIN.bounds }, { ...PLAY });
+  assert.deepEqual(worldBoundsFor(0), { minX: PLAY.minX, maxX: PLAY.maxX, minZ: PLAY.minZ, maxZ: PLAY.maxZ });
   assert.ok(PEER_BOUNDS.minX <= WORLD_BOUNDS.minX - 2 && PEER_BOUNDS.maxX >= WORLD_BOUNDS.maxX + 2);
   assert.ok(PEER_BOUNDS.minZ <= WORLD_BOUNDS.minZ - 2 && PEER_BOUNDS.maxZ >= WORLD_BOUNDS.maxZ + 2);
   assert.ok(Number.isInteger(WORLD_VERSION) && WORLD_VERSION >= 1);
+  // No slice wired: the world terrain is today's.
+  assert.deepEqual(T.worldTerrain({ slices: [], roads: [] }).bounds, worldBoundsFor(0));
+  for (let n = 1; n <= P1_LAYOUTS.length; n++) assert.deepEqual({ ...world(n).bounds }, worldBoundsFor(n), `bounds with ${n} wired`);
 });
 
 test('decks carry only bodies at or above them: swimmers, boats and ragdolls below get the ground', () => {
@@ -262,6 +315,264 @@ test('polygons, margins and docks facing other ways', () => {
   assert.equal(t.pierNear(-80, -230, 1.4), north); // the landward side is open
   assert.equal(t.pierNear(-83.5, -195, 1.4), null);
   assert.ok(!t.navigable(-76, -188.1, 1.15) && t.navigable(-76, -188, 1.15));
+});
+
+// ---- The wired map (worldTerrain): today's area unchanged, the slices' water, banks, docks, decks, land ----
+
+test('world terrain: today\'s area is exactly today\'s at every wiring step (ground, sidewalks, docks, water, land)', () => {
+  const box = { minX: LAND.minX, maxX: LAND.maxX, minZ: RIVER.minZ, maxZ: LAND.maxZ };
+  for (let n = 1; n <= P1_LAYOUTS.length; n++) {
+    const W = world(n);
+    let checked = 0;
+    // Thủ Thiêm's piers reach out into today's river from the far bank: their surroundings are new.
+    const added = W.docks.filter((d) => d.id >= DOCKS.length).map((d) => ({ minX: d.berth.minX - 3, maxX: d.berth.maxX + 3, minZ: d.berth.minZ - 3, maxZ: d.berth.maxZ + 3 }));
+    const check = (x, z) => {
+      if (!(x >= box.minX && x <= box.maxX && z >= box.minZ && z <= box.maxZ)) return;
+      if (added.some((r) => inRect(r, x, z))) return;
+      checked++;
+      const g = groundHeight(x, z), w = W.groundHeight(x, z);
+      if (!Object.is(g, w)) assert.fail(`${n} wired: groundHeight(${x}, ${z}): legacy ${g}, world ${w}`);
+      if (onSidewalk(x, z) !== W.onSidewalk(x, z)) assert.fail(`${n} wired: onSidewalk(${x}, ${z})`);
+      if (ix(dockAt(x, z)) !== tid(W.dockAt(x, z))) assert.fail(`${n} wired: dockAt(${x}, ${z})`);
+      if (!Object.is(T.waterLevel(x, z), W.waterLevel(x, z))) assert.fail(`${n} wired: waterLevel(${x}, ${z}): ${T.waterLevel(x, z)} vs ${W.waterLevel(x, z)}`);
+      if (T.deep(x, z) !== W.deep(x, z)) assert.fail(`${n} wired: deep(${x}, ${z})`);
+      for (const r of [0, 0.4, 0.5]) {
+        // Beyond today's fences the land goes on now: compare where the walker's disc stays inside them.
+        if (x - r <= LAND.minX + 0.01 || x + r >= LAND.maxX - 0.01 || z + r >= LAND.maxZ - 0.01) continue;
+        if (inRect(LAND, x, z, r) !== W.walkable(x, z, r)) assert.fail(`${n} wired: walkable(${x}, ${z}, ${r}): world ${W.walkable(x, z, r)}`);
+      }
+      for (const m of [0, 0.35, 1.15]) {
+        // The buoy lines at x -138 and 352 are gone once the river runs on.
+        if (x - m <= RIVER.minX + 0.01 || x + m >= RIVER.maxX - 0.01) continue;
+        if (inRect(RIVER, x, z, m) !== W.inWater(x, z, m)) assert.fail(`${n} wired: inWater(${x}, ${z}, ${m})`);
+        if (boatWater(x, z, m) !== W.navigable(x, z, m)) assert.fail(`${n} wired: navigable(${x}, ${z}, ${m})`);
+      }
+      for (const reach of [0.35, 1.4]) if (ix(legacyPier(x, z, reach)) !== tid(W.pierNear(x, z, reach))) assert.fail(`${n} wired: pierNear(${x}, ${z}, ${reach})`);
+      // Until Thủ Thiêm is built the promenade is the nearest bank a swimmer can climb (after it, the far bank may be).
+      if (n < 5 && z < RIVER.maxZ && z > RIVER.minZ) {
+        const a = T.bankNear(x, z, Infinity, true), b = W.bankNear(x, z, Infinity, true);
+        if (a.bank.kind !== b.bank.kind || !Object.is(a.d, b.d) || a.x !== b.x || a.z !== b.z) assert.fail(`${n} wired: bankNear(${x}, ${z})`);
+        const fa = T.bankNear(x, z, 2.5)?.bank.kind ?? null, fb = W.bankNear(x, z, 2.5)?.bank.kind ?? null;
+        if (fa !== fb) assert.fail(`${n} wired: bankNear(${x}, ${z}, 2.5): ${fa} vs ${fb}`);
+      }
+    };
+    for (const [x, z] of samples(n === P1_LAYOUTS.length ? 3e5 : 6e4, 100 + n)) check(x, z);
+    for (const [x, z] of edges()) check(x, z);
+    assert.ok(checked > 3e4);
+  }
+});
+
+test('world terrain: Cầu Khánh Hội carries walkers and cars over the canal; swimmers, boats and ragdolls under it get the water', () => {
+  const W = world(1), deckY = 0.1 + 1, swimmer = WATER_LEVEL - 1.25;
+  // On the carriageway over the water: 1 m above the street; on its sidewalk a curb higher.
+  assert.equal(W.groundHeight(412, -108), deckY);
+  assert.equal(W.groundHeight(412, -108, deckY), deckY);
+  assert.ok(Math.abs(W.groundHeight(412, -98) - (deckY + T.CURB_HEIGHT)) < 1e-12);
+  // Underneath: the swimmer swims, the boat floats, a body on the bed lies there, one falling past the deck keeps falling.
+  assert.equal(W.groundHeight(412, -108, swimmer), RIVER_BED);
+  assert.ok(W.deep(412, -108, swimmer) && !W.deep(412, -108, deckY) && !W.deep(412, -108));
+  assert.equal(W.groundHeight(412, -108, WATER_LEVEL), RIVER_BED);
+  assert.equal(W.groundHeight(412, -108, RIVER_BED + 0.2), RIVER_BED);
+  assert.equal(W.groundHeight(412, -108, deckY - T.DECK_STEP - 0.01), RIVER_BED);
+  assert.equal(W.waterLevel(412, -108), WATER_LEVEL);
+  // Walking over it along z -108 (the carriageway) and z -98 (the sidewalk): the body follows the surface without a
+  // cliff, never swims, and stays on walkable ground (the deck over the water, its fill over the kè walk).
+  for (const z of [-108, -98, -119.8]) {
+    let y = W.groundHeight(355, z), top = -Infinity;
+    for (let x = 355; x <= 470; x += 0.1) {
+      const g = W.groundHeight(x, z, y);
+      assert.ok(Math.abs(g - y) < 0.2, `a cliff at (${x.toFixed(1)}, ${z}): ${y.toFixed(3)} → ${g.toFixed(3)}`);
+      y = g; top = Math.max(top, y);
+      assert.ok(!W.deep(x, z, y), `swimming on the bridge at (${x.toFixed(1)}, ${z})`);
+      assert.ok(W.walkable(x, z, 0.4), `not walkable at (${x.toFixed(1)}, ${z})`);
+    }
+    assert.ok(top >= deckY && top <= deckY + T.CURB_HEIGHT + 1e-9, `the deck's top at z ${z}: ${top}`);
+  }
+  // Swimming under it along the canal, and a hire boat under it: open water all the way, never lifted.
+  for (let z = -136; z <= -80; z += 0.25) {
+    for (const x of [395, 412, 429]) {
+      assert.ok(W.inWater(x, z, 0.35) && W.deep(x, z, swimmer) && W.groundHeight(x, z, swimmer) === RIVER_BED, `swimmer at (${x}, ${z})`);
+      if (x === 412) assert.ok(W.navigable(x, z, 1.15) && W.navigable(x, z - 2.6, 0.9), `boat at (${x}, ${z})`);
+    }
+  }
+  // Thrown off its side into the canal: past the parapet the ground is the bed at any height.
+  for (const y of [3, deckY, 0, WATER_LEVEL, -2]) assert.equal(W.groundHeight(412, -94, y), RIVER_BED);
+  // Every district deck, any height: over the water only bodies at most DECK_STEP below are carried; on the ramps' fill everyone is.
+  const r = rng(77);
+  for (let n = 1; n <= P1_LAYOUTS.length; n += 4) {
+    const D = world(n);
+    let over = 0, fill = 0, under = 0;
+    for (const deck of D.decks) {
+      const s = deck.shape;
+      for (let i = 0; i < 4000; i++) {
+        const x = s.minX + r() * (s.maxX - s.minX), z = s.minZ + r() * (s.maxZ - s.minZ);
+        if (!T.inShape(s, x, z)) continue;
+        const y = deck.y(x, z), yHint = WATER_LEVEL - 3 + r() * 6;
+        const tops = D.decks.filter((d) => T.inShape(d.shape, x, z)).map((d) => ({ d, y: d.y(x, z) }));
+        const got = D.groundHeight(x, z, yHint);
+        if (D.wetAt(x, z)) {
+          over++;
+          const carried = tops.filter((q) => yHint >= q.y - T.DECK_STEP);
+          if (!carried.length) { under++; assert.ok(got < y - T.DECK_STEP, `${deck.name} (${x}, ${z}) y ${yHint}: lifted to ${got}`); }
+          else assert.equal(got, Math.max(...carried.map((q) => q.y), D.groundHeight(x, z, -1e9)));
+        } else { fill++; assert.ok(got >= y - 1e-12, `${deck.name} fill at (${x}, ${z})`); }
+      }
+    }
+    assert.ok(over > 1000 && fill > 300 && under > 300, `deck samples: ${over} over water, ${fill} on fill, ${under} under`);
+  }
+});
+
+test('world terrain: banks are typed by the land behind them; climbing out lands on walkable ground', () => {
+  const kind = (W, x, z, reach = 3) => W.bankNear(x, z, reach)?.bank.kind ?? null;
+  const W1 = world(1), W2 = world(2), W3 = world(3), W5 = world(5);
+  assert.equal(kind(W1, 500, -139), 'wharf', 'W1 bank at (500, -139)'); // the Khánh Hội quay
+  assert.equal(kind(W1, 370, -139), 'promenade', 'W1 bank at (370, -139)'); // the Bến Nghé strip's river park
+  assert.equal(kind(W1, 394, 0), 'ke', 'W1 bank at (394, 0)'); // Kênh Bến Nghé, both walls
+  assert.equal(kind(W1, 430, 200), 'ke', 'W1 bank at (430, 200)');
+  assert.equal(kind(W1, 412, -137.2, 1), null, 'W1 bank at (412, -137.2)'); // the canal's mouth on the river is no bank
+  assert.ok(W1.navigable(412, -137.6, 1.15) && W1.navigable(412, -138.4, 1.15) && W1.navigable(412, -136.8, 1.15), 'a boat passes the canal mouth');
+  assert.equal(kind(W1, 0, -202), 'far', 'W1 bank at (0, -202)'); // Thủ Thiêm not built: the far bank
+  assert.equal(kind(W1, -150, 0), null, 'W1 bank at (-150, 0)'); // Bình Thạnh not built: no Thị Nghè canal yet
+  assert.equal(kind(W2, -177, 0), 'ke', 'W2 bank at (-177, 0)');
+  assert.equal(kind(W2, -300, 202), 'ke', 'W2 bank at (-300, 202)'); // Nhiêu Lộc, Bình Thạnh's kè
+  assert.equal(kind(W2, -300, 228), 'far', 'W2 bank at (-300, 228)'); // its Quận 3 bank before Quận 3
+  assert.equal(kind(W3, -300, 228), 'ke', 'W3 bank at (-300, 228)');
+  assert.equal(kind(W2, -400, -139), 'promenade', 'W2 bank at (-400, -139)'); // Bình Thạnh's river park
+  assert.equal(kind(W5, 0, -202), 'promenade', 'W5 bank at (0, -202)'); // Thủ Thiêm's riverside park
+  assert.equal(kind(W5, -400, -202), 'wharf', 'W5 bank at (-400, -202)'); // the villa's private frontage
+  assert.equal(kind(W5, 520, -235), 'promenade', 'W5 bank at (520, -235)'); // the basin's taper
+  assert.equal(kind(W5, -470, -202), 'far', 'W5 bank at (-470, -202)'); // Thảo Điền, west of Trần Não, is P2
+  // The far-bank notice fires only on a far bank that is left (game.ts climbOut).
+  for (const W of [W1, W2, W3, W5]) {
+    const bad = [];
+    let n = 0;
+    for (const b of W.banks) {
+      if (!b.climbable || b.kind === 'steps') continue;
+      const len = Math.hypot(b.bx - b.ax, b.bz - b.az);
+      if (len < 3) continue;
+      const mx = (b.ax + b.bx) / 2, mz = (b.az + b.bz) / 2;
+      if (!W.inBounds(mx, mz)) continue;
+      n++;
+      // A swimmer just off the wall climbs out `land` behind the waterline; a walker `vault - 0.2` behind it vaults into open water.
+      const hit = W.bankNear(mx + b.nx * 1, mz + b.nz * 1, Infinity, true);
+      const lx = hit.x - hit.bank.nx * hit.bank.land, lz = hit.z - hit.bank.nz * hit.bank.land;
+      if (!W.walkable(lx, lz, 0.4) && !W.dockAt(lx, lz)) bad.push(`${b.kind} ${b.id} (${mx.toFixed(1)}, ${mz.toFixed(1)}): lands at (${lx.toFixed(1)}, ${lz.toFixed(1)})`);
+      const vx = mx + b.nx * b.drop, vz = mz + b.nz * b.drop;
+      if (!W.inWater(vx, vz, 0.35) && !W.hullAt(vx, vz)) bad.push(`${b.kind} ${b.id}: vault lands off the water at (${vx.toFixed(1)}, ${vz.toFixed(1)})`);
+    }
+    assert.ok(n > 4);
+    assert.deepEqual(bad, []);
+  }
+});
+
+test('world terrain: land is today\'s LAND, the slices and their roads, less the water and the railings', () => {
+  const W1 = world(1), W2 = world(2), W3 = world(3), W4 = world(4), W5 = world(5);
+  // Võ Văn Kiệt's east sidewalk is raised and walkable; the canal is not; the kè walk is up to its railing.
+  assert.ok(W1.onSidewalk(386, 0) && Math.abs(W1.groundHeight(386, 0) - (0.1 + T.CURB_HEIGHT)) < 1e-12 && W1.walkable(386, 0, 0.4));
+  assert.ok(!W1.onSidewalk(372, 0) && W1.groundHeight(372, 0) === 0.1);
+  assert.ok(!W1.walkable(412, 0) && W1.wetAt(412, 0) && !W1.walkable(395, 0));
+  assert.ok(W1.walkable(390.5, 20) && !W1.walkable(391.2, 20));
+  // (the cargo ship's deck is walked: its own test below)
+  assert.ok(W1.walkable(500, 200, 0.4) && W1.walkable(560, -120, 0.4) && !W1.walkable(527, -170) && W1.walkable(527, -158));
+  // Unbuilt land is not land; a slice's roads are, to the hoardings beyond their outer sidewalks.
+  assert.ok(!W1.walkable(-150, 0) && W2.walkable(-150, 0, 0.4));
+  assert.ok(!W5.walkable(-550, 330) && !W5.walkable(-550, 330, 0.4));
+  assert.ok(W5.walkable(-450, -380, 0.4) && W5.onSidewalk(-450, -380) && !W5.walkable(-455, -380));
+  assert.ok(!W3.walkable(40, 300) && W4.walkable(40, 300, 0.4));
+  // Bình Thạnh's ground runs on to its P1 edge hoarding (x -713.5) beside the river park and the canal park: no wall at x -700.
+  for (const z of [-130, -118, -100, 190, 196]) assert.ok(W2.walkable(-705, z, 0.4) && W2.walkable(-712.9, z, 0.4) && !W2.walkable(-714, z), `Bình Thạnh's west edge at z ${z}`);
+  // The Khánh Hội quay is an open wharf (no railing: a walker reaches its edge and steps off); kè and promenade are railed.
+  assert.ok(W1.openEdge(500, -137.1) && W1.walkable(500, -137.0) && !W1.walkable(500, -137.2));
+  assert.ok(!W1.openEdge(390.6, 20) && !W1.openEdge(370, -135.1) && !T.openEdge(0, -135.1));
+  // The glide's fence: land, roads, decks, docks and water (with 2 m to spare over a wall top); not unbuilt land.
+  assert.ok(W1.inPlay(0, -136) && W1.inPlay(390.6, 20) && W1.inPlay(412, -108) && !W1.inPlay(-300, 60) && !W5.inPlay(-560, 340));
+  // The Thị Nghè decks carry today's roads west over the canal.
+  assert.ok(W2.walkable(-190, 0, 0.4) && W2.groundHeight(-190, 0) > 1 && W2.groundHeight(-190, 0, WATER_LEVEL - 1.25) === RIVER_BED);
+  // In bounds, everywhere a body may be is land, a deck, a dock or open water; out of it nothing is.
+  for (const W of [W1, W5]) {
+    assert.ok(W.inPlay(0, 0) && W.inPlay(0, -170) && W.inPlay(-80, -145) && !W.inPlay(0, -300) === (W === W1));
+  }
+});
+
+test('world terrain: docks and the cargo ship by wiring step', () => {
+  const keys = (W) => W.docks.map((d) => d.key);
+  assert.deepEqual(keys(world(1)), ['an-hoa', 'an-hoa-ca-no', 'bach-dang', 'du-thuyen', 'ben-nha-rong']);
+  assert.deepEqual(keys(world(2)), ['an-hoa', 'an-hoa-ca-no', 'bach-dang', 'du-thuyen', 'ben-nha-rong', 'ben-binh-thanh']);
+  assert.deepEqual(keys(world(5)), ['an-hoa', 'an-hoa-ca-no', 'bach-dang', 'du-thuyen', 'ben-nha-rong', 'ben-binh-thanh', 'ben-do-thu-thiem', 'ben-thu-thiem', 'biet-thu']);
+  const W = world(5);
+  for (const d of W.docks) {
+    const b = W.banks[d.bank];
+    assert.equal(b.water, 0);
+    assert.equal(b.az, d.side === 'S' ? RIVER.maxZ : RIVER.minZ, `${d.key} stands on its bank`);
+    assert.equal(d.nz, d.side === 'S' ? -1 : 1);
+    for (const l of d.landings) assert.equal(W.dockAt((l.minX + l.maxX) / 2, (l.minZ + l.maxZ) / 2), d, `${d.key} landing`);
+    assert.equal(W.groundHeight(d.x, (d.pier.minZ + d.pier.maxZ) / 2), T.PIER_DECK);
+    // A swimmer off the pier's end reaches it; a boat keeps clear of it.
+    const endZ = d.side === 'S' ? d.pier.minZ : d.pier.maxZ;
+    assert.equal(W.pierNear(d.x, endZ + d.nz * 1, 1.4), d);
+    assert.ok(!W.navigable(d.x, endZ + d.nz * 0.5, 1.15) && W.navigable(d.x, endZ + d.nz * 4, 1.15), `${d.key} berth`);
+    if (d.role !== 'private') assert.ok(W.groundHeight(d.steps.minX + 1, d.side === 'S' ? d.steps.minZ + 0.2 : d.steps.maxZ - 0.2) < WATER_LEVEL, `${d.key} steps run into the water`);
+    assert.equal(d.ferry, d.key === 'an-hoa' || d.key === 'ben-do-thu-thiem');
+  }
+  // The cargo ship: nobody passes through its hull; the dark water in its lee between quay and hull stays open (c2-m3).
+  const W1 = world(1);
+  assert.ok(W1.hullAt(527, -158) && !W1.navigable(527, -158, 1) && !W1.navigable(480, -158, 1) && !W1.navigable(540, -149.5, 1.15));
+  assert.ok(W1.navigable(527, -144, 1.15) && W1.navigable(527, -172, 1.15));
+  for (const [x, z] of [[563, -138.6], [540, -144.5], [500, -144], [470, -142], [432, -141], [400, -140]]) assert.ok(W1.inWater(x, z, 0.35) && !W1.hullAt(x, z, 0.35), `the swim along the hull at (${x}, ${z})`);
+});
+
+test('world terrain: the cargo ship is boarded up its gangway or from the water, and walked on deck', () => {
+  const W1 = world(1), top = WATER_LEVEL + 4.4;
+  // The gangway: from street level on the quay, evenly up to the deck where it meets the hull; nothing either side of it.
+  assert.ok(Math.abs(W1.groundHeight(527, -137.2) - 0.1) < 1e-9 && W1.walkable(527, -137.2, 0.4));
+  let last = 0.1;
+  for (let z = -138; z >= -150; z -= 0.5) {
+    const y = W1.groundHeight(527, z, last);
+    assert.ok(y >= last - 1e-9 && y - last < 0.2, `the gangway climbs evenly at z ${z}: ${y}`);
+    assert.ok(W1.walkable(527, z, 0.4) && !W1.walkable(529, z), `on the gangway, not beside it, at z ${z}`);
+    last = y;
+  }
+  assert.ok(Math.abs(last - top) < 1e-9);
+  // The deck: walkable to its rails, at deck height for anyone up there, the river bed for a swimmer alongside below.
+  assert.ok(W1.walkable(527, -151.5, 0.4) && W1.walkable(545, -164.6, 0.4) && W1.walkable(489.5, -151, 0.4));
+  assert.equal(W1.groundHeight(545, -158, top), top);
+  assert.equal(W1.groundHeight(527, -149.5, WATER_LEVEL - 1), RIVER_BED);
+  // A swimmer climbs out at a tyre fender (quay side) or the pilot ladder (river side) onto the deck beside it.
+  for (const [x, z] of [[534, -149.4], [488, -149.4], [545, -166.6]]) {
+    const c = W1.climbNear(x, z, 1.6);
+    assert.ok(c && W1.walkable(c.toX, c.toZ, 0.35) && W1.groundHeight(c.toX, c.toZ) === top, `a way up at (${x}, ${z})`);
+  }
+  assert.equal(W1.climbNear(527, -144, 1.6), null);
+});
+
+test('world terrain: installTerrain switches every exported query to the wired map and back', () => {
+  const W = world(1);
+  const before = { g: T.groundHeight(412, -108), b: { ...T.bounds } };
+  assert.equal(before.g, groundHeight(412, -108));
+  T.installTerrain(W);
+  try {
+    assert.equal(T.TERRAIN, W);
+    assert.equal(T.liveTerrain(), W);
+    assert.equal(T.groundHeight(412, -108), 1.1);
+    assert.equal(T.groundHeight(412, -108, WATER_LEVEL - 1.25), RIVER_BED);
+    assert.deepEqual({ ...T.bounds }, worldBoundsFor(1));
+    assert.deepEqual([...T.wiredSlices()], ['quan-4']);
+    assert.ok(T.walkable(386, 0, 0.4) && T.inWater(412, 0, 1) && T.navigable(412, 0, 1.15) && !T.navigable(527, -158, 1));
+    assert.equal(T.dockAt(455, -145)?.key, 'ben-nha-rong');
+  } finally { T.installTerrain(T.LEGACY_TERRAIN); }
+  assert.equal(T.TERRAIN, T.LEGACY_TERRAIN);
+  assert.equal(T.groundHeight(412, -108), before.g);
+  assert.deepEqual({ ...T.bounds }, before.b);
+});
+
+test('timing: the wired terrain\'s hot queries', () => {
+  const W = world(5), r = rng(9), pts = [];
+  for (let i = 0; i < 1e5; i++) pts.push([-720 + r() * 1420, -440 + r() * 885]);
+  const time = (f) => { let s = 0; const t0 = performance.now(); for (let k = 0; k < 3; k++) for (const [x, z] of pts) s += +f(x, z); return (performance.now() - t0) / (3 * pts.length) * 1e3; };
+  time((x, z) => W.groundHeight(x, z)); time((x, z) => W.walkable(x, z, 0.4));
+  const g = time((x, z) => W.groundHeight(x, z)), gh = time((x, z) => W.groundHeight(x, z, 0.3)), w = time((x, z) => W.walkable(x, z, 0.4)), n = time((x, z) => W.navigable(x, z, 1.15));
+  console.log(`  wired map (5 slices): groundHeight ${g.toFixed(3)} µs, with yHint ${gh.toFixed(3)} µs, walkable(0.4) ${w.toFixed(3)} µs, navigable ${n.toFixed(3)} µs per call`);
+  assert.ok(g < 4 && gh < 4 && w < 25 && n < 4, 'terrain queries stay cheap on the wired map');
 });
 
 test('timing: terrain groundHeight against the legacy function', () => {

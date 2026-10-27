@@ -1,15 +1,15 @@
 import * as THREE from 'three';
 import { BUILDINGS, LIFE, PLOTS, POIS, SCENERY, pathClearance, type Building, type HawkerStop, type LifeGroup, type Poi } from './city';
 import { DOWNTOWN_X, PLAZA } from './map/consts';
-import { createNav, type Waypoint } from './nav';
+import { buildNav, createNav, type Waypoint } from './nav';
 import { SECONDS_PER_HOUR } from './clock';
 import { walkOk } from './signals';
 import { CURB_HEIGHT, groundHeight, onSidewalk, seatHeight } from './world';
 import {
-  ACT_TIME, HOLDS_VESSEL, LIFE_LINES, SEATED, createBookings, createGatherings, lifeActs, openOver, overlaps, spliceSlice, vesselOf,
+  ACT_TIME, HOLDS_VESSEL, LIFE_LINES, NHAU, SEATED, createBookings, createGatherings, inHours, lifeActs, openOver, overlaps, spliceSlice, vesselOf,
   type Act, type Goods, type Life, type Vessel,
 } from './street-life';
-import { HELD, createCrowdProps, createStreetFurniture, createWisps, setPropGlow, type Held } from './crowd-props';
+import { HELD, createCrowdProps, createStreetFurniture, createWisps, setPropGlow, type Furniture, type Held } from './crowd-props';
 import type { FallMode, HitKind, createRagdolls, RagdollBody, RagdollLook } from './ragdoll';
 import {
   ARM, ARM_POSES, BODY_SCALE, CLOTH, FIGURE, FigureBatch, HAND, HEAD, TORSO, chestMatrix, deriveStyle, figureGeometry, figureMaterial, gait, gripMatrix, handCode,
@@ -17,6 +17,11 @@ import {
   type ArmPose, type Detail, type FigurePalettes, type FigureStyle,
 } from './figures';
 import { BRAIN, INCIDENTS, createIncidents, createMind, createSense, decide, drift, engage, perceive, type Incident, type IncidentKind, type Intent, type Mind } from './brain';
+import { CROWD_RADIUS, DROP_RADIUS, WALKERS, crowdTarget, district, doings, sliceAt, spotAt, type DEatery, type DPoi, type Spot as CrowdSpot } from './district-life';
+import { LEGACY_LOT_COUNT as LEGACY_LOTS, LOTS } from './parking';
+import { createCollisionIndex } from './map/collision';
+import { QUAN_1_SOUTH_EXTRA } from './map/layout/quan-1-south';
+import type { GenBuilding } from './map/gen/buildings';
 
 type Ragdolls = ReturnType<typeof createRagdolls>;
 /** Street-life roles: roaming hawkers (quang gánh, carts), vé số sellers, xe ôm drivers, homemakers and giữ xe attendants. */
@@ -75,6 +80,13 @@ export type Npc = {
   act: Act; actFrom: number; actUntil: number; offX: number; offZ: number; gaze: number;
   /** The path leg (a crosswalk) the lights have let them start across. */
   crossOk: number;
+  /** Where the ground height `y` was last looked up (it is kept while they stand still). */
+  gx: number; gz: number;
+  /**
+   * One of the districts' crowd (a pool slot, see ambientTick): free or out, whether it has been out of doors yet, when
+   * it came, the post it keeps (a stall, a giữ-xe chair, a xe ôm saddle), the seat it is heading for, the doing it is at.
+   */
+  ambient?: { free: boolean; out: boolean; born: number; post: string | null; seat: number; doing: string | null };
 };
 export type GangShot = { from: THREE.Vector3; hit: boolean };
 /** People on the street this frame, and what the rain and the brain have them doing. */
@@ -126,6 +138,28 @@ const LINES = {
   hungry: ['Đói bụng quá, kiếm gì ăn thôi.', 'Làm tô bún cho ấm bụng.', 'Ghé quán ăn chút đã.'],
   tired: ['Mệt quá, về nghỉ thôi.', 'Hôm nay đi nhiều quá…'],
   avoid: ['Thôi, tránh xa ra…', 'Sợ quá, đi chỗ khác.', 'Đi đường khác thôi.'],
+  /** Walking about outside the rush hours. */
+  stroll: ['Đi dạo chút cho mát.', 'Ghé đâu uống nước đi.', 'Phố đông ghê ha.', 'Trời hôm nay dễ chịu ghê.', 'Mua gì về cho tụi nhỏ ta?'],
+  /** The night market's sellers (Phan Bội Châu, by Bến Thành): souvenirs and clothes, not fish. */
+  choDem: ['Áo thun đẹp nè, vô coi đi!', 'Nón lá đây, bán rẻ nè!', 'Móc khóa, quà lưu niệm đây!', 'Hello, you buy? Rẻ lắm!', 'Mua hai cái bớt cho nè!'],
+};
+/** Night streets after 19:00 (Bùi Viện's walking street, Vĩnh Khánh's ốc tables), by the place's crowd. */
+const NIGHT_STREET_LINES: Record<'bui-vien' | 'vinh-khanh', string[]> = {
+  'bui-vien': ['Một, hai, ba, dô!', 'Cho thêm tháp bia nha!', 'Nhạc to quá trời!', 'Phố Tây vui ghê!', 'Ê, qua quán kia đi!'],
+  'vinh-khanh': ['Ốc hương xào bơ tỏi ngon bá cháy!', 'Cho thêm dĩa sò điệp nướng!', 'Một, hai, ba, dô!', 'Đông vui quá trời!', 'Khói thơm quá!'],
+};
+/** What the slices' doings say (district-life.ts Doing): the cà phê bệt on the cathedral lawn, the promoters, kites, picnics… */
+const DOING_LINES: Partial<Record<string, string[]>> = {
+  bet: ['Cho ly bạc xỉu nha!', 'Ngồi bệt nhà thờ mát ghê.', 'Tối nay đông người ghê.', 'Ly cà phê muối nha chị!'],
+  promoter: ['Vô đi anh, bia rẻ nè!', 'Happy hour nè, mua một tặng một!', 'Menu đây anh chị ơi!', 'Nhạc sống tối nay, vô đi!'],
+  kite: ['Gió lên rồi, thả diều thôi!', 'Diều bay cao ghê!', 'Thả dây thêm chút nữa!'],
+  picnic: ['Trải bạt ngồi đây nè!', 'Gió sông mát quá trời.', 'Ăn bánh tráng trộn không?'],
+  jog: ['Chạy thêm một vòng nữa!', 'Hít thở đều nha.'],
+  fish: ['Hôm nay cá không cắn câu…', 'Suỵt, cá sắp cắn rồi!'],
+  dacau: ['Chuyền qua đây!', 'Đá đẹp quá!'],
+  photo: ['Cười lên nào!', 'Nghiêng qua chút nữa!', 'Chụp thêm tấm nữa nha!'],
+  incense: ['Nam mô A Di Đà Phật.', 'Cầu bình an cho cả nhà.'],
+  wait: ['Xe sao lâu tới quá…', 'Chắc sắp tới rồi.'],
 };
 const WATCH_LINES: Record<IncidentKind, string[]> = {
   body: ['Trời ơi!', 'Có ai gọi cấp cứu chưa?', 'Gọi 115 đi!', 'Tội nghiệp quá…'],
@@ -146,6 +180,8 @@ const SADDLE = 0.88, FLOORBOARD = 0.34;
 const styleRole = (role: Role) => (role === 'hawker' || role === 'lottery' || role === 'homemaker' || role === 'xeom' || role === 'guard' ? 'vendor' : role);
 /** Quang gánh hawkers carry a pole and baskets; the others push a cart. */
 const POLE_GOODS = new Set<Goods>(['xoi', 'fruit', 'hotvitlon']);
+/** How many people the districts can lend out round the player at once (district-life.ts PEAK tops out below it). */
+const AMBIENT_POOL = 76;
 /** Contract names of the street roles other systems look up (interaction prompts). */
 const ROLE_NAMES: Record<string, Role> = { 've-so': 'lottery', lottery: 'lottery', 'xe-om': 'xeom', xeom: 'xeom', 'giu-xe': 'guard', guard: 'guard', hawker: 'hawker', homemaker: 'homemaker' };
 const EATERIES = new Set<Building['kind']>(['cafe', 'food']);
@@ -250,7 +286,19 @@ export function createNpcs(
     bikeAt?: (x: number, z: number) => boolean;
   } = {},
 ) {
-  const nav = createNav();
+  /** The wired districts (district-life.ts): their POIs follow today's in one id space. */
+  const D = district();
+  // The walking network: the shared one (nav.ts), or, while that is still today's grid, one over the live map's roads
+  // (the districts' sidewalks, hẻm and footways come with the graph).
+  const shared = createNav();
+  const nav = D.world.roads && shared.roads !== D.world.roads ? buildNav(D.world.roads) : shared;
+  /** A POI by id in the one id space (today's POIS, then the districts'). */
+  const poiAt = (id: number): Poi => (id < D.poiBase ? POIS[id] : D.pois[id - D.poiBase]);
+  /** A district eatery table's top (district-render.ts: 0.45 m for a café's, 0.62 m otherwise), looked up once. */
+  const eateryTops = new Float64Array(D.eateries.length).fill(NaN);
+  const eateryTop = (e: DEatery) => { let y = eateryTops[e.index]; if (Number.isNaN(y)) eateryTops[e.index] = y = groundHeight(e.x, e.z) + (e.variant === 'coffee' ? 0.45 : 0.62); return y; };
+  /** A district seat's quán (its table, dish and hours), if it has one. */
+  const eateryAt = (p: Poi | null | undefined): DEatery | null => (p && p.group === undefined && p.id >= D.poiBase ? (D.pois[p.id - D.poiBase]?.eatery ?? -1) >= 0 ? D.eateries[D.pois[p.id - D.poiBase].eatery] : null : null);
   let seed = 7;
   const random = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
   // Personalities come from their own seeded stream so the schedules above stay exactly as they were.
@@ -293,7 +341,7 @@ export function createNpcs(
       health: gang >= 0 ? GANG_HEALTH : MAX_HEALTH, hitAt: -99, afraidFor: 0, lastAimed: -99, robbedDay: -1,
       chatterAt: random() * 20, checkAt: random() * 2, nextAttack: 0, body: null, timer: 0, pooled: false,
       mind: createMind(mindRandom, role), leave: [], claim: null,
-      act: 'none', actFrom: 0, actUntil: random() * 4, offX: 0, offZ: 0, gaze: 0, crossOk: -1,
+      act: 'none', actFrom: 0, actUntil: random() * 4, offX: 0, offZ: 0, gaze: 0, crossOk: -1, gx: NaN, gz: NaN,
       sitT: 0, riseUntil: -1, seatTop: 0.5, seatFloor: 0, actParam: 0, incenseAM: -1, incensePM: -1, pendA: 0, pendV: 0, lastSpeed: 0,
     });
   }
@@ -830,6 +878,20 @@ export function createNpcs(
   // Two extra slots for scripted mission characters (thieves).
   for (let k = 0; k < 2; k++) addNpc('thief', homes[k], [], { shirt: '#3d3d3d', pants: '#1f1f1f', skin: '#c58f69' });
   for (const thief of npcs.slice(crowd)) thief.state = 'away';
+  // The districts' crowd: a pool of people the districts lend out round the player (ambientTick). The seeded stream
+  // is put back afterwards, so nothing made from it after this point changes.
+  {
+    const saved = seed, size = D.buildings.length ? AMBIENT_POOL : 0, home = D.buildings.find((b) => b.kind === 'home') ?? homes[0];
+    for (let k = 0; k < size; k++) {
+      // A free slot's day is one whole day in (a valid ring, as every day here is); recruit() gives it its own.
+      addNpc('worker', home, [activity(0, 0, 'home', at(home, true))], { shirt: SHIRTS[k % SHIRTS.length], pants: PANTS[k % PANTS.length], skin: SKINS[k % SKINS.length] });
+      const n = npcs[npcs.length - 1];
+      n.state = 'away'; n.inside = null;
+      n.ambient = { free: true, out: false, born: 0, post: null, seat: -1, doing: null };
+    }
+    seed = saved;
+  }
+  const ambient = npcs.filter((n) => n.ambient);
 
   // Instanced rendering: every person is a body (torso, head and face, hair, hat, clothes), a left arm, a right
   // arm (hand and whatever it holds) and two legs, each one figure mesh for the whole crowd, plus open umbrellas:
@@ -843,6 +905,8 @@ export function createNpcs(
   const armsR = new FigureBatch(figureGeometry('armR', detail), materials.arm, npcs.length);
   const legs = new FigureBatch(figureGeometry('leg', detail), materials.leg, npcs.length * 2);
   const umbrellas = new FigureBatch(umbrellaGeometry(), materials.rigid, npcs.length);
+  /** Manhattan distance from the player past which people are neither posed nor drawn (the fog ends at 260 m). */
+  const FOG_SKIP = 340;
   // Distance level of detail: people more than FAR_LOD metres from the camera are drawn with the coarse figures
   // (mitten hands, fewer segments), a few pixels tall at that range; four more draw calls, far fewer triangles.
   const FAR_LOD = 55;
@@ -1041,10 +1105,11 @@ export function createNpcs(
   const pole = new THREE.Matrix4(), poleEnd = new THREE.Vector3(), hipTurned = new THREE.Vector3();
   /** The fist's grip frame (metres, unscaled) of an arm just posed. */
   function grip(arm: THREE.Matrix4, pose: ArrayLike<number>, side: 1 | -1, p: THREE.Vector3, q: THREE.Quaternion) { gripMatrix(arm, pose, side, held).decompose(p, q, gripScale); }
+  /** Whether the camera's frustum (last frame's) holds a sphere round the whole person, an open umbrella included. */
+  const inFrame = (npc: Npc) => !view || view.intersectsSphere(bound.set(bound.center.set(npc.x, npc.y + 1.1, npc.z), 1.35));
   function draw(npc: Npc, i: number, time: number) {
     if (!visible(npc)) return;
-    // A sphere round the whole person, an open umbrella included.
-    if (view && !view.intersectsSphere(bound.set(bound.center.set(npc.x, npc.y + 1.1, npc.z), 1.35))) return;
+    if (!inFrame(npc)) return;
     const d = dress[i], style = d.style, look = d.look, k = npc.id;
     const B = detail === 'hi' && eyeKnown && Math.hypot(npc.x - eye.x, npc.y - eye.y, npc.z - eye.z) > FAR_LOD ? farSet : nearSet;
     const sit = npc.pose === 'sit';
@@ -1080,7 +1145,9 @@ export function createNpcs(
     const cafe = sit && !!poi && poi.kind === 'cafe-seat';
     const life = npc.state === 'at' ? npc.current?.life : undefined;
     const group = poi && poi.group !== undefined ? LIFE.groups[poi.group] : null;
-    const vessel = life === 'meal' || life === 'coffee' || life === 'tea' || life === 'beer' || life === 'karaoke' ? vesselOf(group?.dish ?? null, life === 'karaoke' ? 'beer' : life, nowHour) : null;
+    // A district quán's stool: its eatery's dish and table (district-life.ts).
+    const dEat = group ? null : eateryAt(poi);
+    const vessel = life === 'meal' || life === 'coffee' || life === 'tea' || life === 'beer' || life === 'karaoke' ? vesselOf(group?.dish ?? dEat?.dish ?? null, life === 'karaoke' ? 'beer' : life, nowHour) : null;
     const near = props.near(npc.x, npc.z);
     // The chest takes a third of a look aside and counters the stride; the head does the rest. Seated, the head
     // alone looks about, so the hands stay on the lap.
@@ -1429,10 +1496,14 @@ export function createNpcs(
     }
     // The dish or glass waits on the table in front of a seated eater whose hands are busy elsewhere.
     if (vessel && sit && sat > 0.6 && group && group.tables.length && !(env > 0.5 && HOLDS_VESSEL.has(act) && (act !== 'eat' || vessel === 'bowl'))) {
-      const seatId = seatOf[npc.id], slot = seatId >= 0 ? POIS[seatId].slot ?? 0 : 0;
+      const seatId = seatOf[npc.id], slot = seatId >= 0 ? poiAt(seatId).slot ?? 0 : 0;
       const tb = group.tables[group.table[slot] ?? 0];
       const dx = npc.x - tb.x, dz = npc.z - tb.z, dl = Math.hypot(dx, dz) || 1;
       props.place(vesselItem(vessel, group.dish), tb.x + (dx / dl) * 0.18, tableTop(tb) + VESSEL_LIFT[vessel], tb.z + (dz / dl) * 0.18, npc.yaw);
+    } else if (vessel && sit && sat > 0.6 && dEat && !(env > 0.5 && HOLDS_VESSEL.has(act) && (act !== 'eat' || vessel === 'bowl'))) {
+      const dx = npc.x - dEat.x, dz = npc.z - dEat.z, dl = Math.hypot(dx, dz) || 1;
+      // district-render.ts eatery tables: 0.45 m for a café's, 0.62 m otherwise.
+      props.place(vesselItem(vessel, dEat.dish), dEat.x + (dx / dl) * 0.18, eateryTop(dEat) + VESSEL_LIFT[vessel], dEat.z + (dz / dl) * 0.18, npc.yaw);
     }
     // Seats that are not furniture: the doorstep stool, the attendant's chair.
     if (sit && sat > 0.3 && npc.seatFloor === 0 && place && (('building' in place && place.slot === DOORSTEP) || ('stand' in place && npc.role === 'guard'))) {
@@ -1507,7 +1578,7 @@ export function createNpcs(
       else if (intent === 'chat' || intent === 'avoid') table = [['none', 1]];
       else if (intent === 'shelter') table = [['phone', 3], ['look', 3], ['cross', 2], ['call', 1], ['none', 2]];
       else if (life && lifeOn(npc, life)) {
-        table = lifeActs(life, { male: !dress[npc.id].style.fem, sitting: spot.sit, friendly: near, hour: nowHour, dish: poi && poi.group !== undefined ? LIFE.groups[poi.group].dish : null });
+        table = lifeActs(life, { male: !dress[npc.id].style.fem, sitting: spot.sit, friendly: near, hour: nowHour, dish: poi && poi.group !== undefined ? LIFE.groups[poi.group].dish : eateryAt(poi)?.dish ?? null });
       } else if (npc.role === 'vendor') table = [['serve', 5], ['shout', 2], ['fan', 2], ['pace', 2], ['phone', 1], ['akimbo', 1], ['look', 1]];
       else if (kind === 'market') table = [['point', 3], ['look', 3], ['pay', 1], ['cross', 1], ['none', 2]];
       else if (kind === 'work') table = [['sweep', front ? 2 : 0], ['phone', 3], ['cross', 2], ['akimbo', 1], ['pace', 3], ['look', 2], ['stretch', 1], ['serve', 1], ['call', 1]];
@@ -1649,7 +1720,7 @@ export function createNpcs(
       if (until > 0 && until <= lead) { chosen = a; break; }
     }
     // In the rain, open-air leisure and meals move under a roof (covered spots like bus stops and stalls stay).
-    if (chosen && raining && chosen.outdoor && (chosen.kind === 'leisure' || chosen.kind === 'eat') && !coveredPlace(chosen.place)) return rainVariant(npc, chosen);
+    if (chosen && raining && chosen.outdoor && (chosen.kind === 'leisure' || chosen.kind === 'eat') && !coveredPlace(chosen.place)) return npc.ambient ? npc.schedule[npc.schedule.length - 1] : rainVariant(npc, chosen);
     return chosen;
   }
   function samePlace(a: Place, b: Place) {
@@ -1752,8 +1823,11 @@ export function createNpcs(
       start.push(...npc.leave);
     }
     unseat(npc);
+    // Never ask the walking network to route from or to nowhere (a NaN would never settle its search).
+    if (!Number.isFinite(npc.x + npc.z)) { npc.x = npc.home.door.x; npc.z = npc.home.door.z; }
     const from = start.length ? start[start.length - 1] : nav.snap(npc.x, npc.z);
-    npc.path = [...start, ...nav.route(from.x, from.z, target.curb.x, target.curb.z)];
+    const routable = Number.isFinite(from.x + from.z + target.curb.x + target.curb.z);
+    npc.path = [...start, ...(routable ? nav.route(from.x, from.z, target.curb.x, target.curb.z) : [])];
     if (target.via) npc.path.push({ x: target.via.x, z: target.via.z, crossing: false });
     npc.path.push({ x: target.x, z: target.z, crossing: false });
     npc.pathIndex = 0;
@@ -1795,8 +1869,10 @@ export function createNpcs(
     if (npc.state === 'inside' && 'building' in next.place && next.place.inside && npc.inside === next.place.building) return;
     walkTo(npc, placePoint(next.place, npc), run);
     const life = next.life;
+    // (The districts' passers-by going in somewhere by day are not going home to sleep.)
+    const homeLine = next.kind === 'home' && (!npc.ambient || nowHour >= 17 || nowHour < 4);
     const line = run ? pick(LINES.dash) : life === 'meal' || life === 'coffee' || life === 'tea' || life === 'beer' ? pick(LIFE_LINES[life])
-      : life ? '' : next.kind === 'work' ? pick(LINES.commute) : next.kind === 'school' ? pick(LINES.school) : next.kind === 'home' ? pick(LINES.home) : '';
+      : life ? '' : next.kind === 'work' ? pick(LINES.commute) : next.kind === 'school' ? pick(LINES.school) : homeLine ? pick(LINES.home) : '';
     if (!life || nearFocus(npc)) say(npc, line, false);
   }
 
@@ -2263,6 +2339,431 @@ export function createNpcs(
   const incidents = createIncidents();
   const restPoint = new THREE.Vector3();
   let started = false;
+  // ---- The districts' crowd (district-life.ts) ----------------------------------------------------------------
+  // Today's residents keep their whole days; the wired slices are peopled by a crowd that lives round the player: a
+  // pool of AMBIENT people who step out of doors, sit down at the quán, mind the stalls, the giữ-xe rows and the xe ôm
+  // corners, shop at the chợ, wait at the bus stops, jog, fly kites and walk from door to door, always where the
+  // camera cannot see them appear (or out of a door, as anyone does), and go back in (or are let go once out of
+  // sight beyond DROP_RADIUS). How many are out follows the place's character and the hour (district-life.ts
+  // crowdTarget: Bến Thành busy by day, Vĩnh Khánh and Bùi Viện packed at night, Quận 3's cafés in the morning, the
+  // chợ at dawn, Thủ Thiêm's joggers and kites at dusk).
+  type Offer = { weight: number; spawn: () => boolean };
+  type Site = { x: number; z: number };
+  /** A post someone keeps while it is open: a stall, a cart, a giữ-xe chair, a xe ôm saddle, a shop front. */
+  type Post = Site & { id: string; place: Place; hours: [number, number]; role: Role; life?: Life; kind: Kind; exit: Building | null };
+  // Furniture: district-render.ts draws each district eatery's table and the stools the generator seated there (and
+  // Bùi Viện's night tables); the stools district-life.ts adds round tables left without any are drawn here, out in
+  // their quán's hours like today's street life. Every district quán's hours (stools out or not) are kept here.
+  const districtStools: Furniture[] = [];
+  const districtGroups: { hours: [number, number][] | null; covered: boolean }[] = [];
+  /** Which district furniture group a district seat belongs to (its eatery or night table). */
+  const seatGroup = new Map<number, number>();
+  for (const e of D.eateries) {
+    const g = districtGroups.length;
+    districtGroups.push({ hours: [e.hours], covered: e.variant === 'hotpot' });
+    for (const id of e.seats) {
+      const p = D.pois[id - D.poiBase];
+      seatGroup.set(id, g);
+      if (p.key.includes(':stool')) districtStools.push({ kind: 'stool42', x: p.x, z: p.z, yaw: p.yaw, tint: (id * 7) % 5, group: g });
+    }
+  }
+  const districtFurniture = districtStools.length ? createStreetFurniture(scene, districtStools, districtGroups) : null;
+  /** Whether a district seat's stools are out (its quán open, dry or under an awning). */
+  const districtSeatOpen = (id: number) => { const g = seatGroup.get(id); return g === undefined || !districtFurniture || districtFurniture.isOpen(g); };
+
+  /** Sites near a point, by 32 m cell. */
+  function cellIndex<T extends Site>(list: readonly T[]) {
+    const cells = new Map<number, T[]>();
+    for (const s of list) { const k = (Math.floor(s.x / 32) + 2048) * 4096 + Math.floor(s.z / 32) + 2048; const c = cells.get(k); if (c) c.push(s); else cells.set(k, [s]); }
+    return (x: number, z: number, r: number, cb: (s: T) => void) => {
+      for (let cx = Math.floor((x - r) / 32); cx <= Math.floor((x + r) / 32); cx++) for (let cz = Math.floor((z - r) / 32); cz <= Math.floor((z + r) / 32); cz++) {
+        const c = cells.get((cx + 2048) * 4096 + cz + 2048);
+        if (c) for (const s of c) cb(s);
+      }
+    };
+  }
+  const dDoors = cellIndex(D.buildings.map((b) => ({ x: b.door.x, z: b.door.z, b })));
+  const dSeats = cellIndex(D.pois.filter((p) => p.seat && p.kind !== 'perch').map((p) => ({ x: p.x, z: p.z, p })));
+  const dStands = cellIndex(D.pois.filter((p) => !p.seat).map((p) => ({ x: p.x, z: p.z, p })));
+  const eateryOf = (p: DPoi) => (p.eatery >= 0 ? D.eateries[p.eatery] : null);
+  /** The district building nearest (x, z) within r that someone can go into (homes and open businesses), for leaving. */
+  function exitNear(x: number, z: number, r: number, hour: number): GenBuilding | null {
+    let best: GenBuilding | null = null, bestD = r;
+    dDoors(x, z, r, (s) => {
+      const b = s.b as GenBuilding, d = Math.abs(b.door.x - x) + Math.abs(b.door.z - z);
+      if (d >= bestD || !(b.kind === 'home' || ((b.kind === 'shop' || b.kind === 'food' || b.kind === 'cafe') && hour >= 6 && hour < 22))) return;
+      best = b; bestD = d;
+    });
+    return best;
+  }
+  const posts: Post[] = [];
+  {
+    const stand = (x: number, z: number, yaw: number, sit = false, top?: number): Place => { const c = nav.snap(x, z); return { stand: { x, z, yaw, sit, covered: false, curb: { x: c.x, z: c.z }, top } }; };
+    const behind = (x: number, z: number, yaw: number, d: number) => {
+      for (const s of [1, -1]) { const bx = x - Math.sin(yaw) * d * s, bz = z - Math.cos(yaw) * d * s; if (world.clear(bx, bz, 0.3)) return { x: bx, z: bz, yaw: s > 0 ? yaw : yaw + Math.PI }; }
+      return null;
+    };
+    for (const p of D.props) {
+      if (p.kind !== 'stall' && p.kind !== 'cart') continue;
+      const at = behind(p.x, p.z, p.yaw, p.kind === 'cart' ? 0.95 : 1.0);
+      if (!at) continue;
+      posts.push({ id: p.id, x: at.x, z: at.z, place: stand(at.x, at.z, at.yaw), hours: p.hours ?? (p.kind === 'stall' ? [5, 12] : [6, 21]), role: 'vendor', kind: 'market', exit: null });
+    }
+    if (D.keys.has('quan-1-south')) {
+      // Bến Thành's sạp round the market (6–24) and the night market on Phan Bội Châu (18–24): one vendor minds two.
+      type Stalls = { hours: [number, number]; stalls: { x: number; z: number; yaw: number }[] };
+      const m = (QUAN_1_SOUTH_EXTRA as unknown as { market: { night: Stalls; day: Stalls } }).market;
+      for (const [tag, set] of [['cho-dem', m.night], ['cho-ngay', m.day]] as const) set.stalls.forEach((st, k) => {
+        if (k % 2) return;
+        const at = behind(st.x, st.z, st.yaw, 1.15);
+        if (at) posts.push({ id: `${tag}:${k}`, x: at.x, z: at.z, place: stand(at.x, at.z, at.yaw), hours: set.hours, role: 'vendor', kind: 'market', exit: null });
+      });
+    }
+    for (const l of LOTS) {
+      if (!l.attendant || l.id < LEGACY_LOTS || l.kind !== 'giuxe') continue;
+      const a = l.attendant;
+      posts.push({ id: `lot${l.id}`, x: a.x, z: a.z, place: stand(a.x, a.z, a.yaw, true, 0.42), hours: l.hours, role: 'guard', life: 'guard', kind: 'work', exit: null });
+    }
+    for (const q of D.perches) {
+      const p = D.pois[q.poi - D.poiBase];
+      posts.push({ id: `perch${q.poi}`, x: p.x, z: p.z, place: { poi: p }, hours: [6, 20.8], role: 'xeom', life: 'xeom', kind: 'work', exit: null });
+    }
+  }
+  const dPosts = cellIndex(posts);
+  const keptBy = new Map<string, Npc>();
+  /** Doings of the slices' EXTRA (jog, fishing, đá cầu, kites, picnics, tai chi, cờ tướng, promoters, photos, incense). */
+  const dDoings = cellIndex(doings(D.keys, D.stamps));
+  /** A few people at each doing at most. */
+  const doingCount = new Map<string, number>();
+  /** Seats someone is on the way to. */
+  const aimed = new Set<number>();
+  let ambientAt = 0, freshUntil = -1;
+  const ambientLook = (role: Role): RagdollLook => {
+    const r = Math.random;
+    if (role === 'student') return { shirt: '#f4f4f0', pants: '#2f3a68', skin: SKINS[Math.floor(r() * SKINS.length)] };
+    if (role === 'guard') return { shirt: pick(['#2f5a3a', '#3f5a7a', '#6d6a63', '#e8e0cc']), pants: pick(PANTS), skin: pick(SKINS), hat: r() < 0.5 ? '#5f6b3a' : undefined };
+    if (role === 'xeom') return { shirt: pick(['#3f5a7a', '#6d6a63', '#2f3a48', '#7b6a58']), pants: pick(PANTS), skin: pick(SKINS), hat: r() < 0.6 ? '#3c4a3a' : undefined };
+    return { shirt: pick(SHIRTS), pants: pick(PANTS), skin: pick(SKINS), hat: role === 'vendor' || role === 'retiree' ? (r() < 0.5 ? '#e5cf92' : undefined) : r() < 0.2 ? '#e5cf92' : undefined };
+  };
+  /** Dresses a pool slot for its new role and look (wardrobe.ts), as the crowd's own are dressed at the start. */
+  function redress(npc: Npc) {
+    const fem = npc.role === 'xeom' || npc.role === 'guard' ? false : undefined;
+    const style = deriveStyle(npc.look, npc.id, styleRole(npc.role), fem === undefined ? {} : { fem });
+    if (npc.role !== 'vendor') style.torso &= ~TORSO.GANH;
+    setStyle(npc.look, style);
+    const d = dress[npc.id], canopy = UMBRELLAS[npc.mind.traits.umbrellaLook % UMBRELLAS.length];
+    d.style = style;
+    d.look = palettesOf(style);
+    d.umbrella = palette([canopy[0], canopy[1]]);
+    d.fan = (style.head & HEAD.CONE) !== 0 && Math.random() < 0.6 ? ARM.NON_LA : ARM.FAN;
+    d.bag = npc.role === 'retiree' && Math.random() < 0.5;
+    d.lap = (style.torso & (TORSO.AO_DAI | TORSO.APRON | TORSO.SKIRT)) !== 0;
+    d.gear = null; d.goods = null;
+  }
+  /** A free pool slot made into someone new: role, look, mind, a day of two slices (the doing, then in at `exit`). */
+  function recruit(role: Role, act: Activity, exit: Building, time: number): Npc | null {
+    const npc = ambient.find((n) => n.ambient!.free);
+    if (!npc) return null;
+    const a = npc.ambient!;
+    a.free = false; a.out = false; a.born = time; a.post = null; a.seat = -1; a.doing = null;
+    Object.assign(npc, {
+      role, gang: -1, home: exit, look: ambientLook(role), current: null, inside: null, path: [], pathIndex: 0, speed: 0, run: false, spot: null, pose: 'idle',
+      health: MAX_HEALTH, hitAt: -99, afraidFor: 0, lastAimed: -99, robbedDay: -1, chatterAt: 4 + Math.random() * 12, checkAt: 0, body: null, timer: 0, pooled: false,
+      mind: createMind(Math.random, role), leave: [], claim: null, act: 'none', actFrom: time, actUntil: time + Math.random() * 3, offX: 0, offZ: 0, gaze: 0, crossOk: -1,
+      sitT: 0, riseUntil: -1, pace: role === 'retiree' ? 1.25 + Math.random() * 0.25 : 1.45 + Math.random() * 0.45,
+    });
+    npc.mind.last = time;
+    const back: Activity = { start: act.end, end: act.start, kind: 'home', place: at(exit, true), outdoor: false };
+    npc.schedule = [act, back];
+    redress(npc);
+    return npc;
+  }
+  /** Puts someone straight on their spot (out of sight), already settled. */
+  function placeOn(npc: Npc, act: Activity) {
+    npc.current = act;
+    npc.inside = null;
+    npc.spot = takeSpot(npc, act.place);
+    npc.x = npc.spot.x; npc.z = npc.spot.z; npc.yaw = npc.targetYaw = npc.spot.yaw;
+    npc.y = groundHeight(npc.x, npc.z);
+    npc.state = 'at'; npc.sitT = 1; npc.leave = leaveFor(act.place);
+    npc.ambient!.out = true;
+  }
+  /** Someone comes out of `door` (or appears on the sidewalk at `from`, out of sight) on their way to the doing. */
+  function setOff(npc: Npc, door: Building | null, from?: Site | null) {
+    if (door) { npc.state = 'inside'; npc.inside = door; npc.x = door.door.x; npc.z = door.door.z; npc.yaw = door.facing; }
+    else if (from) { npc.inside = null; npc.state = 'at'; npc.x = from.x; npc.z = from.z; npc.spot = { x: from.x, z: from.z, yaw: npc.yaw, sit: false }; npc.leave = []; npc.ambient!.out = true; }
+    else { letGo(npc); return false; }
+    npc.y = groundHeight(npc.x, npc.z);
+    npc.checkAt = 0;
+    return true;
+  }
+  /** Out of a door near (x, z), or else onto a sidewalk out of sight; false (and the slot let go) if neither is there. */
+  const arriveFrom = (npc: Npc, x: number, z: number, hour: number) => { const door = doorOut(x, z, hour); return setOff(npc, door, door ? null : sidewalkOut()); };
+  /** Whether a person may simply be there at (x, z) now: out of sight, or just after a jump in time or place. */
+  const hidden = (x: number, z: number) => clock < freshUntil || !seen(x, z);
+  /** Lets a pool slot go (gone in, or out of sight far away). */
+  function letGo(npc: Npc) {
+    const a = npc.ambient!;
+    if (a.free) return;
+    stop(npc, clock);
+    release(npc);
+    unseat(npc);
+    if (a.post) { keptBy.delete(a.post); a.post = null; }
+    if (a.seat >= 0) { aimed.delete(a.seat); a.seat = -1; }
+    if (a.doing) { doingCount.set(a.doing, Math.max(0, (doingCount.get(a.doing) ?? 1) - 1)); a.doing = null; }
+    if (npc.body) { ragdolls.remove(npc.body); npc.body = null; }
+    a.free = true;
+    npc.state = 'away'; npc.inside = null; npc.current = null; npc.path = []; npc.spot = null;
+    npc.schedule = [{ start: 0, end: 0, kind: 'home', place: at(npc.home, true), outdoor: false }];
+  }
+  const sphere = new THREE.Sphere(new THREE.Vector3(), 1.6);
+  /** What hides someone from the camera: buildings only (a lamp post or a tree trunk does not), today's and the districts'. */
+  const walls = createCollisionIndex();
+  for (const p of PLOTS) walls.addBox((p.ground.minX + p.ground.maxX) / 2, (p.ground.minZ + p.ground.maxZ) / 2, (p.ground.maxX - p.ground.minX) / 2, (p.ground.maxZ - p.ground.minZ) / 2, 0);
+  for (const b of D.buildings) if (b.h > 2.5) walls.addBox(b.box.cx, b.box.cz, b.box.hx, b.box.hz, b.box.yaw);
+  /** Whether the camera would see a person appear or vanish at (x, z): in the frustum, near enough and not behind a building. */
+  function seen(x: number, z: number) {
+    if (!view || !eyeKnown) return Math.hypot(x - focusX, z - focusZ) < 90;
+    const d = Math.hypot(x - eye.x, z - eye.z);
+    if (d < 8) return true;
+    if (d > 170 || !view.intersectsSphere(sphere.set(sphere.center.set(x, groundHeight(x, z) + 1, z), 1.6))) return false;
+    // Hidden only if a building stands between, with a margin round the person (half a shoulder width either side).
+    const nx = (x - eye.x) / d, nz = (z - eye.z) / d;
+    for (const side of [-0.6, 0, 0.6]) {
+      const ex = eye.x - nz * side, ez = eye.z + nx * side;
+      if (walls.cast(ex, ez, nx, nz, d - 1) >= d - 1.05) return true;
+    }
+    return false;
+  }
+  /** A door near (x, z) someone may come out of now, out of sight or a little way off (people step out of doors anyway). */
+  function doorOut(x: number, z: number, hour: number, avoid?: Building | null): Building | null {
+    let best: Building | null = null, bestScore = Infinity;
+    const night = hour >= 22 || hour < 5;
+    dDoors(x, z, 45, (s) => {
+      const b = s.b as GenBuilding;
+      if (b === avoid || b.typology === 'warehouse' || (night && b.kind !== 'home' && b.zone !== 'night')) return;
+      const d = Math.hypot(b.door.x - x, b.door.z - z), fd = Math.hypot(b.door.x - focusX, b.door.z - focusZ);
+      if (fd < 12) return;
+      const score = d + (seen(b.door.x, b.door.z) ? 25 : 0) + Math.random() * 10;
+      if (score < bestScore) { best = b; bestScore = score; }
+    });
+    return best;
+  }
+  /** A spot on a walking line 40–70 m from the player, out of sight, to start walking from. */
+  function sidewalkOut(): Site | null {
+    for (let k = 0; k < 6; k++) {
+      const a = Math.random() * Math.PI * 2, r = 40 + Math.random() * 30;
+      const s = nav.snap(focusX + Math.sin(a) * r, focusZ + Math.cos(a) * r);
+      if (s.segment.crossing || Math.hypot(s.x - focusX, s.z - focusZ) < 35 || seen(s.x, s.z) || !sliceAt(D.keys, s.x, s.z, 6)) continue;
+      return { x: s.x, z: s.z };
+    }
+    return null;
+  }
+  const span = (h: number, len: number): [number, number] => [((h - 0.02) % 24 + 24) % 24, ((h + len) % 24 + 24) % 24];
+  const actOf = (h: number, len: number, kind: Kind, place: Place, life?: Life): Activity => { const [s, e] = span(h, len); return { start: s, end: e, kind, place, outdoor: !('building' in place && place.inside), life }; };
+  /** Who sits down at a quán at this hour, and what for. */
+  function dinerLife(e: DEatery | null, hour: number): Life {
+    const dish = e?.dish ?? null;
+    if (dish === 'cafe' || dish === 'trasua') return 'coffee';
+    if (dish === 'bia' || (e?.night && hour >= 17) || (dish && NHAU[dish] !== undefined && hour >= NHAU[dish]!)) return 'beer';
+    return 'meal';
+  }
+  const dayRole = (hour: number): Role => (hour < 7.5 || (hour >= 14 && hour < 17) ? (Math.random() < 0.5 ? 'retiree' : 'worker') : hour >= 21 ? (Math.random() < 0.6 ? 'owl' : 'worker') : Math.random() < 0.8 ? 'worker' : 'retiree');
+
+  /** The chợ hall nearest (x, z) within 120 m (Bến Thành, Bà Chiểu, Tân Định, Xóm Chiếu), or null. */
+  function marketNear(x: number, z: number): GenBuilding | null {
+    let best: GenBuilding | null = null, bestD = 120;
+    for (const b of D.buildings) if (b.typology === 'market-hall') { const d = Math.hypot(b.door.x - x, b.door.z - z); if (d < bestD) { best = b; bestD = d; } }
+    return best;
+  }
+  /** Up to n of a list, picked at random (the list is shuffled in place). */
+  function sample<T>(list: T[], n: number): T[] {
+    for (let i = 0; i < Math.min(n, list.length); i++) { const j = i + Math.floor(Math.random() * (list.length - i)); const t = list[i]; list[i] = list[j]; list[j] = t; }
+    return list.length > n ? list.slice(0, n) : list;
+  }
+  /** What there is to do round (fx, fz) now, weighted; one is picked per spawn. */
+  function offers(fx: number, fz: number, hour: number, raining: boolean, time: number, spot: CrowdSpot | null): Offer[] {
+    const list: Offer[] = [];
+    const night = spot === 'bui-vien' || spot === 'vinh-khanh';
+    // A post that is open and kept by nobody: its keeper (must-fill, so the stalls, rows and corners are never unminded).
+    dPosts(fx, fz, 80, (p) => {
+      if (keptBy.has(p.id) || !inHours([p.hours], hour) || Math.hypot(p.x - fx, p.z - fz) > 80) return;
+      if (raining && p.role === 'xeom') return;
+      list.push({ weight: 9, spawn: () => {
+        const exit = exitNear(p.x, p.z, 60, hour);
+        if (!exit) return false;
+        const npc = recruit(p.role, actOf(hour, Math.min(3, ((p.hours[1] - hour + 24) % 24) || 3), p.kind, p.place, p.life), exit, time);
+        if (!npc) return false;
+        npc.ambient!.post = p.id; keptBy.set(p.id, npc);
+        if (hidden(p.x, p.z)) { placeOn(npc, npc.schedule[0]); return true; }
+        return arriveFrom(npc, p.x, p.z, hour);
+      } });
+    });
+    // Diners and drinkers at an open quán's free stools.
+    // (A sample of a dozen of the free ones, weighted for all of them, so a street of a hundred stools costs no more.)
+    const seats: DPoi[] = [];
+    dSeats(fx, fz, CROWD_RADIUS, (s) => {
+      const p = s.p as DPoi, e = eateryOf(p);
+      if (seatHolder.has(p.id) || aimed.has(p.id) || !districtSeatOpen(p.id) || (raining && !(e?.variant === 'hotpot'))) return;
+      if ((p.hours && !inHours([p.hours], hour)) || Math.hypot(p.x - fx, p.z - fz) > CROWD_RADIUS) return;
+      seats.push(p);
+    });
+    const seatScale = Math.max(1, seats.length / 12);
+    for (const p of sample(seats, 12)) {
+      const e = eateryOf(p);
+      const kind: Kind = p.kind === 'cafe-seat' ? 'eat' : 'leisure';
+      // Nearer tables first: the street round the player fills before the far end of the block.
+      const near = 1.6 - Math.hypot(p.x - fx, p.z - fz) / CROWD_RADIUS;
+      const w = seatScale * near * (p.kind === 'cafe-seat' ? (e?.night || night ? 3.2 : 2) : p.kind === 'bus-stop' ? 0.5 : hour >= 6 && hour < 19 ? 0.5 : 0.25);
+      list.push({ weight: w, spawn: () => {
+        const exit = exitNear(p.x, p.z, 50, hour) ?? exitNear(p.x, p.z, 300, hour);
+        if (!exit) return false;
+        const len = p.kind === 'cafe-seat' ? (dinerLife(e, hour) === 'coffee' ? 0.6 + Math.random() * 0.9 : 0.35 + Math.random() * 0.5) : 0.3 + Math.random() * 0.6;
+        const life = p.kind === 'cafe-seat' ? dinerLife(e, hour) : undefined;
+        const npc = recruit(dayRole(hour), actOf(hour, len, kind, { poi: p }, life), exit, time);
+        if (!npc) return false;
+        npc.ambient!.seat = p.id; aimed.add(p.id);
+        if (hidden(p.x, p.z)) { placeOn(npc, npc.schedule[0]); return true; }
+        return arriveFrom(npc, p.x, p.z, hour);
+      } });
+    }
+    // Shoppers at the chợ, people in the parks and yards.
+    const stands: DPoi[] = [];
+    dStands(fx, fz, 70, (s) => {
+      const p = s.p as DPoi;
+      if ((p.hours && !inHours([p.hours], hour)) || (raining && p.kind !== 'market')) return;
+      stands.push(p);
+    });
+    const standScale = Math.max(1, stands.length / 8);
+    for (const p of sample(stands, 8)) {
+      const market = p.kind === 'market';
+      const w = standScale * (market ? (hour >= 5 && hour < 11 ? 1.6 : hour < 18 ? 0.6 : 0) : (hour >= 5 && hour < 9) || (hour >= 16 && hour < 20) ? 0.8 : hour >= 9 && hour < 16 ? 0.25 : 0);
+      if (!w) continue;
+      list.push({ weight: w, spawn: () => {
+        const exit = exitNear(p.x, p.z, 60, hour) ?? exitNear(p.x, p.z, 300, hour);
+        if (!exit) return false;
+        const npc = recruit(market ? (Math.random() < 0.6 ? 'retiree' : 'worker') : dayRole(hour), actOf(hour, market ? 0.15 + Math.random() * 0.25 : 0.3 + Math.random() * 0.6, market ? 'market' : 'leisure', { poi: p }), exit, time);
+        if (!npc) return false;
+        if (hidden(p.x, p.z)) { placeOn(npc, npc.schedule[0]); return true; }
+        return setOff(npc, doorOut(p.x, p.z, hour));
+      } });
+    }
+    // The slices' doings: joggers at dawn and dusk, kites, picnics, tai chi, cờ tướng, Bùi Viện's promoters, wedding photos.
+    dDoings(fx, fz, 90, (g) => {
+      if (!inHours([g.hours], hour) || raining) return;
+      const key = `${g.what}:${g.x}:${g.z}`, cap = g.what === 'jog' ? 4 : g.what === 'picnic' || g.what === 'taichi' || g.what === 'bet' ? 5 : g.what === 'chess' || g.what === 'photo' ? 3 : 2;
+      if ((doingCount.get(key) ?? 0) >= cap) return;
+      list.push({ weight: g.what === 'promoter' ? 3 : 2.5, spawn: () => {
+        // Off home afterwards, however far (the riverside parks have no doors near): out of sight they are let go anyway.
+        const exit = exitNear(g.x, g.z, 120, hour) ?? exitNear(g.x, g.z, 320, hour);
+        if (!exit) return false;
+        const k = doingCount.get(key) ?? 0, a = k * 2.1 + g.x;
+        const ox = g.what === 'jog' || g.what === 'promoter' || g.what === 'fish' ? 0 : Math.sin(a) * (0.9 + k * 0.25), oz = g.what === 'jog' || g.what === 'promoter' || g.what === 'fish' ? 0 : Math.cos(a) * (0.9 + k * 0.25);
+        const x = g.x + ox, z = g.z + oz;
+        if (!world.clear(x, z, 0.3)) return false;
+        const c = nav.snap(x, z), sit = g.what === 'picnic' || g.what === 'fish' || g.what === 'bet';
+        const yaw = g.what === 'jog' || g.what === 'promoter' || g.what === 'fish' || g.what === 'photo' ? g.yaw : Math.atan2(g.x - x, g.z - z);
+        const place: Place = { stand: { x, z, yaw, sit, covered: false, curb: { x: c.x, z: c.z }, top: sit ? 0.12 : undefined } };
+        const role: Role = g.what === 'promoter' ? 'vendor' : g.what === 'wait' ? (Math.random() < 0.6 ? 'retiree' : 'worker') : g.what === 'bet' ? (Math.random() < 0.7 ? 'student' : 'worker') : g.what === 'taichi' || g.what === 'chess' || g.what === 'fish' ? 'retiree' : g.what === 'kite' ? (Math.random() < 0.5 ? 'student' : 'worker') : 'worker';
+        const life: Life | undefined = g.what === 'taichi' ? 'exercise' : g.what === 'chess' ? 'kibitz' : undefined;
+        const npc = recruit(role, actOf(hour, g.what === 'jog' ? 0.6 : 0.5 + Math.random() * 0.8, g.what === 'promoter' ? 'work' : 'leisure', place, life), exit, time);
+        if (!npc) return false;
+        npc.ambient!.doing = key; doingCount.set(key, k + 1);
+        if (g.what === 'jog' && g.pts) {
+          // A jog: from one end of the loop (out of sight) round to the other at a run's easy pace.
+          npc.pace = 2.5 + Math.random() * 0.5;
+          const n = g.pts.length / 2, i0 = Math.floor(Math.random() * n), from = { x: g.pts[i0 * 2], z: g.pts[i0 * 2 + 1] }, j = (i0 + Math.max(1, n - 1)) % n;
+          const end: Place = { stand: { x: g.pts[j * 2], z: g.pts[j * 2 + 1], yaw: 0, sit: false, covered: false, curb: { x: g.pts[j * 2], z: g.pts[j * 2 + 1] } } };
+          npc.schedule[0] = { ...npc.schedule[0], place: end };
+          const s = nav.snap(from.x, from.z);
+          if (!hidden(s.x, s.z)) { letGo(npc); return false; }
+          return setOff(npc, null, { x: s.x, z: s.z });
+        }
+        if (hidden(x, z)) { placeOn(npc, npc.schedule[0]); return true; }
+        return setOff(npc, doorOut(x, z, hour));
+      } });
+    });
+    // People walking from door to door (to work, to school, home, to the shops, in and out of the chợ): a share of the
+    // whole by the place's character (WALKERS), so a market street is mostly passers-by and an ốc street mostly diners.
+    const others = list.reduce((sum, o) => sum + o.weight, 0), share = spot ? WALKERS[spot] : 0.4;
+    const walkWeight = Math.max(2, (others * share) / Math.max(0.05, 1 - share));
+    const market = (spot === 'cho' || spot === 'ben-thanh') && hour >= 5 && hour < 18 ? marketNear(fx, fz) : null;
+    for (let k = 0; k < 3; k++) list.push({ weight: walkWeight / 3, spawn: () => {
+      // Out of the chợ, or out of a door near the player, or along the sidewalk from out of sight.
+      const fromMarket = !!market && Math.random() < 0.35 && !seen(market.door.x, market.door.z);
+      const from = fromMarket ? market : doorOut(fx, fz, hour);
+      const start = from ? from.door : sidewalkOut();
+      if (!start) return false;
+      // Somewhere 20–60 m on: another door (the chợ, as often as not, round a market).
+      let to: GenBuilding | null = market && !fromMarket && Math.random() < 0.5 ? market : null;
+      for (let j = 0; j < 10 && !to; j++) {
+        // Further afield where doors are few (a park, the riverside).
+        const a = Math.random() * Math.PI * 2, r = (j < 6 ? 20 : 50) + Math.random() * 40;
+        to = exitNear(start.x + Math.sin(a) * r, start.z + Math.cos(a) * r, j < 6 ? 30 : 60, hour);
+        if (to === from) to = null;
+      }
+      if (!to) return false;
+      const school = hour >= 6.2 && hour < 7.3 && to.kind === 'school';
+      const kind: Kind = school ? 'school' : to.kind === 'home' ? (hour >= 16 || hour < 5 ? 'home' : 'leisure') : to.typology === 'market-hall' || to.kind === 'shop' || to.kind === 'food' || to.kind === 'cafe' ? 'market' : 'work';
+      const npc = recruit(school ? 'student' : market && to === market ? (Math.random() < 0.6 ? 'retiree' : 'worker') : dayRole(hour), actOf(hour, 0.05, kind, at(to, true)), to, time);
+      if (!npc) return false;
+      if (market && (to === market || from === market)) dress[npc.id].bag = Math.random() < 0.7;
+      return setOff(npc, from, from ? null : start);
+    } });
+    // A vé số seller doing the round of the quán tables: the night streets after dark, the cafés and the chợ by day
+    // (tickets are sold 6:30–19:30 for the 16:15 draw, and on into the evening for tomorrow's).
+    const vesoDay = (spot === 'cafe-q3' || spot === 'cho' || spot === 'ben-thanh' || spot === 'residential') && hour >= 6.5 && hour < 19.5;
+    if (((night && hour >= 17 && hour < 23.5) || vesoDay) && ambient.filter((n) => !n.ambient!.free && n.role === 'lottery').length < 2) {
+      list.push({ weight: 0.8, spawn: () => {
+        const tables: DEatery[] = [];
+        for (const e of D.eateries) if ((e.night || vesoDay) && Math.abs(e.x - fx) < 70 && Math.abs(e.z - fz) < 70 && inHours([e.hours], hour)) tables.push(e);
+        if (tables.length < 3) return false;
+        tables.sort(() => Math.random() - 0.5);
+        const stops = tables.slice(0, 4).map((e) => { const x = e.x + Math.sin(e.yaw) * 1.1, z = e.z + Math.cos(e.yaw) * 1.1, c = nav.snap(x, z); return { stand: { x, z, yaw: e.yaw + Math.PI, sit: false, covered: false, curb: { x: c.x, z: c.z } } } as Place; });
+        const exit = exitNear(fx, fz, 80, hour);
+        if (!exit) return false;
+        const npc = recruit('lottery', actOf(hour, 0.15, 'work', stops[0], 'lottery'), exit, time);
+        if (!npc) return false;
+        // Stop after stop, a few minutes each, then away.
+        const sched: Activity[] = stops.map((p, k) => actOf(hour + k * 0.15, 0.15, 'work', p, 'lottery'));
+        sched.push({ start: sched[sched.length - 1].end, end: sched[0].start, kind: 'home', place: at(exit, true), outdoor: false });
+        npc.schedule = sched;
+        return arriveFrom(npc, fx, fz, hour);
+      } });
+    }
+    return list;
+  }
+  /** Spawns and lets go of the districts' crowd round the player, a few at a time (about four times a second). */
+  function ambientTick(time: number, hour: number, raining: boolean) {
+    if (!ambient.length || time < ambientAt) return;
+    ambientAt = time + 0.25;
+    const fresh = time < freshUntil;
+    clock = time;
+    let near = 0;
+    for (const npc of ambient) {
+      const a = npc.ambient!;
+      if (a.free) continue;
+      if (npc.state !== 'inside' && npc.state !== 'away') a.out = true;
+      const d = Math.hypot(npc.x - focusX, npc.z - focusZ);
+      // Gone in (after having been out), knocked out of the day (a xe ôm fare, a hospital stay), or out of sight far off.
+      if ((npc.state === 'inside' && a.out) || npc.state === 'away' || (npc.state !== 'down' && ((d > DROP_RADIUS && !seen(npc.x, npc.z)) || d > 190))) { letGo(npc); continue; }
+      if (a.seat >= 0 && npc.state === 'at') aimed.delete(a.seat);
+      if (d < CROWD_RADIUS) near++;
+    }
+    const target = Math.min(ambient.length, crowdTarget(D.keys, focusX, focusZ, hour, raining));
+    if (near >= target) return;
+    const spot = spotAt(D.keys, focusX, focusZ);
+    const list = offers(focusX, focusZ, hour, raining, time, spot);
+    // Up to two a tick (a burst after a jump in time or place, behind the fade).
+    for (let k = 0; k < (fresh ? 8 : 2) && near < target && list.length; k++) {
+      const total = list.reduce((s, o) => s + o.weight, 0);
+      let roll = Math.random() * total, pickIdx = 0;
+      for (let i = 0; i < list.length; i++) { roll -= list[i].weight; if (roll <= 0) { pickIdx = i; break; } }
+      const offer = list.splice(pickIdx, 1)[0];
+      if (offer.spawn()) near++;
+    }
+  }
+
   let day = 0;
   let lastHour = 0;
   const events: NpcEvents = { robbed: [], strikes: 0, shots: [], crowd: { outside: 0, umbrellas: 0, sheltering: 0, exposed: 0, watching: 0, chatting: 0 } };
@@ -2307,22 +2808,30 @@ export function createNpcs(
      */
     seatsNear(x: number, z: number, r: number) {
       const out: { id: number; x: number; z: number; yaw: number; top: number; kind: string; taken: boolean; free: boolean }[] = [];
-      for (const p of POIS) {
-        if (!p.seat || p.kind === 'perch' || Math.abs(p.x - x) > r || Math.abs(p.z - z) > r || Math.hypot(p.x - x, p.z - z) > r) continue;
-        if (p.group !== undefined && !furniture.isOpen(p.group)) continue;
+      // Today's places, then the districts' seats through their 32 m index (no copy of either table per call: this runs every frame on foot).
+      const take = (p: (typeof POIS)[number] | (typeof D.pois)[number]) => {
+        if (!p.seat || p.kind === 'perch' || Math.abs(p.x - x) > r || Math.abs(p.z - z) > r || Math.hypot(p.x - x, p.z - z) > r) return;
+        if (p.group !== undefined && !furniture.isOpen(p.group)) return;
+        if (p.id >= D.poiBase && !districtSeatOpen(p.id)) return;
         const taken = seatHolder.has(p.id);
         out.push({ id: p.id, x: p.x, z: p.z, yaw: p.yaw, top: seatTopOf(p).top, kind: p.kind, taken, free: !taken });
-      }
+      };
+      for (const p of POIS) take(p);
+      dSeats(x, z, r, (s) => take(s.p));
       return out;
     },
     /** Reserves the nearest free seat within `maxDist` for the player (no one else will sit there until released), or null. */
     claimSeat(x: number, z: number, maxDist: number) {
-      let best: Poi | null = null, bestD = maxDist;
-      for (const p of POIS) {
-        if (!p.seat || p.kind === 'perch' || seatHolder.has(p.id) || (p.group !== undefined && !furniture.isOpen(p.group))) continue;
+      const pick = { best: null as Poi | null, d: maxDist };
+      const consider = (p: (typeof POIS)[number] | (typeof D.pois)[number]) => {
+        if (!p.seat || p.kind === 'perch' || seatHolder.has(p.id) || (p.group !== undefined && !furniture.isOpen(p.group)) || (p.id >= D.poiBase && !districtSeatOpen(p.id))) return;
+        if (Math.abs(p.x - x) > maxDist || Math.abs(p.z - z) > maxDist) return;
         const dd = Math.hypot(p.x - x, p.z - z);
-        if (dd <= bestD && !npcs.some((n) => n.state === 'walking' && n.current && 'poi' in n.current.place && n.current.place.poi === p && Math.hypot(n.x - p.x, n.z - p.z) < 1.2)) { best = p; bestD = dd; }
-      }
+        if (dd <= pick.d && !npcs.some((n) => n.state === 'walking' && n.current && 'poi' in n.current.place && n.current.place.poi === p && Math.hypot(n.x - p.x, n.z - p.z) < 1.2)) { pick.best = p as Poi; pick.d = dd; }
+      };
+      for (const p of POIS) consider(p);
+      dSeats(x, z, maxDist, (s) => consider(s.p));
+      const best = pick.best;
       if (!best) return null;
       seatHolder.set(best.id, PLAYER);
       return { id: best.id, x: best.x, z: best.z, yaw: best.yaw, top: seatTopOf(best).top, kind: best.kind as string };
@@ -2359,6 +2868,8 @@ export function createNpcs(
      * says they are at `hour`, instead of walking there for minutes.
      */
     skipTo(hour: number) {
+      for (const npc of ambient) letGo(npc);
+      freshUntil = clock + 1.5;
       for (const npc of npcs) {
         if (npc.role === 'thief' || npc.state === 'down' || npc.state === 'away') continue;
         if (npc.mind.intent !== 'routine') stop(npc, clock);
@@ -2409,14 +2920,15 @@ export function createNpcs(
     },
     /** Counts for checks: who is doing what on the street right now. */
     lifeStats() {
-      const s = { exercising: 0, stools: 0, eating: 0, chessGames: 0, kidsPlaying: 0, outside: 0, beer: 0, couples: 0, hawkers: 0, doorstep: 0, seated: 0 };
+      const s = { exercising: 0, stools: 0, eating: 0, chessGames: 0, kidsPlaying: 0, outside: 0, beer: 0, couples: 0, hawkers: 0, doorstep: 0, seated: 0, ambient: 0, districtDiners: 0, districtKeepers: 0 };
       for (const npc of npcs) {
         if (!visible(npc)) continue;
         s.outside++;
         const life = npc.current?.life, at = npc.state === 'at';
         if (npc.pose === 'sit') s.seated++;
         if (at && life === 'exercise') s.exercising++;
-        if (at && seatOf[npc.id] >= 0 && POIS[seatOf[npc.id]].kind === 'stool') { s.stools++; if (life === 'meal' || life === 'beer') s.eating++; }
+        if (at && seatOf[npc.id] >= 0 && poiAt(seatOf[npc.id]).kind === 'stool') { s.stools++; if (life === 'meal' || life === 'beer') s.eating++; }
+        if (npc.ambient) { s.ambient++; if (at && seatOf[npc.id] >= D.poiBase && poiAt(seatOf[npc.id]).kind === 'cafe-seat') s.districtDiners++; if (npc.ambient.post && at) s.districtKeepers++; }
         if (at && (life === 'shuttle' || life === 'chase')) s.kidsPlaying++;
         if (at && life === 'beer') s.beer++;
         if (at && life === 'couple') s.couples++;
@@ -2534,11 +3046,13 @@ export function createNpcs(
       focusZ = fz;
       clock = time;
       nowHour = hour;
-      if (!started) { settle(hour); started = true; lastHour = hour; }
+      if (!started) { settle(hour); started = true; lastHour = hour; freshUntil = time + 1.5; }
       if (hour < lastHour) day++;
       lastHour = hour;
       // Street life: stools out or stacked, group scenes (whose turn, the shuttlecock, toasts), members still there.
       furniture.update(time, hour, raining);
+      districtFurniture?.update(time, hour, raining);
+      ambientTick(time, hour, raining);
       gatherings.tick(time, lifeHooks);
       if (time >= sweepAt) {
         sweepAt = time + 2;
@@ -2575,6 +3089,7 @@ export function createNpcs(
       }
       for (const batch of batches) batch.begin();
       npcs.forEach((npc, i) => {
+        if (npc.ambient?.free) return;
         const mind = npc.mind;
         // --- downed and away ---
         if (npc.state === 'down') {
@@ -2595,7 +3110,7 @@ export function createNpcs(
           return;
         }
         if (npc.state === 'away') {
-          if (npc.role !== 'thief' && time > npc.timer) {
+          if (npc.role !== 'thief' && !npc.ambient && time > npc.timer) {
             npc.state = 'inside';
             npc.inside = npc.home;
             npc.health = npc.gang >= 0 ? GANG_HEALTH : MAX_HEALTH;
@@ -2774,25 +3289,39 @@ export function createNpcs(
           if (npc.gang >= 0 && d < 9 && !threat.inVehicle) npc.targetYaw = Math.atan2(-dx, -dz);
         } else if (npc.act !== 'none' || npc.offX || npc.offZ) stopAct(npc, time);
         npc.yaw = angleLerp(npc.yaw, npc.targetYaw, 1 - Math.exp(-dt * 8));
-        // The gait advances with the distance covered (a step is as long as the legs reach), so feet do not slide.
-        const moving = npc.pose === 'walk' || npc.pose === 'run';
-        npc.go = THREE.MathUtils.damp(npc.go, moving ? Math.min(1, npc.speed / 1.3) : 0, 8, dt);
-        const run = moving ? clamp((npc.speed - 2) / 1.6, 0, 1) : 0, amp = (0.48 + 0.34 * run) * npc.go;
-        const step = 2 * FIGURE.sole * BODY_SCALE * dress[i].style.height * Math.sin(Math.max(0.2, amp)) * (1 + 0.08 * run);
-        npc.stride += (npc.speed * dt * Math.PI) / step;
-        npc.swing = Math.sin(npc.stride) * amp;
-        if (dress[i].gear === 'pole') {
-          // Gánh baskets swing on their cords: they lag as the walk speeds up and bob with every step.
-          const acc = clamp((npc.speed - npc.lastSpeed) / Math.max(dt, 1e-3), -4, 4), steps = Math.max(1, Math.ceil(dt * 30)), h = dt / steps;
-          for (let s = 0; s < steps; s++) {
-            const force = -(9.8 / 0.6) * npc.pendA - 2.5 * npc.pendV + acc * 0.5 + 1.6 * Math.sin(2 * npc.stride) * npc.go;
-            npc.pendV += force * h;
-            npc.pendA = clamp(npc.pendA + npc.pendV * h, -0.5, 0.5);
-          }
+        // Beyond the fog nobody sees how anyone walks, looks or swings their clothes: only where they go is kept.
+        const beyond = Math.abs(npc.x - fx) + Math.abs(npc.z - fz) > FOG_SKIP;
+        // The ground under someone who has not moved is where it was (terrain lookups are not free); a walker looks it
+        // up again every 12 cm (a few frames).
+        const walked = Math.abs(npc.x - npc.gx) + Math.abs(npc.z - npc.gz);
+        if (walked > (npc.state === 'walking' || npc.state === 'fleeing' ? 0.12 : 0) || walked !== walked) { npc.y = ground(npc.x, npc.z); npc.gx = npc.x; npc.gz = npc.z; }
+        // Off screen (or beyond the fog) nobody sees the stride, the eyes or the clothes: only where they go is kept.
+        const onScreen = !beyond && inFrame(npc);
+        if (!onScreen) npc.lastSpeed = npc.speed;
+        if (beyond) {
+          stats.outside++;
+          return;
         }
-        npc.lastSpeed = npc.speed;
-        npc.y = ground(npc.x, npc.z);
-        animate(npc, time, dt, threat, d);
+        // The gait advances with the distance covered (a step is as long as the legs reach), so feet do not slide.
+        const moving = onScreen && (npc.pose === 'walk' || npc.pose === 'run');
+        if (onScreen) {
+          npc.go = THREE.MathUtils.damp(npc.go, moving ? Math.min(1, npc.speed / 1.3) : 0, 8, dt);
+          const run = moving ? clamp((npc.speed - 2) / 1.6, 0, 1) : 0, amp = (0.48 + 0.34 * run) * npc.go;
+          const step = 2 * FIGURE.sole * BODY_SCALE * dress[i].style.height * Math.sin(Math.max(0.2, amp)) * (1 + 0.08 * run);
+          npc.stride += (npc.speed * dt * Math.PI) / step;
+          npc.swing = Math.sin(npc.stride) * amp;
+          if (dress[i].gear === 'pole') {
+            // Gánh baskets swing on their cords: they lag as the walk speeds up and bob with every step.
+            const acc = clamp((npc.speed - npc.lastSpeed) / Math.max(dt, 1e-3), -4, 4), steps = Math.max(1, Math.ceil(dt * 30)), h = dt / steps;
+            for (let s = 0; s < steps; s++) {
+              const force = -(9.8 / 0.6) * npc.pendA - 2.5 * npc.pendV + acc * 0.5 + 1.6 * Math.sin(2 * npc.stride) * npc.go;
+              npc.pendV += force * h;
+              npc.pendA = clamp(npc.pendA + npc.pendV * h, -0.5, 0.5);
+            }
+          }
+          npc.lastSpeed = npc.speed;
+          animate(npc, time, dt, threat, d);
+        }
 
         // --- chatter near the player ---
         npc.chatterAt -= dt;
@@ -2806,20 +3335,26 @@ export function createNpcs(
           if (lifeLine) {
             if (nearFocus(npc, crier ? 30 : 22) && lifeLines >= 1) { lifeLines--; say(npc, lifeLine, crier); }
           } else if (Math.hypot(npc.x - focusX, npc.z - focusZ) < 28 && npc.state !== 'afraid' && intent !== 'chat' && !(life && npc.state === 'at')) {
-            const kind = npc.current?.kind;
+            const kind = npc.current?.kind, h = ((hour % 24) + 24) % 24;
+            // What the place is (Bùi Viện, Vĩnh Khánh, Bến Thành's night market…) and what this person came out to do.
+            const spot = D.keys.size ? spotAt(D.keys, npc.x, npc.z) : null, doingKey = npc.ambient?.doing ?? null;
+            const doing = doingKey ? DOING_LINES[doingKey.slice(0, doingKey.indexOf(':'))] : undefined;
+            const nightStreet = (spot === 'bui-vien' || spot === 'vinh-khanh') && (h >= 19 || h < 2) ? NIGHT_STREET_LINES[spot] : null;
             const line = intent === 'watch' && mind.incident ? pick(WATCH_LINES[mind.incident.kind])
               : intent === 'avoid' ? pick(LINES.avoid)
               : intent === 'shelter' ? (npc.state === 'at' ? pick(LINES.shelter) : pick(LINES.rain))
               : npc.gang >= 0 ? pick(LINES.gangCalm)
               : raining && mind.umbrella > 0.5 ? pick(LINES.umbrella)
               : raining && npc.state === 'walking' ? pick(LINES.rain)
+              : doing ? pick(doing)
+              : nightStreet ? pick(nightStreet)
               : (hour > 21 || hour < 5) ? pick(LINES.night)
-              : kind === 'market' ? pick(LINES.market)
+              : kind === 'market' ? pick(spot === 'ben-thanh' && h >= 17.5 ? LINES.choDem : LINES.market)
               : kind === 'work' && npc.state === 'at' ? pick(LINES.work)
               : kind === 'eat' ? pick(LINES.eat)
-              : kind === 'leisure' ? pick(LINES.leisure)
+              : kind === 'leisure' ? pick(h >= 18 || h < 5 ? LINES.stroll : LINES.leisure)
               : kind === 'school' ? pick(LINES.school)
-              : npc.state === 'walking' ? pick(LINES.commute) : '';
+              : npc.state === 'walking' ? pick((h >= 6 && h < 9) || (h >= 16.5 && h < 19) ? LINES.commute : LINES.stroll) : '';
             say(npc, line, false);
           }
         }
@@ -2831,7 +3366,7 @@ export function createNpcs(
         else if (raining) stats.exposed++;
         if (mind.intent === 'watch' && npc.state === 'at') stats.watching++;
         if (mind.intent === 'chat') stats.chatting++;
-        draw(npc, i, time);
+        if (onScreen) draw(npc, i, time);
       });
       // The shuttlecocks in flight (drawn a little large so they read at a distance), steam off the open phở pots and
       // smoke off freshly lit incense near the player.

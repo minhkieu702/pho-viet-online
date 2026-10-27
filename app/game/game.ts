@@ -1,20 +1,25 @@
 import * as THREE from 'three';
 import { buildWorld, dockAt, groundHeight, onSidewalk } from './world';
-import { BUILDINGS, LANDMARKS, LIFE, PLOTS, ROADS_X, ROADS_Z, SCENERY, WATER_LEVEL, inRect, type Dock } from './city';
+import { LANDMARKS, LIFE, PLOTS, SCENERY, WATER_LEVEL, inRect, type Dock } from './city';
 import { LIFE_LINES } from './street-life';
-import { BASE, OWN_VEHICLE, createRegistry, type Ctx, type Entry, type Focus, type MenuItem, type MenuView, type PromptView } from './interact';
+import { BASE, OWN_VEHICLE, createRegistry, noticeEntry, type Ctx, type Entry, type Focus, type MenuItem, type MenuView, type PromptView } from './interact';
 import { ATM_SPOTS, COUNTERS, FORTUNES, PLACES, VENDING_SPOTS, counterAt, hourLabel, hoursLabel, isOpen, lunarDay, opensAt, type CounterDef, type Hours, type Place } from './counters';
 import {
   DRAW_HOUR, HAGGLE_OFF, MAX_TICKETS, applyEffect, drawDay, drawNumber, footSpeed, haggle, prizeFor, regenRate, ticketNumber,
   type BuffId, type EffectHost, type Ticket,
 } from './services';
 import { SECONDS_PER_HOUR } from './clock';
-import { SWIM_DEPTH, TERRAIN, bankNear, bounds, deep as deepWater, inBounds, inWater, navigable, pierNear, walkable, waterLevel } from './map/terrain';
+import { SWIM_DEPTH, TERRAIN, bankNear, bounds, climbNear, deep as deepWater, hullAt, inBounds, inPlay, inWater, navigable, openEdge, pierNear, walkable, waterLevel, wetAt } from './map/terrain';
 import { createBoats, makeBoatMesh, type Boat } from './boats';
 import { createBuses } from './buses';
 import { LOTS, SPOTS } from './parking';
+import { worldBuilding, worldPlot } from './district-life';
+import { registerStreets } from './map/districts';
+import { districtStreets } from './map/mapdata';
 import { createNav } from './nav';
 import { createCollisionIndex, OWNER } from './map/collision';
+import { DISTRICT_PLOTS, DISTRICT_STAMPS, WORLD_BUILDINGS, WORLD_PLOTS, isWired } from './map/world-map';
+import { QUAN_1_SOUTH_EXTRA } from './map/layout/quan-1-south';
 import { createRagdolls, type BodyPart, type HitKind, type RagdollBody, type RagdollLook } from './ragdoll';
 import { createNpcs, GANGS, type Npc } from './npcs';
 import { createEffects, makeGun } from './effects';
@@ -25,7 +30,8 @@ import { createAtmosphere, type Weather } from './atmosphere';
 import { createAnimals } from './animals';
 import { createSideMissions, type SideMissionView } from './side-missions';
 import { playBoom, playCrash, playHorn, playShot, playThud, setRain, unlockAudio } from './audio';
-import { STOP_LINE, lightFor, nearest } from './signals';
+import { nodeLight } from './signals';
+import { worldRoads } from './map/world-types';
 import { WEAPONS, weaponById, type WeaponId } from './weapons';
 import { MISSION_DEFS, createMissions, type MissionEvent, type MissionId, type MissionView } from './missions';
 import { createPeerInterpolator, createSnapshotClock } from './peer-interpolation';
@@ -51,7 +57,7 @@ import { createZombies } from './zombies';
 import { createInteriors, type InteriorKind, type RoomAct } from './interiors';
 import { VENUE_SERVICES, serviceOf, type VenueRoom } from './venues';
 import { createSky, HORIZON } from './sky';
-import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuName, isSoftwareGpu, type QualityMode } from './quality';
+import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuName, isIntegratedGpu, isSoftwareGpu, type QualityMode } from './quality';
 
 export type VehicleKind = 'foot' | 'scooter' | 'car' | 'police' | 'boat' | 'swim';
 export type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
@@ -885,8 +891,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   // scans it treats them as infinitely tall) and one over the building blocks with their roof heights.
   const solids = createCollisionIndex();
   for (const c of world.colliders) solids.add(c.minX, c.minZ, c.maxX, c.maxZ, -Infinity, Infinity, OWNER.legacy, c);
+  // The wired districts' solids (map/world-map.ts): oriented boxes, as tall as the legacy ones are treated.
+  for (const c of world.districtColliders) solids.addBox(c.cx, c.cz, c.hx, c.hz, c.yaw, -Infinity, Infinity, OWNER.legacy, c);
   const roofs = createCollisionIndex();
   for (const p of PLOTS) roofs.add(p.full.minX, p.full.minZ, p.full.maxX, p.full.maxZ, 0, p.h, OWNER.roof, p);
+  for (const p of DISTRICT_PLOTS) roofs.addBox(p.box.cx, p.box.cz, p.box.hx, p.box.hz, p.box.yaw, 0, p.h, OWNER.roof, p);
+  // (world.attach, which also precompiles the district materials, waits for the quality level: applyLevel below.)
   const roofHits: number[] = [];
 
   function worldClear(x: number, z: number, radius: number) {
@@ -916,6 +926,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const explosives = createExplosives(scene, groundHeight);
   const pickups = createPickups(scene, groundHeight);
   const sayAt = (key: string, text: string, at: () => { x: number; y: number; z: number } | null, shout = false) => bubbles.say(key, text, performance.now(), at, shout ? 2600 : 3400, shout ? 'shout' : 'say');
+  // The wired slices' streets for the HUD's street line (districts.ts settleStreet names them like today's).
+  registerStreets(districtStreets());
   const npcs = createNpcs(scene, ragdolls, { clear: worldClear, sight: lineOfSight }, {
     onRest: (x, z) => effects.pool(x, z),
     // Seated on a low stool the head is lower than on a bench: the bubble follows the seat height.
@@ -924,7 +936,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     bikeAt: (x, z) => vehicles.parkedAt(x, z, 0.9),
   });
   const vehicles = createVehicles(scene, worldClear);
-  const boats = createBoats(scene);
+  // The boats carry the player too (the đò ngang, river bus W2): fares, putting them down on a pier, a line in the HUD.
+  const boats = createBoats(scene, {
+    pay: (k) => { if (cash < k) return false; cash -= k; return true; },
+    place: (x, z, yaw) => { Object.assign(state, { x, z, angle: yaw }); bodyY = groundHeight(x, z); swimming = false; cameraTarget.set(x, 1, z); },
+    notify: (text, ms) => notify(text, ms),
+    say: (key, text, at) => sayAt(key, text, at),
+  });
   const police = createPolice(scene, vehicles, ragdolls, { clear: worldClear, sight: lineOfSight, ground: groundHeight }, (key, text, at) => sayAt(key, text, at, true));
   const zombies = createZombies(scene, ragdolls, {
     clear: (x, z, radius) => worldClear(x, z, radius) && !vehicles.blocked(x, z, radius),
@@ -1141,7 +1159,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
   // Roller shutters (cửa cuốn) over the fronts of the shophouse counters: pulled down outside opening hours (and for
   // good in zombie mode), so a closed shop reads as closed from the street (design-real C3). One instanced draw.
-  const shutterPlaces = PLACES.filter((p) => p.kind === 'counter' && p.building >= 0 && ['legacy', 'home', 'shop', 'midrise', 'kiosk'].includes(PLOTS[p.building].style));
+  const shutterPlaces = PLACES.filter((p) => p.kind === 'counter' && p.building >= 0 && !p.id.startsWith('dk:') && ['legacy', 'home', 'shop', 'midrise', 'kiosk'].includes(worldPlot(p.building).style));
   const shutterTexture = (() => {
     const c = document.createElement('canvas');
     c.width = 8; c.height = 64;
@@ -1160,9 +1178,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   shutters.receiveShadow = true;
   scene.add(shutters);
   const shutterFrames = shutterPlaces.map((p) => {
-    const b = BUILDINGS[p.building], fx = Math.sin(b.facing), fz = Math.cos(b.facing), ax = Math.cos(b.facing), az = -Math.sin(b.facing);
+    const b = worldBuilding(p.building), fx = Math.sin(b.facing), fz = Math.cos(b.facing), ax = Math.cos(b.facing), az = -Math.sin(b.facing);
     const wx = b.door.x - fx * 0.8, wz = b.door.z - fz * 0.8, along = (b.x - wx) * ax + (b.z - wz) * az;
-    const height = Math.min(3, PLOTS[p.building].h - 0.5);
+    const height = Math.min(3, worldPlot(p.building).h - 0.5);
     return { key: p.key, x: wx + ax * along + fx * 0.07, z: wz + az * along + fz * 0.07, yaw: b.facing, width: Math.max(1.6, Math.min(b.w - 0.7, 9)), top: groundHeight(b.door.x, b.door.z) + height, height };
   });
   let shutterState = '', shutterHour = -1, shutterZombie = false;
@@ -1374,6 +1392,18 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     shadowsAllowed = want && fade > 0;
   }
+  // Every program the street needs compiles in parallel before the first frame is drawn (KHR_parallel_shader_compile
+  // where the driver has it): the first frames do not stall for hundreds of milliseconds compiling them one by one.
+  let compiled = false, compiling = 0;
+  /** Instanced meshes in the scene (rescanned every 60 frames) and those hidden for the frame because they are empty. */
+  const instanced: THREE.InstancedMesh[] = [], emptied: THREE.InstancedMesh[] = [];
+  let emptyScan = 60;
+  function warmPrograms() {
+    const n = ++compiling;
+    compiled = false;
+    renderer.compileAsync(scene, camera).catch(() => { /* compiled on first use instead */ }).finally(() => { if (n === compiling) compiled = true; });
+    setTimeout(() => { if (n === compiling) compiled = true; }, 4000);
+  }
   function applyLevel(next: number) {
     level = THREE.MathUtils.clamp(next, 0, QUALITY_LEVELS.length - 1);
     const preset = QUALITY_LEVELS[level];
@@ -1390,9 +1420,17 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     // Street dressing (fine layer, smoke, patterns, cables) and street-life props follow the same level.
     world.setDetail(level);
     npcs.setPropDetail(level);
+    // The lane fleet's cap (design-engine §8: 60 / 45 / 30 vehicles by preset).
+    vehicles.setQuality(level);
   }
   applyLevel(level);
   renderer.shadowMap.needsUpdate = true;
+  // A district tile appearing re-renders the (otherwise static) shadow map; the district materials compile now, in
+  // their final variant (the quality level patches walls and paving), off the first frames.
+  world.attach(renderer, camera, { discrete: !isIntegratedGpu(gpu) });
+  // After createGame returns: the page sets its saved quality level first (which swaps figure materials), so the
+  // programs compile once, in their final variants, and no material is disposed while compileAsync waits on it.
+  setTimeout(warmPrograms, 0);
 
   function adaptQuality(now: number, interval: number) {
     const verdict = monitor.sample(now, interval);
@@ -1495,38 +1533,46 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   // ---- Red lights: a cruiser nearby will not let it go. ----
-  let lightGap = Infinity, lightJunction = '';
+  let lightGap = Infinity, lightApproach = -1;
+  /**
+   * Crossing a stop line of the live roads (map/world-types.ts: today's grid and the wired districts' junctions) on red,
+   * riding faster than 4 m/s along the road, with the police within 55 m: a crime.
+   */
   function checkRedLight(time: number) {
     if (!state.riding || Math.abs(velocity) < 4) { lightGap = Infinity; return; }
-    const alongX = Math.abs(Math.sin(state.angle)) > Math.abs(Math.cos(state.angle));
-    const dir = Math.sign((alongX ? Math.sin(state.angle) : Math.cos(state.angle)) * velocity) || 1;
-    const along = alongX ? state.x : state.z, cross = alongX ? state.z : state.x;
-    const road = nearest(alongX ? ROADS_Z : ROADS_X, cross);
-    if (Math.abs(cross - road) > 7) { lightGap = Infinity; return; }
-    const junction = nearest(alongX ? ROADS_X : ROADS_Z, along + dir * 20);
-    const gap = (junction - along) * dir - STOP_LINE;
-    const key = `${junction}:${road}:${alongX}`;
-    if (key === lightJunction && lightGap > 0 && gap <= 0 && gap > -4) {
-      const light = alongX ? lightFor(junction, road, 'x', time) : lightFor(road, junction, 'z', time);
-      if (light === 'red') {
-        let seen = false;
-        police.forEachUnit((x, z) => { if (Math.hypot(x - state.x, z - state.z) < 55) seen = true; });
-        if (seen) { police.crime(1, time); notify('Vượt đèn đỏ ngay trước mặt cảnh sát!', 2500); }
-      }
+    const roads = worldRoads().roads;
+    const h = roads.nearestEdge(state.x, state.z, 14, (e) => e.traffic && e.cls !== 'hem');
+    if (!h || h.d > h.edge.half + 1) { lightGap = Infinity; return; }
+    // Which way along the road (riding across it is not running its lights).
+    const sign = Math.sign(velocity) || 1, along = (Math.sin(state.angle) * h.hx + Math.cos(state.angle) * h.hz) * sign;
+    if (Math.abs(along) < 0.6) { lightGap = Infinity; return; }
+    const e = h.edge, dir = along > 0 ? 1 : -1, node = roads.nodes[dir > 0 ? e.b : e.a];
+    const arm = node.arms.find((a) => a.edge === e.id && a.end === (dir > 0 ? 1 : 0));
+    if (node.control !== 'signal' || !arm || arm.approach < 0) { lightGap = Infinity; return; }
+    const gap = (dir > 0 ? e.len - h.s : h.s) - arm.setback;
+    if (arm.approach === lightApproach && lightGap > 0 && gap <= 0 && gap > -4 && nodeLight(node.id, arm.group, time) === 'red') {
+      let seen = false;
+      police.forEachUnit((x, z) => { if (Math.hypot(x - state.x, z - state.z) < 55) seen = true; });
+      if (seen) { police.crime(1, time); notify('Vượt đèn đỏ ngay trước mặt cảnh sát!', 2500); }
     }
-    lightJunction = key;
+    lightApproach = arm.approach;
     lightGap = gap;
   }
 
-  /** Open water a swimmer can be in: inside the buoys and beside (not under) the piers; the steps lead out. */
+  /** Open water a swimmer can be in: inside the buoys and beside (not under) the piers or a moored ship's hull; the steps lead out. */
   function swimClear(x: number, z: number) {
     if (!inWater(x, z, 0.35)) { const d = dockAt(x, z); return !!d && inRect(d.steps, x, z); }
-    return !pierNear(x, z, 0.35);
+    return !pierNear(x, z, 0.35) && !hullAt(x, z, 0.35);
   }
-  /** Where the player on foot can go: the land (clear of everything), the docks, or off a dock into the river. */
+  /**
+   * Where the player on foot can go: the land (clear of everything), the docks, or off a dock into the river; on a
+   * quay with no railing (a wharf) right up to its edge and over it into the water.
+   */
   function footClear(x: number, z: number) {
     if (swimming) return swimClear(x, z) && !boats.hit(x, z, 0.35);
     if (clearAt(x, z, 0.4) || dockAt(x, z)) return true;
+    if (openEdge(x, z) && !wetAt(x, z) && solids.clear(x, z, 0.4)) return true;
+    if (openEdge(state.x, state.z) && wetAt(x, z) && !hullAt(x, z, 0.35)) return true;
     return dockAt(state.x, state.z) !== null && swimClear(x, z);
   }
   /** The hire boat's hull at a spot: three points along it in open water, clear of the other boats. */
@@ -2160,7 +2206,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         if (!isOpen(def.hours, c.hour)) { const [verb, label] = closedText(def, c.hour); return dimView(place.id, verb, label); }
         const away = AWAY[def.kind];
         if (away && !sellerAt(place.anchor.x, place.anchor.z, away.r)) return dimView(place.id, away.text[0], away.text[1]);
-        return { id: place.id, key: 'E', verb: def.verb, label: def.kind === 'atm' ? `số dư ${formatThousands(bank)}` : titleCase(place.name), price: def.kind === 'atm' || def.kind === 'bank' || def.kind === 'police' || def.kind === 'pagoda' ? undefined : headline(def) };
+        return { id: place.id, key: 'E', verb: def.verb, label: def.kind === 'atm' ? `số dư ${formatThousands(bank)}` : titleCase(place.name), price: def.kind === 'atm' || def.kind === 'bank' || def.kind === 'police' || def.kind === 'pagoda' || def.kind === 'church' || def.kind === 'market' ? undefined : headline(def) };
       },
       use(c) {
         if (c.zombie || (refusedUntil.get(place.id) ?? 0) > c.time || !isOpen(def.hours, c.hour)) return;
@@ -2508,7 +2554,11 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
           use: (c) => { if (!c.zombie && isOpen(hours, c.hour)) onEvent({ type: 'venue', kind: place.key as VenueRoom }); },
         };
       }
-      case 'deck': return { ...base, prompt: () => ({ id: place.id, key: 'E', verb: 'Lên đài quan sát tầng 68', label: 'nhảy dù', price: DECK_PRICE }), use: () => enterDeck() };
+      case 'deck': {
+        // Looked up when asked (the deck table is set up further down createGame).
+        const tower = () => DECKS[place.key] ?? DECKS.deck;
+        return { ...base, prompt: () => ({ id: place.id, key: 'E', verb: `Lên đài quan sát tầng ${tower().floor}`, label: 'nhảy dù', price: tower().price }), use: () => enterDeck(tower()) };
+      }
       case 'heist': return {
         ...base, hold: 1.2, crime: 3,
         prompt: (c) => {
@@ -2546,7 +2596,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     };
   }
   for (const place of PLACES) {
-    registry.add(place.kind === 'counter' ? counterEntry(place) : place.kind === 'seat' ? seatEntry(place) : place.kind === 'bin' ? binEntry(place) : legacyEntry(place));
+    registry.add(place.kind === 'counter' ? counterEntry(place) : place.kind === 'seat' ? seatEntry(place) : place.kind === 'bin' ? binEntry(place) : place.kind === 'notice' ? noticeEntry(place) : legacyEntry(place));
   }
   // The sidewalk karaoke (street life, LIFE.groups): in its hours the neighbours hand the player the mic for a song;
   // otherwise the loudspeaker just says when it starts.
@@ -2677,15 +2727,20 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     } else notify('Nổ máy rồi · không ai thấy. Đi thôi!', 2500);
     takeCar(car);
   }
+  /** The vehicles the provider below has listed this frame (a woken parked one is listed once). */
+  const providerCars = new Set<Car>();
   registry.addProvider((x, z, _r, out) => {
     if (state.riding || swimming || boat || glide) return;
     if (!seat && Math.hypot(bikeX - x, bikeZ - z) < 2.6) { ownBike.x = bikeX; ownBike.z = bikeZ; out.push(ownBike); }
-    for (const car of vehicles.cars) {
+    const listed = providerCars;
+    listed.clear();
+    for (const car of vehicles.live) {
       if (car.mode === 'off' || car.mode === 'player' || car.mode === 'chase' || car.mode === 'leave') continue;
       if (Math.abs(car.x - x) > 6 || Math.abs(car.z - z) > 6) continue;
+      listed.add(car);
       out.push(carEntry(car));
     }
-    for (const car of vx.curbNear?.(x, z, 6) ?? []) if (!vehicles.cars.includes(car) && car.mode !== 'player') out.push(carEntry(car));
+    for (const car of vx.curbNear?.(x, z, 6) ?? []) if (!listed.has(car) && car.mode !== 'player') out.push(carEntry(car));
   });
   vx.onTow?.((car) => {
     if (car !== playerLastCar) return;
@@ -2765,6 +2820,23 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   const closingOf = (npc: Npc) => { const a = npc.current as { life?: string; end?: number } | null; return a?.life === 'guard' && a.end !== undefined ? a.end : null; };
   /** What a roaming hawker sells right now (street-life slices carry their goods). */
   const goodsOf = (npc: Npc) => (npc.current as { goods?: string } | null)?.goods ?? '';
+  /** Heritage sites of the wired districts (Quận 1 south: the palace, the cathedral, the post office, City Hall, Bến Thành). */
+  const HERITAGE = isWired('quan-1-south') ? QUAN_1_SOUTH_EXTRA.heritage : [];
+  function heritageAt(x: number, z: number) {
+    for (const h of HERITAGE) {
+      const p = h.poly;
+      let inside = false;
+      for (let i = 0, j = p.length - 2; i < p.length; j = i, i += 2) if ((p[i + 1] > z) !== (p[j + 1] > z) && x < ((p[j] - p[i]) * (z - p[i + 1])) / (p[j + 1] - p[i + 1]) + p[i]) inside = !inside;
+      if (inside) return h;
+    }
+    return null;
+  }
+  /** Xe ôm destinations in the wired districts, by stamp id. */
+  const XEOM_STOPS: Record<string, string> = {
+    'cho-ben-thanh': 'Chợ Bến Thành', 'nha-tho-duc-ba': 'Nhà thờ Đức Bà', 'buu-dien-thanh-pho': 'Bưu điện Thành phố', 'nha-rong': 'Bến Nhà Rồng',
+    'lang-ong': 'Lăng Ông Bà Chiểu', 'nha-tho-tan-dinh': 'Nhà thờ Tân Định', 'chua-vinh-nghiem': 'Chùa Vĩnh Nghiêm', 'ben-xe-mien-dong': 'Bến xe Miền Đông cũ',
+    'dinh-doc-lap': 'Dinh Độc Lập',
+  };
   /** Xe ôm: a destination menu priced 10.000đ + 2.000đ per 100 m (haggling allowed); the ride is a fade across town. */
   function openXeOm(npc: Npc) {
     serveAt(npc.x, npc.z, 'Đi đâu con? Lên xe chú chở!', npc);
@@ -2773,6 +2845,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       { id: 'congan', name: 'Công an phường', at: LANDMARKS.police }, { id: 'chua', name: 'Chùa An Hòa', at: { x: -25.4, z: 116.4 } },
       { id: 'bachdang', name: 'Bến Bạch Đằng', at: { x: 190, z: -128 } }, { id: 'nhahat', name: 'Nhà hát Thành phố', at: { x: 243, z: -8.4 } },
     ];
+    // The wired districts' landmarks, set down on the curb in front of them (Thủ Thiêm has no bridge yet: no xe ôm there).
+    for (const s of DISTRICT_STAMPS) {
+      const name = XEOM_STOPS[s.id], b = s.building >= 0 ? WORLD_BUILDINGS[s.building] : null;
+      if (name && b && s.slice !== 'thu-thiem') places.push({ id: s.id, name, at: { x: b.curb.x, z: b.curb.z } });
+    }
+    if (isWired('quan-4')) places.push({ id: 'vinhkhanh', name: 'Phố ốc Vĩnh Khánh', at: { x: 535, z: 6 } });
     const target = missions.view().target;
     if (target) places.push({ id: 'nhiemvu', name: `Điểm nhiệm vụ: ${missions.view().label}`, at: target });
     const fare = (p: { x: number; z: number }) => 10 + Math.round((2 * Math.hypot(p.x - state.x, p.z - state.z)) / 100);
@@ -3000,8 +3078,18 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (!(hit.d > -b.vault) || !(Math.sin(state.angle) * b.nx + Math.cos(state.angle) * b.nz > 0.4) || dockAt(state.x + b.nx * 1.4, state.z + b.nz * 1.4)) return null;
     return { x: hit.x + b.nx * b.drop, z: hit.z + b.nz * b.drop };
   }
-  /** Out of the water: onto a pier alongside, or up a climbable bank (the promenade wall). */
+  /** Out of the water: up a moored ship's fenders or ladder, onto a pier alongside, or up a climbable bank (the promenade wall). */
   function climbOut() {
+    const up = climbNear(state.x, state.z, 1.6);
+    if (up && clearAt(up.toX, up.toZ, 0.35)) {
+      state.x = up.toX;
+      state.z = up.toZ;
+      swimming = false;
+      bodyY = groundHeight(state.x, state.z);
+      jumpV = 2.4;
+      notify(up.name === 'pilot-ladder' ? 'Leo thang dây lên boong tàu.' : 'Bám lốp chống va leo lên boong tàu.', 2000);
+      return;
+    }
     const dock = pierNear(state.x, state.z, 1.4);
     if (dock) {
       const p = dock.landings[0];
@@ -3013,18 +3101,27 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       return;
     }
     const hit = bankNear(state.x, state.z, Infinity, true);
+    let blocked = false;
     if (hit && hit.d < hit.bank.reach) {
-      const b = hit.bank, x = hit.x - b.nx * b.land, z = hit.z - b.nz * b.land;
-      if (clearAt(x, z, 0.4)) {
+      // Up the wall onto the walk behind it: straight up, else a little along it or further in (a bollard, a bench, a railing post).
+      const b = hit.bank, tx = -b.nz, tz = b.nx, inset = b.inset ?? 0;
+      for (const back of [b.land, b.land + 0.7, Math.max(inset + 0.45, b.land - 0.5)]) for (const along of [0, 0.8, -0.8, 1.6, -1.6]) {
+        const x = hit.x - b.nx * back + tx * along, z = hit.z - b.nz * back + tz * along;
+        if (!clearAt(x, z, 0.4)) continue;
         state.x = x;
         state.z = z;
         swimming = false;
+        // (onto a bridge's ramp where its abutment meets the bank)
         bodyY = groundHeight(state.x, state.z);
         jumpV = 2.4;
         return;
       }
+      blocked = true;
     }
-    notify(bankNear(state.x, state.z, 2.5)?.bank.kind === 'far' ? 'Bờ bên kia có hàng rào, không lên được. Bơi về phía phố.' : 'Bơi sát bờ kè hoặc cầu tàu rồi nhấn Space để leo lên.', 2500);
+    const near = bankNear(state.x, state.z, 2.5);
+    notify(near?.bank.kind === 'far'
+      ? near.bank.water === 0 && near.bank.nz > 0.5 ? 'Bờ bên kia có hàng rào, không lên được. Bơi về phía phố.' : 'Bờ này là đất dự án, rào kín, không lên được. Bơi sang bờ bên kia.'
+      : blocked ? 'Trên bờ vướng đồ, bơi dọc bờ thêm một đoạn rồi leo lên.' : 'Bơi sát bờ kè hoặc cầu tàu rồi nhấn Space để leo lên.', 2500);
   }
 
   // ---- The hire boat ----
@@ -3071,7 +3168,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     velocity = 0;
     state.x = best.x;
     state.z = best.z;
-    bodyY = Math.max(groundHeight(state.x, state.z), waterLevel(state.x, state.z) + 0.4);
+    // Over the side under a bridge: into the water, not onto the deck above.
+    bodyY = Math.max(groundHeight(state.x, state.z, waterLevel(state.x, state.z) + 0.4), waterLevel(state.x, state.z) + 0.4);
   }
   function driveBoat(dt: number, now: number, throttle: number, steerInput: number, braking: boolean) {
     const b = boat!;
@@ -3118,36 +3216,46 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   // ---- The observation deck and the parachute jump ----
-  const DECK_PRICE = 50;
-  /** The jump-off point at the front edge of the supertall's central tube. */
-  function deckSpot() {
-    const t = LANDMARKS.tower, f = PLOTS[t.id].full;
-    const tube = (Math.min(f.maxX - f.minX, f.maxZ - f.minZ) - 2) / 3;
-    const fx = Math.round(Math.sin(t.facing)), fz = Math.round(Math.cos(t.facing));
-    return { x: (f.minX + f.maxX) / 2 + fx * (tube / 2 - 1), z: (f.minZ + f.maxZ) / 2 + fz * (tube / 2 - 1), y: PLOTS[t.id].h + 0.2, yaw: t.facing };
+  /** A supertall with an observation deck on its central tube and the parachute jump off it (world building id). */
+  type DeckTower = { id: number; name: string; floor: number; price: number; jumpYaw: number };
+  const DECKS: Record<string, DeckTower> = { deck: { id: LANDMARKS.tower.id, name: LANDMARKS.tower.name, floor: 68, price: 50, jumpYaw: LANDMARKS.tower.facing } };
+  {
+    // THÁP BỜ SÔNG (Bình Thạnh, BINH_THANH_EXTRA.deck): its deck on floor 79, the jump off the north face over the park.
+    const bt = DISTRICT_STAMPS.find((s) => s.id === 'thap-bo-song' && s.building >= 0);
+    if (bt) DECKS['deck-bo-song'] = { id: bt.building, name: WORLD_BUILDINGS[bt.building].name, floor: 79, price: 200, jumpYaw: Math.PI };
   }
-  function enterDeck() {
-    if (cash < DECK_PRICE) { notify(`Vé lên đài quan sát: ${formatThousands(DECK_PRICE)}.`, 2500); return; }
-    cash -= DECK_PRICE;
+  /** The tower the player is up (or was last up). */
+  let deckTower: DeckTower = DECKS.deck;
+  /** The jump-off point at the edge of the supertall's central tube that faces the jump. */
+  function deckSpot(t: DeckTower) {
+    const f = WORLD_PLOTS[t.id].full;
+    const tube = (Math.min(f.maxX - f.minX, f.maxZ - f.minZ) - 2) / 3;
+    const fx = Math.round(Math.sin(t.jumpYaw)), fz = Math.round(Math.cos(t.jumpYaw));
+    return { x: (f.minX + f.maxX) / 2 + fx * (tube / 2 - 1), z: (f.minZ + f.maxZ) / 2 + fz * (tube / 2 - 1), y: WORLD_PLOTS[t.id].h + 0.2, yaw: t.jumpYaw };
+  }
+  function enterDeck(t: DeckTower = DECKS.deck) {
+    if (cash < t.price) { notify(`Vé lên đài quan sát: ${formatThousands(t.price)}.`, 2500); return; }
+    cash -= t.price;
     dip();
-    const spot = deckSpot();
+    deckTower = t;
+    const spot = deckSpot(t);
     glide = { phase: 'deck', y: spot.y, vy: 0, speed: 0, since: performance.now() };
     Object.assign(state, { x: spot.x, z: spot.z, angle: spot.yaw });
     velocity = 0;
     Object.assign(view, { yaw: spot.yaw + Math.PI + 0.7, pitch: 0.38, dist: 16 });
     manualCameraAt = performance.now();
-    notify('Đài quan sát THÁP PHƯƠNG NAM · WASD đi dạo · Space nhảy dù · E đi thang máy xuống', 7000);
+    notify(`Đài quan sát ${t.name} · WASD đi dạo · Space nhảy dù · E đi thang máy xuống`, 7000);
   }
   function leaveDeck() {
     dip();
     glide = null;
-    const door = LANDMARKS.tower.door;
-    Object.assign(state, { x: door.x, z: door.z, angle: LANDMARKS.tower.facing });
+    const b = WORLD_BUILDINGS[deckTower.id], door = b.door;
+    Object.assign(state, { x: door.x, z: door.z, angle: b.facing });
     bodyY = groundHeight(door.x, door.z);
   }
   /** Walking about the top of the central tube (round the spire), camera-relative like on the street. */
   function deckWalk(dt: number, vertical: number, horizontal: number) {
-    const t = LANDMARKS.tower, f = PLOTS[t.id].full;
+    const f = WORLD_PLOTS[deckTower.id].full;
     const tube = (Math.min(f.maxX - f.minX, f.maxZ - f.minZ) - 2) / 3, cx = (f.minX + f.maxX) / 2, cz = (f.minZ + f.maxZ) / 2;
     const fx = -Math.sin(smoothView.yaw), fz = -Math.cos(smoothView.yaw);
     const dx = fx * vertical - fz * horizontal, dz = fz * vertical + fx * horizontal;
@@ -3205,8 +3313,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     velocity = g.speed;
     const nx = state.x + Math.sin(state.angle) * g.speed * dt, nz = state.z + Math.cos(state.angle) * g.speed * dt;
-    if (!airBlocked(nx, state.z, g.y)) state.x = nx; else g.speed *= 0.5;
-    if (!airBlocked(state.x, nz, g.y)) state.z = nz; else g.speed *= 0.5;
+    // Not out over land nobody has built yet (beyond the project hoardings): the canopy turns back as from a wall.
+    if (!airBlocked(nx, state.z, g.y) && inPlay(nx, state.z)) state.x = nx; else g.speed *= 0.5;
+    if (!airBlocked(state.x, nz, g.y) && inPlay(state.x, nz)) state.z = nz; else g.speed *= 0.5;
     state.x = Math.max(bounds.minX + 1, Math.min(bounds.maxX - 1, state.x));
     state.z = Math.max(bounds.minZ + 1, Math.min(bounds.maxZ - 1, state.z));
     g.y += g.vy * dt;
@@ -3226,7 +3335,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     motion.land = 1;
     velocity = g.speed * 0.3;
     if (water) { bodyY = waterLevel(state.x, state.z); splash(state.x, state.z, now, 2); notify(hard > 14 ? 'Ùm! Rơi thẳng xuống sông.' : 'Đáp xuống sông! Bơi vào bờ thôi.', 3000); return; }
-    bodyY = groundHeight(state.x, state.z);
+    // (onto a bridge deck only from above it: g.y is the jumper's height)
+    bodyY = groundHeight(state.x, state.z, g.y);
     if (hard > 14) {
       damagePlayer(Math.min(90, hard * 3), now, undefined, 'Rơi tự do');
       if (down !== 'wasted') knockPlayer(Math.sin(state.angle) * 4, 2, Math.cos(state.angle) * 4, now);
@@ -3284,7 +3394,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (boat) { boat.x = x; boat.z = z; }
       else if (playerCar) { playerCar.x = x; playerCar.z = z; }
       else if (state.riding) { bikeX = x; bikeZ = z; }
-      bodyY = Math.max(bodyY, groundHeight(x, z));
+      bodyY = Math.max(bodyY, groundHeight(x, z, bodyY));
     };
     for (let r = 0.6; r <= 14; r += 0.6) {
       for (let k = 0; k < 16; k++) {
@@ -3768,7 +3878,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     }
     // Parked vehicles that are only drawn wake up first, so the blast reaches them too.
     vx.curbNear?.(b.x, b.z, b.radius + 2);
-    for (const car of vehicles.cars) {
+    for (const car of vehicles.live) {
       if (car.mode === 'off') continue;
       const d = Math.hypot(car.x - b.x, car.z - b.z);
       if (d < b.radius + 2) damageCar(car, b.damage * 1.4 * (1 - d / (b.radius + 2)), now);
@@ -3784,6 +3894,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   function fire(now: number, time: number) {
     if (swimming || glide) return;
     const def = weaponById(weapon);
+    // Heritage sites (QUAN_1_SOUTH_EXTRA.heritage): weapons stay holstered inside; any fighting there is a crime at once.
+    const site = heritageAt(state.x, state.z);
+    if (site && !zombieMode) {
+      if (site.noWeapons && def.id !== 'fists') { lastShot = now; notify(`${site.name} là di tích · cất vũ khí, không được nổ súng ở đây`, 2500); return; }
+      // police.crime's heat: wanted = 1 + heat / 4, so 4 per star brings the site's stars at once.
+      if (site.noCombat && police.wanted < site.wanted) { police.crime(4 * (site.wanted - 1) + 1, time); notify(`Gây rối ở di tích ${site.name}! Bảo vệ đã báo công an.`, 3000); }
+    }
     if (def.magazine) {
       const rounds = ammo.get(weapon);
       if (reloadWeapon) return;
@@ -4007,7 +4124,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   /** Traffic and police vehicles knock down a player on foot; cruisers ram the player's vehicle. */
   function vehicleImpacts(now: number) {
     if (down) return;
-    for (const car of vehicles.cars) {
+    for (const car of vehicles.live) {
       if (car === playerCar || car.mode === 'off' || Math.abs(car.speed) < 4.5) continue;
       const dx = state.x - car.x, dz = state.z - car.z;
       if (dx * dx + dz * dz > 16) continue;
@@ -4038,12 +4155,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const prompt: PromptView | null = hold ? { ...hold.view, progress: Math.min(1, (now - hold.started) / ((hold.entry.hold ?? 1) * 1000)) }
       : busy || menu ? null : stateView() ?? (missionHasE || offer ? null : focus?.view ?? null);
     const focusText = prompt ? promptText(prompt) : '';
+    // The wired districts build a few ms a frame after the start (world.ts): say so until they are all up.
+    const build = world.districtProgress();
     const hint = now < notificationUntil ? notification
       : down === 'wasted' ? 'Đang được đưa đi cấp cứu…'
       : down === 'busted' ? 'Đang bị còng tay, áp giải về đồn…'
       : surrendered ? 'Đang đầu hàng · Nhấn H để hạ tay xuống'
       : playerBody ? 'Đang đứng dậy…'
-      : glide?.phase === 'deck' ? 'Đài quan sát tầng 68 · WASD đi dạo · Space nhảy dù · E đi thang máy xuống'
+      : glide?.phase === 'deck' ? `Đài quan sát tầng ${deckTower.floor} · WASD đi dạo · Space nhảy dù · E đi thang máy xuống`
       : glide?.phase === 'fall' ? 'Rơi tự do · Space bung dù · A/D lượn · W lao nhanh'
       : glide ? `Dù lượn · cao ${Math.round(glide.y)} m · A/D lái · W lao xuống · S hãm`
       : heist ? `Đang mở két… ${Math.min(100, Math.round(((now - heist.started) / HEIST_MS) * 100))}% · ở yên gần quầy, đừng đi xa`
@@ -4059,6 +4178,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       : nearMission ? missionInfo.objective
       : offer ? `Nhấn E để nhận việc: ${offer.def.title} (+${formatThousands(offer.def.reward)})`
       : prompt ? focusText
+      : build.done < build.tiles ? `Đang dựng phố mới… ${Math.round((build.done / Math.max(1, build.tiles)) * 100)}%`
       : missionInfo.status !== 'active' ? 'Nhấn M để chọn nhiệm vụ mới hoặc chơi lại'
       : state.riding ? (weapon !== 'fists' ? 'W ga · S phanh/lùi · A/D lái · Space phanh tay · Click bắn' : 'W ga · S phanh/lùi · A/D lái · Space phanh tay · E xuống xe')
       : police.wanted ? 'Đang bị truy nã · Trốn khỏi tầm mắt cảnh sát, hoặc nhấn H để đầu hàng'
@@ -4621,12 +4741,18 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     updateHeist(now);
     // The hire boat goes back to its dock once it has been left far behind.
     if (!boat && boats.rental.mode === 'player' && now - boatLeftAt > 4000 && Math.hypot(boats.rental.x - state.x, boats.rental.z - state.z) > 160) boats.dock();
-    boats.update(dt, time, swimming || boat ? { x: state.x, z: state.z } : null);
+    boats.update(dt, time, swimming || boat ? { x: state.x, z: state.z } : null, cameraTarget);
     boats.setNight(atmosphere.night);
 
     // The world moves on: weather and clock, traffic, police, gangs and residents.
     // Rain fills whatever the camera can see, so it scales with the zoom.
     if (atmosphere.update(dt, time, cameraTarget, THREE.MathUtils.clamp(smoothView.dist * 2.4, 50, 220)) && shadowsAllowed) renderer.shadowMap.needsUpdate = true;
+    {
+      // Up an observation deck or under a parachute the city below is seen further: the fog draws back with the
+      // camera's height (the world draws as far as the fog, world.ts), and is back to the street's below 40 m.
+      const up = glide ? Math.max(0, camera.position.y - 40) : 0, fog = scene.fog as THREE.Fog;
+      if (up > 0) { fog.near += up * 0.9; fog.far += up * 1.3; }
+    }
     if (followShadows(cameraTarget.x, cameraTarget.z) && shadowsAllowed) renderer.shadowMap.needsUpdate = true;
     if (interior) {
       hemi.intensity = 2.3;
@@ -4832,7 +4958,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     // swimming); stepping off a pier or over the railing it first drops into the river.
     walker.group.visible = !state.riding && !playerBody && !boat && !(ride && ride.pose && ride.pose !== 'chair');
     const swimPace = swimming ? Math.min(1, velocity / 1.6) : 0;
-    const surface = glide ? glide.y : swimming ? WATER_LEVEL - 1.25 + swimPace * 0.44 : groundHeight(state.x, state.z) - 0.02;
+    // The ground under the body at its own height (bodyY): a bridge deck above a swimmer or a walker on the kè below it is not theirs.
+    const surface = glide ? glide.y : swimming ? WATER_LEVEL - 1.25 + swimPace * 0.44 : groundHeight(state.x, state.z, bodyY + jumpY) - 0.02;
     if (!glide && bodyY > surface + 0.08) {
       fallV -= 18 * dt;
       bodyY = Math.max(surface, bodyY + fallV * dt);
@@ -4997,7 +5124,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (walker.group.visible) effects.blob(state.x, groundHeight(state.x, state.z) + 0.02, state.z, 0.9 * Math.max(0.5, 1 - jumpY * 0.35));
     if (!playerCar || bikeX !== state.x) effects.blob(bikeX, groundHeight(bikeX, bikeZ) + 0.02, bikeZ, bikeId === 'horse' ? 1.2 : 0.9, bikeId === 'horse' ? 2.6 : 2.1, bikeAngle);
     for (const person of [shopkeeper.group, receiver.group]) if (person.visible) effects.blob(person.position.x, person.position.y + 0.04, person.position.z, 0.9);
-    for (const car of vehicles.cars) {
+    for (const car of vehicles.live) {
       // A recycled wreck is a fresh vehicle again.
       if (wrecks.has(car) && car.health > 0) wrecks.delete(car);
       if (car.mode === 'off') continue;
@@ -5036,7 +5163,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       smokeAt = now + 140;
       const bikeFraction = bikeHealth / bikeById(bikeId).health;
       if (bikeFraction < 0.35 && bikeId !== 'horse') effects.smoke(bikeX, 0.9, bikeZ, now, bikeFraction <= 0);
-      for (const car of vehicles.cars) {
+      for (const car of vehicles.live) {
         if (car.mode === 'off') continue;
         const fraction = car.health / carMax(car);
         if (fraction < 0.35) effects.smoke(car.x + Math.sin(car.yaw) * (car.kind === 'moto' ? 0.5 : 1.8), 1.2, car.z + Math.cos(car.yaw) * (car.kind === 'moto' ? 0.5 : 1.8), now, fraction <= 0);
@@ -5114,10 +5241,15 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     bubbles.update(now, cameraTarget.x, cameraTarget.z);
     effects.update(now, dt);
     canvas.style.cursor = interior ? (productHover ? 'pointer' : '') : !active ? '' : rotating ? 'grabbing' : armed ? 'none' : '';
-    if (!covered) {
+    if (!covered && compiled) {
       world.update(time);
       sky.update(camera, time, atmosphere.sunDirection, atmosphere.tint, atmosphere.cover, 1 - atmosphere.night);
+      // An instanced batch with nothing in it this frame (no rider, no wreck, no prop out) would still cost a draw call.
+      if (++emptyScan >= 60) { emptyScan = 0; instanced.length = 0; scene.traverse((o) => { if ((o as THREE.InstancedMesh).isInstancedMesh) instanced.push(o as THREE.InstancedMesh); }); }
+      for (const m of instanced) if (m.count === 0 && m.visible) { m.visible = false; emptied.push(m); }
       renderer.render(scene, camera);
+      for (const m of emptied) m.visible = true;
+      emptied.length = 0;
     }
     if (now - hudTime >= 120) {
       hudTime = now;
@@ -5192,9 +5324,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   // Local development only: a handle for automated checks and screenshots (teleport, camera, clock, stats).
   if (typeof location !== 'undefined' && /^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
     (window as unknown as Record<string, unknown>).__pvo = {
+      /** The world (world.ts): districts() build progress, buildAllDistricts(), districtColliders. */
+      world,
       tp: (x: number, z: number, angle = 0) => { Object.assign(state, { x, z, angle, riding: false }); bodyY = groundHeight(x, z); cameraTarget.set(x, 1, z); },
       ride: (x: number, z: number, angle: number) => { parkedWith = null; bikeX = x; bikeZ = z; bikeAngle = angle; Object.assign(state, { x, z, angle, riding: true }); velocity = 0; cameraTarget.set(x, 1, z); },
       view: (yaw: number, pitch: number, dist: number) => { Object.assign(view, { yaw, pitch, dist }); manualCameraAt = performance.now() + 1e9; },
+      /** The nearest point of the walking network (tools: a screenshot spot on a sidewalk). */
+      snap: (x: number, z: number) => { const s = nav.snap(x, z); return { x: s.x, z: s.z }; },
       hours: (h: number) => atmosphere.setHours(h),
       // A clock jump as after a fade: parked vehicles and the crowd are put where the new hour has them.
       jump: (h: number) => { atmosphere.setHours(h); clockJumped(); },
@@ -5204,6 +5340,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       stats: () => ({ calls: renderer.info.render.calls, triangles: renderer.info.render.triangles, geometries: renderer.info.memory.geometries, textures: renderer.info.memory.textures, fps: monitor.fps }),
       info: () => ({ x: state.x, z: state.z, riding: state.riding, swimming, boat: !!boat, glide: glide ? { ...glide } : null, down, wanted: police.wanted, cash, hint: notification }),
       scene, camera, renderer, npcs, vehicles, police, ragdolls, zombies, buses, boats,
+      /** The player's body height and water state, and the live terrain (map/terrain.ts: decks, banks, docks, land). */
+      body: () => ({ x: state.x, y: bodyY, z: state.z, swimming, boat: !!boat, ground: groundHeight(state.x, state.z, bodyY) }),
+      terrain: () => TERRAIN,
       /** How a look is dressed (wardrobe bits and colours), to find people in a given outfit. */
       style: (look: FigureLook) => styleOf(look),
       people: { walker, rider, passenger, seated, helm, shopkeeper, receiver },
@@ -5234,7 +5373,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
         else if (what === 'car') {
           // The nearest car (not a motorbike) still on the street.
           let car: Car | null = null;
-          for (const c of vehicles.cars) if (c.kind !== 'moto' && c.mode !== 'off' && c.mode !== 'player' && (!car || Math.hypot(c.x - state.x, c.z - state.z) < Math.hypot(car.x - state.x, car.z - state.z))) car = c;
+          for (const c of vehicles.live) if (c.kind !== 'moto' && c.mode !== 'off' && c.mode !== 'player' && (!car || Math.hypot(c.x - state.x, c.z - state.z) < Math.hypot(car.x - state.x, car.z - state.z))) car = c;
           if (car) enterCar(car, now);
           return car?.kind ?? null;
         }

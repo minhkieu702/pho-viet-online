@@ -128,14 +128,14 @@ export const QUAN_1_SOUTH: DistrictLayout = {
     { id: 'ham-nghi-nam', name: 'ĐƯỜNG HÀM NGHI', cls: 'R1', pts: [270, 385, 270, 425] },
     { id: 'pasteur', name: 'ĐƯỜNG PASTEUR', cls: 'R2', pts: [188, 300, 188, 385], trees: 'round' },
     { id: 'phan-boi-chau', name: 'ĐƯỜNG PHAN BỘI CHÂU', cls: 'R2', pts: [232, 300, 232, 385], speed: 7, closedHours: [18, 24], trees: 'round' },
-    { id: 'bui-vien', name: 'ĐƯỜNG BÙI VIỆN', cls: 'R2', pts: [270, 250, 372, 250], half: 3.5, sidewalk: 2.5, speed: 7, closedHours: [19, 2], trees: 'round' },
+    { id: 'bui-vien', name: 'ĐƯỜNG BÙI VIỆN', cls: 'R2', pts: [270, 250, 372, 250], half: 3.5, sidewalk: 2.5, speed: 7, closedHours: [19, 2], trees: 'round', mix: 'pho-tay' },
     // Lanes for people and motos only: the book street, the palace's drive round its fountain lawn, the hẻm of the Phạm Ngũ Lão quarter.
     { id: 'duong-sach', name: 'ĐƯỜNG SÁCH NGUYỄN VĂN BÌNH', cls: 'hem', pts: [216, 216, 216, 300], half: 3.5, traffic: false },
     { id: 'loi-vao-dinh', name: 'LỐI VÀO DINH ĐỘC LẬP', cls: 'hem', pts: [135, 280, 102, 280, 102, 320, 135, 320], half: 3, traffic: false },
     { id: 'hem-24-le-thanh-ton', name: 'HẺM 24 LÊ THÁNH TÔN', cls: 'hem', pts: [300, 162, 300, 250], half: 1.75, traffic: false },
     { id: 'hem-24-21-le-thanh-ton', name: 'HẺM 24/21 LÊ THÁNH TÔN', cls: 'hem', pts: [300, 207, 355, 207], half: 1.6, traffic: false },
-    { id: 'hem-40-bui-vien', name: 'HẺM 40 BÙI VIỆN', cls: 'hem', pts: [300, 250, 300, 300], half: 1.6, traffic: false },
-    { id: 'hem-72-bui-vien', name: 'HẺM 72 BÙI VIỆN', cls: 'hem', pts: [338, 250, 338, 300], half: 1.6, traffic: false },
+    { id: 'hem-40-bui-vien', name: 'HẺM 40 BÙI VIỆN', cls: 'hem', pts: [300, 250, 300, 300], half: 1.6, traffic: false, mix: 'pho-tay' },
+    { id: 'hem-72-bui-vien', name: 'HẺM 72 BÙI VIỆN', cls: 'hem', pts: [338, 250, 338, 300], half: 1.6, traffic: false, mix: 'pho-tay' },
     // Through the block behind the police station, from Lê Duẩn and Nguyễn Thị Minh Khai to a shared corner.
     { id: 'hem-86-le-duan', name: 'HẺM 86 LÊ DUẨN', cls: 'hem', pts: [238, 300, 238, 262], half: 1.5, traffic: false },
     { id: 'hem-12-ntmk', name: 'HẺM 12 NGUYỄN THỊ MINH KHAI', cls: 'hem', pts: [238, 216, 238, 262], half: 1.5, traffic: false },
@@ -237,7 +237,11 @@ export const QUAN_1_SOUTH_EXTRA = {
    * Each stool is a 'cafe-seat' POI for the wiring (hours as the closure). The street's businesses keep the generator's
    * night mix until a 'pho-tay' street mix (bars, hostels, tour offices, massage, money exchange) exists in gen/buildings.ts.
    */
-  nightSeats: { road: 'bui-vien', hours: [19, 2] as [number, number], lane: 2.4, table: { w: 0.8, d: 0.6 }, stool: { along: 0.85, lane: 0.75, r: 0.25 }, tables: bvSeats() },
+  nightSeats: {
+    road: 'bui-vien', hours: [19, 2] as [number, number], lane: 2.4, table: { w: 0.8, d: 0.6 }, stool: { along: 0.85, lane: 0.75, r: 0.25 }, tables: bvSeats(), name: 'BÙI VIỆN', dish: 'bia' as const, district: 'D2' as const,
+    /** The walking street's neon gateways just inside its barriers, the posts behind the curbs. */
+    arches: [{ ax: 281.6, az: 246.15, bx: 281.6, bz: 253.85, text: 'PHỐ ĐI BỘ BÙI VIỆN', sub: 'PHỐ TÂY • ẨM THỰC • ÂM NHẠC' }, { ax: 356.2, az: 246.15, bx: 356.2, bz: 253.85, text: 'PHỐ ĐI BỘ BÙI VIỆN', sub: 'PHỐ TÂY • ẨM THỰC • ÂM NHẠC' }],
+  },
   /** The book street's kiosks against the post office's side wall (8–21), a 5 m lane left open. */
   bookstalls: { hours: [8, 21] as [number, number], stalls: row(213.4, 233, 266, 3.3, H).map((s) => ({ ...s, w: 2.8, d: 1.6 })) },
   /**

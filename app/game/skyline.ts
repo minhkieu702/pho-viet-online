@@ -103,12 +103,21 @@ gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor, fogFactor * 0.92);
 
 type Screen = { at: { x: number; z: number }; y: number; w: number; h: number; yaw: number };
 
-export function buildSkyline(kit: SkylineKit, plots: { plot: Plot; building: Building }[]) {
+/**
+ * Which of the hazy towers across the river and beyond the east fence still stand: a wired district replaces them
+ * (WIRING-PLAN §3: Quận 4 the 16 east of the canal, Thủ Thiêm the 34 across the river). Their random draws are
+ * made either way, so the ones left never move.
+ */
+export type SkylineOptions = { hazeEast?: boolean; hazeNorth?: boolean };
+/** A downtown plot: today's (its `full` rect) or a district's (its oriented `box`). */
+type TowerPlot = { plot: Plot & { box?: { cx: number; cz: number; hx: number; hz: number; yaw: number } }; building: Building };
+
+export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineOptions = {}) {
   const { shape, sign } = kit;
-  const screens: Screen[] = [];
-  const boxes: Facade[] = [];
-  const prisms: Facade[] = [];
-  const beacons: THREE.Vector3[] = [];
+  let screens: Screen[] = [];
+  let boxes: Facade[] = [];
+  let prisms: Facade[] = [];
+  let beacons: THREE.Vector3[] = [];
   const box = (color: ColorLike, x: number, y: number, z: number, w: number, h: number, d: number, yaw = 0, shadow = true, role: Role = 'solid') =>
     shape('box', color, x, y, z, w, h, d, yaw, 0, shadow, role);
   const colors = new Map<string, THREE.Color>();
@@ -132,12 +141,16 @@ export function buildSkyline(kit: SkylineKit, plots: { plot: Plot; building: Bui
     };
   }
 
-  for (const { plot: p, building: b } of plots) {
+  /** Draws the towers of `list` (their facade blocks into the lists above, the rest through the kit). */
+  function drawTowers(list: TowerPlot[]) {
+  for (const { plot: p, building: b } of list) {
     const spec = p.tower as TowerSpec;
     const f = p.full;
-    const x = (f.minX + f.maxX) / 2, z = (f.minZ + f.maxZ) / 2;
+    // A district plot stands at any angle: its oriented box gives the centre and the size along and across its front.
+    const ob = p.box;
+    const x = ob ? ob.cx : (f.minX + f.maxX) / 2, z = ob ? ob.cz : (f.minZ + f.maxZ) / 2;
     const sideways = Math.abs(Math.sin(p.facing)) > 0.5;
-    const w = sideways ? f.maxZ - f.minZ : f.maxX - f.minX, d = sideways ? f.maxX - f.minX : f.maxZ - f.minZ;
+    const w = ob ? ob.hx * 2 : sideways ? f.maxZ - f.minZ : f.maxX - f.minX, d = ob ? ob.hz * 2 : sideways ? f.maxX - f.minX : f.maxZ - f.minZ;
     const h = p.h, front = d / 2;
     const r = seeded(p.seed);
     const F = frame(x, z, p.facing);
@@ -155,7 +168,8 @@ export function buildSkyline(kit: SkylineKit, plots: { plot: Plot; building: Bui
       const s = at(0, front + 0.26);
       sign(b.name, b.subtitle, p.signColor, s.x, signY, s.z, Math.min(width * 0.9, 14), 1.6, p.facing, '#f4f7f8');
     };
-    const beacon = (lx: number, y: number, lz: number) => { const q = at(lx, lz); beacons.push(new THREE.Vector3(q.x, y, q.z)); };
+    // Aviation lights (a district's five-storey chung cư has none).
+    const beacon = (lx: number, y: number, lz: number) => { if (ob && y < 45) return; const q = at(lx, lz); beacons.push(new THREE.Vector3(q.x, y, q.z)); };
 
     if (spec.form === 'glass') {
       const pod = spec.podium;
@@ -379,26 +393,37 @@ export function buildSkyline(kit: SkylineKit, plots: { plot: Plot; building: Bui
     }
   }
 
+  }
+  drawTowers(plots);
+
   // ---- Across the river and beyond the east fence: a skyline in the haze (no colliders, nobody goes there). ----
+  // Each tower's draws are made whether it stands or not (a wired district took its place), so the rest stay put.
   const far = seeded(4242);
   const farGlass = ['#6f8fa8', '#7d9aa5', '#5d7f96', '#8aa4b0', '#6a8c8a'], farFrame = ['#c8ccd0', '#d6cfc0', '#b9c2c8', '#e0d8c8'];
+  // With Thủ Thiêm's strip built (step 18) they stand beyond its P1 edge instead (z -490..-580: the new urban area
+  // still going up, P2), so the skyline across the river from Bạch Đằng and An Hòa stays, lit at night.
   for (let i = 0; i < 34; i++) {
-    const x = -200 + i * 19 + far() * 8, z = -226 - far() * 70;
-    const w = 14 + far() * 12, d = 14 + far() * 10, h = 30 + far() * far() * 150;
-    boxes.push({ x, y: h / 2, z, sx: w, sy: h, sz: d, yaw: 0, glass: color(farGlass[Math.floor(far() * farGlass.length)]), frame: color(farFrame[Math.floor(far() * farFrame.length)]), floor: 3.6, bay: 1.8, pattern: Math.floor(far() * 4), lit: 0.4, seed: far() * 30 });
+    const x = -200 + i * 19 + far() * 8, back = far(), z = opts.hazeNorth === false ? -490 - back * 90 : -226 - back * 70;
+    const w = 14 + far() * 12, d = 14 + far() * 10, h = (opts.hazeNorth === false ? 50 : 30) + far() * far() * 150;
+    const tower: Facade = { x, y: h / 2, z, sx: w, sy: h, sz: d, yaw: 0, glass: color(farGlass[Math.floor(far() * farGlass.length)]), frame: color(farFrame[Math.floor(far() * farFrame.length)]), floor: 3.6, bay: 1.8, pattern: Math.floor(far() * 4), lit: 0.4, seed: far() * 30 };
+    boxes.push(tower);
     if (h > 70) beacons.push(new THREE.Vector3(x, h + 1, z));
   }
   for (let i = 0; i < 16; i++) {
     const x = 380 + far() * 120, z = -120 + i * 17 + far() * 6;
     const w = 14 + far() * 10, d = 14 + far() * 10, h = 24 + far() * far() * 110;
-    boxes.push({ x, y: h / 2, z, sx: w, sy: h, sz: d, yaw: 0, glass: color(farGlass[Math.floor(far() * farGlass.length)]), frame: color(farFrame[Math.floor(far() * farFrame.length)]), floor: 3.6, bay: 1.8, pattern: Math.floor(far() * 4), lit: 0.4, seed: far() * 30 });
+    const tower: Facade = { x, y: h / 2, z, sx: w, sy: h, sz: d, yaw: 0, glass: color(farGlass[Math.floor(far() * farGlass.length)]), frame: color(farFrame[Math.floor(far() * farFrame.length)]), floor: 3.6, bay: 1.8, pattern: Math.floor(far() * 4), lit: 0.4, seed: far() * 30 };
+    if (opts.hazeEast !== false) boxes.push(tower);
   }
 
-  // ---- The instanced facade meshes. ----
+  // ---- The instanced facade meshes (one shared material; districts add theirs tile by tile). ----
   const uniforms = { night: { value: 0 }, sky: { value: new THREE.Color('#bcd2dc') } };
   const material = facadeMaterial(uniforms);
   kit.materials.push(material);
   const matrix = new THREE.Matrix4(), q = new THREE.Quaternion(), up = new THREE.Vector3(0, 1, 0), pos = new THREE.Vector3(), size = new THREE.Vector3();
+  /** Where facadeMesh and the screens and beacons go (the world's root, or a district tile). */
+  let target: THREE.Object3D = kit.root;
+  const made: THREE.Object3D[] = [];
   function facadeMesh(base: THREE.BufferGeometry, list: Facade[]) {
     const geometry = base;
     const grid = new Float32Array(list.length * 4), glassA = new Float32Array(list.length * 4), frameA = new Float32Array(list.length * 3);
@@ -417,10 +442,11 @@ export function buildSkyline(kit: SkylineKit, plots: { plot: Plot; building: Bui
     mesh.receiveShadow = true;
     mesh.computeBoundingSphere();
     kit.geometries.push(geometry);
-    kit.root.add(mesh);
+    target.add(mesh);
+    made.push(mesh);
     return mesh;
   }
-  facadeMesh(new THREE.BoxGeometry(1, 1, 1), boxes);
+  if (boxes.length) facadeMesh(new THREE.BoxGeometry(1, 1, 1), boxes);
   // Octagonal sections, flat-shaded so each facet gets its own window grid.
   if (prisms.length) {
     const octagon = new THREE.CylinderGeometry(0.5, 0.5, 1, 8, 1).toNonIndexed();
@@ -431,7 +457,7 @@ export function buildSkyline(kit: SkylineKit, plots: { plot: Plot; building: Bui
   // ---- LED screens (an animated canvas, scrolled through a few adverts) and red aviation beacons. ----
   const canvas = typeof document !== 'undefined' ? document.createElement('canvas') : null;
   let screenTexture: THREE.CanvasTexture | null = null;
-  if (canvas && screens.length) {
+  if (canvas) {
     canvas.width = 512; canvas.height = 1024;
     const ctx = canvas.getContext('2d');
     if (ctx) {
@@ -455,22 +481,31 @@ export function buildSkyline(kit: SkylineKit, plots: { plot: Plot; building: Bui
   kit.materials.push(screenMaterial);
   const screenGeometry = new THREE.PlaneGeometry(1, 1);
   kit.geometries.push(screenGeometry);
-  for (const s of screens) {
-    const mesh = new THREE.Mesh(screenGeometry, screenMaterial);
-    mesh.position.set(s.at.x, s.y, s.at.z);
-    mesh.rotation.y = s.yaw;
-    mesh.scale.set(s.w, s.h, 1);
-    kit.root.add(mesh);
-  }
   const beaconGeometry = new THREE.IcosahedronGeometry(0.55, 0);
   const beaconMaterial = new THREE.MeshBasicMaterial({ color: '#ff3a2a', toneMapped: false, fog: false });
   kit.geometries.push(beaconGeometry);
   kit.materials.push(beaconMaterial);
-  const beaconMesh = new THREE.InstancedMesh(beaconGeometry, beaconMaterial, Math.max(1, beacons.length));
-  beacons.forEach((b, i) => beaconMesh.setMatrixAt(i, matrix.makeTranslation(b.x, b.y, b.z)));
-  beaconMesh.count = beacons.length;
-  beaconMesh.computeBoundingSphere();
-  kit.root.add(beaconMesh);
+  let beaconMeshes = 0;
+  /** The screens and the beacons collected so far, into `target`. */
+  function screensAndBeacons() {
+    for (const s of screens) {
+      const mesh = new THREE.Mesh(screenGeometry, screenMaterial);
+      mesh.position.set(s.at.x, s.y, s.at.z);
+      mesh.rotation.y = s.yaw;
+      mesh.scale.set(s.w, s.h, 1);
+      target.add(mesh);
+      made.push(mesh);
+    }
+    if (!beacons.length && (beaconMeshes || target !== kit.root)) return;
+    const beaconMesh = new THREE.InstancedMesh(beaconGeometry, beaconMaterial, Math.max(1, beacons.length));
+    beacons.forEach((b, i) => beaconMesh.setMatrixAt(i, matrix.makeTranslation(b.x, b.y, b.z)));
+    beaconMesh.count = beacons.length;
+    beaconMesh.computeBoundingSphere();
+    target.add(beaconMesh);
+    made.push(beaconMesh);
+    beaconMeshes++;
+  }
+  screensAndBeacons();
 
   let advert = 0;
   return {
@@ -479,7 +514,61 @@ export function buildSkyline(kit: SkylineKit, plots: { plot: Plot; building: Bui
       uniforms.night.value = night * power;
       uniforms.sky.value.copy(sky);
       screenMaterial.color.setScalar(power ? 0.55 + night * 0.45 : 0.04);
-      beaconMesh.visible = power > 0;
+      beaconMaterial.visible = power > 0;
+    },
+    /**
+     * Towers of a district tile (chung cư, the CBD stamps): their details through the kit (whatever sink the world
+     * has set), their facade blocks, screens and beacons into `into`. `dry` (the sign pass) lays out signs only.
+     * Returns the meshes made.
+     */
+    /**
+     * Far stand-ins for the districts' tall buildings: a district tile is hidden past the fog cut, but a tower's facade
+     * hazes out far beyond it (its fog is softened), so from across the river the skyline would vanish. One facade box
+     * each (lit windows at night) and a beacon on the tall ones, in the world's root; `show(i, on)` hides one while
+     * its own tile draws the real building.
+     */
+    standIns(list: { x: number; z: number; w: number; d: number; h: number; yaw: number; seed: number; glass: string; frame: string; lit: number }[]) {
+      if (!list.length) return { show: (() => { /* none */ }) as (i: number, on: boolean) => void };
+      const facades: Facade[] = list.map((f) => ({ x: f.x, y: f.h / 2, z: f.z, sx: f.w, sy: f.h, sz: f.d, yaw: f.yaw, glass: color(f.glass), frame: color(f.frame), floor: 3.4, bay: 1.8, pattern: f.seed % 4, lit: f.lit, seed: f.seed % 30 }));
+      target = kit.root;
+      const mesh = facadeMesh(new THREE.BoxGeometry(1, 1, 1), facades);
+      mesh.castShadow = false;
+      mesh.frustumCulled = false;
+      const tall = list.map((f, i) => (f.h >= 70 ? i : -1)).filter((i) => i >= 0);
+      const lights = new THREE.InstancedMesh(beaconGeometry, beaconMaterial, Math.max(1, tall.length));
+      lights.count = tall.length;
+      lights.frustumCulled = false;
+      const lightOf = new Map(tall.map((i, k) => [i, k]));
+      const place = (i: number, on: boolean) => {
+        const f = facades[i];
+        mesh.setMatrixAt(i, on ? matrix.compose(pos.set(f.x, f.y, f.z), q.setFromAxisAngle(up, f.yaw), size.set(f.sx, f.sy, f.sz)) : matrix.makeScale(0, 0, 0));
+        const k = lightOf.get(i);
+        if (k !== undefined) lights.setMatrixAt(k, on ? matrix.makeTranslation(f.x, f.sy + 1, f.z) : matrix.makeScale(0, 0, 0));
+      };
+      facades.forEach((_, i) => place(i, true));
+      kit.root.add(lights);
+      const shown = new Uint8Array(facades.length).fill(1);
+      return {
+        show(i: number, on: boolean) {
+          if (shown[i] === (on ? 1 : 0)) return;
+          shown[i] = on ? 1 : 0;
+          place(i, on);
+          mesh.instanceMatrix.needsUpdate = true;
+          lights.instanceMatrix.needsUpdate = true;
+        },
+      };
+    },
+    addTowers(list: TowerPlot[], into: THREE.Object3D, dry = false) {
+      screens = []; boxes = []; prisms = []; beacons = [];
+      drawTowers(list);
+      made.length = 0;
+      if (dry) return [] as THREE.Object3D[];
+      target = into;
+      if (boxes.length) facadeMesh(new THREE.BoxGeometry(1, 1, 1), boxes);
+      if (prisms.length) { const octagon = new THREE.CylinderGeometry(0.5, 0.5, 1, 8, 1).toNonIndexed(); octagon.computeVertexNormals(); facadeMesh(octagon, prisms); }
+      screensAndBeacons();
+      target = kit.root;
+      return made.slice();
     },
     update(time: number) {
       // Beacons blink once a second; the screens change advert every few seconds.

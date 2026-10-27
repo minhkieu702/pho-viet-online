@@ -383,18 +383,23 @@ export type CrowdProps = ReturnType<typeof createCrowdProps>;
  * The street furniture as one batch: stools and tables are out while their quán is open (and dry, unless under
  * an awning), a stack of stools by the wall otherwise. update() checks the hour twice a second.
  */
-export function createStreetFurniture(scene: THREE.Scene, furniture: readonly LifeFurniture[], groups: readonly LifeGroup[], ground: (x: number, z: number) => number = groundHeight) {
-  const kinds = ['stool', 'stack', 'table0', 'table1', 'table2', 'chess', 'altar', 'stand', 'speaker'] as const;
+/**
+ * A piece of street furniture: today's (city.ts LIFE.furniture), or a district quán's 'stool42' (the taller plastic
+ * stool district-render.ts puts round a district eatery table, seat 0.42 m) for the stools district-life.ts adds.
+ */
+export type Furniture = Omit<LifeFurniture, 'kind'> & { kind: LifeFurniture['kind'] | 'stool42' };
+export function createStreetFurniture(scene: THREE.Scene, furniture: readonly Furniture[], groups: readonly Pick<LifeGroup, 'hours' | 'covered'>[], ground: (x: number, z: number) => number = groundHeight) {
+  const kinds = ['stool', 'stack', 'table0', 'table1', 'table2', 'chess', 'altar', 'stand', 'speaker', 'stool42'] as const;
   const builders: Record<(typeof kinds)[number], () => THREE.BufferGeometry> = {
     stool: stoolGeometry, stack: stackGeometry, table0: () => tableGeometry(0), table1: () => tableGeometry(1), table2: () => tableGeometry(2),
-    chess: chessGeometry, altar: altarGeometry, stand: standGeometry, speaker: speakerGeometry,
+    chess: chessGeometry, altar: altarGeometry, stand: standGeometry, speaker: speakerGeometry, stool42: () => stoolParts(new ModelParts(), 0.42).build(),
   };
   const { mesh, ids } = batchOf(kinds.map((k) => builders[k]()), Math.max(1, furniture.length));
-  const geometryOf = (f: LifeFurniture) => ids[kinds.indexOf((f.kind === 'table' ? `table${f.tint % 3}` : f.kind) as (typeof kinds)[number])];
+  const geometryOf = (f: Furniture) => ids[kinds.indexOf((f.kind === 'table' ? `table${f.tint % 3}` : f.kind) as (typeof kinds)[number])];
   furniture.forEach((f, i) => {
     mesh.addInstance(geometryOf(f));
     mesh.setMatrixAt(i, tmpM.compose(tmpP.set(f.x, ground(f.x, f.z), f.z), tmpQ.setFromEuler(tmpE.set(0, f.yaw, 0)), tmpS.set(1, 1, 1)));
-    mesh.setColorAt(i, tmpC.set(f.kind === 'stool' || f.kind === 'stack' ? STOOL_TINTS[f.tint % STOOL_TINTS.length] : '#ffffff'));
+    mesh.setColorAt(i, tmpC.set(f.kind === 'stool' || f.kind === 'stool42' || f.kind === 'stack' ? STOOL_TINTS[f.tint % STOOL_TINTS.length] : '#ffffff'));
   });
   mesh.computeBoundingBox();
   mesh.computeBoundingSphere();
@@ -405,7 +410,7 @@ export function createStreetFurniture(scene: THREE.Scene, furniture: readonly Li
     furniture.forEach((f, i) => {
       const g = f.group >= 0 ? groups[f.group] : null;
       const out = !g || open[f.group];
-      let show = f.kind === 'stack' ? !out : f.kind === 'stool' || f.kind === 'table' ? out : true;
+      let show = f.kind === 'stack' ? !out : f.kind === 'stool' || f.kind === 'stool42' || f.kind === 'table' ? out : true;
       // Altars are only dressing; a chess board stays, or the players at it would play on thin air.
       if (level >= 5 && f.kind === 'altar') show = false;
       mesh.setVisibleAt(i, show);

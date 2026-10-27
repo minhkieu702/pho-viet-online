@@ -12,10 +12,20 @@ import { BUILDINGS, POIS, SCENERY, VENUES, LANDMARKS, type Building, type Point 
 const LIFE = (city as unknown as { LIFE?: unknown }).LIFE;
 import type { Effect, Service } from './services';
 import { MENU, type Dish } from './street-life';
+import { district, type DistrictView } from './district-life';
+import { QUAN_1_SOUTH_EXTRA } from './map/layout/quan-1-south';
+import { BINH_THANH_EXTRA } from './map/layout/binh-thanh';
+import * as transit from './transit';
+
+/** The bus shelters and piers transit.ts serves (its audit list): a district shelter among them needs no notice. */
+const transitStops = ((transit as unknown as { AUDIT_ENTRIES?: { covers: string[]; x: number; z: number; r: number }[] }).AUDIT_ENTRIES ?? []).filter((e) => e.covers.includes('transit'));
+import type { GenBuilding } from './map/gen/buildings';
 
 export type CounterKind = 'food' | 'cafe' | 'cart' | 'stall' | 'kiosk' | 'beer' | 'taphoa' | 'mart' | 'pharmacy' | 'gold' | 'barber' | 'tailor'
   | 'fashion' | 'florist' | 'books' | 'hotel' | 'repair' | 'post' | 'police' | 'bank' | 'theatre' | 'mall' | 'office' | 'school' | 'pagoda'
-  | 'atm' | 'vending' | 'lottery' | 'giuxe' | 'xeom';
+  | 'atm' | 'vending' | 'lottery' | 'giuxe' | 'xeom'
+  /** The districts: a parish church, a chợ hall, a clinic, a museum's ticket desk, shops a street's own trade. */
+  | 'church' | 'market' | 'clinic' | 'ticket' | 'shop';
 /** Icons the counter panel and the prompt chip draw for a kind (page.tsx maps them to lucide icons). */
 export type MenuIcon = 'coffee' | 'food' | 'beer' | 'store' | 'pill' | 'gem' | 'scissors' | 'shirt' | 'flower' | 'book' | 'hotel' | 'wrench' | 'post'
   | 'police' | 'bank' | 'ticket' | 'pagoda' | 'school' | 'bike';
@@ -422,6 +432,406 @@ export const COUNTER_DISH: Partial<Record<string, Dish>> = {
 export const menuHours = (spans: readonly (readonly [number, number])[]): Hours => spans.map(([a, b]) => [a, b <= a ? b + 24 : b] as const);
 for (const [key, dish] of Object.entries(COUNTER_DISH)) if (dish) COUNTERS[key].hours = menuHours(MENU[dish]);
 
+// ---- The districts' trades ----------------------------------------------------------------------------------------
+// Every sign the generator puts on a district shophouse, kiosk or stamp (gen/buildings.ts STALLS, OC, SEAFOOD, BEER,
+// NIGHT_FOOD, CAFES, SHOPS, MARKET_SHOPS) sells what it says. Today's carts and quán carry an owner's name in their
+// title (Bún riêu Cô Hai); the districts' get a plain one, the sign's own name heads the panel.
+const BIA = s('bia', 'Bia lon', 20, '+5 máu, hơi say.', { heal: 5, drunk: 25 });
+const NUOC = s('nuoc', 'Nước suối', 8, '+3 máu, mát người 1 phút.', { heal: 3, buff: { id: 'mat', seconds: 60 }, litter: 1 });
+const FOOT_NHAU = 'Đã uống rượu bia thì không lái xe. Ngồi ghế nhựa ăn tại chỗ hồi thêm 30% máu.';
+/** A district version of a counter with its own title (and anything else that differs). */
+const alias = (key: string, patch: Partial<CounterDef>): CounterDef => ({ ...COUNTERS[key], ...patch });
+const DISTRICT_COUNTERS: Record<string, CounterDef> = {
+  // ---- Night food: Vĩnh Khánh's ốc, seafood, the grill, hotpot, nhậu ----
+  oc: {
+    kind: 'food', icon: 'food', title: 'Gọi ốc', verb: 'Gọi ốc', hours: [[16, 24.5]], robbable: 1, eatIn: true, foot: FOOT_NHAU,
+    intro: 'Thau ốc bày trước cửa, bếp than đỏ rực, khách ngồi tràn xuống vỉa hè tới khuya.',
+    items: [
+      s('oclen', 'Ốc len xào dừa', 60, 'Nước cốt dừa béo, hút rột rột · +25 máu.', { heal: 25 }),
+      s('sodiep', 'Sò điệp nướng mỡ hành', 70, '+28 máu.', { heal: 28 }),
+      s('ochuong', 'Ốc hương rang muối ớt', 120, 'Cả dĩa cho nhóm bạn · +45 máu, no bụng 2 phút.', { heal: 45, buff: { id: 'no', seconds: 120 } }),
+      s('ngheu', 'Nghêu hấp sả', 50, '+20 máu.', { heal: 20 }),
+      BIA,
+    ],
+  },
+  haisan: {
+    kind: 'food', icon: 'food', title: 'Gọi hải sản', verb: 'Gọi món', hours: [[16, 23.5]], robbable: 1, eatIn: true, foot: FOOT_NHAU,
+    intro: 'Bể kính sục khí đầy tôm cua, chọn con nào làm con nấy, tính tiền theo ký.',
+    items: [
+      s('tom', 'Tôm nướng muối ớt', 150, '+45 máu, no bụng 2 phút.', { heal: 45, buff: { id: 'no', seconds: 120 } }),
+      s('muc', 'Mực hấp gừng', 120, '+40 máu.', { heal: 40 }),
+      s('ghe', 'Càng ghẹ rang muối', 180, '+55 máu, no bụng 3 phút.', { heal: 55, buff: { id: 'no', seconds: 180 } }),
+      BIA,
+    ],
+  },
+  nuong: {
+    kind: 'food', icon: 'food', title: 'Gọi đồ nướng', verb: 'Gọi đồ nướng', hours: [[16.5, 23.5]], robbable: 1, eatIn: true, foot: FOOT_NHAU,
+    intro: 'Bếp than giữa bàn, thịt ướp sa tế, khói thơm cả khúc đường.',
+    items: [
+      s('bo', 'Bò nướng ngói', 120, '+40 máu, no bụng 2 phút.', { heal: 40, buff: { id: 'no', seconds: 120 } }),
+      s('muc', 'Mực nướng sa tế', 110, '+38 máu.', { heal: 38 }),
+      s('bachi', 'Ba chỉ nướng', 90, '+32 máu.', { heal: 32 }),
+      BIA,
+    ],
+  },
+  lau: {
+    kind: 'food', icon: 'food', title: 'Gọi lẩu', verb: 'Gọi lẩu', hours: [[17, 23.5]], robbable: 1, eatIn: true, foot: FOOT_NHAU,
+    intro: 'Nồi lẩu sôi lục bục trên bếp ga mini, rau nhúng chất đầy rổ.',
+    items: [
+      s('laude', 'Lẩu dê', 250, 'Cả nồi cho nhóm bạn · hồi đầy máu, no bụng 5 phút.', { full: true, buff: { id: 'no', seconds: 300 } }),
+      s('laubo', 'Lẩu bò nhúng giấm', 220, 'Hồi đầy máu, no bụng 4 phút.', { full: true, buff: { id: 'no', seconds: 240 } }),
+      s('laithai', 'Lẩu Thái hải sản', 280, 'Chua cay · hồi đầy máu, no bụng 5 phút.', { full: true, buff: { id: 'no', seconds: 300 } }),
+      s('ngot', 'Nước ngọt', 15, '+5 máu, mát người 1 phút.', { heal: 5, buff: { id: 'mat', seconds: 60 }, litter: 1 }),
+    ],
+  },
+  nhau: {
+    kind: 'beer', icon: 'beer', title: 'Gọi bia', verb: 'Gọi bia', hours: [[16, 24]], robbable: 1, eatIn: true, foot: FOOT_NHAU,
+    intro: 'Bàn thấp, ghế nhựa, thùng đá bia bên chân. Một, hai, ba, dzô!',
+    items: [
+      BIA,
+      s('thung', 'Thùng bia cả bàn', 220, '+20 máu, +40 điểm, say.', { heal: 20, score: 40, drunk: 100 }),
+      s('khomuc', 'Khô mực nướng', 60, '+20 máu.', { heal: 20 }),
+      s('long', 'Lòng xào nghệ', 70, '+25 máu.', { heal: 25 }),
+    ],
+  },
+  // ---- Phố Tây's trades (Bùi Viện) ----
+  spa: {
+    kind: 'barber', icon: 'flower', title: 'Massage', verb: 'Vào massage', hours: [[10, 24]], robbable: 1,
+    intro: 'Ghế ngả, chậu ngâm chân thảo dược, máy lạnh mát rượi. Nhân viên bấm huyệt cho khách vừa cuốc bộ cả ngày.',
+    items: [
+      s('chan', 'Massage chân 45 phút', 150, 'Ngâm chân, bấm huyệt · +30 máu, mát người 3 phút, thời gian trôi 45 phút.', { heal: 30, buff: { id: 'mat', seconds: 180 }, hours: 0.75 }),
+      s('body', 'Massage body 60 phút', 280, 'Hồi đầy máu, thời gian trôi 1 giờ.', { full: true, hours: 1 }),
+    ],
+  },
+  doitien: {
+    kind: 'gold', icon: 'gem', title: 'Quầy đổi tiền', verb: 'Vào quầy đổi tiền', hours: [[8, 23]], robbable: 3,
+    intro: 'Bảng tỷ giá đèn LED, USD, EUR, Won đổi tại chỗ. Có camera và bảo vệ.',
+    items: [
+      s('sim', 'Sim du lịch 4G', 120, 'Gọi điện, xem bản đồ cả tháng · +10 điểm.', { item: 'sim du lịch', score: 10 }),
+      s('bando', 'Bản đồ Sài Gòn', 30, 'Bản đồ giấy song ngữ · +5 điểm.', { item: 'bản đồ Sài Gòn', score: 5 }),
+    ],
+  },
+  tour: {
+    kind: 'ticket', icon: 'ticket', title: 'Tour và vé xe', verb: 'Hỏi tour', hours: [[8, 22]], robbable: 1,
+    intro: 'Tờ rơi Củ Chi, Mỹ Tho, Vũng Tàu dán kín tường; vé xe khách giường nằm đi khắp nơi.',
+    items: [
+      s('xichlo', 'Tour xích lô phố cổ', 200, 'Một vòng Bến Thành, Đồng Khởi, Nhà thờ Đức Bà · +30 điểm, thời gian trôi 1 giờ.', { score: 30, hours: 1 }),
+      s('cuchi', 'Vé tour địa đạo Củ Chi', 350, 'Đi sáng mai, xe đón tại khách sạn · +25 điểm.', { item: 'vé tour Củ Chi', score: 25 }),
+      s('vexe', 'Vé xe khách đi Vũng Tàu', 160, 'Xe giường nằm, khởi hành 6 giờ sáng · +10 điểm.', { item: 'vé xe Vũng Tàu', score: 10 }),
+    ],
+  },
+  tattoo: {
+    kind: 'barber', icon: 'scissors', title: 'Tiệm xăm', verb: 'Vào tiệm xăm', hours: [[11, 24]], robbable: 1,
+    intro: 'Đèn trắng, ghế da, album hình xăm dày cộm. Thợ xăm vừa làm vừa nghe nhạc rock.',
+    items: [
+      s('nho', 'Xăm hình nhỏ', 300, 'Một bông sen trên cổ tay · +30 điểm.', { score: 30, item: 'hình xăm bông sen' }),
+      s('khuyen', 'Xỏ khuyên tai', 100, '+10 điểm.', { score: 10 }),
+    ],
+  },
+  bar: {
+    kind: 'beer', icon: 'beer', title: 'Gọi đồ uống', verb: 'Gọi đồ uống', hours: [[17, 26]], robbable: 2, eatIn: true, foot: 'Đã uống rượu bia thì không lái xe.',
+    intro: 'Đèn lồng giăng ngang phố đi bộ, nhạc sống mở hết cỡ, khách Tây khách ta ngồi tràn ra đường.',
+    items: [
+      s('bia', 'Bia Sài Gòn', 30, '+5 máu, hơi say.', { heal: 5, drunk: 30 }),
+      s('cocktail', 'Cocktail', 90, '+30 điểm, say.', { score: 30, drunk: 70 }),
+      s('nuocep', 'Nước ép trái cây', 50, '+12 máu, mát người 2 phút.', { heal: 12, buff: { id: 'mat', seconds: 120 }, litter: 1 }),
+    ],
+  },
+  chaovit: {
+    kind: 'food', icon: 'food', title: 'Gọi cháo vịt', verb: 'Gọi cháo vịt', hours: [[16, 23]], robbable: 1, eatIn: true, foot: FOOT_FOOD,
+    intro: 'Vịt luộc chặt dĩa, gỏi bắp cải, chấm nước mắm gừng.',
+    items: [s('chao', 'Cháo vịt', 40, '+30 máu, no bụng 2 phút.', { heal: 30, buff: { id: 'no', seconds: 120 } }), s('goi', 'Gỏi vịt', 80, '+35 máu.', { heal: 35 }), TRA_DA],
+  },
+  // ---- Day food ----
+  namvang: {
+    kind: 'food', icon: 'food', title: 'Gọi hủ tiếu', verb: 'Gọi hủ tiếu', hours: [[6, 13], [16, 21]], robbable: 1, eatIn: true, foot: FOOT_FOOD,
+    intro: 'Hủ tiếu Nam Vang khô hay nước, tôm, gan, thịt bằm, trứng cút.',
+    items: [s('nuoc', 'Hủ tiếu Nam Vang nước', 55, '+35 máu, no bụng 2 phút.', { heal: 35, buff: { id: 'no', seconds: 120 } }), s('kho', 'Hủ tiếu khô', 55, '+35 máu, no bụng 2 phút.', { heal: 35, buff: { id: 'no', seconds: 120 } }), TRA_DA],
+  },
+  bunbo: {
+    kind: 'food', icon: 'food', title: 'Gọi bún bò', verb: 'Gọi bún bò', hours: [[6, 13], [16, 21]], robbable: 1, eatIn: true, foot: FOOT_FOOD,
+    intro: 'Bún bò Huế cay nồng mùi sả, giò heo, chả cua.',
+    items: [s('bunbo', 'Bún bò Huế', 50, '+35 máu, no bụng 2 phút.', { heal: 35, buff: { id: 'no', seconds: 120 } }), s('dacbiet', 'Bún bò đặc biệt', 65, '+45 máu, no bụng 3 phút.', { heal: 45, buff: { id: 'no', seconds: 180 } }), TRA_DA],
+  },
+  binhdan: {
+    kind: 'food', icon: 'food', title: 'Gọi cơm', verb: 'Gọi cơm', hours: [[10, 14], [16.5, 20]], robbable: 1, eatIn: true, foot: FOOT_FOOD,
+    intro: 'Tủ kính bày chục món: cá kho, thịt kho trứng, canh chua, rau luộc. Chỉ món nào lấy món đó.',
+    items: [s('com', 'Cơm hai món', 35, '+30 máu, no bụng 2 phút.', { heal: 30, buff: { id: 'no', seconds: 120 } }), s('ba', 'Cơm ba món', 45, '+38 máu, no bụng 3 phút.', { heal: 38, buff: { id: 'no', seconds: 180 } }), s('canh', 'Canh chua', 15, '+10 máu.', { heal: 10 }), TRA_DA],
+  },
+  ganuong: {
+    kind: 'food', icon: 'food', title: 'Gọi cơm gà', verb: 'Gọi món', hours: [[10, 21]], robbable: 1, eatIn: true, foot: FOOT_FOOD,
+    intro: 'Gà nướng mật ong trên lò than, cơm gà xối mỡ giòn rụm.',
+    items: [s('xoimo', 'Cơm gà xối mỡ', 45, '+32 máu, no bụng 2 phút.', { heal: 32, buff: { id: 'no', seconds: 120 } }), s('nuong', 'Gà nướng nửa con', 120, '+50 máu, no bụng 3 phút.', { heal: 50, buff: { id: 'no', seconds: 180 } }), TRA_DA],
+  },
+  bobia: {
+    kind: 'food', icon: 'food', title: 'Mua bò bía', verb: 'Mua bò bía', hours: [[14, 21]], robbable: 0, eatIn: true, foot: FOOT_FOOD,
+    intro: 'Bò bía lạp xưởng, củ sắn, trứng chiên; gỏi cuốn tôm thịt chấm tương đen.',
+    items: [s('bobia', 'Bò bía (5 cuốn)', 25, '+15 máu.', { heal: 15, litter: 1 }), s('goicuon', 'Gỏi cuốn (3 cuốn)', 30, '+18 máu.', { heal: 18, litter: 1 })],
+  },
+  bunthitnuong: {
+    kind: 'food', icon: 'food', title: 'Gọi bún thịt nướng', verb: 'Gọi món', hours: [[10, 21]], robbable: 1, eatIn: true, foot: FOOT_FOOD,
+    intro: 'Thịt nướng than, chả giò, đồ chua, đậu phộng, mỡ hành, nước mắm chua ngọt.',
+    items: [s('bun', 'Bún thịt nướng chả giò', 45, '+32 máu, no bụng 2 phút.', { heal: 32, buff: { id: 'no', seconds: 120 } }), s('nem', 'Nem nướng', 40, '+25 máu.', { heal: 25 }), TRA_DA],
+  },
+  miquang: {
+    kind: 'food', icon: 'food', title: 'Gọi mì Quảng', verb: 'Gọi mì Quảng', hours: [[6, 14]], robbable: 1, eatIn: true, foot: FOOT_FOOD,
+    intro: 'Mì Quảng tôm thịt, bánh tráng mè, rau sống, ít nước mà đậm.',
+    items: [s('mi', 'Mì Quảng tôm thịt', 45, '+32 máu, no bụng 2 phút.', { heal: 32, buff: { id: 'no', seconds: 120 } }), s('caolau', 'Cao lầu', 45, '+30 máu.', { heal: 30 }), TRA_DA],
+  },
+  'q-bunrieu': alias('bunrieu', { kind: 'food', title: 'Gọi bún riêu' }),
+  'q-banhxeo': alias('banhxeo', { kind: 'food', title: 'Gọi bánh xèo' }),
+  'q-xoi': alias('xoi', { kind: 'food', title: 'Mua xôi' }),
+  'q-che': alias('che', { kind: 'food', title: 'Mua chè' }),
+  'q-hutieu': alias('hutieu', { kind: 'food', title: 'Gọi hủ tiếu gõ' }),
+  'q-banhcuon': alias('banhcuon', { kind: 'food', title: 'Gọi bánh cuốn' }),
+  'q-banhcanh': alias('banhcanh', { kind: 'food', title: 'Gọi bánh canh' }),
+  'q-chaolong': alias('chaolong', { kind: 'food', title: 'Gọi cháo lòng' }),
+  'q-phobo': alias('pho', { title: 'Gọi phở' }),
+  'q-nuocmia': alias('nuocmia', { kind: 'cafe', eatIn: true, intro: 'Máy ép mía chạy rè rè, thêm chút tắc cho thơm; dừa xiêm chặt tại chỗ.' }),
+  // ---- Cafés ----
+  sinhto: {
+    kind: 'cafe', icon: 'coffee', title: 'Gọi sinh tố', verb: 'Gọi sinh tố', hours: [[7, 22]], robbable: 1, eatIn: true,
+    intro: 'Tủ trái cây xếp đầy, máy xay chạy suốt: bơ, mãng cầu, dâu, cam vắt.',
+    items: [
+      s('bo', 'Sinh tố bơ', 30, '+12 máu, mát người 2 phút.', { heal: 12, buff: { id: 'mat', seconds: 120 }, litter: 1 }),
+      s('cam', 'Nước cam vắt', 30, '+12 máu, mát người 2 phút.', { heal: 12, buff: { id: 'mat', seconds: 120 }, litter: 1 }),
+      s('dua', 'Dừa tươi', 25, '+10 máu, mát người 2 phút.', { heal: 10, buff: { id: 'mat', seconds: 120 }, litter: 1 }),
+    ],
+  },
+  trada: {
+    kind: 'cafe', icon: 'coffee', title: 'Gọi trà', verb: 'Gọi trà chanh', hours: [[8, 23]], robbable: 1, eatIn: true,
+    intro: 'Ghế nhựa quay ra đường, ly trà chanh to, bịch hướng dương cắn suốt buổi.',
+    items: [
+      s('trachanh', 'Trà chanh', 15, '+5 máu, mát người 2 phút.', { heal: 5, buff: { id: 'mat', seconds: 120 }, litter: 1 }),
+      s('tratac', 'Trà tắc', 12, '+4 máu, mát người 2 phút.', { heal: 4, buff: { id: 'mat', seconds: 120 }, litter: 1 }),
+      s('huongduong', 'Hướng dương', 15, '+5 điểm.', { score: 5, litter: 1 }),
+    ],
+  },
+  // ---- Shops ----
+  phone: {
+    kind: 'shop', icon: 'store', title: 'Điện thoại', verb: 'Xem điện thoại', hours: [[8, 21.5]], robbable: 2,
+    intro: 'Điện thoại cũ mới, sim số đẹp, ốp lưng, cáp sạc treo kín tường.',
+    items: [s('sac', 'Sạc dự phòng', 150, 'Mang theo khỏi lo hết pin · +10 điểm.', { item: 'sạc dự phòng', score: 10 }), s('sim', 'Sim số đẹp', 100, '+20 điểm.', { score: 20 }), s('op', 'Ốp lưng', 50, '+5 điểm.', { score: 5 })],
+  },
+  photo: {
+    kind: 'shop', icon: 'book', title: 'Photo – in ấn', verb: 'Photo giấy tờ', hours: [[7, 21]], robbable: 1,
+    intro: 'Máy photo chạy không nghỉ, in ảnh, ép plastic, đánh máy hồ sơ.',
+    items: [s('photo', 'Photo giấy tờ', 2, '+2 điểm.', { score: 2 }), s('ep', 'Ép plastic', 5, '+3 điểm.', { score: 3 }), s('in', 'In ảnh màu', 10, '+5 điểm.', { score: 5 })],
+  },
+  stationery: {
+    kind: 'shop', icon: 'book', title: 'Văn phòng phẩm', verb: 'Mua đồ', hours: [[7, 21]], robbable: 1,
+    intro: 'Tập vở, bút bi, giấy gói quà, bản đồ thành phố.',
+    items: [s('but', 'Bút bi', 5, '+2 điểm.', { score: 2 }), s('tap', 'Tập vở', 15, '+5 điểm.', { score: 5 }), s('bando', 'Bản đồ giấy Sài Gòn', 20, '+10 điểm.', { score: 10, item: 'bản đồ giấy' })],
+  },
+  appliance: {
+    kind: 'shop', icon: 'store', title: 'Điện máy', verb: 'Xem đồ điện', hours: [[8, 21]], robbable: 2,
+    intro: 'Quạt, nồi cơm, tivi chất tới trần, ông chủ ngồi canh từ sáng tới tối.',
+    items: [s('quat', 'Quạt mini cầm tay', 90, 'Mát người 5 phút.', { buff: { id: 'mat', seconds: 300 } }), s('den', 'Đèn pin', 60, '+5 điểm.', { item: 'đèn pin', score: 5 })],
+  },
+  gas: {
+    kind: 'shop', icon: 'store', title: 'Gas – nước đá', verb: 'Mua nước đá', hours: [[6, 21]], robbable: 1,
+    intro: 'Bình gas xếp hàng, thùng nước đá, bình nước 20 lít giao tận nhà.',
+    items: [s('da', 'Bọc nước đá', 5, 'Mát người 2 phút.', { buff: { id: 'mat', seconds: 120 } }), NUOC, s('binh', 'Bình nước 20 lít', 25, '+10 máu.', { heal: 10 })],
+  },
+  hardware: {
+    kind: 'shop', icon: 'wrench', title: 'Kim khí – điện nước', verb: 'Mua đồ', hours: [[7, 20]], robbable: 1,
+    intro: 'Ốc vít, ổ khóa, bóng đèn, dây điện, cái gì cũng có trong mấy chục ngăn kéo.',
+    items: [s('khoa', 'Ổ khóa chống trộm', 60, 'Khóa xe cho chắc · +5 điểm.', { item: 'ổ khóa', score: 5 }), s('bong', 'Bóng đèn', 30, '+5 điểm.', { score: 5 }), s('keo', 'Cuộn băng keo', 10, '+2 điểm.', { score: 2 })],
+  },
+  shoes: {
+    kind: 'shop', icon: 'shirt', title: 'Giày dép', verb: 'Xem giày dép', hours: [[8, 21.5]], robbable: 1,
+    intro: 'Dép tổ ong, dép lào, giày thể thao xếp tận ra vỉa hè.',
+    items: [s('tong', 'Dép tổ ong', 30, '+5 điểm.', { score: 5 }), s('lao', 'Dép lào', 25, '+5 điểm.', { score: 5 }), s('giay', 'Giày thể thao', 250, '+30 điểm.', { score: 30, item: 'giày mới' })],
+  },
+  rice: {
+    kind: 'shop', icon: 'store', title: 'Gạo', verb: 'Mua gạo', hours: [[6, 20]], robbable: 1,
+    intro: 'Bao gạo mở miệng bày cả dãy: ST25, Nàng Hương, nếp cái hoa vàng.',
+    items: [s('st25', 'Gạo ST25 (5 kg)', 180, 'Mang về làm quà · +20 điểm.', { item: 'gạo ST25', score: 20 }), s('nep', 'Nếp cái (1 kg)', 40, '+5 điểm.', { score: 5 })],
+  },
+  dentist: {
+    kind: 'clinic', icon: 'pill', title: 'Nha khoa', verb: 'Khám răng', hours: [[8, 20]], robbable: 1,
+    intro: 'Ghế nha sĩ, đèn sáng trắng, tiếng máy khoan ro ro.',
+    items: [s('kham', 'Khám và cạo vôi răng', 150, '+10 máu, +10 điểm.', { heal: 10, score: 10 }), s('tram', 'Trám răng', 200, '+15 máu.', { heal: 15 })],
+  },
+  photostudio: {
+    kind: 'shop', icon: 'ticket', title: 'Tiệm ảnh', verb: 'Chụp ảnh', hours: [[8, 21]], robbable: 1,
+    intro: 'Phông xanh, đèn flash, chụp ảnh thẻ lấy liền.',
+    items: [s('the', 'Chụp ảnh thẻ', 30, '+10 điểm.', { score: 10 }), s('kyniem', 'Ảnh kỷ niệm Sài Gòn', 80, '+30 điểm.', { score: 30, item: 'ảnh kỷ niệm' })],
+  },
+  fabric: {
+    kind: 'stall', icon: 'shirt', title: 'Sạp vải', verb: 'Xem vải', hours: [[6, 18]], robbable: 0, haggle: true,
+    intro: 'Cây vải xếp chồng, cô chủ đo vải bằng sải tay. Mua vải thì nhớ trả giá.',
+    items: [s('vai', 'Vải may áo dài', 150, '+20 điểm.', { item: 'vải lụa', score: 20 }), s('khan', 'Khăn rằn', 30, '+5 điểm.', { item: 'khăn rằn', score: 5 })],
+  },
+  dried: {
+    kind: 'stall', icon: 'store', title: 'Sạp đồ khô', verb: 'Mua đồ khô', hours: [[6, 18]], robbable: 0, haggle: true,
+    intro: 'Tôm khô, mực khô, nấm đông cô, hạt điều; mùi biển thơm cả dãy.',
+    items: [s('muc', 'Khô mực (0,5 kg)', 120, 'Làm quà · +15 điểm.', { item: 'khô mực', score: 15 }), s('tom', 'Tôm khô', 150, '+15 điểm.', { item: 'tôm khô', score: 15 }), s('dieu', 'Hạt điều rang muối', 60, '+15 máu.', { heal: 15 })],
+  },
+  fruit: {
+    kind: 'stall', icon: 'food', title: 'Sạp trái cây', verb: 'Mua trái cây', hours: [[5.5, 19]], robbable: 0, haggle: true,
+    intro: 'Trái cây miền Tây chất thành núi: xoài cát, măng cụt, chôm chôm, dưa hấu.',
+    items: [s('xoai', 'Xoài cát Hòa Lộc', 40, '+12 máu.', { heal: 12 }), s('mangcut', 'Măng cụt (1 kg)', 50, '+15 máu.', { heal: 15 }), s('duahau', 'Dưa hấu ướp lạnh', 30, '+12 máu, mát người 2 phút.', { heal: 12, buff: { id: 'mat', seconds: 120 } })],
+  },
+  spice: {
+    kind: 'stall', icon: 'store', title: 'Sạp gia vị', verb: 'Mua gia vị', hours: [[5.5, 18]], robbable: 0, haggle: true,
+    intro: 'Hũ mắm, chai nước mắm, bao tiêu ớt; cô chủ cho nếm thử từng loại.',
+    items: [s('mam', 'Nước mắm Phú Quốc', 60, 'Mang về làm quà · +10 điểm.', { item: 'nước mắm', score: 10 }), s('ruoc', 'Mắm ruốc', 30, '+5 điểm.', { score: 5 })],
+  },
+  plastic: {
+    kind: 'stall', icon: 'store', title: 'Sạp đồ nhựa', verb: 'Mua đồ nhựa', hours: [[6, 18]], robbable: 0, haggle: true,
+    intro: 'Ghế nhựa đỏ xếp chồng cao quá đầu, thau, rổ, xô đủ màu.',
+    items: [s('ghe', 'Ghế nhựa đỏ', 25, 'Đúng chiếc ghế của mọi quán vỉa hè · +5 điểm.', { item: 'ghế nhựa', score: 5 }), s('thau', 'Thau nhựa', 30, '+3 điểm.', { score: 3 })],
+  },
+  butcher: {
+    kind: 'stall', icon: 'store', title: 'Sạp thịt', verb: 'Mua thịt', hours: [[5, 12]], robbable: 0, haggle: true,
+    intro: 'Thịt heo mới mổ lúc khuya, chặt tại chỗ trên thớt gỗ.',
+    items: [s('bachi', 'Thịt ba chỉ (0,5 kg)', 70, 'Mang về nấu cơm · +10 điểm.', { item: 'thịt heo', score: 10 }), s('suon', 'Sườn non (0,5 kg)', 90, '+10 điểm.', { item: 'sườn', score: 10 })],
+  },
+  veg: {
+    kind: 'stall', icon: 'store', title: 'Sạp rau', verb: 'Mua rau', hours: [[5, 13]], robbable: 0, haggle: true,
+    intro: 'Rau Đà Lạt, rau thơm, chanh ớt; mua bó rau là được cho thêm nắm hành.',
+    items: [s('rau', 'Rau sạch Đà Lạt', 20, '+5 điểm.', { score: 5, item: 'bó rau' }), s('thom', 'Bó rau thơm', 10, '+3 điểm.', { score: 3 })],
+  },
+  market: {
+    kind: 'market', icon: 'store', title: 'Đi chợ', verb: 'Vào chợ', hours: [[5, 18]], robbable: 0, haggle: true,
+    intro: 'Lối đi hẹp giữa các sạp, tiếng mời chào, mùi cá tươi, trái cây, cà phê rang. Mua ở chợ thì nhớ trả giá.',
+    items: [
+      s('rau', 'Bó rau thơm', 10, 'Húng quế, ngò gai, tía tô · +5 điểm.', { score: 5, item: 'bó rau' }),
+      s('traicay', 'Trái cây', 20, 'Xoài, chôm chôm · +12 máu.', { heal: 12 }),
+      s('ca', 'Cá tươi', 40, 'Cá lóc còn quẫy · mang về làm quà.', { item: 'cá tươi', score: 10 }),
+      s('nonla', 'Nón lá', 50, 'Che nắng · +10 điểm.', { item: 'nón lá', score: 10 }),
+      s('nuoc', 'Nước sâm', 8, '+3 máu, mát người 1 phút.', { heal: 3, buff: { id: 'mat', seconds: 60 }, litter: 1 }),
+    ],
+  },
+  'cho-dem': {
+    kind: 'stall', icon: 'shirt', title: 'Chợ đêm', verb: 'Xem hàng', hours: [[18, 24]], robbable: 0, haggle: true,
+    intro: 'Sạp chợ đêm bày áo thun, nón lá, móc khóa, đồ lưu niệm. Giá nói thách, nhớ trả giá.',
+    items: [s('ao', 'Áo thun Sài Gòn', 120, 'Thay áo mới ngay.', { look: 'shirt' }), s('nonla', 'Nón lá', 50, '+10 điểm.', { item: 'nón lá', score: 10 }), s('mockhoa', 'Móc khóa xích lô', 20, '+5 điểm.', { score: 5 })],
+  },
+  'sap-ben-thanh': alias('sap', { title: 'Sạp quanh chợ', hours: [[6, 24]], intro: 'Sạp quanh chợ Bến Thành: trái cây cắt sẵn, đồ khô, nón lá và quà lưu niệm. Mua ở chợ thì nhớ trả giá.' }),
+  'sach-cu': alias('books', { title: 'Đường sách', intro: 'Sạp sách cũ dưới tán cây: truyện, sách xưa, bưu thiếp Sài Gòn.', hours: [[8, 21]] }),
+  // ---- Services ----
+  chua: alias('pagoda', { title: 'Thắp hương', intro: 'Khói hương, tiếng chuông và mõ. Mùng một và ngày rằm chùa đông khách thập phương.' }),
+  church: {
+    kind: 'church', icon: 'pagoda', title: 'Nhà thờ', verb: 'Vào nhà thờ', hours: [[5, 20]], robbable: 0,
+    intro: 'Hàng ghế gỗ, tượng Đức Mẹ, ánh nến lung linh. Thánh lễ 5:00 và 17:30, giữ trật tự trong nhà thờ.',
+    items: [
+      s('nen', 'Thắp nến cầu nguyện', 5, 'Tâm an, tỉnh táo 2 phút · +10 điểm.', { buff: { id: 'tinh', seconds: 120 }, score: 10 }),
+      s('hoa', 'Dâng hoa', 30, '+20 điểm.', { score: 20 }),
+    ],
+  },
+  clinic: {
+    kind: 'clinic', icon: 'pill', title: 'Phòng khám', verb: 'Khám bệnh', hours: ALL_DAY, robbable: 0,
+    intro: 'Trực cấp cứu 24/24. Vết thương nhẹ được băng bó ngay ở phòng khám.',
+    items: [s('bang', 'Băng bó vết thương', 30, '+30 máu.', { heal: 30 }), s('kham', 'Khám tổng quát', 80, '+60 máu.', { heal: 60 }), s('thuoc', 'Thuốc hạ sốt', 15, '+10 máu.', { heal: 10 })],
+  },
+  congan: alias('police', { title: 'Trực ban công an' }),
+  buudien: alias('post', { title: 'Bưu điện Thành phố', intro: 'Mái vòm sắt, bản đồ Sài Gòn xưa trên tường, quầy bán tem và bưu thiếp.', items: [s('buuthiep', 'Bưu thiếp Sài Gòn', 10, '+10 điểm.', { score: 10 }), s('guikien', 'Gửi bưu kiện', 25, 'Gửi quà về quê · +15 điểm.', { score: 15 }), s('tem', 'Tem kỷ niệm', 5, '+5 điểm.', { score: 5 })] }),
+  'dinh-doc-lap': {
+    kind: 'ticket', icon: 'ticket', title: 'Vé tham quan', verb: 'Mua vé tham quan', hours: [[8, 16.5]], robbable: 0,
+    intro: 'Di tích quốc gia đặc biệt: phòng họp nội các, hầm chỉ huy, xe tăng trong sân.',
+    items: [s('ve', 'Vé tham quan', 65, 'Một giờ đi khắp dinh · +60 điểm.', { hours: 1, score: 60 })],
+  },
+  'nha-rong': {
+    kind: 'ticket', icon: 'ticket', title: 'Bảo tàng Hồ Chí Minh', verb: 'Mua vé tham quan', hours: [[7.5, 17]], robbable: 0,
+    intro: 'Bến Nhà Rồng, nơi Bác Hồ ra đi tìm đường cứu nước năm 1911; nay là bảo tàng.',
+    items: [s('ve', 'Vé tham quan', 20, 'Một giờ trong bảo tàng · +40 điểm.', { hours: 1, score: 40 })],
+  },
+  'ben-xe': {
+    kind: 'kiosk', icon: 'store', title: 'Hàng quán bến xe', verb: 'Mua đồ đi đường', hours: [[4, 22]], robbable: 1,
+    intro: 'Bến xe cũ vẫn còn quầy bán đồ đi đường: bánh mì, nước suối, áo mưa giấy.',
+    items: [s('banhmi', 'Bánh mì đi đường', 20, '+15 máu.', { heal: 15, litter: 1 }), NUOC, s('aomua', 'Áo mưa giấy', 15, 'Phòng khi mưa.', { item: 'áo mưa' })],
+  },
+  'nha-mau': {
+    kind: 'office', icon: 'ticket', title: 'Nhà mẫu', verb: 'Xem nhà mẫu', hours: [[8, 17]], robbable: 0,
+    intro: 'Sa bàn khu đô thị mới, căn hộ mẫu sáng choang, nhân viên tư vấn mời nước.',
+    items: [s('xem', 'Xem căn hộ mẫu', 0, '+10 điểm.', { score: 10 }), s('nuoc', 'Ly nước mời khách', 0, '+3 máu.', { heal: 3 })],
+  },
+};
+Object.assign(COUNTERS, DISTRICT_COUNTERS);
+COUNTERS['q-bunrieu'].hours = COUNTERS.bunrieu.hours;
+
+/** A district sign's trade: [name prefix, counter key], longest prefixes first where they overlap. */
+const DISTRICT_TRADES: [string, string][] = [
+  // food
+  ['HỦ TIẾU NAM VANG', 'namvang'], ['HỦ TIẾU GÕ', 'q-hutieu'], ['HỦ TIẾU', 'namvang'], ['BÚN BÒ HUẾ', 'bunbo'], ['BÚN BÒ', 'bunbo'], ['BÚN THỊT NƯỚNG', 'bunthitnuong'], ['BÚN RIÊU', 'q-bunrieu'],
+  ['BÁNH XÈO', 'q-banhxeo'], ['XÔI SÁNG', 'q-xoi'], ['XÔI', 'q-xoi'], ['CHÈ', 'q-che'], ['BÁNH CUỐN', 'q-banhcuon'], ['BÁNH CANH', 'q-banhcanh'], ['CHÁO LÒNG', 'q-chaolong'],
+  ['CHÁO VỊT', 'chaovit'], ['CƠM TẤM', 'comtam'], ['CƠM BÌNH DÂN', 'binhdan'], ['PHỞ', 'q-phobo'], ['BÁNH MÌ', 'banhmi'], ['GÀ NƯỚNG', 'ganuong'], ['BÒ BÍA', 'bobia'],
+  ['MÌ QUẢNG', 'miquang'], ['ỐC', 'oc'], ['SÒ ỐC', 'oc'], ['HẢI SẢN', 'haisan'], ['NƯỚNG NGÓI', 'nuong'], ['MỰC NƯỚNG', 'nuong'], ['TÔM NƯỚNG', 'nuong'], ['LẨU', 'lau'],
+  ['QUÁN NHẬU', 'nhau'], ['NHẬU', 'nhau'], ['BIA', 'nhau'], ['BAR', 'bar'],
+  // Phố Tây (gen/buildings.ts 'pho-tay'): bars and beer clubs, beds for the night, massage, exchange and tour desks, tattoos
+  ['BEER CLUB', 'bar'], ['PUB', 'bar'], ['LOUNGE', 'bar'], ['HOSTEL', 'hotel'], ['KHÁCH SẠN MINI', 'hotel'], ['NHÀ NGHỈ', 'hotel'], ['GUESTHOUSE', 'hotel'],
+  ['MASSAGE', 'spa'], ['SPA', 'spa'], ['ĐỔI TIỀN', 'doitien'], ['TOUR DU LỊCH', 'tour'], ['VÉ XE', 'tour'], ['TRAVEL', 'tour'], ['XĂM HÌNH', 'tattoo'], ['TATTOO', 'tattoo'],
+  // cafés
+  ['TRÀ SỮA', 'trasua'], ['SINH TỐ', 'sinhto'], ['NƯỚC MÍA', 'q-nuocmia'], ['TRÀ ĐÁ', 'trada'], ['CÀ PHÊ', 'coba'],
+  // shops and the market's sạp
+  ['TẠP HÓA', 'taphoa'], ['MINI MART', 'mart'], ['TIỆM MAY', 'tailor'], ['TIỆM TÓC', 'barber'], ['NHÀ THUỐC', 'pharmacy'], ['SỬA XE', 'repair'], ['ĐIỆN THOẠI', 'phone'],
+  ['PHOTO', 'photo'], ['VĂN PHÒNG PHẨM', 'stationery'], ['TIỆM VÀNG', 'gold'], ['ĐIỆN MÁY', 'appliance'], ['GAS', 'gas'], ['KIM KHÍ', 'hardware'], ['ĐỒ ĐIỆN', 'hardware'],
+  ['TIỆM HOA', 'florist'], ['GIÀY DÉP', 'shoes'], ['QUẦN ÁO', 'fashion'], ['GẠO', 'rice'], ['NHÀ SÁCH', 'books'], ['NHA KHOA', 'dentist'], ['TIỆM ẢNH', 'photostudio'],
+  ['VẢI', 'fabric'], ['ĐỒ KHÔ', 'dried'], ['TRÁI CÂY', 'fruit'], ['GIA VỊ', 'spice'], ['ĐỒ NHỰA', 'plastic'], ['THỊT HEO', 'butcher'], ['RAU CỦ', 'veg'], ['CHỢ', 'market'],
+].sort((a, b) => b[0].length - a[0].length) as [string, string][];
+/** What a stamp's door offers (by stamp id); a notice is a door that answers with why it stays shut (design-real C3). */
+const STAMP_PLACES: Record<string, { key: string } | { notice: [string, string] }> = {
+  'nha-rong': { key: 'nha-rong' }, kho7: { notice: ['Cửa khóa', 'kho riêng, không phận sự miễn vào'] }, 'cang-khanh-hoi': { notice: ['Cổng cảng', 'chỉ xe hàng và công nhân được vào'] },
+  'factory-p1': { notice: ['Cửa khóa', 'công trình nguy hiểm, cấm vào'] }, 'thap-bo-song': { key: 'office' }, 'ben-xe-mien-dong': { key: 'ben-xe' },
+  'biet-thu-hoa-su': { notice: ['Biệt thự công vụ', 'bảo vệ không cho khách lạ vào'] }, 'ubnd-thanh-pho': { notice: ['Trụ sở Ủy ban', 'chỉ tiếp khách có hẹn'] },
+  'dinh-doc-lap': { key: 'dinh-doc-lap' }, 'buu-dien-thanh-pho': { key: 'buudien' }, 'cho-ben-thanh': { key: 'market' }, 'cao-oc-sao-mai': { key: 'office' },
+  'toa-nha-dong-khoi': { key: 'office' }, 'khach-san-ham-nghi': { key: 'hotel' }, 'quan-bar-bui-vien': { key: 'bar' },
+  'ga-ben-thanh-1': { notice: ['Ga ngầm Bến Thành', 'tàu metro chưa chạy tới ga này'] }, 'ga-ben-thanh-2': { notice: ['Ga ngầm Bến Thành', 'tàu metro chưa chạy tới ga này'] },
+  'ga-ben-thanh-3': { notice: ['Ga ngầm Bến Thành', 'tàu metro chưa chạy tới ga này'] }, 'ga-ben-thanh-4': { notice: ['Ga ngầm Bến Thành', 'tàu metro chưa chạy tới ga này'] },
+  'tram-xe-buyt-23-9': { notice: ['Trạm xe buýt 23/9', 'đón xe ở các trạm dọc đường'] }, 'ben-do-thu-thiem': { notice: ['Bến đò', 'lên đò ở cầu tàu'] },
+  'ben-thu-thiem': { notice: ['Bến tàu buýt sông', 'lên tàu ở cầu tàu'] }, 'tu-vien-thu-thiem': { key: 'church' }, 'thap-doi-a': { notice: ['Công trường', 'cấm vào khu vực thi công'] },
+  'thap-doi-b': { notice: ['Công trường', 'cấm vào khu vực thi công'] }, 'can-cau-thap': { notice: ['Cần cẩu tháp', 'cấm leo trèo'] }, 'nha-mau-ban-dao': { key: 'nha-mau' },
+  'cay-xang-vong-cung': { key: 'mart' }, 'sat-hach-lai-xe': { notice: ['Sân sát hạch', 'chỉ thí sinh có lịch thi được vào'] },
+  'benh-vien-binh-thanh': { key: 'clinic' }, 'tram-y-te-thu-thiem': { key: 'clinic' },
+  // The story villa (P1 on Thủ Thiêm's riverside; the Thảo Điền one when P2 lands): a locked door that says why.
+  'villa-p1': { notice: ['Cửa khóa', 'nhà riêng, có camera'] }, villa: { notice: ['Cửa khóa', 'nhà riêng, có camera'] },
+};
+/** Food carts on district sidewalks by their dressing variant (gen/dressing.ts streetFront: hours [[6,10],[7,19],[16,22],[14,22],[5,10]]). */
+export const CART_TRADES = ['banhmi', 'q-nuocmia', 'ganh-hotvitlon', 'q-che', 'q-xoi'] as const;
+
+/** The counter for a district building by its sign (or its kind for public buildings); null: a home. */
+export function districtKeyOf(b: Pick<GenBuilding, 'kind' | 'name' | 'typology' | 'stamp'>): string | { notice: [string, string] } | null {
+  if (b.stamp && STAMP_PLACES[b.stamp]) { const p = STAMP_PLACES[b.stamp]; return 'key' in p ? p.key : p; }
+  switch (b.kind) {
+    case 'home': return null;
+    case 'pagoda': return b.typology === 'church' ? 'church' : 'chua';
+    case 'school': return 'school';
+    case 'police': return 'congan';
+    case 'hospital': return 'clinic';
+    case 'post': return 'buudien';
+    case 'hotel': return 'hotel';
+    case 'office': return b.typology === 'warehouse' ? { notice: ['Kho hàng', 'không phận sự miễn vào'] } : 'office';
+    default: {
+      const n = b.name.toUpperCase();
+      for (const [prefix, key] of DISTRICT_TRADES) if (n === prefix || n.startsWith(`${prefix} `)) return key;
+      return b.kind === 'cafe' ? 'coba' : b.kind === 'food' ? 'binhdan' : 'taphoa';
+    }
+  }
+}
+/** A counter that sells while its eatery's stools are out: `key` with those hours (registered once, e.g. 'oc@16-26'). */
+function withHours(key: string, spans: readonly (readonly [number, number])[]): string {
+  if (!spans.length) return key;
+  const hours = menuHours(spans);
+  const id = `${key}@${hours.map(([a, b]) => `${a}-${b}`).join(',')}`;
+  if (!COUNTERS[id]) COUNTERS[id] = { ...COUNTERS[key], hours };
+  return id;
+}
+/**
+ * What the same plate costs by district: downtown (Quận 1: Bến Thành, Bùi Viện, the CBD) a third dearer, Quận 3 and
+ * the new town across the river a little, Quận 4 and Bình Thạnh what the neighbourhood pays. Rounded to 5.000đ above
+ * 10.000đ (1.000đ below).
+ */
+const DISTRICT_PRICE: Partial<Record<string, number>> = { 'quan-1-south': 1.3, 'quan-3': 1.1, 'thu-thiem': 1.15 };
+function withPrice(key: string, slice: string | undefined): string {
+  const k = slice ? DISTRICT_PRICE[slice] : undefined, def = COUNTERS[key];
+  if (!k || !def?.items.length || def.kind === 'police' || def.kind === 'pagoda' || def.kind === 'church' || def.kind === 'ticket') return key;
+  const id = `${key}*${k}`;
+  if (!COUNTERS[id]) COUNTERS[id] = { ...def, items: def.items.map((it) => ({ ...it, price: it.price <= 0 ? it.price : it.price * k > 10 ? Math.round((it.price * k) / 5) * 5 : Math.round(it.price * k) })) };
+  return id;
+}
+
 /** Counter key for a building by its sign (null: no counter, e.g. a nightlife venue handled by venues.ts). */
 export function counterKeyOf(b: Pick<Building, 'kind' | 'name'>): string | null {
   const n = b.name;
@@ -497,7 +907,9 @@ export type FacadeKind = 'counter' | 'door' | 'seat' | 'transit' | 'atm' | 'boat
  * Places with a fixed position. Kinds beyond the catalogue: the legacy shops opened by game.ts events (gun store,
  * motorbike showroom, hospital, nightlife venues), the observation deck, the bank job, the hire boats, seats and bins.
  */
-export type PlaceKind = 'counter' | 'gunstore' | 'bikeshop' | 'hospital' | 'venue' | 'deck' | 'heist' | 'boat' | 'seat' | 'bin';
+export type PlaceKind = 'counter' | 'gunstore' | 'bikeshop' | 'hospital' | 'venue' | 'deck' | 'heist' | 'boat' | 'seat' | 'bin'
+  /** A district door that stays shut on purpose (a warehouse, a building site, a ministry): it answers why (design-real C3). */
+  | 'notice';
 export type Place = {
   id: string; kind: PlaceKind; name: string;
   /** Catalogue key (counters, ATMs, vending machines), venue kind, or seat kind. */
@@ -510,6 +922,10 @@ export type Place = {
   building: number;
   /** Seats: the POI, the furniture under it and its top above the ground (street-life stools; else world.ts SEAT_TOP). */
   poi?: number; seat?: 'bench' | 'stool'; top?: number;
+  /** Notices: what the dim prompt says ([verb, label]). */
+  notice?: [string, string];
+  /** District places: the slice that laid them. */
+  slice?: string;
 };
 
 /**
@@ -616,7 +1032,90 @@ function nearestCafe(x: number, z: number) {
 const GUN_RING = { x: -18, z: 49.6 };
 const BIKE_RING = { x: 20, z: -10.9 };
 
-export const PLACES: Place[] = buildPlaces();
+/**
+ * The wired districts' places (district-life.ts): a counter (or a notice) at every door that is not a home, the chung
+ * cư kiosks, carts, market stalls, Bến Thành's night market and the book street, bins, and every seat (eatery stools,
+ * benches, bus-stop benches, Bùi Viện's night stools). Ids are unique across the city: buildings `d<id>`, POI seats
+ * `seat<poi id>` (one POI id space), props `dp:<slice>/<key>`.
+ */
+export function districtPlaces(v: DistrictView): Place[] {
+  const places: Place[] = [];
+  /** The slice that built a district building (by its id range). */
+  const sliceOf = (id: number) => v.world.slices.find((s) => id >= s.data.idBase && id < s.data.idBase + s.data.buildings.length)?.key;
+  const hoursOf = new Map<number, [number, number][]>();
+  for (const e of v.eateries) if (e.building >= 0) { const list = hoursOf.get(e.building) ?? []; if (!list.some(([a, b]) => a === e.hours[0] && b === e.hours[1])) list.push(e.hours); hoursOf.set(e.building, list); }
+  for (const b of v.buildings) {
+    const want = districtKeyOf(b);
+    if (!want) continue;
+    const at = out(b, 0.7);
+    if (typeof want !== 'string') {
+      places.push({ id: `d${b.id}`, kind: 'notice', name: b.name, key: 'notice', x: at.x, z: at.z, r: 2.4, yaw: b.facing, anchor: { ...b.door }, covers: ['door'], building: b.id, notice: want.notice });
+      continue;
+    }
+    // A quán sells while its stools are out (one clock with the crowd that sits on them); a night street's from dusk.
+    const spans = hoursOf.get(b.id) ?? (b.zone === 'night' && (b.kind === 'food' || b.kind === 'cafe') ? [[17, 2] as [number, number]] : []);
+    const key = withPrice(b.kind === 'food' || b.kind === 'cafe' ? withHours(want, spans) : want, sliceOf(b.id));
+    places.push({ id: `d${b.id}`, kind: 'counter', name: b.name, key, x: at.x, z: at.z, r: 2.4, yaw: b.facing, anchor: { ...b.door }, covers: ['counter', 'door'], building: b.id });
+  }
+  // Ground-floor kiosks of the chung cư slabs: a counter on the wall, facing out.
+  for (const k of v.kiosks) {
+    const key = withPrice(districtKeyOf({ kind: k.kind, name: k.name, typology: 'tube', stamp: null }) as string, k.slice);
+    const x = k.x + Math.sin(k.yaw) * 0.6, z = k.z + Math.cos(k.yaw) * 0.6;
+    places.push({ id: `dk:${k.slice}/${k.key}`, kind: 'counter', name: k.name, key, x, z, r: 2, yaw: k.yaw, anchor: { x: k.x, z: k.z }, covers: ['counter'], building: k.building, slice: k.slice });
+  }
+  for (const p of v.props) {
+    const id = `dp:${p.id}`;
+    if (p.kind === 'cart') {
+      const key = CART_TRADES[p.variant] ?? 'banhmi', h = p.hours;
+      places.push({ id, kind: 'counter', name: COUNTERS[key].title.toUpperCase(), key: withPrice(h ? withHours(key, [h]) : key, p.slice), x: p.x + Math.sin(p.yaw) * 0.9, z: p.z + Math.cos(p.yaw) * 0.9, r: 2.2, yaw: p.yaw, anchor: { x: p.x, z: p.z }, covers: ['counter'], building: -1, slice: p.slice });
+    } else if (p.kind === 'stall') {
+      places.push({ id, kind: 'counter', name: 'SẠP CHỢ', key: 'sap', x: p.x, z: p.z, r: 3.2, yaw: p.yaw, anchor: { x: p.x, z: p.z }, covers: ['counter'], building: -1, slice: p.slice });
+    } else if (p.kind === 'bin') {
+      places.push({ id, kind: 'bin', name: 'THÙNG RÁC', key: 'bin', x: p.x, z: p.z, r: 1.6, yaw: p.yaw, anchor: { x: p.x, z: p.z }, covers: [], building: -1, slice: p.slice });
+    } else if (p.kind === 'shelter' && !transitStops.some((t) => Math.hypot(t.x - p.x, t.z - p.z) <= t.r)) {
+      // A district bus shelter no line stops at yet (transit.ts lists the ones its buses serve): it says so.
+      places.push({ id, kind: 'notice', name: 'TRẠM XE BUÝT', key: 'notice', x: p.x, z: p.z, r: 3, yaw: p.yaw, anchor: { x: p.x, z: p.z }, covers: ['transit'], building: -1, notice: ['Trạm xe buýt', 'chưa có tuyến nào dừng ở trạm này'], slice: p.slice });
+    }
+  }
+  // THÁP BỜ SÔNG's observation deck and parachute jump (BINH_THANH_EXTRA.deck): the ticket counter at its river-side lobby door.
+  if (v.keys.has('binh-thanh')) {
+    const d = BINH_THANH_EXTRA.deck, b = v.buildings.find((x) => x.stamp === d.stamp);
+    if (b) places.push({ id: 'deck-bo-song', kind: 'deck', name: b.name, key: 'deck-bo-song', x: d.counter.x, z: d.counter.z, r: 3.2, yaw: d.counter.yaw, anchor: { x: d.counter.x, z: d.counter.z }, covers: ['door'], building: b.id, slice: 'binh-thanh' });
+  }
+  // Quận 1 south's EXTRA stalls: Bến Thành's night market on Phan Bội Châu (18–24) and the book street (8–21).
+  if (v.keys.has('quan-1-south')) {
+    type Stalls = { stalls: { x: number; z: number; yaw: number }[] };
+    const q1 = QUAN_1_SOUTH_EXTRA as unknown as { market: { night: Stalls; day: Stalls }; bookstalls: Stalls };
+    q1.market.night.stalls.forEach((st, i) => places.push({ id: `cho-dem:${i}`, kind: 'counter', name: 'CHỢ ĐÊM BẾN THÀNH', key: 'cho-dem', x: st.x + Math.sin(st.yaw) * 1.4, z: st.z + Math.cos(st.yaw) * 1.4, r: 2.2, yaw: st.yaw, anchor: { x: st.x, z: st.z }, covers: ['counter'], building: -1, slice: 'quan-1-south' }));
+    q1.market.day.stalls.forEach((st, i) => places.push({ id: `cho-ngay:${i}`, kind: 'counter', name: 'SẠP CHỢ BẾN THÀNH', key: 'sap-ben-thanh', x: st.x + Math.sin(st.yaw) * 1.4, z: st.z + Math.cos(st.yaw) * 1.4, r: 2.2, yaw: st.yaw, anchor: { x: st.x, z: st.z }, covers: ['counter'], building: -1, slice: 'quan-1-south' }));
+    q1.bookstalls.stalls.forEach((st, i) => places.push({ id: `duong-sach:${i}`, kind: 'counter', name: 'ĐƯỜNG SÁCH', key: 'sach-cu', x: st.x + Math.sin(st.yaw) * 1.2, z: st.z + Math.cos(st.yaw) * 1.2, r: 2.2, yaw: st.yaw, anchor: { x: st.x, z: st.z }, covers: ['counter'], building: -1, slice: 'quan-1-south' }));
+  }
+  // A quán table nobody can sit at (no room for a stool round it) still takes orders: its quán's counter at the table.
+  const counterOf = new Map(places.filter((p) => p.kind === 'counter' && p.id.startsWith('d')).map((p) => [p.building, p]));
+  for (const e of v.eateries) {
+    const c = e.seats.length ? null : counterOf.get(e.building);
+    if (c) places.push({ ...c, id: `dt:${e.slice}/${e.key}`, x: e.x + Math.sin(e.yaw) * 0.7, z: e.z + Math.cos(e.yaw) * 0.7, r: 1.8, yaw: e.yaw, anchor: { x: e.x, z: e.z }, covers: ['counter'], slice: e.slice });
+  }
+  // Seats: eatery stools belong to their quán (its counter takes the order), the rest are benches and bus-stop seats.
+  // Bùi Viện's night stools belong to the quán in front of them.
+  const foodDoors = v.buildings.filter((b) => b.kind === 'food' || b.kind === 'cafe');
+  const nightHost = (x: number, z: number) => { let best = -1, bestD = 16; for (const b of foodDoors) { const d = Math.hypot(b.door.x - x, b.door.z - z); if (d < bestD) { best = b.id; bestD = d; } } return best; };
+  const nightSeat = new Set(v.nightTables.flatMap((t) => t.seats));
+  for (const p of v.pois) {
+    if (!p.seat || p.kind === 'perch') continue;
+    const stool = p.kind !== 'bench' && p.kind !== 'bus-stop';
+    const host = p.building >= 0 ? p.building : nightSeat.has(p.id) ? nightHost(p.x, p.z) : -1;
+    places.push({
+      id: `seat${p.id}`, kind: 'seat', name: stool ? 'GHẾ QUÁN' : p.kind === 'bus-stop' ? 'GHẾ CHỜ XE BUÝT' : p.key.startsWith('ring-rim:') ? 'THÀNH HỒ CON RÙA' : 'GHẾ ĐÁ', key: p.kind, x: p.x, z: p.z,
+      r: stool ? 1.4 : 1.1, yaw: p.yaw, anchor: { x: p.x, z: p.z }, covers: ['seat'], building: host, poi: p.id, seat: stool ? 'stool' : 'bench', top: p.seatH, slice: p.slice,
+    });
+  }
+  return places;
+}
+
+/** Today's places, then the wired districts'. */
+export const LEGACY_PLACES: Place[] = buildPlaces();
+export const PLACES: Place[] = [...LEGACY_PLACES, ...districtPlaces(district())];
 
 /** Which counter a robbed shopkeeper stood at (within 6 m): its stars and whether it is protected. */
 export function counterAt(x: number, z: number) {

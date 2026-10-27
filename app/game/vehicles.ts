@@ -1,11 +1,11 @@
 import * as THREE from 'three';
-import { LAND, ROADS_X, ROADS_Z } from './city';
-import { STOP_LINE, lightFor } from './signals';
+import { nodeLight } from './signals';
 import { groundHeight } from './world';
 import { SECONDS_PER_HOUR } from './clock';
 import { playHorn } from './audio';
-import { ASPHALT_HALF } from './map/terrain';
 import { SPOTS, wanted as spotWanted } from './parking';
+import type { Lane, RoadEdge, RoadGraph, RoadNode } from './map/roads';
+import { hoursUntil, inHours, worldRoads, worldVersion, type WorldRoads } from './map/world-types';
 import type { RagdollLook } from './ragdoll';
 import {
   CAR_DRIVER, FIGURE, FigureBatch, HAND, RIDER, TORSO, applyRig, armFK, deriveStyle, figureGeometry, figureMaterial, handCode, limbMatrix,
@@ -16,9 +16,13 @@ import {
 } from './vehicle-models';
 
 /**
- * Traffic on the street grid: cars and motorbikes that keep to right-hand lanes, stop at red lights, turn at
- * junctions, stop for anyone on a crosswalk and ease past anything standing in their lane; police cruisers that
- * route along road centre lines to the player; and every parked vehicle in town (parking.ts spots: sidewalk
+ * Traffic on the live road graph (map/world-types.ts: today's grid plus the wired districts): cars and motorbikes in
+ * the right-hand lanes of the edges, through the nodes on smooth connectors that keep their bodies on the asphalt,
+ * stopping at red lights, yielding at junctions without lights to the main road and to whoever is already in the
+ * box, stopping for anyone on a crosswalk, shifting out of the curb lane past occupied bays (and merging behind
+ * whoever already drives where they move to), keeping off streets while they are closed (Bùi Viện's walking street,
+ * the night markets) and easing past anything standing in their lane; police cruisers that route along road centre
+ * lines to the player; and every parked vehicle in town (parking.ts spots: sidewalk
  * scooters, giữ-xe rows, car parks), which stays where it is parked, wakes when something hits it and can be
  * ridden away. Vehicles collide as capsules: an impact exchanges momentum (with spin from where it lands), knocks
  * cars out of their lane into a skid, and topples motorbikes. Vehicles left blocking the road are towed; the
@@ -33,10 +37,15 @@ export type CarMode = 'lane' | 'parked' | 'player' | 'chase' | 'hold' | 'leave' 
  * spot, never recycled into traffic), the player's own, one the player took and left, or a wreck.
  */
 export type CarRole = 'traffic' | 'police' | 'curb' | 'owned' | 'loose' | 'wreck';
-/** Why a lane vehicle waits: a light, the vehicle ahead, people crossing, crossing traffic, or something it cannot get past. */
-export type Wait = 'light' | 'queue' | 'walk' | 'cross' | 'block' | null;
+/**
+ * Why a lane vehicle waits: a light, the vehicle ahead, people crossing, crossing traffic, giving way at a junction
+ * without lights (or turning left across oncoming traffic), a gap to merge into, or something it cannot get past.
+ */
+export type Wait = 'light' | 'queue' | 'walk' | 'cross' | 'yield' | 'merge' | 'block' | null;
 type Axis = 'x' | 'z';
 type Point = { x: number; z: number };
+/** What a lane vehicle will do at the end of its edge: the connector it takes there. */
+export type Plan = Connector;
 /** Someone traffic stops for: a pedestrian on a crosswalk, or (`body`) a person lying in the road. */
 export type Walker = Point & { body?: boolean };
 export type Car = {
@@ -47,11 +56,31 @@ export type Car = {
   z: number;
   yaw: number;
   speed: number;
+  /**
+   * Lane state: the edge of the live road graph, the travel direction on it (+1 from node a to b), the arc length of
+   * the vehicle's centre from node a, its lane (index into edge.fwd or edge.back) and that lane's offset right of
+   * the centre line; through a node, the connector it is on and how far along it.
+   */
+  edge: number;
+  s: number;
+  dir: number;
+  lane: number;
+  laneOff: number;
+  conn: Connector | null;
+  connS: number;
+  /** On a connector, how far right of its path it drives (getting round something standing in the junction). */
+  connLat: number;
+  /** The connector it means to take at the end of this edge. */
+  plan: Plan | null;
+  /** Derived each frame for checks and tools: the axis it drives along ('x': more east-west), the road's cross coordinate there and its own along it. */
   axis: Axis;
   road: number;
   along: number;
-  dir: number;
-  plan: { axis: Axis; road: number; dir: number; at: number; along: number } | null;
+  /** Who it waits for this frame (a queue, a merge, giving way), and since when it has waited at a junction. */
+  waitFor: Car | null;
+  yieldSince: number;
+  /** When it last entered a node's box (who was there first goes first). */
+  boxAt: number;
   cruise: number;
   driver: RagdollLook | null;
   waypoints: Point[];
@@ -90,13 +119,10 @@ export type PlayerView = Point & { car: Car | null; wanted?: number };
 /** A player vehicle the tow truck took away, waiting for its fine at the ward police. */
 export type Impounded = { id: number; style: string; label: string; since: number; fee: number };
 
-/** Roads a vehicle can drive along an axis (east-west roads for 'x'), and the junctions it meets on the way. */
-const roadsAlong = (axis: Axis) => (axis === 'x' ? ROADS_Z : ROADS_X);
-const junctionsAlong = (axis: Axis) => (axis === 'x' ? ROADS_X : ROADS_Z);
-/** The last junction in a direction along an axis: beyond it the road only runs into the fence. */
-const lastJunction = (axis: Axis, dir: number) => { const list = junctionsAlong(axis); return dir > 0 ? list[list.length - 1] : list[0]; };
 /** How far from the player traffic is kept (and recycled from), so the streets around them stay busy. */
 const TRAFFIC_NEAR = 140, TRAFFIC_FAR = 200;
+/** Ngã tư Hàng Xanh (binh-thanh.ts BINH_THANH_EXTRA.hangXanh) and the half-size of the box round it that jams at the evening rush. */
+const HANG_XANH = { x: -390, z: 0, r: 130 } as const;
 export const CAR_HALF_WIDTH = 1.05;
 export const CAR_HALF_LENGTH = 2.3;
 export const CAR_HEALTH = 160;
@@ -166,10 +192,21 @@ export function impulse(a: Body, b: Body, c: { nx: number; nz: number; px: numbe
 }
 // Cars keep to the middle of the right-hand side, motorbikes hug the curb.
 const LANES: Record<CarKind, number> = { traffic: 3.0, police: 3.0, moto: 5.4 };
-// Sài Gòn traffic is motorbikes: at most CAR_LANES cars run beside 25 bikes (83%); the spare cars are there for the
-// zombie mode's wrecks. FLOW is the share of them on the road by the hour (rush hours full, the small hours a quarter).
-const COUNTS: Record<CarKind, number> = { traffic: 8, police: 8, moto: 25 };
-const CAR_LANES = 5;
+// Sài Gòn traffic is motorbikes (about 83%): the lane fleet's cap follows the quality level (design-engine §8: 60 / 45
+// / 30 vehicles on High / Medium / Low), and within it the streets round the player get as many as their lanes hold
+// (LANE_METRES per bike, per car), by the hour's flow (rush hours full, the small hours a quarter). The spare cars are
+// there for the zombie mode's wrecks.
+const COUNTS: Record<CarKind, number> = { traffic: 13, police: 8, moto: 50 };
+/** Lane fleet caps by quality level (quality.ts QUALITY_LEVELS order: Cao … Tối thiểu). */
+const FLEET_CAPS: readonly { moto: number; traffic: number }[] = [
+  { moto: 50, traffic: 10 }, { moto: 38, traffic: 7 }, { moto: 38, traffic: 7 }, { moto: 25, traffic: 5 }, { moto: 25, traffic: 5 }, { moto: 25, traffic: 5 },
+];
+/** Lane metres (length times lanes, within TRAFFIC_NEAR) per motorbike and per car at the full flow: today's grid round An Hòa (about 9 km of lanes) holds the whole High fleet. */
+const LANE_METRES = { moto: 175, traffic: 900 } as const;
+/** The quality level until the game sets one: the smallest fleet (today's 25 bikes and 5 cars), as tests and sims run. */
+const DEFAULT_LEVEL = 5;
+/** A strongly connected set of lane states smaller than this is not driven unless it is the largest (a stub, a parking aisle). */
+const MIN_OPEN = 40;
 /** Share of the lane fleet running at an hour: rush 6:30-8:30 and 16:30-19:00, daytime 0.75, late evening 0.5, night 0.25. */
 export function flowShare(hour: number) {
   const h = ((hour % 24) + 24) % 24;
@@ -178,8 +215,15 @@ export function flowShare(hour: number) {
   if ((h >= 21 && h < 23) || (h >= 5 && h < 6.5)) return 0.5;
   return 0.25;
 }
-/** How many of a kind may run in the lanes at an hour. */
-const laneAllowance = (kind: CarKind, hour: number) => Math.round((kind === 'moto' ? COUNTS.moto : CAR_LANES) * flowShare(hour));
+/**
+ * How many of a kind may run in the lanes at an hour: the quality level's cap, fewer where the streets round the player
+ * have few lanes (`laneMetres`, Infinity: no limit), times the hour's flow.
+ */
+const laneAllowance = (kind: CarKind, hour: number, level = DEFAULT_LEVEL, laneMetres = Infinity) => {
+  if (kind === 'police') return 0;
+  const cap = FLEET_CAPS[Math.max(0, Math.min(FLEET_CAPS.length - 1, level))][kind];
+  return Math.round(Math.max(Math.min(cap, laneMetres / LANE_METRES[kind]), kind === 'moto' ? 6 : 1) * flowShare(hour));
+};
 const BODY_COLORS = ['#c9493b', '#3f6f9f', '#e8d6a8', '#5e927c', '#f0f0ea', '#2f3a40', '#d98c3c', '#8c6fae', '#9fb4d6', '#b8b2a4'];
 const MOTO_COLORS = ['#ed763e', '#4f86c6', '#c9493b', '#e8e2d0', '#2b2f33', '#86b8a0', '#d4b164', '#a57fb0'];
 const TAXI_COLORS = ['#f3f1ea', '#3a9a68'];
@@ -522,50 +566,400 @@ function angleLerp(from: number, to: number, t: number) {
 }
 
 
-/** Position of a lane-driving vehicle from its road, along-coordinate, direction and distance right of the centre line. */
-function lanePoint(kind: CarKind, axis: Axis, road: number, along: number, dir: number, lateral = LANES[kind]) {
-  return axis === 'x' ? { x: along, z: road + dir * lateral, yaw: dir > 0 ? Math.PI / 2 : -Math.PI / 2 } : { x: road - dir * lateral, z: along, yaw: dir > 0 ? 0 : Math.PI };
+// ---- The lane network on the live road graph --------------------------------------------------------------------
+
+/** A travel state: an edge driven one way (edge * 2, plus 1 when driven from node b to node a). */
+export const stateOf = (edge: number, dir: number) => edge * 2 + (dir > 0 ? 0 : 1);
+const dirOfState = (k: number): 1 | -1 => (k & 1 ? -1 : 1);
+type Use = 'car' | 'moto';
+const laneUseOf = (kind: CarKind): Use => (kind === 'moto' ? 'moto' : 'car');
+/** Body half-width and half-length a kind's connectors are laid out for. */
+const BODY: Record<Use, [number, number]> = { car: [CAR_HALF_WIDTH, CAR_HALF_LENGTH], moto: [0.4, 1.0] };
+/** Sideways acceleration (m/s²) traffic accepts through a node. */
+const GRIP: Record<Use, number> = { car: 3.2, moto: 4.0 };
+/** A body keeps this far inside the edge of the asphalt. */
+const KERB_CLEAR = 0.15;
+
+/**
+ * A way through a node: from a lane of one travel state to a lane of the next, leaving the in-edge at arc `sIn` and
+ * joining the out-edge at arc `sOut` (arc lengths from each edge's node a), `latOut` metres right of the out-edge's
+ * centre line. Turning, its path is a quadratic corner between the two lane lines, as wide as the body allows on the
+ * asphalt (a tight right turn swings out and ends wider than its lane, then eases back in); straight on, an ease from
+ * one lane line to the other; a U-turn, a half circle across the road.
+ */
+export type Connector = {
+  id: number; node: number; from: number; to: number; inLane: number; outLane: number;
+  sIn: number; sOut: number; latOut: number;
+  /** -1 left, 0 straight on, 1 right, 2 back the way it came. */
+  turn: number;
+  /** The path (x,z pairs), arc length at each point, and its length. */
+  pts: Float64Array; cum: Float64Array; len: number;
+  /** Comfortable speed through it (m/s). */
+  vmax: number;
+  /** How far before the node, along the in-edge, it starts. */
+  before: number;
+  /** Half width of the bodies it is laid out for (cars or motorbikes). */
+  hw: number;
+};
+
+/** Distance from (x, z) to a polyline (x,z pairs). */
+function polylineDistance(p: readonly number[], x: number, z: number) {
+  let best = Infinity;
+  for (let k = 0; k + 3 < p.length; k += 2) {
+    const ax = p[k], az = p[k + 1], dx = p[k + 2] - ax, dz = p[k + 3] - az, l2 = dx * dx + dz * dz;
+    const t = l2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / l2)) : 0;
+    const ex = x - ax - dx * t, ez = z - az - dz * t, d = ex * ex + ez * ez;
+    if (d < best) best = d;
+  }
+  return Math.sqrt(best);
+}
+/** Where a vehicle `lat` metres right of an edge's centre line is at arc s, driving `dir`, and its heading. */
+function laneAt(roads: RoadGraph, e: RoadEdge, s: number, dir: number, lat: number) {
+  const p = roads.pointAt(e, s), hx = p.hx * dir, hz = p.hz * dir;
+  return { x: p.x - hz * lat, z: p.z + hx * lat, hx, hz };
 }
 
-/** Whether a point is on a carriageway (north-south roads start at the riverside road). */
+export type LaneNet = ReturnType<typeof createLaneNet>;
+/**
+ * Everything traffic derives from the live roads: each travel state's lanes for cars and motorbikes, where it can go
+ * at its far node and how it turns there, which arms of a junction without lights are the main road, the
+ * connectors (built when first needed, then shared), which connectors cross, and which states are open now: those
+ * in the largest strongly connected part of the network once the closed streets (and those about to close) are
+ * left out, so traffic never turns into a dead end or a street it could not leave.
+ */
+export function createLaneNet(world: WorldRoads) {
+  const roads = world.roads, edges = roads.edges, nodes = roads.nodes, S = edges.length * 2;
+  const armOf = new Int32Array(edges.length * 2).fill(-1);
+  nodes.forEach((n) => n.arms.forEach((a, i) => { armOf[a.edge * 2 + a.end] = i; }));
+  const arrival = (k: number) => (dirOfState(k) > 0 ? edges[k >> 1].b : edges[k >> 1].a);
+  const departure = (k: number) => (dirOfState(k) > 0 ? edges[k >> 1].a : edges[k >> 1].b);
+  /** The arm a state reaches its far node along, and the arm it leaves its near node by. */
+  const inArm = (k: number) => nodes[arrival(k)].arms[armOf[(k >> 1) * 2 + (dirOfState(k) > 0 ? 1 : 0)]];
+  const outArm = (k: number) => nodes[departure(k)].arms[armOf[(k >> 1) * 2 + (dirOfState(k) > 0 ? 0 : 1)]];
+  const lanesOf = (k: number): Lane[] => (dirOfState(k) > 0 ? edges[k >> 1].fwd : edges[k >> 1].back);
+  /** Lane indices a kind may use in a state, from the centre line out to the curb. */
+  const laneLists: Record<Use, number[][]> = { car: [], moto: [] };
+  for (let k = 0; k < S; k++) {
+    for (const use of ['car', 'moto'] as Use[]) {
+      const list: number[] = [];
+      lanesOf(k).forEach((l, i) => { if (l.use === use || l.use === 'any') list.push(i); });
+      laneLists[use].push(list.sort((a, b) => lanesOf(k)[a].off - lanesOf(k)[b].off));
+    }
+  }
+  const lanesFor = (k: number, use: Use) => laneLists[use][k];
+  /** States leaving each state's far node (never straight back along itself). */
+  const exits: number[][] = [];
+  for (let k = 0; k < S; k++) exits.push(nodes[arrival(k)].arms.map((a) => stateOf(a.edge, a.end === 0 ? 1 : -1)).filter((o) => o !== (k ^ 1)));
+  /** -1 left, 0 straight on, 1 right, 2 back. */
+  function turnOf(from: number, to: number) {
+    if (to === (from ^ 1)) return 2;
+    const a = inArm(from), b = outArm(to), hx = -a.hx, hz = -a.hz, dot = hx * b.hx + hz * b.hz;
+    if (dot > 0.75) return 0;
+    if (dot < -0.97) return 2;
+    return hx * b.hz - hz * b.hx > 0 ? 1 : -1;
+  }
+  /** A junction: three or more roads (not a fence end). */
+  const isJunction = (n: RoadNode) => n.arms.length >= 3 && n.control !== 'fence-end';
+  /**
+   * The main road through each junction without lights: the pair of arms most nearly opposite, ranked by class and
+   * width, a street running on under one name preferred; any bigger road joining it is main road too. Where no two
+   * arms are opposite, the biggest roads are.
+   */
+  const rank = (e: RoadEdge) => (e.cls === 'R1' ? 200 : e.cls === 'R2' ? 100 : 0) + e.half + (e.traffic ? 50 : 0);
+  const major = nodes.map((n) => {
+    const m = new Uint8Array(n.arms.length);
+    if (!isJunction(n)) return m.fill(1);
+    let bi = -1, bj = -1, best = -Infinity;
+    for (let i = 0; i < n.arms.length; i++) {
+      for (let j = i + 1; j < n.arms.length; j++) {
+        const a = n.arms[i], b = n.arms[j], dot = a.hx * b.hx + a.hz * b.hz;
+        if (dot > -0.7) continue;
+        const ea = edges[a.edge], eb = edges[b.edge];
+        const score = Math.min(rank(ea), rank(eb)) * 2 + (ea.name === eb.name ? 50 : 0) - dot * 10;
+        if (score > best) { best = score; bi = i; bj = j; }
+      }
+    }
+    if (bi >= 0) {
+      m[bi] = m[bj] = 1;
+      const floor = Math.min(rank(edges[n.arms[bi].edge]), rank(edges[n.arms[bj].edge]));
+      n.arms.forEach((a, i) => { if (rank(edges[a.edge]) > floor + 20) m[i] = 1; });
+    } else {
+      const top = Math.max(...n.arms.map((a) => rank(edges[a.edge])));
+      n.arms.forEach((a, i) => { if (rank(edges[a.edge]) >= top - 1e-6) m[i] = 1; });
+    }
+    return m;
+  });
+  /** Whether a state reaches its far node on the main road (always, at a node with lights or none to give way at). */
+  const onMajor = (k: number) => major[arrival(k)][armOf[(k >> 1) * 2 + (dirOfState(k) > 0 ? 1 : 0)]] === 1;
+  /** The asphalt round each node: its roads (not hẻm) as edges whose centre lines a body must stay within. */
+  const carriage = nodes.map((n) => [...new Set(n.arms.map((a) => a.edge))].filter((e) => edges[e].cls !== 'hem' || n.arms.every((a) => edges[a.edge].cls === 'hem')));
+  const onCarriage = (list: number[], x: number, z: number) => {
+    for (const id of list) { const e = edges[id]; if (polylineDistance(e.pts, x, z) < e.half - KERB_CLEAR) return true; }
+    return false;
+  };
+
+  // ---- Connectors ----
+  let ids = 0;
+  const cache = new Map<number, Connector>();
+  /** Off-asphalt body points along a path (x,z pairs with headings), counting each bad sample once. */
+  function offAsphalt(list: number[], pts: number[], hw: number, hl: number) {
+    let bad = 0;
+    for (let i = 0; i < pts.length; i += 2) {
+      const j = Math.min(pts.length - 2, i + 2), k = Math.max(0, i - 2);
+      let hx = pts[j] - pts[k], hz = pts[j + 1] - pts[k + 1];
+      const l = Math.hypot(hx, hz) || 1;
+      hx /= l; hz /= l;
+      const x = pts[i], z = pts[i + 1], ax = hl * 0.75, rx = -hz * hw, rz = hx * hw;
+      if (!onCarriage(list, x + rx, z + rz) || !onCarriage(list, x - rx, z - rz)
+        || !onCarriage(list, x + hx * ax + rx, z + hz * ax + rz) || !onCarriage(list, x + hx * ax - rx, z + hz * ax - rz)
+        || !onCarriage(list, x - hx * ax + rx, z - hz * ax + rz) || !onCarriage(list, x - hx * ax - rx, z - hz * ax - rz)) bad++;
+    }
+    return bad;
+  }
+  function make(node: number, from: number, inLane: number, to: number, outLane: number, turn: number, pts: number[], sIn: number, sOut: number, latOut: number, before: number, use: Use): Connector {
+    const n = pts.length / 2, cum = new Float64Array(n);
+    for (let i = 1; i < n; i++) cum[i] = cum[i - 1] + Math.hypot(pts[i * 2] - pts[i * 2 - 2], pts[i * 2 + 1] - pts[i * 2 - 1]);
+    // Tightest radius along it, from the turn between successive chords.
+    let rmin = Infinity;
+    for (let i = 1; i + 1 < n; i++) {
+      const ax = pts[i * 2] - pts[i * 2 - 2], az = pts[i * 2 + 1] - pts[i * 2 - 1], bx = pts[i * 2 + 2] - pts[i * 2], bz = pts[i * 2 + 3] - pts[i * 2 + 1];
+      const la = Math.hypot(ax, az), lb = Math.hypot(bx, bz);
+      if (la < 1e-6 || lb < 1e-6) continue;
+      const ang = Math.abs(Math.atan2(ax * bz - az * bx, ax * bx + az * bz));
+      if (ang > 1e-4) rmin = Math.min(rmin, ((la + lb) / 2) / ang);
+    }
+    const vmax = Math.max(2.2, Math.min(16, Math.sqrt(GRIP[use] * rmin)));
+    return { id: ids++, node, from, to, inLane, outLane, sIn, sOut, latOut, turn, pts: Float64Array.from(pts), cum, len: cum[n - 1], vmax, before, hw: BODY[use][0] };
+  }
+  function build(from: number, inLane: number, to: number, outLane: number, use: Use): Connector {
+    const e1 = edges[from >> 1], d1 = dirOfState(from), e2 = edges[to >> 1], d2 = dirOfState(to);
+    const node = arrival(from), n = nodes[node], L1 = lanesOf(from)[inLane], L2 = lanesOf(to)[outLane];
+    const turn = turnOf(from, to), [hw, hl] = BODY[use], a1 = inArm(from), a2 = outArm(to), junction = isJunction(n);
+    const room1 = Math.max(0.4, e1.len * 0.48), room2 = Math.max(0.4, e2.len * 0.48);
+    const sAt1 = (t: number) => (d1 > 0 ? e1.len - t : t), sAt2 = (u: number) => (d2 > 0 ? u : e2.len - u);
+    const at1 = (t: number, lat: number) => laneAt(roads, e1, sAt1(t), d1, lat), at2 = (u: number, lat: number) => laneAt(roads, e2, sAt2(u), d2, lat);
+    const list = carriage[node];
+    if (turn === 2) {
+      // Round across the road in a half circle, short of the node (at a dead end, short of its barrier).
+      const t = Math.min(room1, Math.max(junction ? a1.setback : 0, 5 + (L1.off + L2.off) / 2));
+      const A = at1(t, L1.off), B = at2(t, L2.off), k = (4 / 3) * (Math.hypot(B.x - A.x, B.z - A.z) / 2), pts: number[] = [];
+      for (let i = 0; i <= 16; i++) {
+        const u = i / 16, v = 1 - u, b0 = v * v * v, b1 = 3 * v * v * u, b2 = 3 * v * u * u, b3 = u * u * u;
+        pts.push(b0 * A.x + b1 * (A.x + A.hx * k) + b2 * (B.x - B.hx * k) + b3 * B.x, b0 * A.z + b1 * (A.z + A.hz * k) + b2 * (B.z - B.hz * k) + b3 * B.z);
+      }
+      return make(node, from, inLane, to, outLane, turn, pts, sAt1(t), sAt2(t), L2.off, t, use);
+    }
+    // How far back along the in-edge it may start (the stop line at a junction) and on along the out-edge it may end.
+    const back = junction ? Math.min(a1.setback, room1) : Math.min(turn === 0 ? 3 : 9, room1);
+    const on = junction ? Math.min(Math.max(a2.setback, 6), room2) : Math.min(turn === 0 ? 3 : 9, room2);
+    if (turn === 0) {
+      const A = at1(back, L1.off), B = at2(on, L2.off), D = Math.hypot(B.x - A.x, B.z - A.z) / 3, pts: number[] = [];
+      const steps = Math.max(2, Math.ceil((D * 3) / 1.5));
+      for (let i = 0; i <= steps; i++) {
+        const u = i / steps, v = 1 - u, b0 = v * v * v, b1 = 3 * v * v * u, b2 = 3 * v * u * u, b3 = u * u * u;
+        pts.push(b0 * A.x + b1 * (A.x + A.hx * D) + b2 * (B.x - B.hx * D) + b3 * B.x, b0 * A.z + b1 * (A.z + A.hz * D) + b2 * (B.z - B.hz * D) + b3 * B.z);
+      }
+      return make(node, from, inLane, to, outLane, turn, pts, sAt1(back), sAt2(on), L2.off, back, use);
+    }
+    // A turn: the quadratic corner between the lane lines, as wide as fits on the asphalt. A right turn round a tight
+    // kerb may also end nearer the centre line than its lane (it swings out); a left turn either side of its lane.
+    const maxLat = e2.half - hw - KERB_CLEAR - 0.1, minLat = Math.min(L2.off, hw + 0.3);
+    const lats = [L2.off];
+    for (let d = 0.6; d <= 2.4 + 1e-9; d += 0.6) {
+      for (const l of turn > 0 ? [L2.off - d] : [L2.off + d, L2.off - d]) if (l <= maxLat && l >= minLat) lats.push(l);
+    }
+    /** Tightest radius of a sampled path. */
+    const radius = (pts: number[]) => {
+      let r = Infinity;
+      for (let i = 2; i + 3 < pts.length; i += 2) {
+        const ax = pts[i] - pts[i - 2], az = pts[i + 1] - pts[i - 1], bx = pts[i + 2] - pts[i], bz = pts[i + 3] - pts[i + 1];
+        const ang = Math.abs(Math.atan2(ax * bz - az * bx, ax * bx + az * bz));
+        if (ang > 1e-4) r = Math.min(r, (Math.hypot(ax, az) + Math.hypot(bx, bz)) / 2 / ang);
+      }
+      return r;
+    };
+    let best: { pts: number[]; t: number; u: number; lat: number; bad: number; score: number } | null = null;
+    for (const lat of lats) {
+      // Past a valid corner that keeps the lane, a wider swing has to earn its place (a much rounder corner).
+      if (best && best.bad === 0 && Math.abs(lat - L2.off) > 1.25) break;
+      for (const f of [1, 0.82, 0.66, 0.52, 0.4, 0.3]) {
+        const t = Math.max(0.3, back * f), u = Math.max(0.3, on * f);
+        const A = at1(t, L1.off), B = at2(u, lat);
+        // Where the two lane lines meet: ahead of A along its heading, before B along its own.
+        const c = A.hx * B.hz - A.hz * B.hx;
+        if (Math.abs(c) < 1e-6) continue;
+        const v = ((B.x - A.x) * B.hz - (B.z - A.z) * B.hx) / c, w = -((B.x - A.x) * A.hz - (B.z - A.z) * A.hx) / c;
+        if (!(v > 0.15 && w > 0.15)) continue;
+        const Cx = A.x + A.hx * v, Cz = A.z + A.hz * v, steps = Math.max(6, Math.ceil((v + w) / 0.6)), pts: number[] = [];
+        for (let i = 0; i <= steps; i++) {
+          const q = i / steps, r = 1 - q;
+          pts.push(r * r * A.x + 2 * q * r * Cx + q * q * B.x, r * r * A.z + 2 * q * r * Cz + q * q * B.z);
+        }
+        const bad = offAsphalt(list, pts, hw, hl);
+        // The roundest corner on the asphalt, a little against leaving the lane.
+        const score = Math.sqrt(Math.min(radius(pts), 60)) - 0.6 * Math.abs(lat - L2.off);
+        if (!best || bad < best.bad || (bad === 0 && best.bad === 0 && score > best.score)) best = { pts, t, u, lat, bad, score };
+        // The first that fits at this offset is its roundest.
+        if (bad === 0) break;
+      }
+    }
+    // Lines that never meet ahead (a hairpin): a straight ease, as on.
+    const A = at1(back, L1.off), B = at2(on, L2.off);
+    const pick = best ?? { pts: [A.x, A.z, (A.x + B.x) / 2, (A.z + B.z) / 2, B.x, B.z], t: back, u: on, lat: L2.off, bad: 0, score: 0 };
+    return make(node, from, inLane, to, outLane, turn, pick.pts, sAt1(pick.t), sAt2(pick.u), pick.lat, pick.t, use);
+  }
+  /** The connector from lane `inLane` of state `from` to lane `outLane` of state `to` (built once, then shared). */
+  function connector(from: number, inLane: number, to: number, outLane: number, use: Use) {
+    const key = (((from * 4 + inLane) * S + to) * 4 + outLane) * 2 + (use === 'moto' ? 1 : 0);
+    let c = cache.get(key);
+    if (!c) cache.set(key, (c = build(from, inLane, to, outLane, use)));
+    return c;
+  }
+  /** Whether two connectors through the same node cross or come within two bodies' width of each other. */
+  const crossings = new Map<number, boolean>();
+  function conflicts(a: Connector, b: Connector) {
+    if (a === b || a.node !== b.node) return false;
+    // Following one another out of the same lane is queueing, not crossing.
+    if (a.from === b.from && a.inLane === b.inLane) return false;
+    const key = a.id < b.id ? a.id * 1048576 + b.id : b.id * 1048576 + a.id;
+    let hit = crossings.get(key);
+    if (hit === undefined) {
+      hit = false;
+      // Converging on the same lane is a conflict; leaving side by side in different lanes is not.
+      const clear = a.hw + b.hw + 0.35;
+      for (let i = 0; i < a.pts.length && !hit; i += 2) {
+        for (let j = 0; j < b.pts.length; j += 2) if (Math.hypot(a.pts[i] - b.pts[j], a.pts[i + 1] - b.pts[j + 1]) < clear) { hit = true; break; }
+      }
+      crossings.set(key, hit);
+    }
+    return hit;
+  }
+
+  // ---- Which states are open now ----
+  const base = new Uint8Array(S);
+  for (let k = 0; k < S; k++) base[k] = edges[k >> 1].traffic && !edges[k >> 1].closed && lanesOf(k).length ? 1 : 0;
+  /** Edges with closing hours. */
+  const timed = world.edges.flatMap((info, i) => (info.closed ? [i] : []));
+  let openKey = '\u0000', open = new Uint8Array(S);
+  /** Closed now, or closing within `ahead` game hours (traffic stays out of a street about to close). */
+  const closedAt = (edge: number, hours: number, ahead = 0) => hoursUntil(world.edges[edge].closed, hours) <= ahead;
+  /** Marks the strongly connected sets of states among those `ok` that traffic drives (Tarjan, iteratively). */
+  function largest(ok: Uint8Array) {
+    const index = new Int32Array(S).fill(-1), low = new Int32Array(S), on = new Uint8Array(S), comp = new Int32Array(S).fill(-1);
+    const stack: number[] = [], work: number[] = [], next: number[] = [];
+    let counter = 0, comps = 0;
+    const sizes: number[] = [];
+    for (let root = 0; root < S; root++) {
+      if (!ok[root] || index[root] >= 0) continue;
+      work.push(root); next.push(0);
+      index[root] = low[root] = counter++; stack.push(root); on[root] = 1;
+      while (work.length) {
+        const v = work[work.length - 1], i = next[next.length - 1], out = exits[v];
+        if (i < out.length) {
+          next[next.length - 1]++;
+          const w = out[i];
+          if (!ok[w]) continue;
+          if (index[w] < 0) { index[w] = low[w] = counter++; stack.push(w); on[w] = 1; work.push(w); next.push(0); }
+          else if (on[w]) low[v] = Math.min(low[v], index[w]);
+          continue;
+        }
+        work.pop(); next.pop();
+        if (work.length) { const u = work[work.length - 1]; low[u] = Math.min(low[u], low[v]); }
+        if (low[v] === index[v]) {
+          let size = 0, w: number;
+          do { w = stack.pop()!; on[w] = 0; comp[w] = comps; size++; } while (w !== v);
+          sizes.push(size); comps++;
+        }
+      }
+    }
+    // The largest set, and every other one big enough to be a district of its own (Thủ Thiêm, reached only by the đò
+    // ngang): no lane joins two sets, so traffic never crosses between them, and it spawns only round the player.
+    let big = -1;
+    sizes.forEach((s, c) => { if (big < 0 || s > sizes[big]) big = c; });
+    const out = new Uint8Array(S);
+    for (let k = 0; k < S; k++) out[k] = comp[k] >= 0 && (comp[k] === big || sizes[comp[k]] >= MIN_OPEN) ? 1 : 0;
+    return out;
+  }
+  /** Brings the open set up to the hour (rebuilt only when a street opens or closes). */
+  function refresh(hours: number, ahead: number) {
+    const shut = timed.filter((e) => closedAt(e, hours, ahead));
+    const key = shut.join(',');
+    if (key === openKey) return;
+    openKey = key;
+    const ok = base.slice();
+    for (const e of shut) ok[e * 2] = ok[e * 2 + 1] = 0;
+    open = largest(ok);
+  }
+  refresh(12, 0);
+  /**
+   * The way out for a vehicle on a state outside the open network (a street that is closing, or closed round it, a
+   * dead end): the exit that starts the shortest way (in nodes) back into it, through any street a car can drive
+   * (closed ones included: it is already inside). -1 when there is none.
+   */
+  const outs = new Map<number, number>();
+  let outsKey = '';
+  function wayOut(k: number, use: Use) {
+    if (outsKey !== openKey) { outs.clear(); outsKey = openKey; }
+    const key = k * 2 + (use === 'moto' ? 1 : 0);
+    const hit = outs.get(key);
+    if (hit !== undefined) return hit;
+    const first = new Map<number, number>(), queue: number[] = [];
+    for (const o of exits[k]) if (base[o] && lanesFor(o, use).length && !first.has(o)) { first.set(o, o); queue.push(o); }
+    let found = -1;
+    for (let i = 0; i < queue.length && found < 0; i++) {
+      const v = queue[i];
+      if (open[v]) { found = first.get(v)!; break; }
+      for (const w of exits[v]) if (base[w] && lanesFor(w, use).length && !first.has(w)) { first.set(w, first.get(v)!); queue.push(w); }
+    }
+    outs.set(key, found);
+    return found;
+  }
+
+  /** Whether a body (centre, heading, half width and length) stands on the asphalt round a node. */
+  function fits(node: number, x: number, z: number, hx: number, hz: number, hw: number, hl: number) {
+    const list = carriage[node], rx = -hz * hw, rz = hx * hw, ax = hx * hl * 0.85, az = hz * hl * 0.85;
+    return onCarriage(list, x + ax + rx, z + az + rz) && onCarriage(list, x + ax - rx, z + az - rz) && onCarriage(list, x - ax + rx, z - az + rz) && onCarriage(list, x - ax - rx, z - az - rz);
+  }
+
+  return {
+    world, roads, S, exits, arrival, departure, inArm, outArm, lanesOf, lanesFor, turnOf, isJunction, onMajor, connector, conflicts, refresh, closedAt, wayOut, fits,
+    /** Whether a state is open (in the connected network, its street not closed or about to close). */
+    open: (k: number) => open[k] === 1,
+    /** Whether a state carries traffic at all (whatever the hour). */
+    drivable: (k: number) => base[k] === 1,
+  };
+}
+const laneNets = new Map<number, LaneNet>();
+/** The lane network of the live roads (rebuilt when the wiring hands over a new map). */
+export function laneNet(): LaneNet {
+  const v = worldVersion();
+  let net = laneNets.get(v);
+  if (!net) { laneNets.clear(); laneNets.set(v, (net = createLaneNet(worldRoads()))); }
+  return net;
+}
+
+/**
+ * Whether a point is on a carriageway of the live roads (asphalt of a road or a hẻm, junction boxes included as the
+ * roads crossing them).
+ */
 export function onAsphalt(x: number, z: number) {
-  return ROADS_Z.some((r) => Math.abs(z - r) < ASPHALT_HALF) || (z > ROADS_Z[0] - ASPHALT_HALF && ROADS_X.some((r) => Math.abs(x - r) < ASPHALT_HALF));
+  return !!worldRoads().roads.edgeAt(x, z);
 }
 
-/** Nearest point on a road centre line, used as the police destination. */
-function snapToRoad(x: number, z: number) {
-  let best = { x: ROADS_X[0], z, axis: 'z' as Axis, road: ROADS_X[0], d: Infinity };
-  for (const r of ROADS_X) {
-    const dv = Math.abs(x - r);
-    if (dv < best.d) best = { x: r, z: THREE.MathUtils.clamp(z, ROADS_Z[0], LAND.maxZ - 3), axis: 'z', road: r, d: dv };
-  }
-  for (const r of ROADS_Z) {
-    const dh = Math.abs(z - r);
-    if (dh < best.d) best = { x: THREE.MathUtils.clamp(x, LAND.minX + 3, LAND.maxX - 3), z: r, axis: 'x', road: r, d: dh };
-  }
-  return best;
-}
-
-/** Waypoints along road centre lines from one point to another (at most one detour road). */
+/** Waypoints along road centre lines from one point to another (the quickest way for a car), ending on the road nearest the target. */
 function roadRoute(fromX: number, fromZ: number, toX: number, toZ: number): Point[] {
-  const a = snapToRoad(fromX, fromZ);
-  const b = snapToRoad(toX, toZ);
-  const route: Point[] = [];
-  if (a.axis === b.axis && a.road === b.road) route.push({ x: b.x, z: b.z });
-  else if (a.axis !== b.axis) {
-    route.push(a.axis === 'z' ? { x: a.road, z: b.road } : { x: b.road, z: a.road });
-    route.push({ x: b.x, z: b.z });
-  } else {
-    // Parallel roads: cross over on whichever perpendicular road is the shortest detour.
-    const from = a.axis === 'z' ? a.z : a.x, to = a.axis === 'z' ? b.z : b.x;
-    const cross = junctionsAlong(a.axis);
-    const via = cross.reduce((best, r) => Math.abs(from - r) + Math.abs(to - r) < Math.abs(from - best) + Math.abs(to - best) ? r : best, cross[0]);
-    if (a.axis === 'z') route.push({ x: a.road, z: via }, { x: b.road, z: via });
-    else route.push({ x: via, z: a.road }, { x: via, z: b.road });
-    route.push({ x: b.x, z: b.z });
-  }
-  if (a.d > 1.5) route.unshift({ x: a.x, z: a.z });
-  return route;
+  const roads = worldRoads().roads;
+  // Both ends on the nearest road a car can drive (not a hẻm beside them).
+  const drivable = (e: RoadEdge) => e.traffic && !e.closed && e.fwd.length + e.back.length > 0 && e.cls !== 'hem';
+  const a = roads.nearestEdge(fromX, fromZ, 80, drivable), b = roads.nearestEdge(toX, toZ, 120, drivable);
+  if (!a || !b) return [{ x: toX, z: toZ }];
+  const r = roads.route(a.x, a.z, b.x, b.z, { use: 'car', snap: 1 });
+  if (!r) return [{ x: toX, z: toZ }];
+  // Ends on the road nearest the target (the cruiser stops there; its crew walks the rest).
+  const out = r.points.slice(1).map((p) => ({ x: p.x, z: p.z }));
+  const first = r.points[0];
+  if (Math.hypot(first.x - fromX, first.z - fromZ) > 1.5) out.unshift({ x: first.x, z: first.z });
+  return out;
 }
 
 /**
@@ -619,7 +1013,8 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   const random = () => { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; };
   const cars: Car[] = [];
   const blank = (index: number, kind: CarKind, role: CarRole): Car => ({
-    index, kind, mode: 'off', x: 0, z: 0, yaw: 0, speed: 0, axis: 'x', road: 0, along: 0, dir: 1, plan: null,
+    index, kind, mode: 'off', x: 0, z: 0, yaw: 0, speed: 0, edge: 0, s: 0, dir: 1, lane: 0, laneOff: LANES[kind], conn: null, connS: 0, connLat: 0, plan: null,
+    axis: 'x', road: 0, along: 0, waitFor: null, yieldSince: -1, boxAt: 0,
     cruise: 10, driver: null, waypoints: [], routeAt: 0, timer: 0, stuck: 0, health: CAR_HEALTH,
     vx: 0, vz: 0, spin: 0, fallen: false, recoverAt: 0,
     role, plate: plateOf(kind === 'moto', index * 3 + (kind === 'moto' ? 1 : kind === 'police' ? 2 : 0)), lateral: LANES[kind], lateralTarget: LANES[kind],
@@ -668,6 +1063,19 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       if (list) for (const id of list) nearIds[n++] = id;
     }
     return n;
+  }
+  /** Spots by 32 m cell (DRAW_CELL), for drawing: the cells within draw range are a few hundred, not thousands. */
+  const DRAW_CELL = 32;
+  const drawCells = new Map<number, Int32Array>();
+  {
+    const lists = new Map<number, number[]>();
+    for (const s of SPOTS) {
+      const key = cellKey(Math.floor(s.x / DRAW_CELL), Math.floor(s.z / DRAW_CELL));
+      let list = lists.get(key);
+      if (!list) lists.set(key, (list = []));
+      list.push(s.id);
+    }
+    for (const [k, l] of lists) drawCells.set(k, Int32Array.from(l));
   }
 
   // The clock the parked vehicles follow (game.ts keeps it in step with setClock; it runs on its own meanwhile).
@@ -893,17 +1301,33 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     modelOf[n].body.setColorAt(slotOf[n], color);
     modelOf[n].body.instanceColor!.needsUpdate = true;
   }
-  /** Leaves a vehicle abandoned somewhere on the roads, often across a lane. */
-  function wreck(car: Car) {
+  /**
+   * A random point on the traffic roads between rMin and rMax of (cx, cz), uniform over their length (edges near the
+   * point, each sampled where it lies in the ring): the edge, the arc, the centre-line point and its heading.
+   */
+  const ringEdges: { edge: RoadEdge; w: number }[] = [];
+  function roadPoint(cx: number, cz: number, rMin: number, rMax: number, ok: (e: RoadEdge) => boolean = (e) => e.traffic) {
+    const roads = worldRoads().roads;
+    ringEdges.length = 0;
+    let total = 0;
+    for (const h of roads.edgesNear(cx, cz, rMax, ok)) { const w = Math.min(h.edge.len, 2 * rMax); ringEdges.push({ edge: h.edge, w }); total += w; }
+    for (let attempt = 0; attempt < 12 && total > 0; attempt++) {
+      let pick = random() * total, e = ringEdges[0].edge;
+      for (const r of ringEdges) { pick -= r.w; if (pick <= 0) { e = r.edge; break; } }
+      const s = random() * e.len, p = roads.pointAt(e, s), d = Math.hypot(p.x - cx, p.z - cz);
+      if (d >= rMin && d <= rMax) return { edge: e, s, x: p.x, z: p.z, hx: p.hx, hz: p.hz };
+    }
+    return null;
+  }
+  /** Leaves a vehicle abandoned on the roads round (px, pz), often across a lane. */
+  function wreck(car: Car, px: number, pz: number) {
     for (let attempt = 0; attempt < 30; attempt++) {
-      const axis: Axis = random() < 0.5 ? 'x' : 'z';
-      const roads = roadsAlong(axis), cross = junctionsAlong(axis);
-      const road = roads[Math.floor(random() * roads.length)];
-      const along = cross[0] + random() * (cross[cross.length - 1] - cross[0]);
-      const across = (random() - 0.5) * 12;
-      const x = axis === 'x' ? along : road + across, z = axis === 'x' ? road + across : along;
-      if (x < LAND.minX + 4 || x > LAND.maxX - 4 || z < LAND.minZ + 4 || z > LAND.maxZ - 4 || blocked(x, z, 2.8, car) || !worldClear(x, z, 1.2)) continue;
-      Object.assign(car, { mode: 'parked', role: 'wreck', x, z, yaw: random() * Math.PI * 2, speed: 0, driver: null, waypoints: [], plan: null, stuck: 0, timer: 0 });
+      const at = roadPoint(px, pz, 20, 170);
+      if (!at) break;
+      const across = (random() - 0.5) * 2 * Math.max(0, at.edge.half - 1);
+      const x = at.x - at.hz * across, z = at.z + at.hx * across;
+      if (blocked(x, z, 2.8, car) || !worldClear(x, z, 1.2)) continue;
+      Object.assign(car, { mode: 'parked', role: 'wreck', x, z, yaw: random() * Math.PI * 2, speed: 0, driver: null, waypoints: [], plan: null, conn: null, stuck: 0, timer: 0 });
       const burnt = car.kind !== 'moto' && random() < 0.35;
       car.health = burnt ? 0 : (car.kind === 'moto' ? MOTO_HEALTH : CAR_HEALTH) * (0.4 + random() * 0.4);
       wrecks.set(car, burnt ? 'burnt' : 'dusty');
@@ -934,7 +1358,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
    * Obstacles other systems put in the road (a bus): centre, half sizes across and along, heading. A `follow` one is a
    * vehicle in traffic: queued behind, kept clear of and waited for as it crosses, never passed; the rest are passed.
    */
-  const obstacles = new Map<string | number, { x: number; z: number; hx: number; hz: number; yaw: number; follow: boolean }>();
+  const obstacles = new Map<string | number, { x: number; z: number; hx: number; hz: number; yaw: number; follow: boolean; speed: number }>();
   /** The player's vehicles (markOwned), oldest first, and the one they drove last. */
   let owned: Car[] = [];
   let lastCar: Car | null = null;
@@ -1093,33 +1517,101 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     lastCar = car;
   }
 
-  function placeOnLane(car: Car, axis: Axis, road: number, along: number, dir: number) {
-    Object.assign(car, { axis, road, along, dir, plan: null, speed: car.cruise * 0.6, lateral: LANES[car.kind], lateralTarget: LANES[car.kind], wait: null });
-    const p = lanePoint(car.kind, axis, road, along, dir);
-    car.x = p.x; car.z = p.z; car.yaw = p.yaw;
+  // ---- Lane traffic on the graph ----
+  /** The live roads' lane network; when the wiring hands over a new map, traffic starts afresh on it. */
+  let net = laneNet();
+  let roads = net.roads;
+  /** Traffic keeps out of a street this many game hours before it closes (it has time to drive out). */
+  const CLOSE_AHEAD = 30 / SECONDS_PER_HOUR;
+  /** Refill traffic never appears in view nearer than this (out of view it may, from 60 m). */
+  const POP_IN = 120;
+
+  /** The axis-style fields older checks read (axis, road, along), from the lane state. */
+  function syncAxis(car: Car) {
+    let p: { x: number; z: number; hx: number; hz: number };
+    if (car.conn) {
+      // Through a node: the road it came in on until it has turned more than half way, then the one it leaves by.
+      const c = car.conn, q = connPoint(c, car.connS), a = net.inArm(c.from), b = net.outArm(c.to);
+      const out = q.hx * b.hx + q.hz * b.hz > -(q.hx * a.hx + q.hz * a.hz);
+      p = roads.pointAt(roads.edges[(out ? c.to : c.from) >> 1], out ? c.sOut : c.sIn);
+      const ax = Math.abs(p.hx) >= Math.abs(p.hz);
+      car.axis = ax ? 'x' : 'z';
+      car.road = ax ? p.z : p.x;
+      car.along = ax ? car.x : car.z;
+      return;
+    }
+    p = roads.pointAt(roads.edges[car.edge], car.s);
+    const ax = Math.abs(p.hx) >= Math.abs(p.hz);
+    car.axis = ax ? 'x' : 'z';
+    car.road = ax ? p.z : p.x;
+    car.along = ax ? p.x : p.z;
+  }
+  /** Puts a vehicle in lane `lane` of state k at arc s, facing its travel. */
+  function placeOnLane(car: Car, k: number, lane: number, s: number) {
+    const e = roads.edges[k >> 1], L = net.lanesOf(k)[lane];
+    Object.assign(car, {
+      edge: k >> 1, dir: dirOfState(k), lane, laneOff: L.off, s, conn: null, connS: 0, plan: null, speed: Math.min(car.cruise, e.speed + 1) * 0.6,
+      lateral: L.off, lateralTarget: L.off, wait: null, waitFor: null, yieldSince: -1,
+    });
+    const p = laneAt(roads, e, s, car.dir, L.off);
+    car.x = p.x; car.z = p.z; car.yaw = Math.atan2(p.hx, p.hz);
+    syncAxis(car);
   }
 
   /**
-   * Puts a traffic vehicle on a random lane spot at least `minDistance` from a point, within TRAFFIC_NEAR
-   * of it where possible (the city is big; traffic is kept where the player is).
+   * Traffic edges round the player to spawn on, by length, lanes (a boulevard carries more than a side street) and
+   * nearness (kept while the player stays within 12 m).
    */
-  function spawnTraffic(car: Car, awayX: number, awayZ: number, minDistance: number) {
-    for (let attempt = 0; attempt < 40; attempt++) {
-      const axis: Axis = random() < 0.5 ? 'x' : 'z';
-      const roads = roadsAlong(axis).filter((r) => Math.abs(r - (axis === 'x' ? awayZ : awayX)) < TRAFFIC_NEAR);
-      if (!roads.length) continue;
-      const road = roads[Math.floor(random() * roads.length)];
-      const cross = junctionsAlong(axis);
-      const centre = axis === 'x' ? awayX : awayZ;
-      const lo = Math.max(cross[0], centre - TRAFFIC_NEAR), hi = Math.min(cross[cross.length - 1], centre + TRAFFIC_NEAR);
+  const spawnPool = { x: NaN, z: NaN, net: null as LaneNet | null, hours: -1, edges: [] as RoadEdge[], weights: [] as number[], total: 0, laneMetres: 0 };
+  function spawnEdges(x: number, z: number) {
+    if (spawnPool.net === net && Math.hypot(x - spawnPool.x, z - spawnPool.z) < 12 && Math.abs(spawnPool.hours - hours) < 0.05) return spawnPool;
+    Object.assign(spawnPool, { x, z, net, hours, total: 0, laneMetres: 0 });
+    spawnPool.edges.length = spawnPool.weights.length = 0;
+    for (const h of roads.edgesNear(x, z, TRAFFIC_NEAR, (e) => e.traffic && (net.open(stateOf(e.id, 1)) || net.open(stateOf(e.id, -1))))) {
+      const lanes = h.edge.fwd.length + h.edge.back.length;
+      // (the nearer streets weigh much more: the traffic the player sees is round them, not out at the edge of the circle)
+      const near = 1.5 - h.d / TRAFFIC_NEAR;
+      const w = Math.min(h.edge.len, 2 * TRAFFIC_NEAR) * Math.max(2, lanes) * near * near * flowWeight(h.edge, hours);
+      spawnPool.edges.push(h.edge); spawnPool.weights.push(w); spawnPool.total += w;
+      // Its lanes within reach (a straight edge's chord through the circle).
+      spawnPool.laneMetres += Math.min(h.edge.len, 2 * Math.sqrt(Math.max(0, TRAFFIC_NEAR * TRAFFIC_NEAR - h.d * h.d))) * Math.max(1, lanes);
+    }
+    return spawnPool;
+  }
+  /**
+   * Where the traffic is thicker than its lanes alone say (districts-hcmc): Hàng Xanh's junction jams at the evening
+   * rush, the central districts' boulevards are busier than the side streets by day.
+   */
+  function flowWeight(e: RoadEdge, hour: number) {
+    const info = net.world.edges[e.id], h = ((hour % 24) + 24) % 24;
+    const m = (e.pts.length >> 2) << 1, mx = e.pts[m], mz = e.pts[m + 1];
+    if (h >= 16.5 && h < 19 && Math.abs(mx - HANG_XANH.x) < HANG_XANH.r && Math.abs(mz - HANG_XANH.z) < HANG_XANH.r) return 2.5;
+    if ((info?.district === 'D2' || info?.district === 'D3') && e.cls !== 'hem' && h >= 7 && h < 22) return 1.3;
+    return 1;
+  }
+  /** The quality level's fleet cap (setQuality). */
+  let level = DEFAULT_LEVEL;
+  /**
+   * Puts a traffic vehicle on a random lane spot of an open traffic edge at least `minDistance` from a point and
+   * within TRAFFIC_NEAR of it (the city is big; traffic is kept where the player is), clear of the junctions (never
+   * between a stop line and its crossing). With `hidden`, never in view nearer than POP_IN.
+   */
+  function spawnTraffic(car: Car, awayX: number, awayZ: number, minDistance: number, hidden = false, attempts = 40) {
+    const use = laneUseOf(car.kind), pool = spawnEdges(awayX, awayZ);
+    for (let attempt = 0; attempt < attempts && pool.total > 0; attempt++) {
+      let pick = random() * pool.total, e = pool.edges[0];
+      for (let i = 0; i < pool.edges.length; i++) { pick -= pool.weights[i]; if (pick <= 0) { e = pool.edges[i]; break; } }
+      const dir: 1 | -1 = random() < 0.5 ? 1 : -1, k = stateOf(e.id, dir);
+      const lanes = net.lanesFor(k, use);
+      if (!net.open(k) || !lanes.length) continue;
+      // Past the stop line it leaves by, and with room to stop before the next.
+      const from = roads.nodes[net.departure(k)], to = roads.nodes[net.arrival(k)];
+      const lo = (net.isJunction(from) ? net.outArm(k).setback : 0) + 6, hi = e.len - (net.isJunction(to) ? net.inArm(k).setback : 0) - 10;
       if (hi <= lo) continue;
-      const along = lo + random() * (hi - lo);
-      // Not inside a junction or between its stop line and the crossing, where a car would sit across a red light.
-      if (cross.some((r) => Math.abs(r - along) < STOP_LINE + 8)) continue;
-      if (along < cross[0] + 2 || along > cross[cross.length - 1] - 2) continue;
-      const dir = random() < 0.5 ? 1 : -1;
-      const p = lanePoint(car.kind, axis, road, along, dir);
-      if (Math.hypot(p.x - awayX, p.z - awayZ) < minDistance) continue;
+      const t = lo + random() * (hi - lo), s = dir > 0 ? t : e.len - t, lane = lanes[Math.floor(random() * lanes.length)];
+      const p = laneAt(roads, e, s, dir, net.lanesOf(k)[lane].off), d = Math.hypot(p.x - awayX, p.z - awayZ);
+      if (d < minDistance || d > TRAFFIC_NEAR) continue;
+      if (hidden && d < POP_IN && sees(p.x, p.z, 3, d)) continue;
       car.mode = 'lane';
       Object.assign(car, { vx: 0, vz: 0, spin: 0, fallen: false, recoverAt: 0, role: 'traffic', still: 0, unseen: 0, timer: 0 });
       car.health = car.kind === 'moto' ? MOTO_HEALTH : CAR_HEALTH;
@@ -1127,42 +1619,229 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       const shirt = Math.floor(random() * DRIVER_SHIRTS.length);
       car.driver = car.kind === 'moto' ? riderLook(shirt) : driverLook(shirt);
       car.stuck = 0;
-      placeOnLane(car, axis, road, along, dir);
+      placeOnLane(car, k, lane, s);
       if (!blocked(car.x, car.z, 2.6, car)) return true;
     }
     car.mode = 'off';
     return false;
   }
 
-  /** Decides what a lane vehicle does at the next junction, never driving into the dead-end edges. */
-  function planJunction(car: Car) {
-    const lane = LANES[car.kind];
-    const ahead = junctionsAlong(car.axis).filter((r) => (r - car.along) * car.dir > lane + 0.5).sort((a, b) => (a - b) * car.dir)[0];
-    if (ahead === undefined) { car.plan = null; return; }
-    const options: { axis: Axis; road: number; dir: number; at: number; along: number }[] = [];
-    if (ahead !== lastJunction(car.axis, car.dir)) options.push({ axis: car.axis, road: car.road, dir: car.dir, at: ahead, along: NaN });
-    const laneCoord = car.axis === 'x' ? car.road + car.dir * lane : car.road - car.dir * lane;
-    const other: Axis = car.axis === 'x' ? 'z' : 'x';
-    for (const nd of [1, -1]) {
-      if (car.road === lastJunction(other, nd)) continue;
-      const at = other === 'z' ? ahead - nd * lane : ahead + nd * lane;
-      options.push({ axis: other, road: ahead, dir: nd, at, along: laneCoord });
+  /**
+   * What a lane vehicle does at the end of its edge: on into an open street (straight on more often, the wider street
+   * more often: traffic keeps to the boulevards), never back the way it came and never into a street it could not leave or one about to close; from the
+   * lane that serves the turn (rights from the curb-side lane, lefts from the one by the centre line) into the
+   * matching lane. Trapped (a street that has closed, a dead end), any way out; none: it turns round short of the end.
+   */
+  function planNext(car: Car) {
+    const k = stateOf(car.edge, car.dir), use = laneUseOf(car.kind);
+    let options = net.exits[k].filter((o) => net.open(o) && net.lanesFor(o, use).length);
+    if (!options.length) { const out = net.wayOut(k, use); if (out >= 0) options = [out]; }
+    if (!options.length) { car.plan = null; return; }
+    const weight = (o: number) => Math.max(1, net.lanesOf(o).length) * (net.turnOf(k, o) === 0 ? 2 : 1);
+    let pick = random() * options.reduce((sum, o) => sum + weight(o), 0), to = options[options.length - 1];
+    for (const o of options) { pick -= weight(o); if (pick <= 0) { to = o; break; } }
+    const turn = net.turnOf(k, to), ins = net.lanesFor(k, use), outs = net.lanesFor(to, use);
+    const rank = Math.max(0, ins.indexOf(car.lane));
+    const inLane = turn === 1 ? ins[ins.length - 1] : turn === -1 ? ins[0] : ins[Math.min(rank, ins.length - 1)];
+    const outLane = turn === 1 ? outs[outs.length - 1] : turn === -1 ? outs[0] : outs[Math.min(ins.indexOf(inLane), outs.length - 1)];
+    car.plan = net.connector(k, inLane, to, outLane, use);
+  }
+  /** Turns round on the spot to the matching lane the other way (after a long wait, or short of a dead end). */
+  function turnBack(car: Car) {
+    const k = stateOf(car.edge, car.dir) ^ 1, lanes = net.lanesFor(k, laneUseOf(car.kind));
+    if (!lanes.length) return false;
+    const lane = lanes[lanes.length - 1], L = net.lanesOf(k)[lane];
+    Object.assign(car, { dir: dirOfState(k), lane, laneOff: L.off, lateral: L.off, lateralTarget: L.off, plan: null, conn: null, connS: 0, yieldSince: -1 });
+    car.uturns++;
+    return true;
+  }
+  /** A point of a connector at arc c, with its heading. */
+  function connPoint(c: Connector, at: number) {
+    const cum = c.cum, n = cum.length;
+    at = Math.max(0, Math.min(c.len, at));
+    let lo = 0, hi = n - 2;
+    while (lo < hi) { const mid = (lo + hi + 1) >> 1; if (cum[mid] <= at) lo = mid; else hi = mid - 1; }
+    const i = Math.min(lo, n - 2), l = cum[i + 1] - cum[i] || 1, t = (at - cum[i]) / l;
+    const dx = c.pts[i * 2 + 2] - c.pts[i * 2], dz = c.pts[i * 2 + 3] - c.pts[i * 2 + 1];
+    return { x: c.pts[i * 2] + dx * t, z: c.pts[i * 2 + 1] + dz * t, hx: dx / l, hz: dz / l };
+  }
+  /** Arc of a connector nearest (x, z). */
+  function connProject(c: Connector, x: number, z: number) {
+    let best = Infinity, at = 0;
+    for (let i = 0; i + 3 < c.pts.length; i += 2) {
+      const ax = c.pts[i], az = c.pts[i + 1], dx = c.pts[i + 2] - ax, dz = c.pts[i + 3] - az, l2 = dx * dx + dz * dz;
+      const t = l2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * dx + (z - az) * dz) / l2)) : 0, d = Math.hypot(x - ax - dx * t, z - az - dz * t);
+      if (d < best) { best = d; at = c.cum[i / 2] + t * Math.sqrt(l2); }
     }
-    const straight = options.find((o) => o.axis === car.axis);
-    car.plan = straight && random() < 0.45 ? straight : options[Math.floor(random() * options.length)];
+    return at;
+  }
+  /** How far a lane vehicle is from the node it drives towards (its centre, along the edge). */
+  const toNode = (car: Car) => (car.dir > 0 ? roads.edges[car.edge].len - car.s : car.s);
+  /** Seconds-ahead threat window of a vehicle coming to a node: within its stop line plus ~2.5 s of travel. */
+  function arriving(o: Car, node: number) {
+    if (o.mode !== 'lane') return false;
+    if (o.conn) return false;
+    const k = stateOf(o.edge, o.dir);
+    if (net.arrival(k) !== node) return false;
+    const d = toNode(o) - (net.isJunction(roads.nodes[node]) ? net.inArm(k).setback : 0) - HALF[o.kind][1];
+    // Standing for a reason of its own (a light, giving way, a queue): no threat yet.
+    if (o.speed < 0.6 && o.wait) return false;
+    return d < 6 + o.speed * 2.5 && (o.speed > 0.6 || d < 2);
+  }
+  /**
+   * Who a vehicle about to take connector `c` at its node must let go first: anyone already in the box on a crossing
+   * path; at a junction without lights, from a side road, anyone coming along the main road whose way crosses; turning
+   * left (lights or not), anyone coming the other way going straight on or right (or turning left and nearer). After
+   * waiting `patience` seconds it takes a smaller gap.
+   */
+  function giveWay(car: Car, c: Connector, patience: number): Car | true | null {
+    const node = roads.nodes[c.node], signal = node.control === 'signal', mine = stateOf(car.edge, car.dir);
+    const minor = !signal && !net.onMajor(mine), left = c.turn === -1, myD = toNode(car);
+    // Buses driving (other systems' vehicles in traffic, registered as obstacles that are followed): one in the box goes
+    // first; from the main road, or coming the other way when turning left, one about to arrive too.
+    const ia = net.inArm(mine);
+    for (const o of obstacles.values()) {
+      if (!o.follow || o.speed < 0.5) continue;
+      const dx = node.x - o.x, dz = node.z - o.z, d = Math.hypot(dx, dz);
+      if (d > 50) continue;
+      const hx = Math.sin(o.yaw), hz = Math.cos(o.yaw);
+      if (d < node.radius + o.hz * 0.6) return true;
+      if ((dx * hx + dz * hz) / (d || 1) < 0.8 || d - o.hz > node.radius + 6 + o.speed * 3) continue;
+      // The arm it comes in along: the one most nearly behind it.
+      let arm = -1, best = -Infinity;
+      node.arms.forEach((a, i) => { const dot = -(a.hx * hx + a.hz * hz); if (dot > best) { best = dot; arm = i; } });
+      if (arm < 0 || node.arms[arm] === ia) continue;
+      const k = stateOf(node.arms[arm].edge, node.arms[arm].end === 1 ? 1 : -1);
+      if (minor && net.onMajor(k)) return true;
+      if (left && net.inArm(k).hx * ia.hx + net.inArm(k).hz * ia.hz < -0.7) return true;
+    }
+    for (const o of active) {
+      if (o === car || o.mode !== 'lane') continue;
+      if (Math.abs(o.x - node.x) > 60 || Math.abs(o.z - node.z) > 60) continue;
+      if (o.conn) {
+        if (o.conn.node === c.node && net.conflicts(o.conn, c)) return o;
+        continue;
+      }
+      if (!o.plan || !arriving(o, c.node) || !net.conflicts(o.plan, c)) continue;
+      const k = stateOf(o.edge, o.dir);
+      if (k === mine) {
+        // From the next lane over, into crossing paths (a car and a motorbike both turning right): the one ahead first.
+        const od = toNode(o);
+        if (od < myD - 1 || (Math.abs(od - myD) <= 1 && ordinal.get(o)! < ordinal.get(car)!)) return o;
+        continue;
+      }
+      // A long wait takes a smaller gap: after a few seconds only who is near its line, then only who is at it (turning
+      // left at lights, sooner: the green is short).
+      const line = toNode(o) - net.inArm(stateOf(o.edge, o.dir)).setback - HALF[o.kind][1], p0 = signal ? 2 : 4, p1 = signal ? 5 : 8;
+      if ((patience > p0 && line > 8) || (patience > p1 && line > 2.5)) continue;
+      // A side road gives way to the main road.
+      if (minor) { if (net.onMajor(k)) return o; continue; }
+      if (!left) continue;
+      // Turning left: the oncoming way first (going straight on or right; turning left too, the nearer one).
+      const opposite = net.inArm(k).hx * net.inArm(mine).hx + net.inArm(k).hz * net.inArm(mine).hz < -0.7;
+      if (!opposite) continue;
+      const theirs = o.plan.turn, od = toNode(o);
+      if (theirs >= 0 || (theirs === -1 && (od < myD - 0.5 || (Math.abs(od - myD) <= 0.5 && ordinal.get(o)! < ordinal.get(car)!)))) return o;
+    }
+    return null;
   }
 
-  /** What stands ahead of a lane vehicle (s0, s1 along the road, lo, hi across it for its centre), gathered per vehicle per frame. */
+  /** projectOn's answer: arc of the nearest point of the edge's line (beyond either end along its tangent) and the offset right of a→b. */
+  let PS = 0, PL = 0;
+  function projectOn(e: RoadEdge, x: number, z: number) {
+    const p = e.pts, last = p.length - 4;
+    let best = Infinity;
+    for (let k = 0; k <= last; k += 2) {
+      const ax = p[k], az = p[k + 1], dx = p[k + 2] - ax, dz = p[k + 3] - az, l2 = dx * dx + dz * dz, l = Math.sqrt(l2) || 1;
+      let u = l2 > 0 ? ((x - ax) * dx + (z - az) * dz) / l2 : 0;
+      if (u < 0 && k > 0) u = 0;
+      if (u > 1 && k < last) u = 1;
+      const qx = ax + dx * u, qz = az + dz * u, d = (x - qx) * (x - qx) + (z - qz) * (z - qz);
+      if (d < best) { best = d; PS = e.cum[k / 2] + u * l; PL = ((x - ax) * -dz + (z - az) * dx) / l; }
+    }
+  }
+  /**
+   * Whether a vehicle `gap` metres short of a stop line stops for its light: on amber when it can stop comfortably, on
+   * red unless it is already too close to stop at all (it went on an amber that has just turned).
+   */
+  const stopsFor = (light: 'green' | 'yellow' | 'red', gap: number, v: number) =>
+    light === 'red' ? v < 2.5 || gap > (v * v) / 14 : light === 'yellow' && gap > (v * v) / 9 + 1;
+  /**
+   * How far along a connector (from arc `from`, then on along its end heading) a body (half width hw, half length hl)
+   * can go before it meets a box (centre, heading, half width and length): Infinity when it never does within `reach`.
+   */
+  function sweep(c: Connector, from: number, reach: number, hw: number, hl: number, ox: number, oz: number, oyaw: number, ow: number, ol: number, off = 0) {
+    const bx = Math.sin(oyaw), bz = Math.cos(oyaw);
+    for (let d = 0; d <= reach; d += 0.5) {
+      const at = from + d, q = connPoint(c, Math.min(at, c.len)), over = Math.max(0, at - c.len);
+      const px = q.x + q.hx * over - q.hz * off, pz = q.z + q.hz * over + q.hx * off;
+      // Separating axes of two rectangles: each one's along and across.
+      const dx = ox - px, dz = oz - pz;
+      let apart = false;
+      for (const [ux, uz, ah, bh] of [[q.hx, q.hz, hl, 0], [-q.hz, q.hx, hw, 0], [bx, bz, ol, 1], [-bz, bx, ow, 1]] as [number, number, number, number][]) {
+        const ra = bh ? hl * Math.abs(q.hx * ux + q.hz * uz) + hw * Math.abs(-q.hz * ux + q.hx * uz) : ah;
+        const rb = bh ? ah : ol * Math.abs(bx * ux + bz * uz) + ow * Math.abs(-bz * ux + bx * uz);
+        if (Math.abs(dx * ux + dz * uz) > ra + rb + PASS_MARGIN) { apart = true; break; }
+      }
+      if (!apart) return d;
+    }
+    return Infinity;
+  }
+  /** Things standing in a junction a vehicle on a connector must get round (x, z, yaw, half width, half length). */
+  const boxObs: number[] = [];
+  /** Offsets off a connector's line to try, nearest the current one first (0 first when it is free). */
+  const OFFSETS = [0, 0.6, -0.6, 1.2, -1.2, 1.8, -1.8, 2.4, -2.4, 3.0, -3.0];
+  const offsets = (now: number) => OFFSETS.slice().sort((a, b) => Math.abs(a) - Math.abs(b) || Math.abs(a - now) - Math.abs(b - now));
+  /** How far along a connector (with an offset) a body goes before meeting one of boxObs. */
+  function clearOf(c: Connector, from: number, reach: number, hw: number, hl: number, off: number) {
+    let d = Infinity;
+    for (let i = 0; i < boxObs.length; i += 5) d = Math.min(d, sweep(c, from, reach, hw, hl, boxObs[i], boxObs[i + 1], boxObs[i + 2], boxObs[i + 3], boxObs[i + 4], off));
+    return d;
+  }
+  /** Whether a body following a connector at an offset stays on the asphalt round its node, from arc `from` to its end. */
+  function fitsAlong(c: Connector, from: number, off: number, hw: number, hl: number) {
+    if (Math.abs(off) < 0.05) return true;
+    for (let a = from; a <= c.len + 1e-6; a += 1) {
+      const q = connPoint(c, a);
+      if (!net.fits(c.node, q.x - q.hz * off, q.z + q.hx * off, q.hx, q.hz, hw, hl)) return false;
+    }
+    return true;
+  }
+  /** Fills boxObs with what stands (not lane traffic) within r of a point: parked, knocked, wrecks, roadblocks, the player's vehicle, bodies, obstacles. */
+  function standingNear(x: number, z: number, r: number, self: Car) {
+    boxObs.length = 0;
+    for (const o of active) {
+      if (o === self || o.mode === 'off' || o.mode === 'lane' || Math.abs(o.x - x) > r || Math.abs(o.z - z) > r) continue;
+      if (o.kind === 'police' && (o.mode === 'chase' || o.mode === 'leave')) continue;
+      const [ow, ol] = HALF[o.kind];
+      boxObs.push(o.x, o.z, o.yaw, ow, ol);
+    }
+    for (const o of obstacles.values()) if (!o.follow && Math.abs(o.x - x) < r + o.hz && Math.abs(o.z - z) < r + o.hz) boxObs.push(o.x, o.z, o.yaw, o.hx, o.hz);
+    for (const p of crossing) if (p.body && Math.abs(p.x - x) < r && Math.abs(p.z - z) < r) boxObs.push(p.x, p.z, 0, 0.9, 0.9);
+    return boxObs.length > 0;
+  }
+  /** Whether something standing in the junction leaves no way along a connector (at any offset on the asphalt). */
+  function connBlocked(c: Connector, hw: number, hl: number) {
+    for (const off of OFFSETS) if (clearOf(c, 0, c.len + 3, hw, hl, off) === Infinity && fitsAlong(c, 0, off, hw, hl)) return false;
+    return true;
+  }
+  /** What stands ahead of a lane vehicle (s0, s1 along the road, lo, hi across it for its centre, bay or not), gathered per vehicle per frame. */
   const bands: number[] = [];
   /**
-   * One lane vehicle's frame: wait for the light, the vehicle ahead, people on the crossing and crossing traffic;
-   * ease past whatever stands in the lane (parked or knocked vehicles, crash leftovers, a body, a bus at its stop,
-   * the player) by moving across within the asphalt, slowly, over the centre line only when nothing comes the
-   * other way; wait and honk when there is no way past, and turn round only after 15 s (6 s at a police roadblock
-   * or a zombie-mode wreck, which are not passed).
+   * One lane vehicle's frame: wait for the light (looking a node ahead across short streets), give way at junctions
+   * without lights and to whoever is already in the box, keep out of a box it could not leave, follow the vehicle
+   * ahead at a braking distance, wait for people on the crossing and for crossing traffic; shift out of the curb lane
+   * past occupied bays (merging behind whoever is already there) and ease past whatever stands in the lane (parked or
+   * knocked vehicles, crash leftovers, a body, a bus at its stop, the player) by moving across within the asphalt,
+   * slowly, over the centre line only when nothing comes the other way; wait and honk when there is no way past, and
+   * turn round only after 15 s (6 s at a police roadblock or a zombie-mode wreck, which are not passed). Then on
+   * along the edge, into the connector at its end and out onto the next edge.
    */
   function driveLane(car: Car, dt: number, time: number, player: PlayerView) {
-    const [hw, hl] = HALF[car.kind], L0 = LANES[car.kind];
+    const [hw, hl] = HALF[car.kind], use = laneUseOf(car.kind);
+    if (!car.conn && !car.plan) planNext(car);
+    const e = roads.edges[car.edge], k = stateOf(car.edge, car.dir), conn = car.conn, plan = car.plan;
+    const L0 = car.laneOff;
     const fx = Math.sin(car.yaw), fz = Math.cos(car.yaw);
     const width = car.kind === 'moto' ? 1.1 : 2.3;
     const check = (x: number, z: number, reach: number, side = width) => {
@@ -1170,190 +1849,374 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       const ahead = dx * fx + dz * fz, lateral = Math.abs(dx * fz - dz * fx);
       return ahead > 0 && ahead < reach && lateral < side;
     };
-    const ax = car.axis === 'x';
-    // The road frame: s ahead of the lane point, l to the right of the centre line.
-    const reach = Math.max(10, car.speed * 1.8 + 6) + hl;
-    let wait: Wait = null, stopGap = Infinity, hard = false, oncoming = false, abandoned = false, tail = Infinity;
+    // The road frame: on an edge, the arc ahead of the vehicle along it and the offset right of its centre line (exact
+    // round a bend; past either end, on along the end's tangent); on a connector, its own path's tangent at the vehicle.
+    let cx = 0, cz = 0, hx: number, hz: number;
+    if (conn) { const q = connPoint(conn, car.connS); cx = q.x; cz = q.z; hx = q.hx; hz = q.hz; }
+    else { const p = roads.pointAt(e, car.s); hx = p.hx * car.dir; hz = p.hz * car.dir; }
+    const rx = -hz, rz = hx;
+    let FS = 0, FL = 0;
+    const frame = (x: number, z: number) => {
+      if (conn) { const dx = x - cx, dz = z - cz; FS = dx * hx + dz * hz; FL = dx * rx + dz * rz; return; }
+      projectOn(e, x, z);
+      FS = (PS - car.s) * car.dir; FL = PL * car.dir;
+    };
+    const half = e.half, reach = Math.max(10, car.speed * 1.8 + 6) + hl;
+    // The other way: whether it has lanes, and how near the centre line its traffic comes (its innermost lanes).
+    const back = net.lanesOf(k ^ 1), twoWay = back.length > 0;
+    const farLane = twoWay ? Math.max(...back.filter((l) => l.use !== 'moto').map((l) => l.off), back[0].off) + 1.6 : 0;
+    let wait: Wait = null, waitFor: Car | null = null, stopGap = Infinity, hard = false, oncoming = false, abandoned = false, tail = Infinity;
+    let lead = Infinity, leadCar: Car | null = null, leadAlong = false;
+    // Its way through the node ahead (the connector it is on or will take), and how far off its start is.
+    const way = conn ?? (plan && plan.turn !== 2 ? plan : null), toWay = way ? (conn ? -car.connS : (way.sIn - car.s) * car.dir) : 0;
+    /**
+     * Where another lane vehicle is along that way (in the same turn, or just out of it on the street beyond): metres
+     * ahead and across, measured along the path, since round a tight corner the headings part long before the bodies do.
+     */
+    const alongWay = (o: Car): [number, number] | null => {
+      if (!way) return null;
+      if (o.conn) {
+        if (o.conn.node !== way.node || o.conn.from !== way.from) return null;
+        if (o.conn !== way && (o.conn.inLane !== way.inLane || o.connS > 4)) return null;
+        return [toWay + o.connS, Math.abs(o.lateral - car.lateral)];
+      }
+      if (way.turn === 2 || o.edge !== way.to >> 1 || o.dir !== dirOfState(way.to)) return null;
+      const past = (o.s - way.sOut) * o.dir;
+      if (past < -1 || past > 30) return null;
+      return [toWay + way.len + past, Math.abs(o.lateral - (way.latOut + (conn ? car.connLat : 0)))];
+    };
     bands.length = 0;
-    const band = (x: number, z: number, ex: number, ez: number, deliberate: boolean, old = false) => {
-      const s = ((ax ? x : z) - car.along) * car.dir, l = (ax ? z - car.road : car.road - x) * car.dir;
-      const es = ax ? ex : ez, el = ax ? ez : ex;
+    boxObs.length = 0;
+    const bandAt = (s: number, l: number, es: number, el: number, deliberate: boolean, old = false, bay = false) => {
       // Passed (its far end 2 m behind the tail), beyond the look-ahead, or off the carriageway.
-      if (s + es < -hl - 2 || s - es > reach || Math.abs(l) - el > ASPHALT_HALF + 0.3) return;
+      if (s + es < -hl - 2 || s - es > reach || Math.abs(l) - el > half + 0.3) return;
       const lo = deliberate ? -Infinity : l - el - hw - PASS_MARGIN, hi = deliberate ? Infinity : l + el + hw + PASS_MARGIN;
-      bands.push(s - es, s + es, lo, hi);
-      if (car.lateral > lo && car.lateral < hi && s > 0) {
+      bands.push(s - es, s + es, lo, hi, bay ? 1 : 0);
+      if (car.lateral > lo && car.lateral < hi && s + es > 0) {
         stopGap = Math.min(stopGap, s - es - hl);
         if (deliberate) hard = true;
       }
       if (old && s < 15) abandoned = true;
     };
+    /** A box (centre, heading, half width and length) in the road frame. */
     const box = (x: number, z: number, yaw: number, bw: number, bl: number, deliberate: boolean, old = false) => {
-      const sn = Math.abs(Math.sin(yaw)), cs = Math.abs(Math.cos(yaw));
-      band(x, z, sn * bl + cs * bw, cs * bl + sn * bw, deliberate, old);
+      const ox = Math.sin(yaw), oz = Math.cos(yaw), ca = Math.abs(ox * hx + oz * hz), sa = Math.abs(ox * rx + oz * rz);
+      frame(x, z);
+      bandAt(FS, FL, ca * bl + sa * bw, sa * bl + ca * bw, deliberate, old);
     };
-    /** Oncoming within 40 m and nearer the centre line than the far moto lane. */
-    const comesAt = (o: Car) => {
-      const s = ((ax ? o.x : o.z) - car.along) * car.dir, l = (ax ? o.z - car.road : car.road - o.x) * car.dir;
-      return s > -6 && s < 40 && l > -(LANES.traffic + 1.6);
-    };
-    if (!player.car) band(player.x, player.z, 0.7, 0.7, false);
+    /** Oncoming within 40 m and nearer the centre line than the far curb lane. */
+    const comesAt = (x: number, z: number, extra = 0) => { frame(x, z); return twoWay && FS > -6 - extra && FS < 40 + extra && FL > -farLane && FL < half; };
+    if (!player.car && !conn) { frame(player.x, player.z); bandAt(FS, FL, 0.7, 0.7, false); }
     // People on a crosswalk anywhere across the lane: wait. A body lying in the road: go round it.
     for (const p of crossing) {
-      if (p.body) band(p.x, p.z, 0.9, 0.9, false);
+      if (p.body) { if (!conn) { frame(p.x, p.z); bandAt(FS, FL, 0.9, 0.9, false); } else boxObs.push(p.x, p.z, 0, 0.9, 0.9); }
       else if (check(p.x, p.z, 9, 2.6)) wait = 'walk';
     }
     for (const other of active) {
       if (other === car || other.mode === 'off') continue;
-      if (Math.abs(other.x - car.x) > reach + 3 || Math.abs(other.z - car.z) > reach + 3) {
-        if (other.mode === 'lane' && other.axis === car.axis && other.road === car.road && other.dir !== car.dir && comesAt(other)) oncoming = true;
-        continue;
-      }
+      const dx = other.x - car.x, dz = other.z - car.z;
+      if (Math.abs(dx) > 45 || Math.abs(dz) > 45) continue;
+      const ofx = Math.sin(other.yaw), ofz = Math.cos(other.yaw), dot = ofx * fx + ofz * fz;
+      const near = Math.abs(dx) <= reach + 3 && Math.abs(dz) <= reach + 3;
       if (other.mode === 'lane') {
-        if (other.axis === car.axis && other.dir === car.dir) {
-          // Following: wait behind the vehicle ahead (as at a red light).
-          if (check(other.x, other.z, other.kind === 'moto' ? 5 : 7.5)) wait ??= 'queue';
-        } else if (other.axis === car.axis) {
+        const [ow, ol] = HALF[other.kind];
+        const along = alongWay(other);
+        if (along && along[0] > 0 && along[0] < reach + ol + 4 && along[1] < hw + ow + 0.2) {
+          const gap = along[0] - hl - ol;
+          if (gap < lead) { lead = gap; leadCar = other; leadAlong = true; }
+          continue;
+        }
+        if (dot > 0.7) {
+          // Following: the nearest vehicle ahead in the way (body widths), at a braking distance; along the street's
+          // own line (round a bend too), in the box along the body.
+          let ahead: number, side: number;
+          if (conn) { ahead = dx * fx + dz * fz; side = Math.abs(dx * fz - dz * fx); }
+          else { frame(other.x, other.z); ahead = FS; side = Math.abs(FL - car.lateral); }
+          if (ahead > 0 && ahead < reach + ol + 4 && side < hw + ow + 0.2) { const gap = ahead - hl - ol; if (gap < lead) { lead = gap; leadCar = other; leadAlong = false; } }
+        } else if (dot < -0.7) {
           // Coming the other way: keep clear of it, and do not pull out over the centre line while it is near.
-          if (other.road === car.road && comesAt(other)) oncoming = true;
-          const [ow, ol] = HALF[other.kind];
-          box(other.x, other.z, other.yaw, ow, ol, false);
-        } else if (check(other.x, other.z, 7.5)) wait = 'cross';
+          if (!conn && comesAt(other.x, other.z)) oncoming = true;
+          if (near && !conn) box(other.x, other.z, other.yaw, ow, ol, false);
+        } else if (near && check(other.x, other.z, 7.5)) {
+          // Crossing in front. In the same box, whoever was in it first goes first; one waiting at its line lets the box clear.
+          const both = conn && other.conn && other.conn.node === conn.node, atLine = conn && !other.conn && other.speed < 1;
+          if (!atLine && (!both || other.boxAt < car.boxAt || (other.boxAt === car.boxAt && ordinal.get(other)! < ordinal.get(car)!))) { wait = 'cross'; waitFor = other; }
+        }
         continue;
       }
+      if (!near) continue;
       if (other.kind === 'police' && (other.mode === 'chase' || other.mode === 'leave')) {
-        if (check(other.x, other.z, 7.5)) wait = 'cross';
+        if (check(other.x, other.z, 7.5)) { wait = 'cross'; waitFor = other; }
         continue;
       }
       // Standing, skidding or being driven by the player: something to get round. Roadblocks and zombie wrecks are not passed.
       const [ow, ol] = HALF[other.kind];
+      if (conn) { boxObs.push(other.x, other.z, other.yaw, ow, ol); continue; }
       box(other.x, other.z, other.yaw, ow, ol, (other.kind === 'police' && other.mode === 'hold') || wrecks.has(other), other.still > 60);
     }
-    // Parked vehicles in their spots are on the sidewalk; one only drawn never stands in a lane.
+    // Things other systems put in the road (a bus at its stop, the player's own bike; a bus driving is followed).
     for (const o of obstacles.values()) {
-      if (!o.follow) { box(o.x, o.z, o.yaw, o.hx, o.hz, false); continue; }
+      if (!o.follow) {
+        if (Math.abs(o.x - car.x) > reach + o.hz + 3 || Math.abs(o.z - car.z) > reach + o.hz + 3) continue;
+        if (!conn) box(o.x, o.z, o.yaw, o.hx, o.hz, false);
+        else boxObs.push(o.x, o.z, o.yaw, o.hx, o.hz);
+        continue;
+      }
       // A bus in traffic, measured to the nearest point of its centre line: queue behind it like a lane vehicle, keep
       // clear of it coming the other way, wait while it crosses.
       const ox = Math.sin(o.yaw), oz = Math.cos(o.yaw), dot = ox * fx + oz * fz;
       if (Math.abs(o.x - car.x) > reach + o.hz + 3 || Math.abs(o.z - car.z) > reach + o.hz + 3) {
-        if (dot < -0.7 && Math.abs(o.x - car.x) < 45 + o.hz && Math.abs(o.z - car.z) < 45 + o.hz) {
-          const s = ((ax ? o.x : o.z) - car.along) * car.dir, l = (ax ? o.z - car.road : car.road - o.x) * car.dir;
-          if (s > -6 && s < 40 + o.hz && l > -(LANES.traffic + 1.6) && l < ASPHALT_HALF) oncoming = true;
-        }
+        if (dot < -0.7 && !conn && Math.abs(o.x - car.x) < 45 + o.hz && Math.abs(o.z - car.z) < 45 + o.hz && comesAt(o.x, o.z, o.hz)) oncoming = true;
         continue;
       }
-      const along = (car.x - o.x) * ox + (car.z - o.z) * oz, u = THREE.MathUtils.clamp(along, -o.hz, o.hz), px = o.x + ox * u, pz = o.z + oz * u;
+      const at = (car.x - o.x) * ox + (car.z - o.z) * oz, u = THREE.MathUtils.clamp(at, -o.hz, o.hz), px = o.x + ox * u, pz = o.z + oz * u;
       if (dot > 0.7) {
-        if (along > -o.hz - hl * 0.5) { box(o.x, o.z, o.yaw, o.hx, o.hz, false); continue; }
+        if (at > -o.hz - hl * 0.5) { if (!conn) box(o.x, o.z, o.yaw, o.hx, o.hz, false); continue; }
         // Behind it: follow at a braking distance, and queue once close.
         const gapAhead = (px - car.x) * fx + (pz - car.z) * fz - hl, side = Math.abs((px - car.x) * fz - (pz - car.z) * fx);
         if (gapAhead > -1 && side < width - hw + o.hx) { tail = Math.min(tail, gapAhead); if (gapAhead < (car.kind === 'moto' ? 3 : 2.9)) wait ??= 'queue'; }
       } else if (dot < -0.92) {
-        const s = ((ax ? o.x : o.z) - car.along) * car.dir, l = (ax ? o.z - car.road : car.road - o.x) * car.dir;
-        if (s > -6 - o.hz && s < 40 + o.hz && l > -(LANES.traffic + 1.6) && l < ASPHALT_HALF) oncoming = true;
-        box(o.x, o.z, o.yaw, o.hx, o.hz, false);
-      } else if (junctionsAlong(car.axis).some((r) => Math.abs(r - car.along) < ASPHALT_HALF + 1.5)) {
+        if (!conn && comesAt(o.x, o.z, o.hz)) oncoming = true;
+        if (!conn) box(o.x, o.z, o.yaw, o.hx, o.hz, false);
+      } else if (conn || (roads.junctionAt(car.x, car.z, 9) !== null)) {
         // Already out in the junction box with a bus turning across: clear the box rather than stop in its way (the
         // bus waits), unless it stands right in front.
-        box(o.x, o.z, o.yaw, o.hx, o.hz, false);
+        if (!conn) box(o.x, o.z, o.yaw, o.hx, o.hz, false);
+        else boxObs.push(o.x, o.z, o.yaw, o.hx, o.hz);
       } else if (check(px, pz, 7.5, width + o.hx)) wait = 'cross';
+    }
+    // In the box: round whatever stands in the way, off the connector's line (on the asphalt), or stop short of it.
+    let connTarget = 0;
+    if (conn) {
+      // Out to where it could stop beyond the connector's end (things standing just past the junction).
+      const left = conn.len - car.connS + Math.max(4, (car.speed * car.speed) / 8 + 4), at = (off: number) => clearOf(conn, car.connS, left, hw, hl, off);
+      connTarget = car.connLat;
+      if (boxObs.length) {
+        let found = false;
+        for (const off of offsets(car.connLat)) if (at(off) === Infinity && fitsAlong(conn, car.connS, off, hw, hl)) { connTarget = off; found = true; break; }
+        const here = at(car.connLat);
+        if (here < Infinity) stopGap = Math.min(stopGap, here);
+        if (!found) connTarget = car.connLat;
+      } else connTarget = 0;
+    }
+    // Occupied curb bays on this side: the curb lane shifts in past them.
+    if (!conn) {
+      const info = net.world.edges[car.edge];
+      for (const bay of info.bays) {
+        if (bay.side !== car.dir || !inHours(bay.hours, hours)) continue;
+        const a = (bay.s0 - car.s) * car.dir, b = (bay.s1 - car.s) * car.dir, s0 = Math.min(a, b), s1 = Math.max(a, b);
+        if (s1 < -hl - 2 || s0 > reach + 8) continue;
+        // In from the curb by the bay's depth, tapering in over 8 m before it.
+        bands.push(s0 - 8, s1, half - bay.depth - hw - PASS_MARGIN, Infinity, 1);
+        if (car.lateral > half - bay.depth - hw - PASS_MARGIN && s1 > 0) stopGap = Math.min(stopGap, s0 - 8 - hl);
+      }
     }
     // Where to drive across the road: the lane if it is free, else the nearest free line (never over the centre while
     // traffic comes the other way, unless already committed to passing).
-    let passing = false, noWay = false;
-    // Plan the way past the nearest thing ahead and whatever stands right after it (within 6 m); anything further
-    // on is dealt with once this is passed (the stop below still keeps the vehicle short of it).
-    let nearest = Infinity, nearEnd = Infinity;
-    for (let i = 0; i < bands.length; i += 4) if (bands[i] < nearest) { nearest = bands[i]; nearEnd = bands[i + 1]; }
-    const inPlan = (i: number) => bands[i] < nearEnd + 6;
-    if (bands.length) {
-      const maxL = ASPHALT_HALF - hw - 0.25, own = hw + 0.15;
-      const minL = car.lateral < own - 0.05 || !oncoming ? -maxL : own;
-      let best = NaN, cost = Infinity;
-      const consider = (l: number) => {
-        if (!(l >= minL && l <= maxL)) return;
-        for (let i = 0; i < bands.length; i += 4) if (inPlan(i) && l > bands[i + 2] && l < bands[i + 3]) return;
-        const c = Math.abs(l - L0) + (l < own ? 1.5 : 0);
-        if (c < cost) { cost = c; best = l; }
-      };
-      consider(L0);
-      for (let i = 0; i < bands.length; i += 4) if (inPlan(i)) { consider(bands[i + 2] - 0.02); consider(bands[i + 3] + 0.02); }
-      if (Number.isNaN(best)) noWay = true;
-      else { car.lateralTarget = best; passing = Math.abs(best - L0) > 0.25; }
-    } else car.lateralTarget = L0;
-    let target = wait === 'queue' || wait === 'walk' || wait === 'cross' ? 0 : car.cruise;
-    if (passing) target = Math.min(target, PASS_SPEED);
+    let passing = false, noWay = false, merging: Car | null = null;
+    if (!conn) {
+      // What it has to get round: the nearest thing alongside or ahead (not what it has left behind), and whatever
+      // else starts within 6 m of that one's end.
+      let nearest = Infinity, nearEnd = Infinity;
+      for (let i = 0; i < bands.length; i += 5) if (bands[i + 1] > -hl && bands[i] < nearest) { nearest = bands[i]; nearEnd = bands[i + 1]; }
+      const inPlan = (i: number) => bands[i + 1] > -hl && bands[i] < nearEnd + 6;
+      // The lane this vehicle wants for its turn at the end of the edge (a lane change on a wider road).
+      let want = L0;
+      if (plan && plan.inLane !== car.lane) want = net.lanesOf(k)[plan.inLane].off;
+      if (bands.length) {
+        const maxL = half - hw - 0.25, own = hw + 0.15;
+        const minL = !twoWay || car.lateral < own - 0.05 || !oncoming ? -maxL : own;
+        let best = NaN, cost = Infinity, obstacle = false;
+        const consider = (l: number) => {
+          if (!(l >= minL && l <= maxL)) return;
+          for (let i = 0; i < bands.length; i += 5) if (inPlan(i) && l > bands[i + 2] && l < bands[i + 3]) return;
+          const c = Math.abs(l - want) + (l < own && twoWay ? 1.5 : 0);
+          if (c < cost) { cost = c; best = l; }
+        };
+        consider(want);
+        for (let i = 0; i < bands.length; i += 5) if (inPlan(i)) { consider(bands[i + 2] - 0.02); consider(bands[i + 3] + 0.02); }
+        // No way past yet (traffic coming the other way): hold back short of all of it, with room to swing out later
+        // rather than tucked in beside something it would then have to cross.
+        if (Number.isNaN(best)) { noWay = true; stopGap = Math.min(stopGap, nearest - hl - 0.3); }
+        else {
+          car.lateralTarget = best;
+          // Away from its lane for something standing in it (not only a bay): a pass, taken slowly.
+          for (let i = 0; i < bands.length; i += 5) if (inPlan(i) && !bands[i + 4] && want > bands[i + 2] && want < bands[i + 3]) obstacle = true;
+          passing = obstacle && Math.abs(best - want) > 0.25;
+        }
+      } else car.lateralTarget = want;
+      // Moving over (a lane change, a merge past a bay; not getting round something standing in its lane, which it
+      // edges round anyway): not into a vehicle alongside or just behind on that line.
+      if (Math.abs(car.lateralTarget - car.lateral) > 0.4 && !passing) {
+        for (const o of active) {
+          if (o === car || o.mode !== 'lane' || Math.abs(o.x - car.x) > 14 || Math.abs(o.z - car.z) > 14) continue;
+          if (Math.sin(o.yaw) * fx + Math.cos(o.yaw) * fz < 0.8) continue;
+          frame(o.x, o.z);
+          const s = FS, l = FL, [ow, ol] = HALF[o.kind];
+          const lo = Math.min(car.lateral, car.lateralTarget), hi = Math.max(car.lateral, car.lateralTarget);
+          if (s > -hl - ol - 4 && s < hl + ol + 0.5 && l > lo - hw - ow - 0.2 && l < hi + hw + ow + 0.2 && Math.abs(l - car.lateral) > 0.3) {
+            // Zip: one behind that is not coming on (queued, or waiting on this one) lets it in first.
+            if (s < 0 && (o.speed < 1 || o.waitFor === car)) continue;
+            merging = o; break;
+          }
+        }
+        if (merging) car.lateralTarget = car.lateral;
+        else if (plan && want !== L0 && Math.abs(car.lateralTarget - want) < 0.05) { car.lane = plan.inLane; car.laneOff = want; }
+      }
+    }
+    const top = conn ? Math.min(car.cruise, conn.vmax) : Math.min(car.cruise, e.speed + 1);
+    let target = wait === 'queue' || wait === 'walk' || wait === 'cross' ? 0 : top;
+    if (passing || (conn && (Math.abs(connTarget) > 0.25 || Math.abs(car.connLat) > 0.25) && boxObs.length)) target = Math.min(target, PASS_SPEED);
     // Stop short of whatever the current line runs into until the new line is clear of it.
     if (stopGap < Infinity) {
       target = Math.min(target, Math.sqrt(Math.max(0, stopGap - 0.5) * 4));
-      if (stopGap < 3 && !wait) wait = 'block';
+      if (stopGap < 3 && !wait) { wait = merging ? 'merge' : 'block'; if (merging) waitFor = merging; }
+    }
+    // The vehicle ahead: follow it at its own pace a little way back (able to stop if it does), queue once close.
+    if (lead < Infinity && leadCar) {
+      const gap = car.kind === 'moto' ? 1.4 : 2.0, room = Math.max(0, lead - gap);
+      const vl = leadAlong ? Math.max(0, leadCar.speed) : Math.max(0, leadCar.speed * (Math.sin(leadCar.yaw) * fx + Math.cos(leadCar.yaw) * fz));
+      target = Math.min(target, Math.sqrt(2 * 3.5 * room + vl * vl), vl + room * 1.2 + 0.3);
+      if (lead < gap + 0.8) { if (!wait || wait === 'block') { wait = 'queue'; waitFor = leadCar; } }
     }
     // Behind a bus: keep a braking distance back from its tail.
     if (tail < Infinity) target = Math.min(target, Math.sqrt(Math.max(0, tail - 1.8) * 5));
-    // The next junction ahead (within a block): its light.
-    const before = car.along;
-    let junction: number | undefined;
-    for (const r of junctionsAlong(car.axis)) {
-      const ahead = (r - car.along) * car.dir;
-      if (ahead > 0 && ahead < 60 && (junction === undefined || ahead < (junction - car.along) * car.dir)) junction = r;
+
+    // ---- The node ahead: its light (and the next one's across a short street), giving way, a box it could not leave ----
+    const brakeTo = (gap: number, why: Wait, who: Car | null = null) => {
+      const limit = Math.sqrt(Math.max(0, gap - 0.2) * 5);
+      if (limit < target) { target = limit; if (limit < 1 && (!wait || wait === 'block')) { wait = why; waitFor = who; } }
+    };
+    let yielding = false;
+    if (!conn && plan) {
+      const node = roads.nodes[plan.node], arm = net.inArm(k), d = toNode(car);
+      const line = net.isJunction(node) ? arm.setback : 0, gap = d - line - hl;
+      if (node.control === 'signal' && arm.approach >= 0 && gap > -0.6 && stopsFor(nodeLight(node.id, arm.group, time), gap, car.speed)) brakeTo(gap, 'light');
+      if (net.isJunction(node) && gap > -0.6 && gap < 30) {
+        // A side road without lights slows right down at its line.
+        if (node.control !== 'signal' && !net.onMajor(k) && gap < 12) target = Math.min(target, Math.max(3, Math.sqrt(Math.max(0, gap) * 3)));
+        if (gap < 6 + car.speed) {
+          const patience = car.yieldSince >= 0 ? time - car.yieldSince : 0;
+          const yieldTo = giveWay(car, plan, patience), who = yieldTo === true ? null : yieldTo;
+          // Something standing in the junction across the way it means to take: another way, or wait at the line.
+          if (!yieldTo && gap < 8 && standingNear(node.x, node.z, node.radius + 14, car) && connBlocked(plan, hw, hl)) {
+            const old = car.plan;
+            planNext(car);
+            for (let tries = 0; tries < 4 && car.plan && car.plan !== old && connBlocked(car.plan, hw, hl); tries++) planNext(car);
+            if (!car.plan || connBlocked(car.plan, hw, hl)) { car.plan = old; brakeTo(gap, 'block'); }
+          }
+          if (yieldTo) { brakeTo(gap, 'yield', who); yielding = true; }
+          else {
+            // Into the box only with room on the far side.
+            const out = roads.edges[plan.to >> 1], od = dirOfState(plan.to);
+            for (const o of active) {
+              if (o === car || o.mode !== 'lane' || o.conn || o.edge !== out.id || o.dir !== od || o.speed > 1) continue;
+              const past = (o.s - plan.sOut) * od;
+              if (past < HALF[o.kind][1] + hl + 1.5 && past > -HALF[o.kind][1] && Math.abs(o.lateral - plan.latOut) < hw + HALF[o.kind][0] + 0.3) { brakeTo(gap, 'queue', o); break; }
+            }
+          }
+        }
+      }
     }
-    if (junction !== undefined) {
-      // Distance from the front bumper to the stop line before the junction.
-      const gap = (junction - car.along) * car.dir - STOP_LINE - hl;
-      const light = ax ? lightFor(junction, car.road, 'x', time) : lightFor(car.road, junction, 'z', time);
-      const stop = light === 'red' || (light === 'yellow' && gap > (car.speed * car.speed) / 9 + 1);
-      if (stop && gap > -0.6) {
-        const limit = Math.sqrt(Math.max(0, gap - 0.2) * 5);
-        if (limit < target) { target = limit; if (limit < 1 && (!wait || wait === 'block')) wait = 'light'; }
+    car.yieldSince = yielding ? (car.yieldSince >= 0 ? car.yieldSince : time) : -1;
+    // The next light along the way, a node on (a short street after this one).
+    {
+      const next = conn ? conn.to : plan ? plan.to : -1;
+      if (next >= 0) {
+        const n2 = roads.nodes[net.arrival(next)], arm2 = net.inArm(next), out = roads.edges[next >> 1];
+        if (n2.control === 'signal' && arm2.approach >= 0) {
+          const c = conn ?? plan!, rest = conn ? conn.len - car.connS : toNode(car) - c.before + c.len;
+          const onOut = dirOfState(next) > 0 ? out.len - c.sOut : c.sOut;
+          const gap2 = rest + onOut - arm2.setback - hl;
+          if (gap2 > -0.6 && gap2 < 60 && stopsFor(nodeLight(n2.id, arm2.group, time), gap2, car.speed)) brakeTo(gap2, 'light');
+        }
       }
     }
     car.wait = wait;
+    car.waitFor = waitFor;
     // Blocked with no way past: honk after a moment and, after a long wait, turn round. Waiting for a light, the
-    // vehicle ahead or people crossing is just waiting.
+    // vehicle ahead, people crossing or a gap is just waiting.
     const stuckNow = (wait === 'block' || wait === 'cross') && car.speed < 1;
     car.stuck = stuckNow ? car.stuck + dt : 0;
     if (stuckNow && car.stuck > 1.5 && (noWay || hard)) honk(car.x, car.z, time, player);
     if (passing && abandoned) honk(car.x, car.z, time, player);
-    if (car.stuck > (hard || wait === 'cross' ? 6 : 15)) {
+    if (car.stuck > (hard || wait === 'cross' ? 6 : 15) && !conn) {
       car.stuck = 0;
-      car.dir = -car.dir;
-      car.plan = null;
-      car.lateral = car.lateralTarget = L0;
-      car.uturns++;
+      turnBack(car);
+      return;
+    }
+    // Shut in the middle of a junction (no turning round there): gone once nobody is looking.
+    if (conn && car.stuck > 8 && !sees(car.x, car.z, 3, Math.hypot(car.x - player.x, car.z - player.z))) {
+      Object.assign(car, { mode: 'off', driver: null, speed: 0, conn: null, plan: null, stuck: 0 });
+      return;
     }
     car.speed = target < car.speed ? Math.max(target, car.speed - 7 * dt) : THREE.MathUtils.damp(car.speed, target, 1.4, dt);
     // Across the road mostly as it rolls (a little even when stopped, edging out to see past).
     const step = (0.8 + Math.abs(car.speed) * 0.45) * dt;
-    car.lateral += THREE.MathUtils.clamp((car.lateralTarget - car.lateral) * (1 - Math.exp(-dt / 0.6)), -step, step);
-    if (!car.plan) planJunction(car);
-    car.along += car.dir * car.speed * dt;
-    const plan = car.plan;
-    if (plan) {
-      if (plan.axis === car.axis) {
-        if ((car.along - plan.at) * car.dir > LANES[car.kind] + 1) car.plan = null;
-      } else if ((before - plan.at) * (car.along - plan.at) <= 0) {
-        car.axis = plan.axis; car.road = plan.road; car.dir = plan.dir; car.along = plan.along;
-        car.plan = null;
-        car.speed *= 0.6;
-        car.lateral = car.lateralTarget = L0;
+    if (!conn) {
+      let next = car.lateral + THREE.MathUtils.clamp((car.lateralTarget - car.lateral) * (1 - Math.exp(-dt / 0.6)), -step, step);
+      // Never sideways into something standing beside it.
+      for (let i = 0; i < bands.length; i += 5) {
+        if (bands[i + 1] < -hl || bands[i] > hl) continue;
+        const lo = bands[i + 2], hi = bands[i + 3];
+        if (car.lateral <= lo && next > lo) next = lo;
+        else if (car.lateral >= hi && next < hi) next = hi;
+      }
+      car.lateral = next;
+    } else {
+      car.connLat += THREE.MathUtils.clamp((connTarget - car.connLat) * (1 - Math.exp(-dt / 0.6)), -step, step);
+      car.lateral = car.laneOff + car.connLat;
+    }
+
+    // ---- On along the edge, through the connector, onto the next edge ----
+    if (car.conn) {
+      const c = car.conn;
+      car.connS += car.speed * dt;
+      if (car.connS >= c.len) {
+        const to = c.to, out = roads.edges[to >> 1], od = dirOfState(to), over = car.connS - c.len;
+        const L = net.lanesOf(to)[c.outLane];
+        Object.assign(car, {
+          edge: to >> 1, dir: od, s: THREE.MathUtils.clamp(c.sOut + od * over, 0, out.len), lane: c.outLane, laneOff: L.off,
+          lateral: c.latOut + car.connLat, lateralTarget: L.off, conn: null, connS: 0, connLat: 0, plan: null, yieldSince: -1,
+        });
+      }
+    } else {
+      car.s = THREE.MathUtils.clamp(car.s + car.dir * car.speed * dt, 0, e.len);
+      const p = car.plan;
+      if (p && (car.s - p.sIn) * car.dir >= 0) {
+        // Into the connector from the lane it is actually in (a lane change it could not finish).
+        const c = car.lane === p.inLane ? p : net.connector(k, car.lane, p.to, p.outLane, use);
+        // Still off its lane (getting round something): it keeps that offset off the connector's line and eases back.
+        const lp = laneAt(roads, e, car.s, car.dir, car.laneOff);
+        car.conn = c;
+        car.connS = Math.min(c.len, connProject(c, lp.x, lp.z));
+        car.connLat = car.lateral - car.laneOff;
+        car.plan = c;
+        car.boxAt = time;
+      } else if (!p && toNode(car) < 8) {
+        // Nowhere to go on (a dead end, every way closed): round before its end.
+        if (!turnBack(car)) car.speed = 0;
       }
     }
-    const p = lanePoint(car.kind, car.axis, car.road, car.along, car.dir, car.lateral);
-    // The body trails its lane point by a short lag, so it rounds every corner in a smooth arc (a radius of
-    // about speed x 0.3 s) instead of pivoting on the spot, and it faces the way it is actually moving.
-    const follow = 1 - Math.exp(-dt / 0.3);
+    // The body trails its lane point by a short lag, so it rounds every corner in a smooth arc instead of pivoting
+    // on the spot, and it faces the way it is actually moving.
+    let px: number, pz: number, pyaw: number;
+    if (car.conn) { const q = connPoint(car.conn, car.connS); px = q.x - q.hz * car.connLat; pz = q.z + q.hx * car.connLat; pyaw = Math.atan2(q.hx, q.hz); }
+    else { const q = laneAt(roads, roads.edges[car.edge], car.s, car.dir, car.lateral); px = q.x; pz = q.z; pyaw = Math.atan2(q.hx, q.hz); }
+    const follow = 1 - Math.exp(-dt / (car.conn ? 0.12 : 0.3));
     const ox = car.x, oz = car.z;
-    car.x += (p.x - car.x) * follow;
-    car.z += (p.z - car.z) * follow;
+    car.x += (px - car.x) * follow;
+    car.z += (pz - car.z) * follow;
     const mx = car.x - ox, mz = car.z - oz;
     if (mx * mx + mz * mz > 1e-6) {
       let desired = Math.atan2(mx, mz);
       // Edging sideways past something at a crawl, the nose points only a little off the lane; rounding a corner
       // (or turning back) it follows the arc.
-      const off = Math.atan2(Math.sin(desired - p.yaw), Math.cos(desired - p.yaw));
-      if (Math.abs(car.speed) < 2 && Math.abs(off) < 2.4) desired = p.yaw + THREE.MathUtils.clamp(off, -0.45, 0.45);
+      const off = Math.atan2(Math.sin(desired - pyaw), Math.cos(desired - pyaw));
+      if (Math.abs(car.speed) < 2 && Math.abs(off) < 2.4) desired = pyaw + THREE.MathUtils.clamp(off, -0.45, 0.45);
       car.yaw = angleLerp(car.yaw, desired, 1 - Math.exp(-dt * 12));
     }
+    syncAxis(car);
   }
 
   /** Steers toward the next waypoint; returns the distance left to the final one. */
@@ -1447,23 +2310,23 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   }
   /** Back into the nearest lane heading the way the vehicle points (merging in from where it stopped), or left parked if it is off the road. */
   function rejoin(car: Car) {
-    let best: { axis: Axis; road: number; d: number } | null = null;
-    for (const axis of ['x', 'z'] as Axis[]) {
-      const cross = axis === 'x' ? car.z : car.x;
-      for (const road of roadsAlong(axis)) {
-        const d = Math.abs(cross - road);
-        if (d < 8 && (!best || d < best.d)) best = { axis, road, d };
-      }
+    const use = laneUseOf(car.kind);
+    let best: { k: number; s: number; off: number; d: number } | null = null;
+    for (const h of roads.edgesNear(car.x, car.z, 8, (e) => e.traffic)) {
+      if (h.d > h.edge.half + 1) continue;
+      const heading = Math.sin(car.yaw) * h.hx + Math.cos(car.yaw) * h.hz, dir: 1 | -1 = heading >= 0 ? 1 : -1, k = stateOf(h.edge.id, dir);
+      if (!net.drivable(k) || !net.lanesFor(k, use).length) continue;
+      if (!best || h.d < best.d) best = { k, s: h.s, off: h.off * dir, d: h.d };
     }
     if (!best) { car.mode = 'parked'; return; }
-    const heading = best.axis === 'x' ? Math.sin(car.yaw) : Math.cos(car.yaw);
-    const dir = heading >= 0 ? 1 : -1;
-    const [hw] = HALF[car.kind];
-    const l = (best.axis === 'x' ? car.z - best.road : best.road - car.x) * dir;
+    const lanes = net.lanesFor(best.k, use), L = net.lanesOf(best.k), off = best.off;
+    const lane = lanes.reduce((a, b) => (Math.abs(L[b].off - off) < Math.abs(L[a].off - off) ? b : a), lanes[0]);
+    const e = roads.edges[best.k >> 1], [hw] = HALF[car.kind];
     Object.assign(car, {
-      mode: 'lane', axis: best.axis, road: best.road, along: best.axis === 'x' ? car.x : car.z, dir, plan: null, speed: 0, recoverAt: 0,
-      lateral: THREE.MathUtils.clamp(l, hw + 0.15, ASPHALT_HALF - hw - 0.25), lateralTarget: LANES[car.kind],
+      mode: 'lane', edge: best.k >> 1, dir: dirOfState(best.k), s: best.s, lane, laneOff: L[lane].off, conn: null, connS: 0, plan: null, speed: 0, recoverAt: 0,
+      lateral: THREE.MathUtils.clamp(off, hw + 0.15, e.half - hw - 0.25), lateralTarget: L[lane].off, yieldSince: -1, wait: null, waitFor: null,
     });
+    syncAxis(car);
   }
   /** Resolves every pair of touching vehicles where at least one is skidding (or a cruiser on a chase); returns the impacts. */
   const movers: Car[] = [];
@@ -1594,24 +2457,33 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   function drawParked(dt: number) {
     for (const m of curbModels.values()) m.used = 0;
     let farMoto = 0, farCar = 0, shade = 0;
-    for (let i = 0; i < curbCars.length; i++) {
-      const car = curbCars[i], n = fleetCount + i;
-      if (car.impounded) continue;
-      if (car.mode === 'off') {
-        if (!occ[i] || !car.home) continue;
-        const s = SPOTS[i];
-        const d = eyeKnown ? Math.hypot(s.x - eye.x, s.z - eye.z) : 0;
-        if (d > DRAW_FAR || (view && !view.intersectsSphere(sphere.set(sphere.center.set(s.x, 0.8, s.z), car.kind === 'moto' ? 1.3 : 2.6)))) continue;
-        spotPose(i);
-        place(car, d > LOD_NEAR ? 'far' : 'near');
-        if (d < SHADOW_FAR) {
-          const moto = car.kind === 'moto';
-          quat.setFromAxisAngle(up, s.yaw);
-          shadows.setMatrixAt(shade++, bodyMatrix.compose(pos.set(s.x, spotY[i] + 0.02, s.z), quat, scale.set(moto ? 0.9 : 2.6, 1, moto ? 2.1 : 5.2)));
-        }
-        continue;
+    /** A parked vehicle only drawn, standing in its spot. */
+    const drawSpot = (i: number) => {
+      const car = curbCars[i];
+      if (car.impounded || car.mode !== 'off' || !occ[i] || !car.home) return;
+      const s = SPOTS[i];
+      const d = eyeKnown ? Math.hypot(s.x - eye.x, s.z - eye.z) : 0;
+      if (d > DRAW_FAR || (view && !view.intersectsSphere(sphere.set(sphere.center.set(s.x, 0.8, s.z), car.kind === 'moto' ? 1.3 : 2.6)))) return;
+      spotPose(i);
+      place(car, d > LOD_NEAR ? 'far' : 'near');
+      if (d < SHADOW_FAR) {
+        const moto = car.kind === 'moto';
+        quat.setFromAxisAngle(up, s.yaw);
+        shadows.setMatrixAt(shade++, bodyMatrix.compose(pos.set(s.x, spotY[i] + 0.02, s.z), quat, scale.set(moto ? 0.9 : 2.6, 1, moto ? 2.1 : 5.2)));
       }
-      pose(car, n, dt);
+    };
+    // The spots within draw range of the eye (the spot index), or every spot when there is no camera.
+    if (eyeKnown) {
+      const ix0 = Math.floor((eye.x - DRAW_FAR) / DRAW_CELL), ix1 = Math.floor((eye.x + DRAW_FAR) / DRAW_CELL), iz0 = Math.floor((eye.z - DRAW_FAR) / DRAW_CELL), iz1 = Math.floor((eye.z + DRAW_FAR) / DRAW_CELL);
+      for (let ix = ix0; ix <= ix1; ix++) for (let iz = iz0; iz <= iz1; iz++) {
+        const list = drawCells.get(cellKey(ix, iz));
+        if (list) for (let k = 0; k < list.length; k++) drawSpot(list[k]);
+      }
+    } else for (let i = 0; i < curbCars.length; i++) drawSpot(i);
+    // The parked vehicles that are entities (promoted, ridden, knocked about): every one is in activeCurb.
+    for (const car of activeCurb) {
+      if (car.impounded || car.mode === 'off') continue;
+      pose(car, ordinal.get(car)!, dt);
       const e = matrix.elements, d = eyeKnown ? Math.hypot(e[12] - eye.x, e[14] - eye.z) : 0;
       if (d > DRAW_FAR || (view && !view.intersectsSphere(sphere.set(sphere.center.set(e[12], e[13] + 0.8, e[14]), car.kind === 'moto' ? 1.3 : 2.6)))) continue;
       place(car, car.mode === 'player' || car.mode === 'knocked' ? 'fleet' : d > LOD_NEAR ? 'far' : 'near');
@@ -1654,16 +2526,28 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     }
   }
 
-  // Initial traffic spread over the grid (as much as the hour allows).
+  // Initial traffic spread over the streets round the start (as much as the hour allows).
   {
     const n = { traffic: 0, moto: 0, police: 0 };
-    for (const car of fleet) if (car.kind !== 'police' && n[car.kind] < laneAllowance(car.kind, hours) && spawnTraffic(car, 12, 12, 14)) n[car.kind]++;
+    const near = spawnEdges(12, 12).laneMetres;
+    for (const car of fleet) if (car.kind !== 'police' && n[car.kind] < laneAllowance(car.kind, hours, level, near) && spawnTraffic(car, 12, 12, 14)) n[car.kind]++;
   }
   rebuildActive();
 
   let flash = 0;
   return {
+    /** Every vehicle: the fleet, then one per parking spot (most of those only drawn, mode 'off'). */
     cars,
+    /**
+     * The vehicles that can be touched this frame: the fleet and the parked ones that are entities (rebuilt each update).
+     * Loops that skip mode 'off' read this instead of `cars`, so their cost follows what is round the player, not the
+     * number of parking spots on the map.
+     */
+    get live(): readonly Car[] { return active; },
+    /** The quality level (quality.ts): the lane fleet's cap follows it (design-engine §8). */
+    setQuality(next: number) { level = Math.max(0, Math.min(FLEET_CAPS.length - 1, Math.round(next))); },
+    /** Lane vehicles allowed round a point now, and the lane metres they share (debug and benches). */
+    allowance(x: number, z: number) { const m = spawnEdges(x, z).laneMetres; return { moto: laneAllowance('moto', hours, level, m), traffic: laneAllowance('traffic', hours, level, m), laneMetres: Math.round(m), level }; },
     blocked,
     raycast,
     roadRoute,
@@ -1672,18 +2556,12 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     spawnPolice(px: number, pz: number, min: number, max: number) {
       const car = fleet.find((c) => c.kind === 'police' && c.mode === 'off');
       if (!car) return null;
+      // On a road centre line between min and max from the player, facing them.
       for (let attempt = 0; attempt < 60; attempt++) {
-        const axis: Axis = random() < 0.5 ? 'x' : 'z';
-        const roads = roadsAlong(axis), cross = junctionsAlong(axis);
-        const road = roads[Math.floor(random() * roads.length)];
-        const centre = axis === 'x' ? px : pz;
-        const lo = Math.max(cross[0] - 5, centre - max), hi = Math.min(cross[cross.length - 1] + 5, centre + max);
-        if (hi <= lo) continue;
-        const along = lo + random() * (hi - lo);
-        const x = axis === 'x' ? along : road, z = axis === 'x' ? road : along;
-        const d = Math.hypot(x - px, z - pz);
-        if (d < min || d > max || blocked(x, z, 3)) continue;
-        Object.assign(car, { mode: 'chase', health: POLICE_CAR_HEALTH, x, z, speed: 0, yaw: Math.atan2(px - x, pz - z), waypoints: [], routeAt: 0, stuck: 0, driver: null });
+        const at = roadPoint(px, pz, min, max);
+        if (!at) break;
+        if (blocked(at.x, at.z, 3)) continue;
+        Object.assign(car, { mode: 'chase', health: POLICE_CAR_HEALTH, x: at.x, z: at.z, speed: 0, yaw: Math.atan2(px - at.x, pz - at.z), waypoints: [], routeAt: 0, stuck: 0, driver: null, conn: null, plan: null });
         return car;
       }
       return null;
@@ -1721,9 +2599,9 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
           if (worldClear(nx, nz, 1.2) && !blocked(nx, nz, 1.0, car)) { car.x = nx; car.z = nz; }
         } else if (car.mode === 'leave') {
           if (!car.waypoints.length || time > car.routeAt) {
-            const p = snapToRoad(car.x, car.z);
-            const awayAlong = p.axis === 'x' ? (car.x > px ? LAND.maxX - 3 : LAND.minX + 3) : (car.z > pz ? LAND.maxZ - 3 : ROADS_Z[0]);
-            car.waypoints = p.axis === 'x' ? [{ x: awayAlong, z: p.road }] : [{ x: p.road, z: awayAlong }];
+            // Off along the roads, away from the player.
+            const ax = car.x - px, az = car.z - pz, l = Math.hypot(ax, az) || 1;
+            car.waypoints = roadRoute(car.x, car.z, car.x + (ax / l) * 120, car.z + (az / l) * 120);
             car.routeAt = time + 3;
           }
           driveRoute(car, dt, 16, null);
@@ -1766,25 +2644,42 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       crossing.length = 0;
       crossing.push(...pedestrians);
       const crashes: Crash[] = [];
+      // A new map from the wiring: lane traffic starts afresh on it.
+      if (laneNet() !== net) {
+        net = laneNet();
+        roads = net.roads;
+        for (const car of fleet) if (car.mode === 'lane') Object.assign(car, { mode: 'off', driver: null, speed: 0, conn: null, plan: null });
+      }
+      // Streets opening and closing with the hour (traffic stays out of one about to close).
+      net.refresh(hours, CLOSE_AHEAD);
       rebuildActive();
       for (const car of active) if (car.mode === 'player') adopt(car);
       // The hour's flow: surplus traffic leaves the road only unseen and far off; missing traffic spawns out of sight.
-      const running = { traffic: 0, moto: 0, police: 0 }, allow = { traffic: laneAllowance('traffic', hours), moto: laneAllowance('moto', hours), police: 0 };
+      const lanesNear = spawnEdges(player.x, player.z).laneMetres;
+      const running = { traffic: 0, moto: 0, police: 0 }, allow = { traffic: laneAllowance('traffic', hours, level, lanesNear), moto: laneAllowance('moto', hours, level, lanesNear), police: 0 };
       for (const car of fleet) if (car.mode === 'lane' && car.kind !== 'police') running[car.kind]++;
+      // A few spawns per frame at most (each tries a few spots out of sight).
+      let spawns = 3;
       for (const car of fleet) {
         if (car.kind === 'police' || car.impounded) continue;
         if (car.mode === 'lane' || car.mode === 'parked') settleShove(car, dt);
         const dp = Math.hypot(car.x - player.x, car.z - player.z);
         if (car.mode === 'lane' && traffic && running[car.kind] > allow[car.kind] && dp > FLIP_ANY && !sees(car.x, car.z, 3, dp)) {
-          Object.assign(car, { mode: 'off', driver: null, speed: 0 });
+          Object.assign(car, { mode: 'off', driver: null, speed: 0, conn: null, plan: null });
+          running[car.kind]--;
+          continue;
+        }
+        // Caught on a street that has closed (a clock jump): gone if nobody sees it, else it drives out.
+        if (car.mode === 'lane' && !car.conn && net.closedAt(car.edge, hours) && !sees(car.x, car.z, 3, dp)) {
+          Object.assign(car, { mode: 'off', driver: null, speed: 0, conn: null, plan: null });
           running[car.kind]--;
           continue;
         }
         // Traffic that has drifted far away from the player reappears on a street nearer them, out of sight.
-        if (car.mode === 'lane' && traffic && dp > TRAFFIC_FAR) spawnTraffic(car, player.x, player.z, 90);
+        if (car.mode === 'lane' && traffic && dp > TRAFFIC_FAR && spawns-- > 0) spawnTraffic(car, player.x, player.z, 50, true, 25);
         if (car.mode === 'lane') driveLane(car, dt, time, player);
         else if (car.mode === 'knocked') skid(car, dt, time);
-        else if (traffic && car.mode === 'off' && running[car.kind] < allow[car.kind] && spawnTraffic(car, player.x, player.z, 60)) running[car.kind]++;
+        else if (traffic && car.mode === 'off' && running[car.kind] < allow[car.kind] && spawns-- > 0 && spawnTraffic(car, player.x, player.z, 35, true, 25)) running[car.kind]++;
       }
       for (const car of activeCurb) {
         if (car.mode === 'parked') settleShove(car, dt);
@@ -1812,7 +2707,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
         } else if (car.mode === 'parked' && dp > 70) {
           // Abandoned vehicles far from the player are recycled into fresh traffic.
           car.timer += dt;
-          if (car.timer > 4) { car.timer = 0; car.role = 'traffic'; spawnTraffic(car, player.x, player.z, 60); }
+          if (car.timer > 4) { car.timer = 0; car.role = 'traffic'; spawnTraffic(car, player.x, player.z, 60, true); }
         } else car.timer = 0;
       }
       tendSpots(player);
@@ -1889,8 +2784,8 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
         if (had) repaint(car);
         if (car.kind === 'police') { car.mode = 'off'; continue; }
         if (car.impounded || (on && car.role === 'owned')) continue;
-        if (on) { if (running[car.kind] < laneAllowance(car.kind, hours) && spawnTraffic(car, px, pz, 14)) running[car.kind]++; else car.mode = 'off'; }
-        else wreck(car);
+        if (on) { if (running[car.kind] < laneAllowance(car.kind, hours, level, spawnEdges(px, pz).laneMetres) && spawnTraffic(car, px, pz, 14)) running[car.kind]++; else car.mode = 'off'; }
+        else wreck(car, px, pz);
       }
       for (const car of curbCars) {
         if (car.impounded || car.role === 'owned' || car === lastCar) continue;
@@ -2030,9 +2925,9 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
      * Something in the road: centre, half sizes across (hx) and along (hz) its heading yaw. Lane traffic gets round it
      * (a bus at its stop), or with `follow` (a bus driving or waiting at a light) queues behind it and waits while it crosses.
      */
-    registerObstacle(id: string | number, x: number, z: number, hx: number, hz: number, yaw: number, follow = false) {
+    registerObstacle(id: string | number, x: number, z: number, hx: number, hz: number, yaw: number, follow = false, speed = 0) {
       const o = obstacles.get(id);
-      if (o) Object.assign(o, { x, z, hx, hz, yaw, follow }); else obstacles.set(id, { x, z, hx, hz, yaw, follow });
+      if (o) Object.assign(o, { x, z, hx, hz, yaw, follow, speed }); else obstacles.set(id, { x, z, hx, hz, yaw, follow, speed });
     },
     clearObstacle(id: string | number) { obstacles.delete(id); },
     /** Counts for checks: parked spots taken, drawn near and far, live parked entities, the impound. */

@@ -69,6 +69,8 @@ export type EdgeSpec = {
   via?: number[];
   half?: number; sidewalk?: number; walk?: number; fwd?: Lane[]; back?: Lane[];
   speed?: number; traffic?: boolean; closed?: boolean; bays?: Bay[];
+  /** Where a junction may have a crosswalk over it (bit 0: at node a, bit 1: at b); all both ends when omitted (a roundabout's arcs: at a only). */
+  walkCross?: number;
 };
 export type RoadInput = { nodes: NodeSpec[]; edges: EdgeSpec[]; phantoms?: Phantom[]; footways?: Footway[] };
 
@@ -193,6 +195,7 @@ export function createRoadGraph(input: RoadInput) {
       // Square across the road: where the road runs straight on (the through road of a T) there is no corner on
       // that side, so that end takes the other side's distance.
       const st = straight[i], p = at(a, a.trim[st & 1 ? 1 : 0], 0), q = at(a, a.trim[st & 2 ? 0 : 1], 1), arm = a.arm >= 0 ? node.arms[a.arm] : null;
+      if (arm && !((input.edges[arm.edge].walkCross ?? 3) & (arm.end === 0 ? 1 : 2))) continue;
       if (informal && mouth >= 0) { if (arm) arm.crosswalk = mouth; continue; }
       if (arm) arm.crosswalk = crosswalks.length;
       if (informal) mouth = crosswalks.length;

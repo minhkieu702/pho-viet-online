@@ -76,6 +76,18 @@ const SIGN_COLORS = ['#b14635', '#245b4f', '#7a4b8c', '#2f5d8a', '#c27c1a', '#1d
 const NEON = ['#ff3d7f', '#3dd6ff', '#ffc23d', '#7dff6a', '#ff8a3d', '#b04dff'];
 const BOARDS = ['#f3e4c7', '#fff2c4', '#e8f0f4', '#fbe3e0', '#f6f6f0'];
 
+/** Bùi Viện's Phố Tây: bars, pubs and beer clubs, hostels and mini-hotels, massage, money exchange and tour offices, late food, a tattoo parlour. */
+const PHO_TAY_BARS: [string, string][] = [
+  ['BAR', 'BIA • COCKTAIL • NHẠC SỐNG'], ['BEER CLUB', 'BIA THÁP • BIA TƯƠI'], ['PUB', 'BIA • BÓNG ĐÁ • NHẠC'], ['LOUNGE', 'SHISHA • COCKTAIL'],
+  ['BAR SÂN THƯỢNG', 'ROOFTOP • NGẮM PHỐ TÂY'], ['BIA HƠI', 'BIA TƯƠI • ĐỒ NHẬU'],
+];
+const PHO_TAY_BEDS: [string, string][] = [['HOSTEL', 'GIƯỜNG TẬP THỂ • WIFI'], ['KHÁCH SẠN MINI', 'PHÒNG ĐÔI • MÁY LẠNH'], ['NHÀ NGHỈ', 'NGHỈ GIỜ • QUA ĐÊM'], ['GUESTHOUSE', 'PHÒNG ĐẸP • GIÁ RẺ']];
+const PHO_TAY_SPA: [string, string][] = [['MASSAGE', 'MASSAGE CHÂN • BODY'], ['SPA', 'XÔNG HƠI • MASSAGE'], ['MASSAGE CHÂN', 'NGÂM CHÂN THẢO DƯỢC']];
+const PHO_TAY_TRAVEL: [string, string][] = [['ĐỔI TIỀN', 'ĐỔI NGOẠI TỆ • USD • EUR'], ['TOUR DU LỊCH', 'CỦ CHI • MIỀN TÂY'], ['VÉ XE', 'VÉ XE KHÁCH • VÉ MÁY BAY'], ['TRAVEL', 'TOUR • VISA • VÉ XE']];
+const PHO_TAY_FOOD: [string, string][] = [['PHỞ 24H', 'PHỞ BÒ • MỞ CẢ ĐÊM'], ['BÁNH MÌ', 'PATÊ • TRỨNG • XÍU MẠI'], ['HỦ TIẾU NAM VANG', 'KHÔ • NƯỚC'], ['CƠM TẤM', 'SƯỜN • BÌ • CHẢ']];
+const PHO_TAY_MART: [string, string][] = [['MINI MART', 'MỞ CỬA 24/7'], ['TẠP HÓA', 'BIA • NƯỚC • THUỐC LÁ']];
+const PHO_TAY_INK: [string, string][] = [['XĂM HÌNH', 'TATTOO • XỎ KHUYÊN'], ['TATTOO', 'XĂM NGHỆ THUẬT']];
+
 export type BusinessKind = 'food' | 'shop' | 'cafe';
 type Pick = { kind: BusinessKind; list: [string, string][]; tag: string };
 /**
@@ -84,10 +96,17 @@ type Pick = { kind: BusinessKind; list: [string, string][]; tag: string };
  */
 const STREET_MIXES: Record<StreetMix, { share: number; picks: [Pick, number][] }> = {
   oc: { share: 0.9, picks: [[{ kind: 'food', list: OC, tag: 'oc' }, 0.45], [{ kind: 'food', list: SEAFOOD, tag: 'sea' }, 0.3], [{ kind: 'food', list: BEER, tag: 'beer' }, 0.15], [{ kind: 'cafe', list: CAFES, tag: 'cafe' }, 0.05], [{ kind: 'shop', list: SHOPS, tag: 'shop' }, 0.05]] },
+  // Phố Tây (Bùi Viện and its hẻm): wall-to-wall bars and beer clubs, hostels, massage, exchange and tour desks, late food.
+  'pho-tay': { share: 0.95, picks: [
+    [{ kind: 'food', list: PHO_TAY_BARS, tag: 'bar' }, 0.45], [{ kind: 'shop', list: PHO_TAY_BEDS, tag: 'bed' }, 0.15], [{ kind: 'shop', list: PHO_TAY_SPA, tag: 'spa' }, 0.08],
+    [{ kind: 'shop', list: PHO_TAY_TRAVEL, tag: 'travel' }, 0.1], [{ kind: 'food', list: PHO_TAY_FOOD, tag: 'late' }, 0.12], [{ kind: 'shop', list: PHO_TAY_MART, tag: 'mart' }, 0.05],
+    [{ kind: 'shop', list: PHO_TAY_INK, tag: 'ink' }, 0.05],
+  ] },
 };
 /** Kind of a frontage lot (and what it sells): its street's mix, else a business share by street class and zone; corner lots always open a business. */
 function kindOfLot(r: Rng, lot: Lot, style: DistrictStyle, mix: StreetMix | undefined): Pick | null {
-  const m = lot.cls !== 'hem' && mix ? STREET_MIXES[mix] : null;
+  // (a hẻm keeps the zone's mix, except Phố Tây's own hẻm, which are as much the walking street as it is)
+  const m = mix && (lot.cls !== 'hem' || mix === 'pho-tay') ? STREET_MIXES[mix] : null;
   const share = m ? m.share : lot.zone === 'night' ? 0.8 : lot.zone === 'market' ? 0.85 : style.business[lot.cls];
   if (!lot.corner && !r.chance(share)) return null;
   let roll = r.next();
@@ -176,7 +195,7 @@ function draftLot(ctx: Ctx, r: Rng, lot: Lot, slab: number): Draft | null {
     name = zoneName(ctx, lot) ?? `CHỢ ${short(net.arts.get(lot.line)?.name ?? 'XÓM')}`; subtitle = 'CHỢ SÁNG • HÀNG TƯƠI SỐNG • ĐỒ KHÔ';
   } else if (lot.use === 'pagoda' || lot.use === 'church') {
     const church = lot.use === 'church';
-    typology = church ? 'church' : 'pagoda'; kind = 'pagoda'; pstyle = 'pagoda'; facade = church ? 'colonial' : 'temple'; storeys = church ? 2 : 1;
+    typology = church ? 'church' : 'pagoda'; kind = 'pagoda'; pstyle = church ? 'church' : 'pagoda'; facade = church ? 'colonial' : 'temple'; storeys = church ? 2 : 1;
     w = lot.w * (church ? 0.5 : 0.62); setback = lot.d * (church ? 0.32 : 0.45); depth = lot.box.hz * 2 - setback - 1.5;
     color = church ? '#e8d5c0' : '#e7b75f'; residents = church ? 0 : 2; jobs = 1;
     name = zoneName(ctx, lot) ?? (church ? `NHÀ THỜ ${short(net.arts.get(lot.line)?.name ?? 'GIÁO XỨ')}` : r.pick(PAGODAS));
@@ -199,7 +218,8 @@ function draftLot(ctx: Ctx, r: Rng, lot: Lot, slab: number): Draft | null {
     typology = 'villa'; kind = 'home'; facade = r.pick(['colonial', 'modern'] as const); storeys = r.int(2) + 2; residents = 3;
     color = r.pick(['#f2e6c9', '#e9d9b0', '#f5f0e6', '#e4cfc0', '#dfe6d6']);
   } else {
-    const pick = kindOfLot(r, lot, style, lot.cls === 'hem' ? undefined : net.arts.get(lot.line)?.mix);
+    const mix = net.arts.get(lot.line)?.mix;
+    const pick = kindOfLot(r, lot, style, lot.cls === 'hem' && mix !== 'pho-tay' ? undefined : mix);
     kind = pick?.kind ?? 'home';
     typology = lot.stilt > 0 ? 'stilt' : 'tube';
     const [lo, hi] = zs.storeys, bonus = lot.cls === 'R1' ? 1 : lot.cls === 'hem' ? -1 : 0;
@@ -299,7 +319,7 @@ export function hemArches(net: Net, hems: HemPlan[]): GenSign[] {
 export function buildStamp(ctx: Ctx, s: StampSpec, line: string, walk: number): Draft | null {
   const typology: Typology = s.kind === 'story' || s.kind === 'landmark' ? 'landmark' : s.kind === 'park' ? 'landmark' : s.kind === 'market' ? 'market-hall' : s.kind as Typology;
   const kind: BuildingKind = s.building ?? (s.kind === 'market' ? 'shop' : s.kind === 'pagoda' || s.kind === 'church' ? 'pagoda' : s.kind === 'school' ? 'school' : s.kind === 'police' ? 'police' : s.kind === 'hospital' ? 'hospital' : s.kind === 'apartment' ? 'home' : 'office');
-  const pstyle: PlotStyle = kind === 'pagoda' ? 'pagoda' : kind === 'school' ? 'school' : kind === 'police' ? 'police' : kind === 'hospital' ? 'hospital' : kind === 'home' ? 'midrise' : kind === 'shop' ? 'shop' : 'office';
+  const pstyle: PlotStyle = s.kind === 'church' ? 'church' : kind === 'pagoda' ? 'pagoda' : kind === 'school' ? 'school' : kind === 'police' ? 'police' : kind === 'hospital' ? 'hospital' : kind === 'home' ? 'midrise' : kind === 'shop' ? 'shop' : 'office';
   const box: OBB = { cx: s.x, cz: s.z, hx: s.w / 2, hz: s.d / 2, yaw: s.yaw };
   const entrance = s.entrance ? { door: { x: r2(s.entrance.x), z: r2(s.entrance.z) }, curb: curbOf(ctx.net, ctx.hems, line, walk, s.entrance.x, s.entrance.z) } : null;
   const found = entrance ? (ctx.door(entrance.door, entrance.curb, box) ? entrance : null) : findDoor(ctx.net, ctx.hems, box, line, walk, ctx.door);

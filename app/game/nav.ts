@@ -1,5 +1,6 @@
 import { LEGACY_ROADS } from './map/roads-legacy.ts';
 import type { Footway, RoadGraph } from './map/roads.ts';
+import { worldRoads, worldVersion } from './map/world-types.ts';
 
 /** A step of a walking route; `crossing` marks legs over a carriageway (on a crosswalk). */
 export type Waypoint = { x: number; z: number; crossing: boolean };
@@ -26,16 +27,17 @@ const TEE = 0.05;
 const HEURISTIC = 1 - 1e-9;
 const STAMP_LIMIT = 0xffffffff;
 
-let shared: Nav | null = null;
+let shared: Nav | null = null, sharedFor = -1;
 
 /**
  * Pedestrian network over the road graph: the walking lines along every road (both sidewalks, or one down the middle
  * of a hẻm) broken at nodes into legs, the crosswalks over junction arms, footways, and joins between walking lines.
- * Routes follow walking lines and only cross roads on crosswalks. It depends only on the road graph (today's grid,
- * LEGACY_ROADS) and searches keep no state between calls, so all callers share one.
+ * Routes follow walking lines and only cross roads on crosswalks. It depends only on the road graph (the live map,
+ * map/world-types.ts: today's grid until the wiring sets the wired districts, whose footways and hẻm come with it)
+ * and searches keep no state between calls, so all callers share one.
  */
 export function createNav() {
-  if (!shared) shared = buildNav();
+  if (!shared || sharedFor !== worldVersion()) { shared = buildNav(worldRoads().roads); sharedFor = worldVersion(); }
   return shared;
 }
 
@@ -260,6 +262,8 @@ export function buildNav(roads: RoadGraph = LEGACY_ROADS) {
 
   /** Walking route between two points on (or near) the network; the start point itself is not included. */
   function route(fromX: number, fromZ: number, toX: number, toZ: number): Waypoint[] {
+    // A NaN start or goal would reopen nodes forever (the heap grows until the allocation fails): no route.
+    if (!Number.isFinite(fromX + fromZ + toX + toZ)) return [];
     nearest(fromX, fromZ);
     const from = segments[nearSeg], fx = nearX, fz = nearZ;
     nearest(toX, toZ);

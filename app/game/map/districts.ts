@@ -1,41 +1,53 @@
 /**
- * Districts of the planned city (design 1: ten districts, phases P0/P1/P2), the named areas of today's map,
- * waterways and street names, as small pure tables. No generation: page.tsx and the SSR bundle may import it.
- * Lookups are rectangle unions, first match wins, half-open [min, max).
+ * Districts of the planned city (design 1: ten districts, phases P0/P1/P2), the named areas of today's map and of
+ * the wired P1 slices, waterways and street names, as small pure tables. No generation: page.tsx and the SSR bundle
+ * may import it. Lookups are rectangle unions, first match wins, half-open [min, max). The streets of the wired
+ * slices are handed over at run time (registerStreets, from map/mapdata.ts on the client).
  */
 import { CITY_PARK, DOCKS, LAND, PARK, PLAZA, RIVER, ROADS_X, ROADS_Z, SQUARE, STREETS_H, STREETS_V, type Rect } from './consts.ts';
+import { isWired, type SliceKey } from './wiring.ts';
+
+// Which slices are wired (their land, zones and streets are live): map/wiring.ts, the one source the map reads too.
+export { P1_ORDER, WIRED_KEYS, isWired, type SliceKey } from './wiring.ts';
 
 export type Phase = 'P0' | 'P1' | 'P2';
 export type DistrictId = 'D1' | 'D2' | 'D3' | 'D4' | 'D5' | 'D6' | 'D7' | 'D8' | 'D9' | 'D10';
-/** One rectangle of a district, the phase that builds it, and the ward shown after the district name ("QUẬN 1 · BẾN NGHÉ"). */
-export type DistrictPart = { rect: Rect; phase: Phase; ward?: string };
+/**
+ * One rectangle of a district, the phase that builds it, the ward shown after the district name ("QUẬN 1 · BẾN
+ * NGHÉ") and the P1 slice that builds most of it (its land is open once that slice is wired).
+ */
+export type DistrictPart = { rect: Rect; phase: Phase; ward?: string; slice?: SliceKey };
 export type District = { id: DistrictId; name: string; subtitle: string; color: string; phase: Phase; parts: DistrictPart[]; label: { x: number; z: number } };
-/** A named area inside a district (today's sub-zones), used by the HUD line and banners. */
-export type Zone = { id: string; name: string; district: DistrictId; rects: Rect[]; phase: Phase };
+/** A named area inside a district (today's sub-zones and the wired slices'), used by the HUD line and banners. */
+export type Zone = { id: string; name: string; district: DistrictId; rects: Rect[]; phase: Phase; slice?: SliceKey };
 /** A river, canal or lake: a polygon (x, z pairs), its label positions, and whether it is open today (P0). */
 export type Water = { id: string; name: string; subtitle: string; poly: number[]; labels: { x: number; z: number; vertical?: boolean }[]; phase: Phase };
-export type Street = { id: string; name: string; label: string; short: string; x1: number; z1: number; x2: number; z2: number };
+/**
+ * A named street: today's run straight from (x1, z1) to (x2, z2); a district street follows its centre lines `lines`
+ * (x,z pairs each) and reaches `reach` metres from them (its asphalt and sidewalk), its box in x1..x2, z1..z2.
+ */
+export type Street = { id: string; name: string; label: string; short: string; x1: number; z1: number; x2: number; z2: number; lines?: number[][]; reach?: number };
 export type Area = { title: string; subtitle: string; zone: string; district: DistrictId | null; water: string | null; key: string };
 
 const r = (minX: number, maxX: number, minZ: number, maxZ: number): Rect => ({ minX, maxX, minZ, maxZ });
 const inside = (b: Rect, x: number, z: number) => x >= b.minX && x < b.maxX && z >= b.minZ && z < b.maxZ;
-const part = (rect: Rect, phase: Phase, ward?: string): DistrictPart => (ward ? { rect, phase, ward } : { rect, phase });
+const part = (rect: Rect, phase: Phase, ward?: string, slice?: SliceKey): DistrictPart => ({ rect, phase, ...(ward ? { ward } : {}), ...(slice ? { slice } : {}) });
 
 /** The whole planned city (design 1, phase P2). */
 export const CITY_BOUNDS = r(-1000, 1150, -620, 860);
 
 export const DISTRICTS: District[] = [
   { id: 'D1', name: 'AN HÒA', subtitle: 'Phường An Hòa · ven kênh Thị Nghè', color: '#5f9846', phase: 'P0', label: { x: -30, z: -81 },
-    parts: [part(r(LAND.minX, 135, -137.6, 137.5), 'P0'), part(r(-175, LAND.minX, -137.6, 137.5), 'P1')] },
+    parts: [part(r(LAND.minX, 135, -137.6, 137.5), 'P0'), part(r(-175, LAND.minX, -137.6, 137.5), 'P1', undefined, 'binh-thanh')] },
   { id: 'D2', name: 'QUẬN 1', subtitle: 'Trung tâm thành phố · ven sông Sài Gòn', color: '#db683f', phase: 'P0', label: { x: 243, z: -81 },
-    parts: [part(r(135, LAND.maxX, -137.6, 137.5), 'P0', 'BẾN NGHÉ'), part(r(LAND.maxX, 392, -137.6, 137.5), 'P1', 'BẾN NGHÉ'), part(r(135, 392, 137.5, 216), 'P1', 'BẾN NGHÉ'),
-      part(r(135, 392, 216, 440), 'P1', 'BẾN THÀNH'), part(r(-54, 135, 216, 385), 'P1', 'BẾN THÀNH')] },
+    parts: [part(r(135, LAND.maxX, -137.6, 137.5), 'P0', 'BẾN NGHÉ'), part(r(LAND.maxX, 392, -137.6, 137.5), 'P1', 'BẾN NGHÉ', 'quan-4'), part(r(135, 392, 137.5, 216), 'P1', 'BẾN NGHÉ', 'quan-1-south'),
+      part(r(135, 392, 216, 440), 'P1', 'BẾN THÀNH', 'quan-1-south'), part(r(-54, 135, 216, 385), 'P1', 'BẾN THÀNH', 'quan-1-south')] },
   { id: 'D3', name: 'QUẬN 3', subtitle: 'Biệt thự · hẻm · cà phê', color: '#8a6fb0', phase: 'P1', label: { x: -150, z: 330 },
-    parts: [part(r(-175, 135, 137.5, 216), 'P1'), part(r(-175, -54, 216, 440), 'P1'), part(r(-54, 135, 385, 440), 'P1'), part(r(-380, -175, 230, 440), 'P1')] },
+    parts: [part(r(-175, 135, 137.5, 216), 'P1', undefined, 'quan-3'), part(r(-175, -54, 216, 440), 'P1', undefined, 'quan-3'), part(r(-54, 135, 385, 440), 'P1', undefined, 'quan-3'), part(r(-380, -175, 230, 440), 'P1', undefined, 'quan-3')] },
   { id: 'D4', name: 'BÌNH THẠNH', subtitle: 'Bờ sông · Hàng Xanh · Bà Chiểu', color: '#2f8f83', phase: 'P1', label: { x: -480, z: 40 },
-    parts: [part(r(-700, -205, -137.6, 200), 'P1'), part(r(-970, -700, -137.6, 200), 'P2')] },
+    parts: [part(r(-700, -205, -137.6, 200), 'P1', undefined, 'binh-thanh'), part(r(-970, -700, -137.6, 200), 'P2')] },
   { id: 'D5', name: 'QUẬN 4', subtitle: 'Khánh Hội · bến cảng', color: '#3f68b8', phase: 'P1', label: { x: 540, z: 190 },
-    parts: [part(r(432, 680, -137.6, 440), 'P1')] },
+    parts: [part(r(432, 680, -137.6, 440), 'P1', undefined, 'quan-4')] },
   { id: 'D6', name: 'CHỢ LỚN', subtitle: 'Quận 5 · phố chợ', color: '#c0392b', phase: 'P2', label: { x: -690, z: 335 },
     parts: [part(r(-1000, -380, 230, 440), 'P2')] },
   { id: 'D7', name: 'QUẬN 8', subtitle: 'Kênh rạch · chợ đầu mối', color: '#a0773f', phase: 'P2', label: { x: -380, z: 620 },
@@ -43,12 +55,16 @@ export const DISTRICTS: District[] = [
   { id: 'D8', name: 'QUẬN 7', subtitle: 'Phú Mỹ Hưng · Tân Thuận', color: '#c39a1c', phase: 'P2', label: { x: 470, z: 600 },
     parts: [part(r(280, 680, 480, 860), 'P2')] },
   { id: 'D9', name: 'THỦ THIÊM · CÁT LÁI', subtitle: 'Đô thị mới bên kia sông', color: '#3fa0c8', phase: 'P1', label: { x: 140, z: -330 },
-    parts: [part(r(-440, 470, -420, RIVER.minZ), 'P1'), part(r(470, 680, -420, RIVER.minZ), 'P1'), part(r(-440, 1150, -620, -420), 'P2'), part(r(680, 1150, -420, -260), 'P2'),
+    parts: [part(r(-440, 470, -420, RIVER.minZ), 'P1', undefined, 'thu-thiem'), part(r(470, 680, -420, RIVER.minZ), 'P1', undefined, 'thu-thiem'), part(r(-440, 1150, -620, -420), 'P2'), part(r(680, 1150, -420, -260), 'P2'),
       part(r(680, 1150, -260, -77.6), 'P2'), part(r(802.4, 1150, -77.6, 860), 'P2')] },
   { id: 'D10', name: 'THẢO ĐIỀN', subtitle: 'Biệt thự ven sông', color: '#b0607a', phase: 'P2', label: { x: -690, z: -300 },
     parts: [part(r(-1000, -440, -620, RIVER.minZ), 'P2')] },
 ];
 export const DISTRICT_BY_ID = Object.fromEntries(DISTRICTS.map((d) => [d.id, d])) as Record<DistrictId, District>;
+/** Whether a part of a district is open: today's map, or built by a wired slice. */
+export const partOpen = (p: DistrictPart) => p.phase === 'P0' || (!!p.slice && isWired(p.slice));
+/** Whether any of a district is open. */
+export const districtOpen = (d: District) => d.parts.some(partOpen);
 
 /** Today's named areas, most specific first; the last one of a district is its default (Quận 1 has none). */
 const DOCK_ZONES: Record<number, [string, DistrictId]> = { [-80]: ['Bến đò An Hòa', 'D1'], 2: ['Bến ca nô An Hòa', 'D1'], 190: ['Bến tàu Bạch Đằng', 'D2'], 300: ['Bến du thuyền', 'D2'] };
@@ -67,8 +83,52 @@ export const ZONES: Zone[] = [
   { id: 'xom-tre', name: 'Xóm Tre', district: 'D1', rects: [r(LAND.minX, -81, -81, 137.5)], phase: 'P0' },
   { id: 'khu-cho-cu', name: 'Khu Chợ Cũ', district: 'D1', rects: [r(-81, 135, 81, 137.5)], phase: 'P0' },
   { id: 'trung-tam-an-hoa', name: 'Trung tâm An Hòa', district: 'D1', rects: [r(-81, 135, -81, 81)], phase: 'P0' },
-  { id: 'bo-kenh-hoang-sa', name: 'Bờ kênh Hoàng Sa', district: 'D1', rects: [r(-175, LAND.minX, -137.6, 137.5)], phase: 'P1' },
+  { id: 'bo-kenh-hoang-sa', name: 'Bờ kênh Hoàng Sa', district: 'D1', rects: [r(-175, LAND.minX, -137.6, 137.5)], phase: 'P1', slice: 'binh-thanh' },
+  ...SLICE_ZONES(),
 ];
+/**
+ * The wired slices' named areas, most specific first (WIRING-PLAN §3 zones per step; QUAN_3_EXTRA.zones and
+ * THU_THIEM_EXTRA.zones as authored there, districts.test checks they match; design 1's for Quận 4, Bình Thạnh
+ * and Quận 1). They name an area only once their slice is wired.
+ */
+function SLICE_ZONES(): Zone[] {
+  const z = (slice: SliceKey, district: DistrictId, id: string, name: string, ...rects: Rect[]): Zone => ({ id, name, district, rects, phase: 'P1', slice });
+  return [
+    // Step 14, Quận 4 and the Bến Nghé strip (design 1, D5 Khánh Hội).
+    z('quan-4', 'D2', 'cong-vien-ben-nghe', 'Công viên Bến Nghé', r(LAND.maxX, 392, -137.6, -96)),
+    z('quan-4', 'D5', 'ben-nha-rong', 'Bến Nhà Rồng', r(455, 520, -137.6, -112)),
+    z('quan-4', 'D5', 'cang-khanh-hoi', 'Cảng Khánh Hội', r(530, 680, -137.6, -62)),
+    z('quan-4', 'D5', 'pho-oc-vinh-khanh', 'Phố ốc Vĩnh Khánh', r(450, 625, -30, 32)),
+    z('quan-4', 'D5', 'cho-xom-chieu', 'Chợ Xóm Chiếu', r(545, 600, 378, 425)),
+    z('quan-4', 'D5', 'xom-chieu', 'Xóm Chiếu', r(432, 680, 300, 440)),
+    z('quan-4', 'D5', 'khanh-hoi', 'Khánh Hội', r(432, 680, -62, 300)),
+    // Step 15, Bình Thạnh east.
+    z('binh-thanh', 'D4', 'khu-do-thi-bo-song', 'Khu đô thị Bờ Sông', r(-700, -470, -137.6, -62)),
+    z('binh-thanh', 'D4', 'hang-xanh', 'Ngã tư Hàng Xanh', r(-445, -335, -30, 45)),
+    z('binh-thanh', 'D4', 'ben-xe-mien-dong', 'Bến xe Miền Đông cũ', r(-700, -585, 92, 150)),
+    z('binh-thanh', 'D4', 'cong-vien-truong-sa', 'Công viên bờ kênh Trường Sa', r(-700, -482, 185, 200)),
+    z('binh-thanh', 'D4', 'ba-chieu', 'Bà Chiểu', r(-585, -440, 55, 192)),
+    // Step 16, Quận 3 (QUAN_3_EXTRA.zones).
+    z('quan-3', 'D3', 'ho-con-rua', 'Hồ Con Rùa', r(-140, -76, 184, 248)),
+    z('quan-3', 'D3', 'tan-dinh', 'Tân Định', r(-175, 135, 137.5, 216)),
+    z('quan-3', 'D3', 'ban-co', 'Bàn Cờ', r(-270, -160, 245, 350)),
+    z('quan-3', 'D3', 'vinh-nghiem', 'Vĩnh Nghiêm', r(-380, -175, 230, 440)),
+    // Step 17, Quận 1 south: the walking street, Bến Thành, Phạm Ngũ Lão, the palace and the cathedral square.
+    z('quan-1-south', 'D2', 'pho-di-bo-bui-vien', 'Phố đi bộ Bùi Viện', r(278, 372, 241, 259)),
+    z('quan-1-south', 'D2', 'ben-thanh', 'Bến Thành', r(182, 300, 266, 372)),
+    z('quan-1-south', 'D2', 'pham-ngu-lao', 'Phạm Ngũ Lão', r(282, 392, 228, 368)),
+    z('quan-1-south', 'D2', 'dinh-doc-lap', 'Dinh Độc Lập', r(26, 126, 229.5, 367)),
+    z('quan-1-south', 'D2', 'cong-xa-paris', 'Công xã Paris', r(126, 214, 228.5, 283)),
+    z('quan-1-south', 'D2', 'cong-vien-tao-dan', 'Công viên Tao Đàn', r(-45, 22, 228.5, 368)),
+    // Step 18, the Thủ Thiêm strip (THU_THIEM_EXTRA.zones).
+    z('thu-thiem', 'D9', 'ben-do-thu-thiem', 'Bến đò Thủ Thiêm', r(-90, -70, -218, -192)),
+    z('thu-thiem', 'D9', 'quang-truong-bo-song', 'Quảng trường Bờ Sông', r(-80, 200, -320, -203.6)),
+    z('thu-thiem', 'D9', 'cong-vien-bo-song', 'Công viên bờ sông Thủ Thiêm', r(-440, 680, -320, -203.6)),
+    z('thu-thiem', 'D9', 'xom-dao-thu-thiem', 'Xóm đạo Thủ Thiêm', r(-157, 0, -420, -320)),
+    z('thu-thiem', 'D9', 'thap-doi', 'Công trường Tháp Đôi', r(200, 340, -420, -320)),
+    z('thu-thiem', 'D9', 'ban-dao-thu-thiem', 'Bán đảo Thủ Thiêm', r(-440, 680, -420, -203.6)),
+  ];
+}
 
 /** Points of an arc around (cx, cz) from angle a0 to a1 (radians, 0 = +x, PI/2 = +z). */
 function arc(cx: number, cz: number, radius: number, a0: number, a1: number, steps = 10) {
@@ -114,7 +174,10 @@ export function districtAt(x: number, z: number): { district: District; part: Di
 }
 /** The named area at (x, z) (docks, parks, the market, the nightlife strip, the promenade…), or null. */
 export function zoneAt(x: number, z: number): Zone | null {
-  for (const zone of ZONES) for (const b of zone.rects) if (inside(b, x, z)) return zone;
+  for (const zone of ZONES) {
+    if (zone.slice && !isWired(zone.slice)) continue;
+    for (const b of zone.rects) if (inside(b, x, z)) return zone;
+  }
   return null;
 }
 /** The waterway at (x, z), or null. Today's river is exactly RIVER between the buoy lines. */
@@ -179,8 +242,39 @@ export const STREETS: Street[] = [
 function streetDistance(s: Street, x: number, z: number) {
   const dx = Math.max(Math.min(s.x1, s.x2) - x, 0, x - Math.max(s.x1, s.x2));
   const dz = Math.max(Math.min(s.z1, s.z2) - z, 0, z - Math.max(s.z1, s.z2));
-  return Math.hypot(dx, dz);
+  if (!s.lines) return Math.hypot(dx, dz);
+  // A district street: to its nearest centre line, less how far its asphalt and sidewalk reach (12.5 on today's roads).
+  if (Math.hypot(dx, dz) > 30) return Infinity;
+  let best = Infinity;
+  for (const p of s.lines) for (let k = 0; k + 3 < p.length; k += 2) {
+    const ax = p[k], az = p[k + 1], ex = p[k + 2] - ax, ez = p[k + 3] - az, l2 = ex * ex + ez * ez;
+    const t = l2 ? Math.max(0, Math.min(1, ((x - ax) * ex + (z - az) * ez) / l2)) : 0;
+    best = Math.min(best, Math.hypot(x - ax - ex * t, z - az - ez * t));
+  }
+  return best - (s.reach ?? 12.5) + 12.5;
 }
+/** The wired slices' streets (registerStreets), by 32 m cell of their boxes. */
+let districtStreets: Street[] = [];
+const streetCells = new Map<number, Street[]>();
+const cellOf = (cx: number, cz: number) => (cx + 1024) * 2048 + cz + 1024;
+/**
+ * Hands the HUD the wired slices' streets (map/mapdata.ts districtStreets() on the client, before the game starts):
+ * each a name with its centre lines and reach. settleStreet then names them like today's roads.
+ */
+export function registerStreets(list: readonly Street[]) {
+  districtStreets = list.slice();
+  streetCells.clear();
+  for (const s of districtStreets) {
+    for (let cx = Math.floor((Math.min(s.x1, s.x2) - 16) / 32); cx <= Math.floor((Math.max(s.x1, s.x2) + 16) / 32); cx++) {
+      for (let cz = Math.floor((Math.min(s.z1, s.z2) - 16) / 32); cz <= Math.floor((Math.max(s.z1, s.z2) + 16) / 32); cz++) {
+        const k = cellOf(cx, cz), list2 = streetCells.get(k);
+        if (list2) list2.push(s); else streetCells.set(k, [s]);
+      }
+    }
+  }
+}
+/** The streets handed over so far (big map labels, tests). */
+export const registeredStreets = (): readonly Street[] => districtStreets;
 /**
  * The street at (x, z): the nearest one within the sidewalk (12.5 m of its centre line). The previous street
  * holds out to 14 m, so a junction keeps the name of the road you came along.
@@ -189,6 +283,11 @@ export function settleStreet(prev: Street | null, x: number, z: number): Street 
   if (prev && streetDistance(prev, x, z) <= 14) return prev;
   let best: Street | null = null, bestD = 12.5;
   for (const s of STREETS) {
+    const d = streetDistance(s, x, z);
+    if (d <= bestD) { best = s; bestD = d; }
+  }
+  const near = streetCells.get(cellOf(Math.floor(x / 32), Math.floor(z / 32)));
+  if (near) for (const s of near) {
     const d = streetDistance(s, x, z);
     if (d <= bestD) { best = s; bestD = d; }
   }

@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import type { Collider } from './world';
 import { WATER_LEVEL } from './city';
 import type { CollisionIndex } from './map/collision';
-import { bounds as terrainBounds } from './map/terrain';
+import { bounds as terrainBounds, onTerrain } from './map/terrain';
 import {
   ARM_ITEMS, FIGURE, FigureBatch, HAND, HEAD, RAGDOLL_RADII, TORSO, figureGeometry, figureMaterial, mixHand, palettesOf, ragdollPose, setBits, styleOf, swingCode,
   type Detail, type FigureLook, type FigureStyle,
@@ -215,10 +215,17 @@ const clamp = (x: number, lo: number, hi: number) => (x < lo ? lo : x > hi ? hi 
 /**
  * `colliders` are what bodies hit (filed in a collision index on first use). `setup.solids` is the game's shared
  * index of static solids (map/collision.ts, refs are colliders): when given, it is queried too, so `colliders` need
- * only hold what it lacks (seats and tables). `setup.bounds` fences the bodies in (default: the terrain's bounds).
+ * only hold what it lacks (seats and tables). `setup.bounds` fences the bodies in (default: the live terrain's bounds).
+ * `groundAt(x, z, yHint)` is the terrain's groundHeight: every body (and loose head, and fallen hat) reads it with its
+ * own height as the hint, so one under a bridge deck (thrown off it into the canal, floating under it) gets the water
+ * and the bed, never the deck above it.
  */
 export type RagdollOptions = { solids?: CollisionIndex | null; bounds?: { minX: number; maxX: number; minZ: number; maxZ: number } };
-export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground: (x: number, z: number) => number, setup: RagdollOptions = {}) {
+export function createRagdolls(scene: THREE.Scene, colliders: Collider[], groundAt: (x: number, z: number, yHint?: number) => number, setup: RagdollOptions = {}) {
+  /** The height of whatever reads the ground now (a body's pelvis, a head, a hat); undefined: the top surface. */
+  let hintY: number | undefined;
+  const ground = (x: number, z: number) => groundAt(x, z, hintY);
+  const lowest = (st: RagdollState) => { let y = Infinity; for (let i = 0; i < st.n; i++) { const v = st.pos[i * 3 + 1] - st.r[i]; if (v < y) y = v; } return y; };
   let detail: Detail = 'hi';
   const materials = { body: figureMaterial('body'), arm: figureMaterial('arm'), leg: figureMaterial('leg') };
   // Torsos first, then loose heads and fallen hats, in one body batch.
@@ -239,6 +246,8 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     ground, grid: null, water: WATER_LEVEL, movers,
     bounds: { ...(setup.bounds ?? terrainBounds) },
   };
+  // The live terrain can be installed after the bodies exist (the wired map): the fence follows its bounds.
+  const stopBounds = setup.bounds ? null : onTerrain(() => { Object.assign(world.bounds!, terrainBounds); });
   let quality: { bodies: number; iterations: number; fullRate: number } = RAGDOLL_QUALITY[0];
   let options = solverOptions(quality.iterations);
   let accumulator = 0, tick = 0, frame = 0, clock = 0, frameDt = 0;
@@ -414,6 +423,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     const i = HEAD_P * 3;
     const vx = (st.pos[i] - st.prev[i]) / st.dt, vz = (st.pos[i + 2] - st.prev[i + 2]) / st.dt;
     const speed = Math.hypot(vx, vz);
+    hintY = HP[1];
     if (!st.asleep && speed > 0.05 && HP[1] - ground(HP[0], HP[2]) < r * 1.3) {
       qa.setFromAxisAngle(va.set(vz / speed, 0, -vx / speed), speed * frameDt / r);
       body.spin.premultiply(qa);
@@ -459,6 +469,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     vel.y -= 9.8 * dt;
     vel.multiplyScalar(Math.pow(0.6, dt));
     p.addScaledVector(vel, dt);
+    hintY = p.y;
     const floor = ground(p.x, p.z);
     let landed = false;
     if (p.y <= floor + 0.004) {
@@ -623,9 +634,12 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     return !!victim;
   }
 
+  /** How many colliders the grid was built over: the list grows while district tiles build (their seats and tables). */
+  let gridCount = -1;
   function spawn(options: SpawnOptions) {
-    // Colliders are static once the world is built (traffic-light poles are added late): index them on first use.
-    if (!world.grid) world.grid = createColliderGrid(colliders, 16, setup.solids ?? null);
+    // Colliders are static once the world is built (traffic-light poles are added late, district seats as their tiles
+    // build): index them on first use, again whenever the list has grown.
+    if (!world.grid || gridCount !== colliders.length) { world.grid = createColliderGrid(colliders, 16, setup.solids ?? null); gridCount = colliders.length; }
     while (bodies.length >= quality.bodies || !freeSlots.length) if (!evict(false) && !evict(true)) break;
     const { x, y, z, yaw, scale, look, velocity: vel } = options;
     const style = styleOf(look);
@@ -635,6 +649,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     const seated = options.from === 'sit';
     // A seated body starts with its hip joints on the seat (the rest skeleton's feet would be below it).
     const feet = seated ? y - (FIGURE.hipY - FIGURE.seatClear) * scale * height : y;
+    hintY = feet;
     const state = createState(skel, { x, y: feet, z, yaw, scale, width, height, mode, ground, pose: seated ? (style.fem ? SEATED.f : SEATED.m) : undefined });
     launch(state, vel.x, vel.y, vel.z, options.kind ?? (options.hit ? 'bullet' : 'fall'), options.hit ?? null);
     // Hinge axes for the first frame (the solver refreshes them on every step).
@@ -735,7 +750,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     },
     /** Shoves parts within `radius` of (x, z) to at least this speed (kicks, walking into a body). */
     push(x: number, z: number, radius: number, vx: number, vy: number, vz: number) {
-      const floorY = ground(x, z);
+      const floorY = groundAt(x, z);
       let touched = 0;
       for (const body of bodies) {
         const p = body.state.pos, reach = body.state.reach + radius;
@@ -756,7 +771,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
     sweep(x: number, z: number, yaw: number, halfW: number, halfL: number, top: number, vx: number, vz: number) {
       if (!bodies.length || movers.length >= 48) return 0;
       const mover = moverPool[movers.length] ?? (moverPool[movers.length] = { x: 0, z: 0, floorY: 0, yaw: 0, halfW: 0, halfL: 0, top: 0, vx: 0, vz: 0 });
-      Object.assign(mover, { x, z, floorY: ground(x, z), yaw, halfW, halfL, top, vx, vz });
+      Object.assign(mover, { x, z, floorY: groundAt(x, z), yaw, halfW, halfL, top, vx, vz });
       movers.push(mover);
       let touched = 0;
       for (const body of bodies) touched += sweepBody(body.state, mover);
@@ -825,6 +840,9 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
         tick++;
         stepped.length = 0;
         for (const body of awake) {
+          // Its lowest part: a body lying or standing on a deck (or less than DECK_STEP under it) is on it; one in the
+          // water below it, or falling past it, is not (the solver reads the ground per part, the hint is the body's).
+          hintY = lowest(body.state);
           if (body.full) step(body.state, world, options, STEP);
           else if (((tick + body.slot) & 1) === 0) step(body.state, world, options, STEP * 2);
           else continue;
@@ -832,6 +850,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
           body.synced = false;
           stepped.push(body);
         }
+        hintY = undefined;
         if (stepped.length && bodies.length > 1) collideBodies(stepped);
       }
       movers.length = 0;
@@ -863,6 +882,7 @@ export function createRagdolls(scene: THREE.Scene, colliders: Collider[], ground
       return { bodies: bodies.length, awake: up, full, cap: quality.bodies, iterations: quality.iterations };
     },
     dispose() {
+      stopBounds?.();
       for (const batch of batches) { scene.remove(batch.mesh); batch.dispose(); }
       if (zombieSet) for (const batch of zombieSet.all) { scene.remove(batch.mesh); batch.dispose(); }
       for (const m of Object.values(materials)) m.dispose();

@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { BUILDINGS, LANDMARKS, POIS, ROADS_X, ROADS_Z, type Building, type Point } from './city';
+import { BUILDINGS, LANDMARKS, POIS, type Building, type Point } from './city';
+import { worldRoads } from './map/world-types';
 
 type Mode = 'foot' | 'vehicle' | 'any';
 type Step =
@@ -26,7 +27,11 @@ const nearest = <T extends Point,>(list: T[], from: Point) => [...list].sort((a,
 const poiOf = (kind: string, from: Point) => nearest(POIS.filter((p) => p.kind === kind), from)[0] ?? POIS[0];
 const homes = () => BUILDINGS.filter((b) => b.residents > 0);
 const door = (b: Building, text: string, extra: Partial<Extract<Step, { kind: 'go' }>> = {}): Step => ({ kind: 'go', x: b.door.x, z: b.door.z, r: 3, text, ...extra });
-const junctions = () => ROADS_X.flatMap((x) => ROADS_Z.map((z) => ({ x, z })));
+/** Crossroads of the live roads: nodes where three or more roads that carry traffic meet. */
+const junctions = () => {
+  const { nodes, edges } = worldRoads().roads;
+  return nodes.filter((n) => n.control !== 'fence-end' && n.arms.filter((a) => edges[a.edge].traffic).length >= 3).map((n) => ({ x: n.x, z: n.z }));
+};
 const school = () => BUILDINGS.find((b) => b.kind === 'school') ?? BUILDINGS[0];
 
 /** Twenty everyday and fun side jobs around the neighbourhood. */
@@ -67,9 +72,9 @@ function scatter(center: Point, radius: number) {
   return { x, z };
 }
 function outerLoop() {
-  // Round An Hòa's outer roads.
-  const r = 108;
-  const pts = [{ x: r, z: -r }, { x: r, z: 0 }, { x: r, z: r }, { x: 0, z: r }, { x: -r, z: r }, { x: -r, z: 0 }, { x: -r, z: -r }, { x: 0, z: -r }];
+  // Round An Hòa's outer roads: the crossroads at the corners and halfway along its ring of streets (x, z = ±108).
+  const r = 108, js = junctions();
+  const pts = [{ x: r, z: -r }, { x: r, z: 0 }, { x: r, z: r }, { x: 0, z: r }, { x: -r, z: r }, { x: -r, z: 0 }, { x: -r, z: -r }, { x: 0, z: -r }].map((p) => nearest(js, p)[0] ?? p);
   const start = Math.floor(Math.random() * pts.length);
   return [...pts.slice(start), ...pts.slice(0, start)];
 }

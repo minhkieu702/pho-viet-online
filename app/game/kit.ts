@@ -8,7 +8,8 @@ export type Kind = 'box' | 'cylinder' | 'cone' | 'ball' | 'bead' | 'gable' | 'hi
  * never cut away, tiles are: roof decks, cladding, shop floors), `roofTile` barrel tiles on prisms, `tube` a
  * fluorescent tube and `led` a blinking LED border, both glowing in their instance colour at night.
  */
-export type Role = 'solid' | 'ground' | 'glass' | 'glassLit' | 'lamp' | 'lantern' | 'water' | 'neon' | 'wall' | 'paving' | 'tiles' | 'roofTile' | 'tube' | 'led';
+/** … 'wash': a floodlight's warm wash on a heritage front, added light that only shows after dark. */
+export type Role = 'solid' | 'ground' | 'glass' | 'glassLit' | 'lamp' | 'lantern' | 'water' | 'neon' | 'wall' | 'paving' | 'tiles' | 'roofTile' | 'tube' | 'led' | 'wash';
 export type ColorLike = string | THREE.Color;
 
 /** Cells of the decal atlas (dressing.ts decalAtlas). */
@@ -61,7 +62,7 @@ export type Kit = {
   cloth: (cell: ClothCell, x: number, y: number, z: number, w: number, h: number, yaw: number, opts: ClothOpts) => void;
   smoke: (kind: SmokeKind, x: number, y: number, z: number) => void;
   /** A pool of shop light on the pavement at night; `shop` is the building id whose opening hours switch it. */
-  pool: (x: number, z: number, size: number, shop: number) => void;
+  pool: (x: number, z: number, size: number, shop: number, color?: string) => void;
   frame: (x: number, z: number, facing: number) => Frame;
   fine: (on: boolean) => void;
 };

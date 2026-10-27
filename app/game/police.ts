@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { ROADS_X, ROADS_Z } from './city';
+import { worldRoads } from './map/world-types';
+import type { RoadEdge } from './map/roads';
 import type { FallMode, HitKind, createRagdolls, RagdollBody, RagdollLook } from './ragdoll';
 import type { Car, createVehicles } from './vehicles';
 import {
@@ -45,10 +46,12 @@ export type PlayerView = {
   armed: boolean; surrendered: boolean; pinned: boolean; night: number;
 };
 export type GasThrow = { fromX: number; fromZ: number; x: number; z: number };
-type Spike = { x: number; z: number; alongX: boolean; until: number };
+/** A spike strip across a road: its middle, the road's heading there, half its length (the asphalt's half width) and until when. */
+type Spike = { x: number; z: number; hx: number; hz: number; half: number; until: number };
 
 const OFFICERS = 16;
 const MAX_SPIKES = 4;
+const UP = new THREE.Vector3(0, 1, 0);
 const LINES = {
   chase: ['Đứng lại!', 'Cảnh sát đây!', 'Giơ tay lên!', 'Không chạy được đâu!'],
   arrest: ['Anh bị bắt!', 'Đưa tay ra sau!'],
@@ -91,8 +94,8 @@ const GUNS: Record<Exclude<CopWeapon, 'baton'>, { range: number; cooldown: numbe
 /**
  * Wanted level, police dispatch and officers on foot. Crimes raise heat; enough heat adds stars.
  * The response escalates with the stars: tasers and batons, then pistols, shotguns and SWAT with
- * SMGs; spike strips ahead of a fleeing vehicle, roadblocks at junctions, and officers who spread
- * out to surround the player and keep their distance when armed.
+ * SMGs; spike strips ahead of a fleeing vehicle and roadblocks at the junction it is heading for, both
+ * found along the live road graph, and officers who spread out to surround the player and keep their distance when armed.
  */
 export function createPolice(
   scene: THREE.Scene,
@@ -272,7 +275,7 @@ export function createPolice(
       // Officers already nearby act at once; otherwise a witness calls it in (worse crimes get a faster
       // response) and the first cars arrive after that.
       const onScene = officers.some((o) => (o.state === 'chase' || o.state === 'return') && Math.hypot(o.x - playerX, o.z - playerZ) < 35)
-        || vehicles.cars.some((c) => c.kind === 'police' && c.mode !== 'off' && Math.hypot(c.x - playerX, c.z - playerZ) < 45);
+        || vehicles.live.some((c) => c.kind === 'police' && c.mode !== 'off' && Math.hypot(c.x - playerX, c.z - playerZ) < 45);
       const delay = onScene ? 0 : Math.max(5, 14 - severity * 2.5) + Math.random() * 4;
       responseAt = time + delay;
       callPending = delay > 0;
@@ -388,39 +391,85 @@ export function createPolice(
     return d;
   }
 
-  /** The road line the player is driving along, if any: axis of travel and the road's coordinate. */
+  /** The road the player is driving along, if any: its edge, where on it, the travel direction (+1 from node a to b). */
   function roadOf(player: PlayerView) {
-    const alongX = Math.abs(Math.sin(player.heading)) > Math.abs(Math.cos(player.heading));
-    const cross = alongX ? player.z : player.x;
-    const roads = alongX ? ROADS_Z : ROADS_X;
-    const road = roads.reduce((best, r) => (Math.abs(r - cross) < Math.abs(best - cross) ? r : best), roads[0]);
-    return Math.abs(road - cross) < 9 ? { alongX, road, dir: Math.sign(alongX ? Math.sin(player.heading) : Math.cos(player.heading)) || 1 } : null;
+    const roads = worldRoads().roads;
+    const h = roads.nearestEdge(player.x, player.z, 14, (e) => e.traffic && e.cls !== 'hem');
+    if (!h || h.d > h.edge.half + 2) return null;
+    const dir: 1 | -1 = Math.sin(player.heading) * h.hx + Math.cos(player.heading) * h.hz >= 0 ? 1 : -1;
+    return { edge: h.edge, s: h.s, dir };
+  }
+  /**
+   * Walks `ahead` metres along the roads from arc s of an edge in a direction, straight on through the nodes (the arm
+   * most nearly ahead that carries traffic). Calls `node` at each node passed (with the distance so far and the edge
+   * it arrives on); stops early when that returns true. Returns where it ends, or null at a dead end.
+   */
+  function walkAhead(edge: RoadEdge, s: number, dir: 1 | -1, ahead: number, node?: (id: number, at: number, from: RoadEdge, fromDir: 1 | -1) => boolean) {
+    const roads = worldRoads().roads;
+    let e = edge, d = dir, at = s, left = ahead, gone = 0;
+    for (let hops = 0; hops < 12; hops++) {
+      const room = d > 0 ? e.len - at : at;
+      if (room >= left) {
+        const p = roads.pointAt(e, at + d * left);
+        return { edge: e, s: at + d * left, dir: d, x: p.x, z: p.z, hx: p.hx * d, hz: p.hz * d };
+      }
+      left -= room; gone += room;
+      const n = roads.nodes[d > 0 ? e.b : e.a];
+      if (node?.(n.id, gone, e, d)) return null;
+      // Straight on: the traffic arm nearest the heading of arrival.
+      const p = roads.pointAt(e, d > 0 ? e.len : 0), hx = p.hx * d, hz = p.hz * d;
+      let best: { e: RoadEdge; d: 1 | -1; dot: number } | null = null;
+      for (const arm of n.arms) {
+        const next = roads.edges[arm.edge];
+        if (next === e || !next.traffic || next.cls === 'hem') continue;
+        const dot = arm.hx * hx + arm.hz * hz;
+        if (!best || dot > best.dot) best = { e: next, d: arm.end === 0 ? 1 : -1, dot };
+      }
+      if (!best || best.dot < 0.3) return null;
+      e = best.e; d = best.d; at = d > 0 ? 0 : e.len;
+    }
+    return null;
   }
 
-  /** Lays a spike strip across the player's road some way ahead. */
+  /** Lays a spike strip across the player's road some way ahead (never inside a junction). */
   function deploySpikes(player: PlayerView, time: number) {
     const lane = roadOf(player);
     if (!lane) return false;
-    const ahead = (lane.alongX ? player.x : player.z) + lane.dir * (40 + Math.random() * 20);
-    const junctions = lane.alongX ? ROADS_X : ROADS_Z;
-    if (ahead < junctions[0] - 20 || ahead > junctions[junctions.length - 1] + 20) return false;
-    if (spikes.length >= MAX_SPIKES) spikes.shift();
-    spikes.push(lane.alongX ? { x: ahead, z: lane.road, alongX: true, until: time + 45 } : { x: lane.road, z: ahead, alongX: false, until: time + 45 });
-    return true;
+    const roads = worldRoads().roads;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const at = walkAhead(lane.edge, lane.s, lane.dir, 40 + Math.random() * 20);
+      if (!at) return false;
+      if (roads.junctionAt(at.x, at.z, 2)) continue;
+      if (spikes.length >= MAX_SPIKES) spikes.shift();
+      spikes.push({ x: at.x, z: at.z, hx: at.hx, hz: at.hz, half: at.edge.half, until: time + 45 });
+      return true;
+    }
+    return false;
   }
 
-  /** Two cruisers parked across the road at the next junction ahead, crews out. */
+  /** Cruisers parked across the road short of the next junction ahead (35–95 m off), crews out. */
   function roadblock(player: PlayerView) {
     const lane = roadOf(player);
     if (!lane) return false;
-    const now = lane.alongX ? player.x : player.z;
-    const junction = (lane.alongX ? ROADS_X : ROADS_Z).filter((r) => (r - now) * lane.dir > 35 && (r - now) * lane.dir < 95).sort((a, b) => Math.abs(a - now) - Math.abs(b - now))[0];
-    if (junction === undefined) return false;
+    const roads = worldRoads().roads;
+    let found: { node: number; from: RoadEdge; dir: 1 | -1 } | null = null;
+    walkAhead(lane.edge, lane.s, lane.dir, 95, (id, at, from, dir) => {
+      const n = roads.nodes[id];
+      if (at >= 35 && n.arms.length >= 3) { found = { node: id, from, dir }; return true; }
+      return false;
+    });
+    if (!found) return false;
+    const { node, from, dir } = found as { node: number; from: RoadEdge; dir: 1 | -1 };
+    const n = roads.nodes[node], arm = n.arms.find((a) => a.edge === from.id && a.end === (dir > 0 ? 1 : 0));
+    // Six metres short of the stop line, across every lane of the way in (a third car on a boulevard).
+    const back = (arm?.setback ?? from.half) + 6, s = dir > 0 ? from.len - back : back;
+    if (s < 0 || s > from.len) return false;
+    const p = roads.pointAt(from, s), hx = p.hx * dir, hz = p.hz * dir, yaw = Math.atan2(hx, hz) + Math.PI / 2;
+    const sides = from.half > 8 ? [-0.62, 0, 0.62] : [-0.46, 0.46];
     let placed = 0;
-    for (const side of [-1, 1]) {
-      const x = lane.alongX ? junction - lane.dir * 6 : lane.road + side * 3.2;
-      const z = lane.alongX ? lane.road + side * 3.2 : junction - lane.dir * 6;
-      const car = vehicles.placePolice(x, z, lane.alongX ? 0 : Math.PI / 2);
+    for (const k of sides) {
+      const off = k * from.half;
+      const car = vehicles.placePolice(p.x - hz * off, p.z + hx * off, yaw + (Math.random() - 0.5) * 0.5);
       if (!car) continue;
       placed++;
       let crew = 0;
@@ -456,8 +505,8 @@ export function createPolice(
     /** True when (x, z) is on a spike strip; the strip is used up. */
     onSpikes(x: number, z: number) {
       for (let i = 0; i < spikes.length; i++) {
-        const s = spikes[i];
-        const inside = s.alongX ? Math.abs(x - s.x) < 0.8 && Math.abs(z - s.z) < 7.2 : Math.abs(z - s.z) < 0.8 && Math.abs(x - s.x) < 7.2;
+        const s = spikes[i], dx = x - s.x, dz = z - s.z;
+        const inside = Math.abs(dx * s.hx + dz * s.hz) < 0.8 && Math.abs(dx * -s.hz + dz * s.hx) < s.half + 0.2;
         if (inside) { spikes.splice(i, 1); return true; }
       }
       return false;
@@ -496,7 +545,7 @@ export function createPolice(
     },
     forEachUnit(callback: (x: number, z: number, onFoot: boolean) => void) {
       for (const o of officers) if (o.state === 'chase' || o.state === 'return') callback(o.x, o.z, true);
-      for (const car of vehicles.cars) if (car.kind === 'police' && (car.mode === 'chase' || car.mode === 'hold')) callback(car.x, car.z, false);
+      for (const car of vehicles.live) if (car.kind === 'police' && (car.mode === 'chase' || car.mode === 'hold')) callback(car.x, car.z, false);
     },
     forEachHurt(time: number, callback: (x: number, y: number, z: number, fraction: number) => void) {
       for (const o of officers) if ((o.state === 'chase' || o.state === 'return') && time - o.hitAt < 4) callback(o.x, HEIGHT + 0.35, o.z, Math.max(0, o.health) / o.maxHealth);
@@ -522,7 +571,8 @@ export function createPolice(
       // Dispatch more cruisers as the wanted level climbs.
       if (wanted > 0 && time > dispatchAt && time >= responseAt) {
         dispatchAt = time + 1.5;
-        const active = vehicles.cars.filter((c) => c.kind === 'police' && (c.mode === 'chase' || c.mode === 'hold')).length;
+        let active = 0;
+        for (const c of vehicles.live) if (c.kind === 'police' && (c.mode === 'chase' || c.mode === 'hold')) active++;
         // More cruisers, bigger crews and closer spawns as the stars climb; the first answer to a call
         // comes from further off, so the cars are seen driving in with sirens.
         if (active < [0, 1, 2, 3, 4, 6][wanted]) {
@@ -550,7 +600,7 @@ export function createPolice(
       for (let i = spikes.length - 1; i >= 0; i--) if (time > spikes[i].until) spikes.splice(i, 1);
       vehicles.updatePolice(dt, time, player.x, player.z, player.car, wanted, player.heading);
       let seen = false;
-      for (const car of vehicles.cars) {
+      for (const car of vehicles.live) {
         if (car.kind !== 'police') continue;
         if ((car.mode === 'chase' || car.mode === 'hold') && Math.hypot(car.x - player.x, car.z - player.z) < 45 + wanted * 6) seen = true;
         // A stopped cruiser lets its crew out on both sides.
@@ -673,7 +723,8 @@ export function createPolice(
         for (let k = 0; k < 2; k++) {
           if (!s) { spikeMesh.setMatrixAt(i * 2 + k, hidden); continue; }
           const y = world.ground(s.x, s.z) + (k ? 0.1 : 0.06);
-          local.compose(pos.set(s.x, y, s.z), quat.identity(), s.alongX ? size.set(k ? 0.12 : 0.6, k ? 0.05 : 0.12, 14) : size.set(14, k ? 0.05 : 0.12, k ? 0.12 : 0.6));
+          // Across the road (local x), thin along it (local z).
+          local.compose(pos.set(s.x, y, s.z), quat.setFromAxisAngle(UP, Math.atan2(s.hx, s.hz)), size.set(s.half * 2, k ? 0.05 : 0.12, k ? 0.12 : 0.6));
           spikeMesh.setMatrixAt(i * 2 + k, local);
         }
       }

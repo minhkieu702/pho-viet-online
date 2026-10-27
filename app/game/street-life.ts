@@ -15,7 +15,9 @@ export type Life = 'meal' | 'coffee' | 'tea' | 'beer' | 'chess' | 'kibitz' | 'ex
   | 'couple' | 'xeom' | 'hawk' | 'lottery' | 'cook' | 'guard';
 /** What a roaming hawker sells. */
 export type Goods = 'banhmi' | 'xoi' | 'fruit' | 'kem' | 'hotvitlon';
-export type Dish = 'pho' | 'bun' | 'bunrieu' | 'hutieu' | 'banhcanh' | 'chao' | 'com' | 'banhxeo' | 'banhcuon' | 'banhmi' | 'xoi' | 'che' | 'cafe' | 'trasua' | 'bia';
+export type Dish = 'pho' | 'bun' | 'bunrieu' | 'hutieu' | 'banhcanh' | 'chao' | 'com' | 'banhxeo' | 'banhcuon' | 'banhmi' | 'xoi' | 'che' | 'cafe' | 'trasua' | 'bia'
+  /** The districts' night food: ốc (Vĩnh Khánh), lẩu (hotpot) and nướng (the grill: seafood, nướng ngói). */
+  | 'oc' | 'lau' | 'nuong';
 /** Kinds of street-life groups (city.ts LIFE.groups). */
 export type LifeKind = 'eatery' | 'beer' | 'chess' | 'exercise' | 'ring' | 'chase' | 'karaoke' | 'couple' | 'xeom';
 
@@ -42,9 +44,10 @@ export const MENU: Record<Dish, [number, number][]> = {
   bun: [[10.5, 14], [17, 22.5]], bunrieu: [[6, 13.5]], hutieu: [[16.5, 1]],
   com: [[10.5, 14], [17, 22.5]], banhxeo: [[14.5, 22.5]], banhcuon: [[6, 10.5]], banhmi: [[5.5, 9.5], [15.5, 20]],
   xoi: [[5.5, 9.5]], che: [[13.5, 22]], cafe: [[6, 22.5]], trasua: [[9, 22]], bia: [[16, 23.5]],
+  oc: [[16, 0.5]], lau: [[17, 23.5]], nuong: [[16.5, 23.5]],
 };
 /** Dishes that turn into a nhậu (beer and snacks) table in the evening, and from when. */
-export const NHAU: Partial<Record<Dish, number>> = { bun: 18, com: 18, banhxeo: 18 };
+export const NHAU: Partial<Record<Dish, number>> = { bun: 18, com: 18, banhxeo: 18, oc: 17, lau: 18, nuong: 17 };
 /** The dish an eatery serves, from its name. */
 export function dishOf(name: string): Dish | null {
   const n = name.toUpperCase();
@@ -75,7 +78,7 @@ export function vesselOf(dish: Dish | null, life: Life | undefined, hour: number
   if (life === 'tea') return 'tea';
   if (dish === 'cafe' || life === 'coffee') return 'coffee';
   if (dish === 'trasua' || dish === 'che') return 'cup';
-  if (dish === 'com' || dish === 'banhxeo' || dish === 'banhcuon' || dish === 'xoi' || dish === 'banhmi') return 'plate';
+  if (dish === 'com' || dish === 'banhxeo' || dish === 'banhcuon' || dish === 'xoi' || dish === 'banhmi' || dish === 'oc' || dish === 'nuong') return 'plate';
   return 'bowl';
 }
 

@@ -9,7 +9,7 @@
  * Static entries sit in a 16 m spatial hash; providers add dynamic ones (vehicles, people, boats, buses) near the
  * player each frame. Pure: no three.js, no DOM (scripts/interact-audit.test.mjs imports auditEntries()).
  */
-import { PLACES, type FacadeKind } from './counters';
+import { PLACES, type FacadeKind, type Place } from './counters';
 import { SPOTS } from './parking';
 import * as transit from './transit';
 
@@ -169,15 +169,29 @@ export function createRegistry(cell = 16) {
 }
 
 /**
+ * A door that stays shut on purpose (a warehouse, a building site, a ministry: counters.ts places of kind 'notice'):
+ * it answers with why, dim and without a key (C3), and E does nothing. Anything that works there wins over it.
+ */
+export function noticeEntry(place: Place): Entry {
+  const [verb, label] = place.notice ?? ['Đóng cửa', place.name];
+  return {
+    id: place.id, kind: 'door', x: place.x, z: place.z, r: place.r, priority: BASE.door - 8,
+    prompt: (c) => (c.zombie ? null : { id: place.id, key: '', verb, label, dim: true }),
+    use() { /* nothing to do: the prompt says why */ },
+  };
+}
+
+/**
  * The static entries game.ts registers (counters, doors, seats, ATMs, the hire boats), for the interact audit:
- * a facade is handled when an entry covering its kind lies within r of it.
+ * a facade is handled when an entry covering its kind lies within r of it. `places` and `spots` default to the
+ * live tables (today's map and the wired districts); the audit also passes those of other wiring steps.
  */
 export type AuditEntry = { id: string; covers: FacadeKind[]; x: number; z: number; r: number };
-export function auditEntries(): AuditEntry[] {
-  const out: AuditEntry[] = PLACES.filter((p) => p.covers.length).map((p) => ({ id: `${p.kind}:${p.key}:${p.id}`, covers: p.covers, x: p.x, z: p.z, r: p.r }));
+export function auditEntries(places: readonly Place[] = PLACES, spots: readonly { id: number; x: number; z: number; vehicle: 'moto' | 'car' }[] = SPOTS): AuditEntry[] {
+  const out: AuditEntry[] = places.filter((p) => p.covers.length).map((p) => ({ id: `${p.kind}:${p.key}:${p.id}`, covers: p.covers, x: p.x, z: p.z, r: p.r }));
   // Parked bikes and cars stand on parking.ts spots; game.ts's curb provider answers each one at run time
   // (vehicles.curbNear: ride your own, hold E to steal anyone else's, nothing while somebody sits on it).
-  for (const s of SPOTS) out.push({ id: `vehicle:curb:${s.id}`, covers: ['vehicle'], x: s.x, z: s.z, r: s.vehicle === 'moto' ? 1.2 : 2.6 });
+  for (const s of spots) out.push({ id: `vehicle:curb:${s.id}`, covers: ['vehicle'], x: s.x, z: s.z, r: s.vehicle === 'moto' ? 1.2 : 2.6 });
   // Bus stops and piers: the transit owner registers their entries at run time (registry.add or a provider, via
   // the register() hook game.ts calls on vehicles, npcs and boats) and lists the same places as pure data here.
   for (const e of (transit as unknown as { AUDIT_ENTRIES?: AuditEntry[] }).AUDIT_ENTRIES ?? []) out.push(e);

@@ -1,7 +1,7 @@
 "use client";
 import {useEffect,useRef,useState,type ComponentType,type KeyboardEvent as ReactKeyboardEvent,type PointerEvent as ReactPointerEvent} from 'react';
-import {Anchor,BedDouble,Bike,Briefcase,Building2,Coffee,Crosshair,Expand,Flag,Flower2,Hospital,Landmark,Layers,LocateFixed,Mail,Martini,Mic,Minus,Music,Plus,School,Shield,Ship,ShoppingBag,Store,Theater,UtensilsCrossed,Banknote,X,type LucideProps} from 'lucide-react';
-import {CITY_BOUNDS,DISTRICTS,DISTRICT_BY_ID,WATERS,type Area} from './game/map/districts';
+import {Anchor,BedDouble,Bike,Briefcase,Building2,Bus,Church,Coffee,Crosshair,Expand,Flag,Flower2,Hospital,Landmark,Layers,LocateFixed,Mail,Martini,Mic,Minus,Music,Plus,School,Shield,Ship,ShoppingBag,Store,Theater,TrainFront,UtensilsCrossed,Banknote,X,type LucideProps} from 'lucide-react';
+import {CITY_BOUNDS,DISTRICTS,DISTRICT_BY_ID,WATERS,isWired,districtOpen,partOpen,type Area} from './game/map/districts';
 import {LAND,RIVER,VENUE_LOOKS,type Rect,type VenueKind} from './game/map/consts';
 import type {MapData,MapLayer,MapPoi,MapPoiKind,BlockTone} from './game/map/mapdata';
 import type {Hud} from './game/game';
@@ -30,13 +30,20 @@ const POI_LOOK:Record<MapPoiKind,[Icon,string]>={
   mall:[ShoppingBag,'#b5223b'],theatre:[Theater,'#8e2b20'],school:[School,'#2c5d8f'],pagoda:[Flower2,'#b8862b'],post:[Mail,'#c08a2a'],tower:[Building2,'#7d5ba6'],
   hospital:[Hospital,'#e05a5a'],police:[Shield,'#1f4fa8'],bank:[Landmark,'#2f7a3a'],atm:[Banknote,'#2f7a3a'],dock:[Ship,'#2f86c6'],boat:[Anchor,'#2f86c6'],
   gun:[Crosshair,'#3f6f9f'],bike:[Bike,'#5e927c'],venue:[Music,'#ff4f8b'],
+  church:[Church,'#6f5a9a'],museum:[Landmark,'#8e2b20'],metro:[TrainFront,'#1f6fb5'],bus:[Bus,'#2f86c6'],
 };
 const VENUE_ICON:Record<VenueKind,Icon>={bar:Martini,karaoke:Mic,motel:BedDouble,club:Music,spa:Flower2,beer:Martini};
 /** Kinds worth a name next to the icon once the map is zoomed in (the rest show it on hover). */
-const NAMED=new Set<MapPoiKind>(['tower','theatre','mall','hospital','police','bank','school','pagoda','market','dock','boat','gun','bike','post']);
+const NAMED=new Set<MapPoiKind>(['tower','theatre','mall','hospital','police','bank','school','pagoda','market','dock','boat','gun','bike','post','church','museum','metro','bus']);
 const TONE:Record<BlockTone,string>={house:'#e5cda5',shop:'#ebbf94',midrise:'#cbc6bb',tower:'#9aa2aa',civic:'#d8cbac'};
-const EXTRA_LABELS=[{text:'QUẬN 1 · BẾN THÀNH',x:262,z:300,color:DISTRICT_BY_ID.D2.color}];
+/** Names of district parts that are not their district's label spot, while their slice is still to come. */
+const EXTRA_LABELS=[{text:'QUẬN 1 · BẾN THÀNH',x:262,z:300,color:DISTRICT_BY_ID.D2.color,slice:'quan-1-south'}].filter(l=>!isWired(l.slice));
 const clamp=(v:number,a:number,b:number)=>Math.max(a,Math.min(b,v));
+/** How the legend names an open district ("QUẬN 4" -> "Quận 4"; Quận 1 by its open wards). */
+const titleName=(n:string)=>n.toLocaleLowerCase('vi').split(' ').map(w=>w==='·'?w:w.charAt(0).toLocaleUpperCase('vi')+w.slice(1)).join(' ');
+const OPEN_NAMES:Partial<Record<string,string>>={D1:'An Hòa',D2:isWired('quan-1-south')?'Quận 1':'Quận 1 · Bến Nghé'};
+/** The district a wired slice's outline lies in (by its first corner's neighbourhood), for its tint. */
+function districtOfPoly(p:number[]){let x=0,z=0;for(let i=0;i<p.length;i+=2){x+=p[i];z+=p[i+1];}x/=p.length/2;z/=p.length/2;return DISTRICTS.find(d=>d.parts.some(q=>x>=q.rect.minX&&x<q.rect.maxX&&z>=q.rect.minZ&&z<q.rect.maxZ))??null;}
 
 function mix(a:string,b:string,t:number){const p=(s:string,i:number)=>parseInt(s.slice(1+i*2,3+i*2),16);return `rgb(${[0,1,2].map(i=>Math.round(p(a,i)*(1-t)+p(b,i)*t)).join(',')})`;}
 const patterns=new WeakMap<CanvasRenderingContext2D,Map<string,CanvasPattern|null>>();
@@ -56,7 +63,7 @@ function drawMap(ctx:CanvasRenderingContext2D,w:number,h:number,v:View,data:MapD
   // Districts still to come: tinted and hatched, with a dashed outline round each district (the seams inside are
   // painted over by the district's own fill).
   for(const d of DISTRICTS){
-    const parts=d.parts.filter(p=>p.phase!=='P0');if(!parts.length)continue;
+    const parts=d.parts.filter(p=>!partOpen(p));if(!parts.length)continue;
     ctx.beginPath();parts.forEach(p=>rect(p.rect));
     ctx.setLineDash([7,5]);ctx.lineWidth=2.5;ctx.strokeStyle=showDistricts?mix(ground,d.color,0.6):'#bdb7a6';ctx.stroke();ctx.setLineDash([]);
     ctx.fillStyle=mix(ground,d.color,showDistricts?(d.phase==='P2'?0.09:0.14):0.03);ctx.fill();
@@ -65,10 +72,13 @@ function drawMap(ctx:CanvasRenderingContext2D,w:number,h:number,v:View,data:MapD
   }
   // Water: the rivers and canals still to come pale, today's river (between the buoy lines) full colour.
   for(const water of WATERS){poly(water.poly);ctx.fillStyle='#a8c8c3';ctx.fill();}
-  // Today's land, tinted by district.
+  // Today's land and the wired slices' (their own outlines), tinted by district.
   fillRect({minX:LAND.minX,maxX:LAND.maxX,minZ:-137.6,maxZ:LAND.maxZ},'#ebe7d4');
+  if(data)for(const o of data.open){poly(o);ctx.fillStyle='#ebe7d4';ctx.fill();}
   if(showDistricts)for(const d of DISTRICTS)for(const p of d.parts)if(p.phase==='P0')fillRect(p.rect,`${d.color}24`);
+  if(showDistricts&&data)for(const o of data.open){const at=districtOfPoly(o);if(at){poly(o);ctx.fillStyle=`${at.color}24`;ctx.fill();}}
   fillRect(RIVER,'#78aeb0');
+  if(data)for(const w of data.waters){poly(w);ctx.fillStyle='#78aeb0';ctx.fill();}
   if(data){
     fillRect({...data.promenade,minX:LAND.minX,maxX:LAND.maxX,maxZ:-118},'#e6d9ba');
     for(const p of data.parks)fillRect(p.rect,p.paved?'#ebe2cd':'#a9c98f');
@@ -80,6 +90,15 @@ function drawMap(ctx:CanvasRenderingContext2D,w:number,h:number,v:View,data:MapD
     for(const b of data.blocks)fillRect(b.rect,TONE[b.tone]);
     if(k>=1.4){ctx.strokeStyle='#5a4a2a26';ctx.lineWidth=1;ctx.beginPath();for(const b of data.blocks)rect(b.rect);ctx.stroke();}
     for(const d of data.docks){fillRect(d.pier,'#8a6a4c');fillRect(d.steps,'#b79e7c');}
+    // The wired slices: greens and yards, then the streets (sidewalk band, carriageway), then the buildings.
+    for(const g of data.greens){poly(g.poly);ctx.fillStyle=g.paved?'#ebe2cd':'#a9c98f';ctx.fill();}
+    const stroke=(pts:number[],width:number,color:string)=>{ctx.beginPath();for(let i=0;i<pts.length;i+=2)ctx[i?'lineTo':'moveTo'](X(pts[i]),Z(pts[i+1]));ctx.lineWidth=Math.max(1,width*k);ctx.strokeStyle=color;ctx.stroke();};
+    ctx.lineCap='round';ctx.lineJoin='round';
+    for(const l of data.lines)if(l.cls!=='hem')stroke(l.pts,2*(l.half+l.sidewalk),'#f3eee1');
+    for(const l of data.lines)stroke(l.pts,l.cls==='hem'?Math.max(2.4,2*l.half):2*l.half,'#fdfcf8');
+    ctx.lineCap='butt';
+    for(const f of data.footprints){poly(f.poly);ctx.fillStyle=TONE[f.tone];ctx.fill();}
+    if(k>=1.4){ctx.strokeStyle='#5a4a2a26';ctx.lineWidth=1;for(const f of data.footprints){poly(f.poly);ctx.stroke();}}
   }
   // Buoy lines close today's river at both ends; a thin line marks today's fences.
   ctx.setLineDash([3,4]);ctx.strokeStyle='#e8893a';ctx.lineWidth=2;ctx.beginPath();for(const x of [RIVER.minX,RIVER.maxX]){ctx.moveTo(X(x),Z(RIVER.minZ));ctx.lineTo(X(x),Z(RIVER.maxZ));}ctx.stroke();ctx.setLineDash([]);
@@ -109,6 +128,22 @@ function drawMap(ctx:CanvasRenderingContext2D,w:number,h:number,v:View,data:MapD
       }
     }
   }
+  // The wired slices' street names along their longest straight piece, once close enough (hẻm only up close).
+  if(data&&k>=1.1){
+    const size=clamp(8+2*k,10,13),font=`600 ${size}px Arial`;ctx.font=font;ctx.letterSpacing='0.3px';
+    const used:number[][]=[];
+    for(const st of data.streets){
+      const hem=st.name.startsWith('HẺM');if(hem&&k<2.6)continue;
+      let best:[number,number,number,number,number]|null=null;
+      for(const p of st.lines??[])for(let i=0;i+3<p.length;i+=2){const len=Math.hypot(p[i+2]-p[i],p[i+3]-p[i+1]);if(!best||len>best[4])best=[p[i],p[i+1],p[i+2],p[i+3],len];}
+      if(!best)continue;
+      const [ax,az,bx,bz,len]=best,name=len*k-14>=ctx.measureText(st.label).width+12?st.label:len*k-14>=ctx.measureText(st.short).width+10?st.short:'';
+      const x=X((ax+bx)/2),y=Z((az+bz)/2);if(!name||!visible(x,y,60))continue;
+      if(used.some(([ux,uy])=>Math.abs(ux-x)<120&&Math.abs(uy-y)<18))continue;used.push([x,y]);
+      let angle=Math.atan2(bz-az,bx-ax);if(angle>Math.PI/2)angle-=Math.PI;if(angle<-Math.PI/2)angle+=Math.PI;
+      text(name,x,y,font,'#5b6656','#ffffff','0.3px',angle);
+    }
+  }
   // District names: the open ones over today's land, the rest marked "Sắp mở". Bold (700) at most: heavier Arial
   // weights resolve to Arial Black, which lacks the precomposed Vietnamese letters (Ậ, Ế, Ủ… fall back to a serif).
   // A name that would overlap one already drawn loses its ward (open districts) or is left out.
@@ -118,7 +153,7 @@ function drawMap(ctx:CanvasRenderingContext2D,w:number,h:number,v:View,data:MapD
     const width=(t:string,font:string,spacing:string)=>{ctx.font=font;ctx.letterSpacing=spacing;return ctx.measureText(t).width;};
     ctx.globalAlpha=k<1.2?1:k<2?0.75:0.45;
     for(const d of DISTRICTS){
-      const ward=d.parts.find(p=>p.phase==='P0'&&p.ward)?.ward;if(!d.parts.some(p=>p.phase==='P0'))continue;
+      const ward=d.parts.find(p=>p.phase==='P0'&&p.ward)?.ward;if(!districtOpen(d))continue;
       const x=X(d.label.x),y=Z(d.label.z)-(near?size*0.35:0);if(!visible(x,y,300))continue;
       const font=`700 ${size}px Arial`,spacing=near?'2px':'1px',name=[ward?`${d.name} · ${ward}`:d.name,d.name].find(t=>room(x,y,width(t,font,spacing),size));
       if(!name)continue;
@@ -135,7 +170,7 @@ function drawMap(ctx:CanvasRenderingContext2D,w:number,h:number,v:View,data:MapD
       ctx.fillStyle='#f9f7eee6';ctx.strokeStyle=mix('#9b9583',color,0.4);ctx.lineWidth=1;ctx.beginPath();ctx.roundRect(x-pw/2,py-ph/2,pw,ph,ph/2);ctx.fill();ctx.stroke();
       ctx.font=chip;ctx.letterSpacing='0.3px';ctx.fillStyle='#6d695d';ctx.fillText('Sắp mở',x+0.15,py+0.5);
     };
-    for(const d of DISTRICTS)if(d.phase!=='P0')soonLabel(d.name,X(d.label.x),Z(d.label.z),d.color);
+    for(const d of DISTRICTS)if(!districtOpen(d))soonLabel(d.name,X(d.label.x),Z(d.label.z),d.color);
     for(const l of EXTRA_LABELS)soonLabel(l.text,X(l.x),Z(l.z),l.color);
   }
 }
@@ -221,7 +256,7 @@ export default function BigMap({hud,peers,area,street,heading,onClose}:Props){
   // Named markers last, so their names are never hidden under a neighbour's icon.
   const shown=markers.filter(onScreen).sort((a,b)=>Number(!!a.label)-Number(!!b.label));
   const scaleM=[10,20,50,100,200,500,1000].find(m=>m*k>=70)??1000;
-  const open=DISTRICTS.filter(d=>d.phase==='P0');
+  const open=DISTRICTS.filter(districtOpen);
   const [kMin,kMax]=view?limits(size.w,size.h):[0,0];
   return <section ref={root} className={`big-map${dragging?' dragging':''}`} role="dialog" aria-modal="true" aria-labelledby="big-map-title" tabIndex={-1} onKeyDown={key} onPointerDown={down} onPointerMove={move} onPointerUp={up} onPointerCancel={up}>
     <canvas ref={canvas} role="img" aria-label={`Bản đồ thành phố: ${open.length} khu vực đã mở, ${DISTRICTS.length-open.length} khu vực sắp mở`}/>
@@ -239,7 +274,7 @@ export default function BigMap({hud,peers,area,street,heading,onClose}:Props){
     <section className={`bm-card bm-legend${legendOpen?'':' closed'}`} aria-label="Lớp bản đồ"><h3>LỚP BẢN ĐỒ</h3>
       {LAYERS.filter(([id])=>id!=='friends'||peers.length>0).map(([id,label,swatch])=><button key={id} className="bm-layer" aria-pressed={layers[id]} onClick={()=>toggle(id)}>
         <span className="bm-swatch">{swatch.map(([I,color],i)=><i key={i} style={{background:color,borderRadius:I?undefined:3}}>{I&&<I size={9} strokeWidth={2.6}/>}</i>)}</span>{label}{id==='food'&&k<1.45&&<small>phóng to</small>}</button>)}
-      <div className="bm-status"><span><i className="open"/>Đã mở: {open.map(d=>d.name==='QUẬN 1'?'Quận 1 · Bến Nghé':d.name==='AN HÒA'?'An Hòa':d.name).join(', ')}</span><span><i className="soon"/>Sắp mở: thành phố sẽ lớn dần</span></div>
+      <div className="bm-status"><span><i className="open"/>Đã mở: {open.map(d=>OPEN_NAMES[d.id]??titleName(d.name)).join(', ')}</span><span><i className="soon"/>Sắp mở: thành phố sẽ lớn dần</span></div>
     </section>
     <div className="bm-zoom">
       <button className="bm-legend-toggle" onClick={toggleLegend} aria-expanded={legendOpen} aria-label="Lớp bản đồ"><Layers size={17}/></button>
