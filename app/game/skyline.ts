@@ -3,6 +3,8 @@ import type { Building, Plot, TowerSpec } from './city';
 import { counterKeyOf } from './counters';
 import { FRONT_OF, IRON, LIGHT_BOXES, acUnit, laundry, railing, verticalSign } from './facades';
 import { DECAL, type ColorLike, type Kit, type Kind as ShapeKind, type Role } from './kit';
+import { NIGHT, scheduleIndex } from './night';
+import { LOBBY_HOURS, buildingLight } from './night-hours';
 
 /**
  * Downtown's buildings: glass towers, a New York-style stepped tower, a lotus-bud tower with a helipad, a
@@ -13,25 +15,34 @@ import { DECAL, type ColorLike, type Kit, type Kind as ShapeKind, type Role } fr
  * canopies, balconies, crowns, signs) go through the world's own batched primitives.
  */
 /** What world.ts lends the skyline: its scene root and disposal lists, and kit.ts drawing (frames carry the street dressing). */
-export type SkylineKit = Pick<Kit, 'shape' | 'sign' | 'frame' | 'fine'> & {
+export type SkylineKit = Pick<Kit, 'shape' | 'sign' | 'frame' | 'fine' | 'lit'> & {
   root: THREE.Group;
   materials: THREE.Material[];
   geometries: THREE.BufferGeometry[];
   textures: THREE.Texture[];
 };
 
-type Facade = { x: number; y: number; z: number; sx: number; sy: number; sz: number; yaw: number; glass: THREE.Color; frame: THREE.Color; floor: number; bay: number; pattern: number; lit: number; seed: number };
+/**
+ * A facade block: its box, window grid and colours; `lit` the share of window runs that light up at their busiest
+ * (below 1), `kind` whose hours they keep after dark (0 offices: the office rhythm, 1 flats and hotels: the flats
+ * rhythm; night.ts nightRhythm).
+ */
+type Facade = { x: number; y: number; z: number; sx: number; sy: number; sz: number; yaw: number; glass: THREE.Color; frame: THREE.Color; floor: number; bay: number; pattern: number; lit: number; seed: number; kind: 0 | 1 };
 
 function seeded(start: number) {
   let s = (Math.floor(start) % 2147483646) + 1;
   return () => { s = (s * 16807) % 2147483647; return (s - 1) / 2147483646; };
 }
 
-/** The facade material: window grid, sky reflection and lit windows at night, all in the fragment shader. */
+/**
+ * The facade material: window grid, sky reflection and lit windows at night, all in the fragment shader. Lit windows
+ * come in runs that follow the hour (night plan §6.6): offices empty out after 20:00, flats stay lit into the night,
+ * a few flats flicker blue with the television (the shared NIGHT rhythm uniforms, filled on the CPU).
+ */
 function facadeMaterial(uniforms: { night: { value: number }; sky: { value: THREE.Color } }) {
   const material = new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.78, metalness: 0.04 });
   material.onBeforeCompile = (shader) => {
-    Object.assign(shader.uniforms, { facadeNight: uniforms.night, facadeSky: uniforms.sky });
+    Object.assign(shader.uniforms, { facadeNight: uniforms.night, facadeSky: uniforms.sky, nightRhythm: NIGHT.nightRhythm, nightTime: NIGHT.nightTime });
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>
 attribute vec4 aGrid;
@@ -59,6 +70,8 @@ vFrame = aFrame;`);
       .replace('#include <common>', `#include <common>
 uniform float facadeNight;
 uniform vec3 facadeSky;
+uniform vec4 nightRhythm;
+uniform float nightTime;
 varying vec3 vFacadePos;
 varying vec3 vFacadeNormal;
 varying vec4 vGrid;
@@ -89,15 +102,18 @@ roughnessFactor = mix(roughnessFactor, 0.16, fWin);
 metalnessFactor = mix(metalnessFactor, 0.42, fWin);`)
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
 vec2 fRun = vec2(floor(fU / (vGrid.y * 4.0)), fCell.y);
-float fLit = step(1.0 - vGlass.a, facadeHash(fRun * 1.7 + vGrid.w + 3.1)) * step(0.12, facadeHash(fCell + 7.7));
-vec3 fWarm = mix(vec3(1.0, 0.8, 0.55), vec3(0.82, 0.9, 1.0), step(0.6, facadeHash(fRun + 2.3)));
+float fKind = floor(vGlass.a), fFrac = fract(vGlass.a);
+float fRhythm = (fKind > 0.5 ? nightRhythm.z : nightRhythm.y) / 0.9;
+float fLit = step(facadeHash(fRun * 1.7 + vGrid.w + 3.1), fFrac * fRhythm) * step(0.12, facadeHash(fCell + 7.7));
+float fTv = fKind * step(facadeHash(fCell + 5.1), 0.08) * nightRhythm.w;
+vec3 fWarm = mix(mix(vec3(1.0, 0.8, 0.55), vec3(0.82, 0.9, 1.0), step(0.6, facadeHash(fRun + 2.3))), vec3(0.42, 0.58, 1.0) * (0.9 + 0.1 * sin(nightTime * 9.0 + fCell.x * 3.1)), fTv);
 totalEmissiveRadiance += fWin * (fLit * (0.55 + 0.25 * fHash) * fWarm + vec3(0.03, 0.05, 0.08)) * facadeNight;`)
       .replace('#include <fog_fragment>', `#ifdef USE_FOG
 float fogFactor = smoothstep(fogNear * 1.7, fogFar * 2.7, vFogDepth);
 gl_FragColor.rgb = mix(gl_FragColor.rgb, fogColor, fogFactor * 0.92);
 #endif`);
   };
-  material.customProgramCacheKey = () => 'tower-facade';
+  material.customProgramCacheKey = () => 'tower-facade|night';
   return material;
 }
 
@@ -112,8 +128,25 @@ export type SkylineOptions = { hazeEast?: boolean; hazeNorth?: boolean };
 /** A downtown plot: today's (its `full` rect) or a district's (its oriented `box`). */
 type TowerPlot = { plot: Plot & { box?: { cx: number; cz: number; hx: number; hz: number; yaw: number } }; building: Building };
 
+/**
+ * A tower's windows after dark (its main facades here, and world.ts's far stand-in of a district tower, which must
+ * match them): the share of windows lit, and whose hours they keep (0 offices, 1 flats and hotels: the flats' rhythm).
+ */
+export function towerWindows(form: string | undefined, buildingKind: string): { lit: number; kind: 0 | 1 } {
+  const flats = form === 'apartment' || form === 'twin';
+  return { lit: flats ? 0.55 : 0.4, kind: flats || form === 'hotel' || buildingKind === 'home' || buildingKind === 'hotel' ? 1 : 0 };
+}
+
+/** A haze tower's kind (offices or flats), from its position: no draw from the haze's random stream. */
+function hazeKind(x: number, z: number): 0 | 1 {
+  const s = Math.sin(x * 12.9898 + z * 78.233) * 43758.5453;
+  return s - Math.floor(s) < 0.5 ? 1 : 0;
+}
+
 export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineOptions = {}) {
   const { shape, sign } = kit;
+  /** Tower lobbies and podiums are lit 6:00–23:00. */
+  const lobbyCode = scheduleIndex(LOBBY_HOURS);
   let screens: Screen[] = [];
   let boxes: Facade[] = [];
   let prisms: Facade[] = [];
@@ -136,7 +169,7 @@ export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineO
       /** A facade block standing on y0 (local centre lx, lz; w along the front, d deep). */
       face: (lx: number, y0: number, lz: number, w: number, h: number, d: number, spec: Partial<Omit<Facade, 'x' | 'y' | 'z' | 'sx' | 'sy' | 'sz' | 'yaw'>> & { glass: THREE.Color; frame: THREE.Color }, prism = false) => {
         const p = at(lx, lz);
-        (prism ? prisms : boxes).push({ floor: 3.6, bay: 1.6, pattern: 0, lit: 0.42, seed: 0, ...spec, x: p.x, y: y0 + h / 2, z: p.z, sx: w, sy: h, sz: d, yaw: facing });
+        (prism ? prisms : boxes).push({ floor: 3.6, bay: 1.6, pattern: 0, lit: 0.42, seed: 0, kind: 0, ...spec, x: p.x, y: y0 + h / 2, z: p.z, sx: w, sy: h, sz: d, yaw: facing });
       },
     };
   }
@@ -157,17 +190,18 @@ export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineO
     const { part, solid, face, at } = F;
     const glass = color(spec.glass), frameColor = color(spec.frame);
     const darkFrame = frameColor.clone().multiplyScalar(0.82);
-    const look = { glass, frame: frameColor, floor: spec.floor, bay: spec.pattern === 3 ? 2.2 : spec.pattern === 2 ? 2.6 : 1.7, pattern: spec.pattern, seed: r() * 40, lit: spec.form === 'apartment' || spec.form === 'twin' ? 0.55 : 0.4 };
+    const windows = towerWindows(spec.form, b.kind);
+    const look = { glass, frame: frameColor, floor: spec.floor, bay: spec.pattern === 3 ? 2.2 : spec.pattern === 2 ? 2.6 : 1.7, pattern: spec.pattern, seed: r() * 40, lit: windows.lit, kind: windows.kind };
     const podiumLook = { ...look, pattern: 1, glass: glass.clone().multiplyScalar(0.85), lit: 0.6 };
-    /** Lobby: a lit glass front, a canopy over the door and the name sign above it. */
-    const lobby = (width: number, height = 5, signY = height + 1.3) => {
+    /** Lobby: a lit glass front, a canopy over the door and the name sign above it (lit 6:00–23:00). */
+    const lobby = (width: number, height = 5, signY = height + 1.3) => kit.lit(lobbyCode, () => {
       part(0, height / 2, front + 0.12, width, height, 0.2, '#86a9b8', 'glassLit', false);
       part(0, height + 0.15, front + 2.2, Math.min(width, 9), 0.3, 4.2, '#d8dcdc');
       for (const k of [-3, 0, 3]) part(k, height - 0.05, front + 2.2, 0.5, 0.06, 0.5, '#fff4d8', 'lamp', false);
       for (const k of [-1, 1]) part(k * (Math.min(width, 9) / 2 - 0.3), height / 2, front + 3.9, 0.25, height, 0.25, '#9aa3a6');
       const s = at(0, front + 0.26);
       sign(b.name, b.subtitle, p.signColor, s.x, signY, s.z, Math.min(width * 0.9, 14), 1.6, p.facing, '#f4f7f8');
-    };
+    });
     // Aviation lights (a district's five-storey chung cư has none).
     const beacon = (lx: number, y: number, lz: number) => { if (ob && y < 45) return; const q = at(lx, lz); beacons.push(new THREE.Vector3(q.x, y, q.z)); };
 
@@ -244,7 +278,8 @@ export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineO
         face(lx, pod, lz, t - 0.3, top - pod, t - 0.3, look);
         part(lx, top + 0.2, lz, t - 0.1, 0.4, t - 0.1, '#eaf3ff', 'lamp', false);
       }
-      face(0, h * 0.9, 0, t + 0.5, 7, t + 0.5, { ...look, pattern: 1, glass: color('#a9cbe0'), lit: 0.95 });
+      // (the observation deck is a public deck, open late: the flats' hours)
+      face(0, h * 0.9, 0, t + 0.5, 7, t + 0.5, { ...look, pattern: 1, glass: color('#a9cbe0'), lit: 0.95, kind: 1 });
       solid('cylinder', 0, h + 11, 0, 0.6, 22, 0.6, '#d4dadd');
       solid('cone', 0, h + 23, 0, 0.6, 3, 0.6, '#d4dadd');
       lobby(w * 0.62, Math.min(8, pod));
@@ -342,6 +377,7 @@ export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineO
       // the menu) showing in the glass and a tube light under the transom that glows after dark (not the whole pane).
       const F = kit.frame(x, z, p.facing);
       const paneW = w - 1.2, paneH = shop - 1.4, py = shop / 2 - 0.2, bays = Math.max(2, Math.min(5, Math.round(paneW / 3)));
+      const shopCode = buildingLight(b.id).code;
       part(0, py, front + 0.04, paneW, paneH, 0.08, '#4a5f70', 'solid', false);
       for (let k = 0; k <= bays; k++) part(-paneW / 2 + (k * paneW) / bays, py, front + 0.1, 0.12, paneH, 0.1, darkFrame);
       part(0, py + paneH / 2 - 0.7, front + 0.1, paneW, 0.1, 0.1, darkFrame);
@@ -349,7 +385,7 @@ export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineO
       part(doorX, 1.15, front + 0.12, 1.8, 2.3, 0.05, '#33404a', 'solid', false);
       for (const k of [-1, 1]) part(doorX + k * 0.9, 1.15, front + 0.14, 0.1, 2.3, 0.06, darkFrame);
       part(doorX, 2.32, front + 0.14, 1.9, 0.1, 0.06, darkFrame);
-      part(0, py + paneH / 2 - 0.82, front + 0.12, paneW - 0.4, 0.07, 0.07, '#eef8ff', 'tube', false);
+      kit.lit(shopCode, () => part(0, py + paneH / 2 - 0.82, front + 0.12, paneW - 0.4, 0.07, 0.07, '#eef8ff', 'tube', false));
       kit.fine(true);
       const inside = b.kind === 'food' || b.kind === 'cafe' ? DECAL.menu : DECAL.goods;
       for (let k = 0; k < bays; k++) {
@@ -360,7 +396,7 @@ export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineO
       kit.fine(false);
       part(0, shop - 0.4, front + 0.9, w - 0.4, 0.15, 1.8, ['#c9493b', '#3f6f9f', '#5e927c', '#d9a441', '#7d5ba6'][Math.floor(r() * 5)]);
       const s = at(0, front + 0.14);
-      sign(b.name, b.subtitle, p.signColor, s.x, shop + 1.0, s.z, Math.min(w - 1, 9), 1.25, p.facing);
+      kit.lit(shopCode, () => sign(b.name, b.subtitle, p.signColor, s.x, shop + 1.0, s.z, Math.min(w - 1, 9), 1.25, p.facing));
       if (b.kind === 'home' || b.kind === 'hotel') {
         for (let y = shop + 3; y < h - 1.5; y += spec.floor) part(0, y, front + 0.5, w - 1.4, 0.15, 1.0, '#e6e0d4', 'solid', false);
       }
@@ -376,7 +412,7 @@ export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineO
         } else for (let lx = -w / 2 + 1.3; lx < w / 2 - 1; lx += 2.6) if (q() < 0.25) acUnit(D, lx, y - 0.9, front + 0.02);
       }
       const tag = FRONT_OF[counterKeyOf(b) ?? ''];
-      if (tag) verticalSign(D, tag[1], (q() < 0.5 ? -1 : 1) * (w / 2 - 0.35), shop + 2.3, front, ...LIGHT_BOXES[Math.floor(q() * LIGHT_BOXES.length)]);
+      if (tag) kit.lit(shopCode, () => verticalSign(D, tag[1], (q() < 0.5 ? -1 : 1) * (w / 2 - 0.35), shop + 2.3, front, ...LIGHT_BOXES[Math.floor(q() * LIGHT_BOXES.length)]));
       if (spec.crown === 'sign') {
         part(0, h + 2.4, -d * 0.1, w * 0.8, 3.4, 0.25, '#2b2f33');
         const ad = at(0, -d * 0.1 + 0.15);
@@ -405,14 +441,14 @@ export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineO
   for (let i = 0; i < 34; i++) {
     const x = -200 + i * 19 + far() * 8, back = far(), z = opts.hazeNorth === false ? -490 - back * 90 : -226 - back * 70;
     const w = 14 + far() * 12, d = 14 + far() * 10, h = (opts.hazeNorth === false ? 50 : 30) + far() * far() * 150;
-    const tower: Facade = { x, y: h / 2, z, sx: w, sy: h, sz: d, yaw: 0, glass: color(farGlass[Math.floor(far() * farGlass.length)]), frame: color(farFrame[Math.floor(far() * farFrame.length)]), floor: 3.6, bay: 1.8, pattern: Math.floor(far() * 4), lit: 0.4, seed: far() * 30 };
+    const tower: Facade = { x, y: h / 2, z, sx: w, sy: h, sz: d, yaw: 0, glass: color(farGlass[Math.floor(far() * farGlass.length)]), frame: color(farFrame[Math.floor(far() * farFrame.length)]), floor: 3.6, bay: 1.8, pattern: Math.floor(far() * 4), lit: 0.4, seed: far() * 30, kind: hazeKind(x, z) };
     boxes.push(tower);
     if (h > 70) beacons.push(new THREE.Vector3(x, h + 1, z));
   }
   for (let i = 0; i < 16; i++) {
     const x = 380 + far() * 120, z = -120 + i * 17 + far() * 6;
     const w = 14 + far() * 10, d = 14 + far() * 10, h = 24 + far() * far() * 110;
-    const tower: Facade = { x, y: h / 2, z, sx: w, sy: h, sz: d, yaw: 0, glass: color(farGlass[Math.floor(far() * farGlass.length)]), frame: color(farFrame[Math.floor(far() * farFrame.length)]), floor: 3.6, bay: 1.8, pattern: Math.floor(far() * 4), lit: 0.4, seed: far() * 30 };
+    const tower: Facade = { x, y: h / 2, z, sx: w, sy: h, sz: d, yaw: 0, glass: color(farGlass[Math.floor(far() * farGlass.length)]), frame: color(farFrame[Math.floor(far() * farFrame.length)]), floor: 3.6, bay: 1.8, pattern: Math.floor(far() * 4), lit: 0.4, seed: far() * 30, kind: hazeKind(x, z) };
     if (opts.hazeEast !== false) boxes.push(tower);
   }
 
@@ -429,7 +465,8 @@ export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineO
     const grid = new Float32Array(list.length * 4), glassA = new Float32Array(list.length * 4), frameA = new Float32Array(list.length * 3);
     list.forEach((f, i) => {
       grid.set([f.floor, f.bay, f.pattern, f.seed], i * 4);
-      glassA.set([f.glass.r, f.glass.g, f.glass.b, f.lit], i * 4);
+      // (the lit share below 1 plus the kind: the shader splits them again)
+      glassA.set([f.glass.r, f.glass.g, f.glass.b, Math.min(0.99, f.lit) + f.kind], i * 4);
       frameA.set([f.frame.r, f.frame.g, f.frame.b], i * 3);
     });
     geometry.setAttribute('aGrid', new THREE.InstancedBufferAttribute(grid, 4));
@@ -509,11 +546,15 @@ export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineO
 
   let advert = 0;
   return {
-    /** Lit windows after dark (no power in zombie mode), and the sky the glass reflects. */
-    setAtmosphere(night: number, power: number, sky: THREE.Color) {
+    /**
+     * Lit windows after dark (no power in zombie mode), and the sky the glass reflects; the LED screens dim to a
+     * glimmer from 23:30 to 6:00.
+     */
+    setAtmosphere(night: number, power: number, sky: THREE.Color, hour = 12) {
       uniforms.night.value = night * power;
       uniforms.sky.value.copy(sky);
-      screenMaterial.color.setScalar(power ? 0.55 + night * 0.45 : 0.04);
+      const h = ((hour % 24) + 24) % 24, late = h >= 23.5 || h < 6 ? 0.08 : 1;
+      screenMaterial.color.setScalar(power ? (0.55 + night * 0.45) * late : 0.04);
       beaconMaterial.visible = power > 0;
     },
     /**
@@ -527,9 +568,10 @@ export function buildSkyline(kit: SkylineKit, plots: TowerPlot[], opts: SkylineO
      * each (lit windows at night) and a beacon on the tall ones, in the world's root; `show(i, on)` hides one while
      * its own tile draws the real building.
      */
-    standIns(list: { x: number; z: number; w: number; d: number; h: number; yaw: number; seed: number; glass: string; frame: string; lit: number }[]) {
+    standIns(list: { x: number; z: number; w: number; d: number; h: number; yaw: number; seed: number; glass: string; frame: string; lit: number; kind?: 0 | 1 }[]) {
       if (!list.length) return { show: (() => { /* none */ }) as (i: number, on: boolean) => void };
-      const facades: Facade[] = list.map((f) => ({ x: f.x, y: f.h / 2, z: f.z, sx: f.w, sy: f.h, sz: f.d, yaw: f.yaw, glass: color(f.glass), frame: color(f.frame), floor: 3.4, bay: 1.8, pattern: f.seed % 4, lit: f.lit, seed: f.seed % 30 }));
+      // (`kind`: whose hours the windows keep, as the real tower's do: towerWindows)
+      const facades: Facade[] = list.map((f) => ({ x: f.x, y: f.h / 2, z: f.z, sx: f.w, sy: f.h, sz: f.d, yaw: f.yaw, glass: color(f.glass), frame: color(f.frame), floor: 3.4, bay: 1.8, pattern: f.seed % 4, lit: f.lit, seed: f.seed % 30, kind: f.kind ?? 0 }));
       target = kit.root;
       const mesh = facadeMesh(new THREE.BoxGeometry(1, 1, 1), facades);
       mesh.castShadow = false;

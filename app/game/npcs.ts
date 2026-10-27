@@ -1105,8 +1105,12 @@ export function createNpcs(
   const pole = new THREE.Matrix4(), poleEnd = new THREE.Vector3(), hipTurned = new THREE.Vector3();
   /** The fist's grip frame (metres, unscaled) of an arm just posed. */
   function grip(arm: THREE.Matrix4, pose: ArrayLike<number>, side: 1 | -1, p: THREE.Vector3, q: THREE.Quaternion) { gripMatrix(arm, pose, side, held).decompose(p, q, gripScale); }
+  /** Squared distance from the camera past which nobody is posed or drawn (the fog's far end and a margin; update sets it). */
+  let fogCull = Infinity;
   /** Whether the camera's frustum (last frame's) holds a sphere round the whole person, an open umbrella included. */
   const inFrame = (npc: Npc) => !view || view.intersectsSphere(bound.set(bound.center.set(npc.x, npc.y + 1.1, npc.z), 1.35));
+  /** Whether a person stands past the fog's far end (and the margin), where nobody would see them. */
+  const inFog = (npc: Npc) => fogCull !== Infinity && (npc.x - eye.x) ** 2 + (npc.y - eye.y) ** 2 + (npc.z - eye.z) ** 2 > fogCull;
   function draw(npc: Npc, i: number, time: number) {
     if (!visible(npc)) return;
     if (!inFrame(npc)) return;
@@ -3045,6 +3049,9 @@ export function createNpcs(
       focusX = fx;
       focusZ = fz;
       clock = time;
+      // Past the fog's far end (and the margin the world draws to) a person is the fog's colour: not posed or drawn.
+      const fogNow = scene.fog as THREE.Fog | null;
+      fogCull = eyeKnown && fogNow && 'far' in fogNow ? (fogNow.far + 20) ** 2 : Infinity;
       nowHour = hour;
       if (!started) { settle(hour); started = true; lastHour = hour; freshUntil = time + 1.5; }
       if (hour < lastHour) day++;
@@ -3296,7 +3303,7 @@ export function createNpcs(
         const walked = Math.abs(npc.x - npc.gx) + Math.abs(npc.z - npc.gz);
         if (walked > (npc.state === 'walking' || npc.state === 'fleeing' ? 0.12 : 0) || walked !== walked) { npc.y = ground(npc.x, npc.z); npc.gx = npc.x; npc.gz = npc.z; }
         // Off screen (or beyond the fog) nobody sees the stride, the eyes or the clothes: only where they go is kept.
-        const onScreen = !beyond && inFrame(npc);
+        const onScreen = !beyond && inFrame(npc) && !inFog(npc);
         if (!onScreen) npc.lastSpeed = npc.speed;
         if (beyond) {
           stats.outside++;

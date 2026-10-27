@@ -189,6 +189,31 @@ export function rooftop(F: Frame, r: Rand, s: RoofSpec, fine: (on: boolean) => v
 
 /** What fills an open shop front, by counter kind. */
 export type FrontKind = 'goods' | 'pharmacy' | 'gold' | 'barber' | 'tailor' | 'repair' | 'florist' | 'food' | 'cafe' | 'home';
+/**
+ * The light of an open front by kind (night plan §6.3): its back wall and ceiling panel (the 'tube' role: grey by day,
+ * luma-matched to the old greys, so only their hue moves; after dark the tube glow turns that hue into cool or warm
+ * light), the entrance tube, and the spill pool on the pavement (display colour × strength `s`: how much it multiplies
+ * the pavement's light, street-lights.ts). Cool white for a
+ * tạp hóa, a pharmacy or a barber, warm for food and cafés, bright warm for the gold shop.
+ */
+export const FRONT_LIGHT: Record<FrontKind, { wall: string; tube: string; pool: string; s: number }> = {
+  goods: { wall: '#8c99a3', tube: '#eef8ff', pool: '#d9ecff', s: 0.8 },
+  pharmacy: { wall: '#8a9c9b', tube: '#f0fbff', pool: '#d6f0e6', s: 0.82 },
+  gold: { wall: '#a6977a', tube: '#fff3c8', pool: '#ffe08a', s: 0.9 },
+  barber: { wall: '#8d99a0', tube: '#eef8ff', pool: '#dfeeff', s: 0.75 },
+  tailor: { wall: '#9e9587', tube: '#fff6e6', pool: '#ffe6c4', s: 0.75 },
+  florist: { wall: '#9a978b', tube: '#fffbe8', pool: '#fff0d8', s: 0.75 },
+  repair: { wall: '#8e979b', tube: '#e8f2ff', pool: '#dfe9f5', s: 0.65 },
+  food: { wall: '#a09484', tube: '#fff1d6', pool: '#ffd6a0', s: 0.85 },
+  cafe: { wall: '#9e9282', tube: '#ffe6bf', pool: '#ffcf96', s: 0.85 },
+  home: { wall: '#93897a', tube: '#ffe9c8', pool: '#ffd9a8', s: 0.5 },
+};
+/**
+ * How many draws openFront takes from its random stream for a kind (its back wall, floor, side, then the goods' colours
+ * or the home's gate). world.ts skips this many when a district front gets a kind of its own, so nothing drawn after
+ * the front on that building moves.
+ */
+export const frontDraws = (kind: FrontKind) => 3 + (kind === 'home' ? 1 : kind === 'goods' || kind === 'pharmacy' || kind === 'florist' || kind === 'barber' || kind === 'tailor' || kind === 'gold' ? 12 : 0);
 export type FrontSpec = {
   lx: number; w: number; h: number; d: number; front: number; wall: ColorLike;
   kind: FrontKind;
@@ -220,10 +245,14 @@ export function openFront(F: Frame, r: Rand, s: FrontSpec) {
   F.part(lx, O + (h - O) / 2, 0, w, h - O, d, wall, 'wall');
   F.part(lx, O / 2, -R / 2, w, O, d - R, wall, 'wall');
   for (const k of [-1, 1]) F.part(lx + k * (w / 2 - P / 2), (O + 0.5) / 2, inside, P, O - 0.5, R, wall, 'wall');
-  // The back wall glows with the tube after dark (tube role: lit in its own colour), shaded grey by day.
-  F.part(lx, 1.9, back + 0.02, iw, 2.8, 0.04, pick(r, s.kind === 'home' ? ['#93897a', '#8a8f86', '#968a78'] : ['#8f9799', '#8b968f', '#969286']), 'tube', false);
+  // The back wall and a ceiling panel glow with the tube after dark (tube role: lit in their own colour, the kind's
+  // light), shaded grey by day. The panel stops 0.4 m short of the front, so nothing lit shows above a closed shutter.
+  const light = FRONT_LIGHT[s.kind];
+  r(); // (the back wall's grey used to be picked here: the stream stays as it was)
+  F.part(lx, 1.9, back + 0.02, iw, 2.8, 0.04, light.wall, 'tube', false);
+  F.part(lx, O - 0.03, inside - 0.2, iw - 0.2, 0.03, R - 0.6, light.wall, 'tube', false);
   F.part(lx, 0.52, inside, iw, 0.04, R, pick(r, ['#d8d2c4', '#c9c4b8', '#e0d6c2']), 'tiles', false);
-  F.part(lx, O - 0.08, inside, 1.2, 0.05, 0.1, '#eef8ff', 'tube', false);
+  F.part(lx, O - 0.08, inside, 1.2, 0.05, 0.1, light.tube, 'tube', false);
   if (s.drum) F.part(lx, O - 0.12, front - 0.06, w - 0.4, 0.26, 0.26, DRUM);
   const side = r() < 0.5 ? -1 : 1, edge = lx + side * (iw / 2 - 0.5), wallDecal = { fine: false };
   s.fine(true);
@@ -281,5 +310,5 @@ export function openFront(F: Frame, r: Rand, s: FrontSpec) {
     }
   }
   s.fine(false);
-  F.pool(lx, front + 2.2, 4.6, s.shop);
+  F.pool(lx, front + 1.8, 5.2, s.shop, light.pool, light.s);
 }

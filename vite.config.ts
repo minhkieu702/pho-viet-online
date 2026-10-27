@@ -1,5 +1,5 @@
 import vinext from "vinext";
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin } from "vite";
 import hostingConfig from "./.openai/hosting.json";
 import { readExecutionProfile } from "./scripts/execution-profile.mjs";
 import { configureToolEnvironment } from "./scripts/tool-environment.mjs";
@@ -41,6 +41,25 @@ const localBindingConfig = {
     : [],
 };
 
+/**
+ * The P1 map worker (app/game/map/world-map-worker.ts, the client's `?worker` import in world-map-start.ts) is bundled
+ * once, and Vite emits its script into every environment's output, the server's (rsc, ssr) too, where wrangler would
+ * attach it to the Worker as two unused modules. Map generation must not ship in or run on the Worker (WIRING-PLAN §2):
+ * the server bundles drop it; the client keeps it at /_next/static/.
+ */
+function clientOnlyMapWorker(): Plugin {
+  return {
+    name: "pvo:client-only-map-worker",
+    apply: "build",
+    applyToEnvironment: (environment) => environment.name !== "client",
+    generateBundle(_options, bundle) {
+      for (const file of Object.keys(bundle)) {
+        if (/(^|\/)world-map-worker-[\w-]+\.js$/.test(file)) delete bundle[file];
+      }
+    },
+  };
+}
+
 export default defineConfig(async ({ command }) => {
   configureToolEnvironment(process.cwd());
 
@@ -58,6 +77,7 @@ export default defineConfig(async ({ command }) => {
     },
     plugins: [
       vinext(),
+      clientOnlyMapWorker(),
       sites({ mockAuth: !managedLinux }),
       connectorPreview(),
       cloudflare({

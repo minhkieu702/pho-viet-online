@@ -14,6 +14,9 @@
 //             default camera (skipped when nothing is wired)
 //   ddrive    the sport bike at full throttle along a long street of that slice (Bến Vân Đồn, Điện Biên Phủ, Võ Văn
 //             Kiệt, Trần Hưng Đạo, Vòng Cung)
+// Two more, only when --scenes names them (night plan §10.3): the heaviest night light, and the lamps on the road.
+//   nightdistrict  on foot in Bùi Viện at 21:30: festoons, neon, signs, open fronts, the crowd and the light pools
+//   nightdrive     the drive at 21:00: head-lamp beams, tail lamps and lamp pools streaming past (gated like drive)
 // With districts wired, the frames from the start of a solo game until every district tile is built are recorded too
 // ("build": max frame, frames over 50 ms), and --gate checks no frame over 50 ms there and draw calls <= 250 (median,
 // every scene).
@@ -52,13 +55,17 @@ const NOTE = flag('note', '');
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const GATES = { discreteFps: 120, intelLowFps: 38, driveP95: 33, signMB: 10, buildMax: 50, calls: 250 };
 const DISTRICT = flag('district', '');
-/** Per P1 slice: a street to stand in at 19:00 (x, z, camera yaw) and a straight run to ride (x, z, heading). */
+/**
+ * Per P1 slice: a street to stand in at 19:00 (x, z, the player's facing; the camera sits behind) and a straight run
+ * to ride (x, z, heading). Bùi Viện's stand (also the nightdistrict scene) is in the walking street looking west along
+ * it, Thủ Thiêm's on Trần Bạch Đằng's east sidewalk looking north (they stood in a Phạm Ngũ Lão block and on a lawn).
+ */
 const DISTRICT_SPOTS = {
   'quan-4': { name: 'Vĩnh Khánh', stand: [535, 6, -2.4], ride: [446.5, -95, 0] },
   'binh-thanh': { name: 'Hàng Xanh', stand: [-390, 12, 2.2], ride: [-235, -5.5, -Math.PI / 2] },
   'quan-3': { name: 'Võ Thị Sáu', stand: [-120, 168, 1.2], ride: [-370, 430.5, Math.PI / 2] },
-  'quan-1-south': { name: 'Bùi Viện', stand: [320, 262, 1.6], ride: [-100, 390.5, Math.PI / 2] },
-  'thu-thiem': { name: 'Thủ Thiêm', stand: [20, -262, 2.8], ride: [-400, -314.5, Math.PI / 2] },
+  'quan-1-south': { name: 'Bùi Viện', stand: [340, 250, -Math.PI / 2], ride: [-100, 390.5, Math.PI / 2] },
+  'thu-thiem': { name: 'Thủ Thiêm', stand: [-145.5, -388, 0], ride: [-400, -314.5, Math.PI / 2] },
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -70,7 +77,9 @@ async function launch(run, port) {
     '--use-angle=d3d11', '--enable-gpu', '--ignore-gpu-blocklist', '--no-first-run', '--no-default-browser-check',
     '--disable-gpu-vsync', '--disable-frame-rate-limit', '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
     '--disable-backgrounding-occluded-windows', ...(run === 'high' ? ['--force_high_performance_gpu'] : []), 'about:blank'];
-  const chrome = spawn(CHROME, flags, { stdio: 'ignore' });
+  // (Chrome's temporary files go to PVO_TEMP, or E:/pvo-tmp on the shared bench machine, whose disk C: is nearly full.)
+  const temp = process.env.PVO_TEMP ?? (existsSync('E:/pvo-tmp') ? 'E:/pvo-tmp' : null);
+  const chrome = spawn(CHROME, flags, { stdio: 'ignore', env: temp ? { ...process.env, TEMP: temp, TMP: temp } : process.env });
   let spawnError = null;
   chrome.on('error', (e) => { spawnError = e; });
   let target;
@@ -330,10 +339,35 @@ async function runOne(run, port) {
       await page.evaluate(`window.__benchClear = false; ${P}.police.reset()`);
       if (result.scenes.drive.speed < 20) result.warnings.push(`drive averaged ${result.scenes.drive.speed} m/s (crash or blocked?)`);
     }
+    if (SCENES.includes('nightdrive')) {
+      // The same run at 21:00 (the bike bought for drive, else the scooter): the vehicles' lamps and the street lamps.
+      await page.evaluate(`${P}.police.reset(); ${P}.hours(21); ${P}.ride(-128, -102.6, Math.PI / 2); ${P}.view(-Math.PI / 2, 0.22, 9);
+        window.__benchClear = true;
+        (function clear() {
+          if (!window.__benchClear) return;
+          const p = ${P}.info();
+          for (const c of ${P}.vehicles.cars) if (c.mode !== 'off' && c.mode !== 'player' && c.x - p.x > -4 && c.x - p.x < 70 && Math.abs(c.z + 102.6) < 4.5) c.mode = 'off';
+          requestAnimationFrame(clear);
+        })();`);
+      await sleep(800);
+      await page.key('keyDown', 'w', 'KeyW', 87);
+      await sleep(5500);
+      await measure('nightdrive');
+      await page.key('keyUp', 'w', 'KeyW', 87);
+      await page.evaluate(`window.__benchClear = false; ${P}.police.reset()`);
+      if (result.scenes.nightdrive.speed < 18) result.warnings.push(`night drive averaged ${result.scenes.nightdrive.speed} m/s (crash or blocked?)`);
+    }
     if (SCENES.includes('night')) {
       await page.evaluate(`${P}.police.reset(); ${P}.hours(21); ${P}.tp(243, 44, Math.PI); ${P}.view(-2.6, 0.2, 70)`);
       await sleep(4000);
       await measure('night');
+    }
+    if (SCENES.includes('nightdistrict') && result.wired?.includes('quan-1-south')) {
+      // Bùi Viện at 21:30, standing (night plan §10.3 step 4): the walking street with everything lit.
+      const [x, z, yaw] = DISTRICT_SPOTS['quan-1-south'].stand;
+      await page.evaluate(`${P}.police.reset(); ${P}.hours(21.5); ${P}.tp(${x}, ${z}, ${yaw}); ${P}.view(${yaw} + Math.PI, 0.32, 12)`);
+      await sleep(5000);
+      await measure('nightdistrict');
     }
     // The newest wired slice (or --district): a street at 19:00 on foot, then a straight run on the sport bike.
     const slice = DISTRICT || result.wired?.at(-1);
@@ -388,6 +422,7 @@ function gates(runs) {
     if (!integrated(r.gpu)) out.push({ gate: `${r.run}: discrete GPU (${r.gpu}) >= ${GATES.discreteFps} fps in every scene`, ok: minFps >= GATES.discreteFps, value: `${minFps} fps (${worst}), quality ${r.quality}` });
     else if (/intel/i.test(r.gpu) && r.quality === 'low') out.push({ gate: `${r.run}: Intel at Low (${r.gpu}) >= ${GATES.intelLowFps} fps in every scene`, ok: minFps >= GATES.intelLowFps, value: `${minFps} fps (${worst})` });
     if (r.scenes.drive) out.push({ gate: `${r.run}: p95 <= ${GATES.driveP95} ms while driving`, ok: r.scenes.drive.p95 <= GATES.driveP95, value: `${r.scenes.drive.p95} ms at ${r.scenes.drive.speed} m/s` });
+    if (r.scenes.nightdrive) out.push({ gate: `${r.run}: p95 <= ${GATES.driveP95} ms while driving at night`, ok: r.scenes.nightdrive.p95 <= GATES.driveP95, value: `${r.scenes.nightdrive.p95} ms at ${r.scenes.nightdrive.speed} m/s` });
     if (r.scenes.ddrive) out.push({ gate: `${r.run}: p95 <= ${GATES.driveP95} ms while driving in ${r.district?.name}`, ok: r.scenes.ddrive.p95 <= GATES.driveP95, value: `${r.scenes.ddrive.p95} ms at ${r.scenes.ddrive.speed} m/s` });
     if (r.build) out.push({ gate: `${r.run}: no frame over ${GATES.buildMax} ms while the districts build`, ok: r.build.max <= GATES.buildMax && r.build.ready, value: `max ${r.build.max} ms, ${r.build.over50} over 50 ms${r.build.ready ? '' : ', NOT finished in 30 s'}` });
     if (scenes.length) { const most = Math.max(...scenes.map(([, s]) => s.calls)), at = scenes.find(([, s]) => s.calls === most)[0]; out.push({ gate: `${r.run}: draw calls <= ${GATES.calls} (median, every scene)`, ok: most <= GATES.calls, value: `${most} (${at})` }); }

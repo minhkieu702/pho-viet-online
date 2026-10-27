@@ -56,13 +56,15 @@ export function surfaceNoise() {
 }
 
 const VERT_COMMON = `#include <common>
+uniform float surfDetail;
 varying vec3 vSurfPos;
 varying vec3 vSurfLocalN;
 varying vec3 vSurfWorldN;
 varying vec3 vSurfScale;
 varying float vSurfCenterY;`;
 const VERT_BEGIN = `#include <begin_vertex>
-{
+vSurfPos = vec3(0.0); vSurfLocalN = vec3(0.0); vSurfWorldN = vec3(0.0); vSurfScale = vec3(0.0); vSurfCenterY = 0.0;
+if (surfDetail > 0.5) {
   mat4 surfM = modelMatrix;
   #ifdef USE_INSTANCING
   surfM = modelMatrix * instanceMatrix;
@@ -74,6 +76,7 @@ const VERT_BEGIN = `#include <begin_vertex>
   vSurfCenterY = surfM[3].y;
 }`;
 const FRAG_COMMON = `#include <common>
+uniform float surfDetail;
 uniform sampler2D surfNoise;
 varying vec3 vSurfPos;
 varying vec3 vSurfLocalN;
@@ -89,9 +92,10 @@ vec3 surfGrout(vec2 p) {
 }`;
 
 /**
- * 0 compiles the patched materials without their patterns (plain instance colours, no extra varyings or texture
- * fetches) for the lowest quality levels; flip it, then set needsUpdate on the materials (world.ts setDetail). Both
- * variants have their own program cache key, so switching back and forth compiles each once.
+ * 0 draws the patched materials without their patterns (plain instance colours: their vertex work and texture fetches
+ * skipped) for the lowest quality levels (world.ts setDetail). A uniform every patched material shares, not a program
+ * variant: switching levels (the auto quality steps 3 → 4 a few seconds into a game on an integrated GPU) compiles
+ * nothing. The branch is on a uniform, so the patterns' derivatives (fwidth, texture LOD) stay defined inside it.
  */
 export const surfaceDetail = { value: 1 };
 
@@ -99,12 +103,12 @@ function patch(material: THREE.MeshStandardMaterial, key: string, noise: THREE.T
   const previous = material.onBeforeCompile;
   material.onBeforeCompile = (shader, renderer) => {
     previous.call(material, shader, renderer);
-    if (surfaceDetail.value < 0.5) return;
     shader.uniforms.surfNoise = { value: noise };
+    shader.uniforms.surfDetail = surfaceDetail;
     shader.vertexShader = shader.vertexShader.replace('#include <common>', VERT_COMMON).replace('#include <begin_vertex>', VERT_BEGIN);
-    shader.fragmentShader = shader.fragmentShader.replace('#include <common>', FRAG_COMMON).replace('#include <color_fragment>', `#include <color_fragment>\n{\n${body}\n}`);
+    shader.fragmentShader = shader.fragmentShader.replace('#include <common>', FRAG_COMMON).replace('#include <color_fragment>', `#include <color_fragment>\nif (surfDetail > 0.5) {\n${body}\n}`);
   };
-  material.customProgramCacheKey = () => (surfaceDetail.value < 0.5 ? `${key}-flat` : key);
+  material.customProgramCacheKey = () => key;
 }
 
 /**

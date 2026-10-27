@@ -3,7 +3,7 @@ import { buildWorld, dockAt, groundHeight, onSidewalk } from './world';
 import { LANDMARKS, LIFE, PLOTS, SCENERY, WATER_LEVEL, inRect, type Dock } from './city';
 import { LIFE_LINES } from './street-life';
 import { BASE, OWN_VEHICLE, createRegistry, noticeEntry, type Ctx, type Entry, type Focus, type MenuItem, type MenuView, type PromptView } from './interact';
-import { ATM_SPOTS, COUNTERS, FORTUNES, PLACES, VENDING_SPOTS, counterAt, hourLabel, hoursLabel, isOpen, lunarDay, opensAt, type CounterDef, type Hours, type Place } from './counters';
+import { ATM_SPOTS, COUNTERS, FORTUNES, PLACES, VENDING_SPOTS, counterAt, hourLabel, hoursLabel, isOpen, lunarDay, opensAt, type CounterDef, type Place } from './counters';
 import {
   DRAW_HOUR, HAGGLE_OFF, MAX_TICKETS, applyEffect, drawDay, drawNumber, footSpeed, haggle, prizeFor, regenRate, ticketNumber,
   type BuffId, type EffectHost, type Ticket,
@@ -26,7 +26,7 @@ import { createEffects, makeGun } from './effects';
 import { createExplosives, type Explosion } from './explosives';
 import { createPickups } from './pickups';
 import { createBubbles } from './bubbles';
-import { createAtmosphere, type Weather } from './atmosphere';
+import { DAY_EXPOSURE, createAtmosphere, type Weather } from './atmosphere';
 import { createAnimals } from './animals';
 import { createSideMissions, type SideMissionView } from './side-missions';
 import { playBoom, playCrash, playHorn, playShot, playThud, setRain, unlockAudio } from './audio';
@@ -39,6 +39,7 @@ import type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib
 import { BIKES, CAR_STATS, MOTO_STATS, POLICE_CAR_STATS, bikeById, repairCost, type BikeId } from './bikes';
 import { createVehicles, makeCarMesh, seatOf, vehicleLabel, vehicleStyle, CAR_HEALTH, MASS, MOTO_HEALTH, POLICE_CAR_HEALTH, type Body, type Car, type Crash } from './vehicles';
 import { MOTO_RIDER, motoParts, vehicleMaterial, type MotoStyle } from './vehicle-models';
+import { OWN, vehicleLights } from './vehicle-lights';
 import {
   ARM_POSES, BODY_SCALE, CAR_DRIVER, FIGURE, HAND, HAND_SOCKET, HEAD, TORSO, armFK, createHeroFigure, deriveStyle, gait, handCode, mixHand, newGait,
   releaseView, setBits, setStyle, sideX, socket, styleOf, twoBoneIK, type FigureLook, type HeroFigure, type WardrobeRole,
@@ -47,6 +48,7 @@ import { createPolice } from './police';
 import { createZombies, type Zombie } from './zombies';
 import { createInteriors, type InteriorKind, type RoomAct } from './interiors';
 import { VENUE_SERVICES, serviceOf, type VenueRoom } from './venues';
+import { VENUE_HOURS } from './night-hours';
 import { createSky, HORIZON } from './sky';
 import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuName, isIntegratedGpu, isSoftwareGpu, type QualityMode } from './quality';
 
@@ -851,7 +853,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   renderer.shadowMap.autoUpdate = false;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.14;
+  renderer.toneMappingExposure = DAY_EXPOSURE;
   renderer.domElement.setAttribute('aria-label', 'Khu phố Việt Nam 3D. WASD để di chuyển, E để tương tác, chuột phải để xoay camera.');
   container.appendChild(renderer.domElement);
   const gpu = gpuName(renderer.getContext());
@@ -927,6 +929,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     bikeAt: (x, z) => vehicles.parkedAt(x, z, 0.9),
   });
   const vehicles = createVehicles(scene, worldClear);
+  // Head-lamp beams, tail lamps, light bars and boats' navigation lights at night: one draw (vehicle-lights.ts).
+  scene.add(vehicleLights.mesh);
   // The boats carry the player too (the đò ngang, river bus W2): fares, putting them down on a pier, a line in the HUD.
   const boats = createBoats(scene, {
     pay: (k) => { if (cash < k) return false; cash -= k; return true; },
@@ -1120,8 +1124,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     return { kind: p.key as VenueRoom, name: p.name, at: { x: p.x, z: p.z }, ring: placeRing(neon, neon, `${p.name} · 18+`, '#1a0b16', p) };
   });
   const scratchLabel = new THREE.Vector3();
-  /** Opening hours of the nightlife doors (the spa by day too, the nhà nghỉ round the clock); past 24 runs over midnight. */
-  const VENUE_HOURS: Record<VenueRoom, Hours> = { bar: [[17, 27]], karaoke: [[14, 26]], club: [[20, 28]], spa: [[9, 23]], motel: [[0, 24]] };
+  // (The nightlife doors open by VENUE_HOURS, night-hours.ts: the same hours switch their neon.)
   // Downtown and the river: speedboats for hire at two docks, the observation deck and the bank.
   const activityRings = [
     ...SCENERY.docks.filter((d) => d.rental).map((d) => placeRing('#2f86c6', '#1d4f7a', 'THUÊ CA NÔ', '#1d4f7a', d.ring)),
@@ -1152,7 +1155,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
   // Roller shutters (cửa cuốn) over the fronts of the shophouse counters: pulled down outside opening hours (and for
   // good in zombie mode), so a closed shop reads as closed from the street (design-real C3). One instanced draw.
-  const shutterPlaces = PLACES.filter((p) => p.kind === 'counter' && p.building >= 0 && !p.id.startsWith('dk:') && ['legacy', 'home', 'shop', 'midrise', 'kiosk'].includes(worldPlot(p.building).style));
+  // (Not a chung cư kiosk's `dk:` counter, nor an eatery table's `dt:`: a table shares its quán's building, hours and
+  // front, so it would only add a second shutter over the same one.)
+  const shutterPlaces = PLACES.filter((p) => p.kind === 'counter' && p.building >= 0 && !p.id.startsWith('dk:') && !p.id.startsWith('dt:') && ['legacy', 'home', 'shop', 'midrise', 'kiosk'].includes(worldPlot(p.building).style));
   const shutterTexture = (() => {
     const c = document.createElement('canvas');
     c.width = 8; c.height = 64;
@@ -4498,6 +4503,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (!target.down) {
         const vehicleBlob = kind === 'foot' ? [0.9, 0.9] : kind === 'scooter' ? [0.9, 2.1] : [2.4, 5];
         if (kind !== 'swim' && kind !== 'boat') effects.blob(x, groundHeight(x, z) + 0.02, z, vehicleBlob[0], vehicleBlob[1], peer.foot.group.rotation.y);
+        // Another player's scooter or car has its lamps on at night, like the player's own (vehicle-lights.ts).
+        if (kind === 'scooter' || kind === 'car' || kind === 'police') vehicleLights.place(peer, x, groundHeight(x, z), z, pose.angle, 0, kind === 'scooter' ? 'scooter' : kind === 'police' ? 'police' : 'sedan', pose.speed, OWN);
       }
     }
   }
@@ -4582,6 +4589,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     updateHeist(now);
     // The hire boat goes back to its dock once it has been left far behind.
     if (!boat && boats.rental.mode === 'player' && now - boatLeftAt > 4000 && Math.hypot(boats.rental.x - state.x, boats.rental.z - state.z) > 160) boats.dock();
+    // Vehicle lights for this frame: the boats, traffic, buses and the player's own bike write theirs, end() draws them.
+    vehicleLights.begin({ camera, night: atmosphere.night, power: zombieMode ? 0 : 1, wet: atmosphere.rain, level, time });
     boats.update(dt, time, swimming || boat ? { x: state.x, z: state.z } : null, cameraTarget);
     boats.setNight(atmosphere.night);
 
@@ -4597,14 +4606,19 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (followShadows(cameraTarget.x, cameraTarget.z) && shadowsAllowed) renderer.shadowMap.needsUpdate = true;
     if (interior) {
       hemi.intensity = 2.3;
+      // Indoors keeps the day's cream hemisphere and exposure (atmosphere.ts turns them moonlit at night).
+      hemi.color.setHex(0xfff2d2);
+      hemi.groundColor.setHex(0x789a8c);
       sun.intensity = 2.1;
       sun.color.set('#fff3e2');
       interiors.setInfo({ owned: [...owned], bike: bikeId });
       interiors.update(dt, time);
     }
+    renderer.toneMappingExposure = interior ? DAY_EXPOSURE : atmosphere.exposure;
     applyShadows();
-    // The hour switches each shop's light pool off while its shutter is down.
-    world.setAtmosphere({ night: atmosphere.night, wet: atmosphere.rain, sky: (scene.fog as THREE.Fog).color, hours: atmosphere.hours });
+    // The night light (night.ts): shops by their opening hours, windows by the household rhythm, the street lamps'
+    // switch at dusk and dawn, the rain on the light pools.
+    world.setAtmosphere({ night: atmosphere.night, lamps: atmosphere.lamps, wet: atmosphere.rain, rain: atmosphere.rain, sky: (scene.fog as THREE.Fog).color, hours: atmosphere.hours });
     vehicles.setNight(atmosphere.night);
     vehicles.setWet(atmosphere.rain);
     setRain(street ? atmosphere.rain : 0);
@@ -4904,6 +4918,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     bike.group.position.set(bikeX, groundHeight(bikeX, bikeZ) + (bikeBroken && !onBike ? 0.18 : -0.04), bikeZ);
     bike.group.rotation.set(0, bikeAngle, bikeBroken && !onBike ? 1.35 : lean, 'YXZ');
     if (onBike) for (const wheel of bike.wheels) wheel.rotation.x += velocity * dt / bike.wheelRadius;
+    // The bike's head lamp lights the road ahead at night, on its own battery in zombie mode too (a horse has none).
+    if (onBike && bikeId !== 'horse') vehicleLights.place(bike, bikeX, groundHeight(bikeX, bikeZ), bikeZ, bikeAngle, lean, bikeId, velocity, OWN);
     if (bike.legs.length) {
       const pace = onBike ? Math.abs(velocity) : 0;
       gallop += pace * dt * 1.6;
@@ -4984,6 +5000,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       ragdolls.sweep(state.x, state.z, state.angle, horse ? 0.45 : 0.4, horse ? 1.2 : 1, horse ? 1.6 : 1.1, Math.sin(state.angle) * velocity, Math.cos(state.angle) * velocity);
     }
     updatePeers(now, time, dt);
+    vehicleLights.end();
     // Only people near the camera get a blob: far off it is too small to see, and the crowd would use them all up.
     const eyeX = camera.position.x, eyeZ = camera.position.z;
     npcs.forEachStanding((x, z, npc) => { if ((x - eyeX) ** 2 + (z - eyeZ) ** 2 < 5600) effects.blob(x, npc.y + 0.02, z, 0.85); });
@@ -5102,12 +5119,14 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   // (parallel where the driver can) while the menu is up, and are drawn once when they are ready.
   let warmed = 0;
   function drawEverything(flashlight: boolean) {
-    const shown: THREE.Object3D[] = [], filled: THREE.InstancedMesh[] = [], culled: THREE.Object3D[] = [];
+    const shown: THREE.Object3D[] = [], filled: THREE.InstancedMesh[] = [], culled: THREE.Object3D[] = [], unhidden: THREE.Material[] = [];
     scene.traverse((o) => {
       if (!o.visible && o !== torch) { o.visible = true; shown.push(o); }
       if (o.frustumCulled) { o.frustumCulled = false; culled.push(o); }
       const mesh = o as THREE.InstancedMesh;
       if (mesh.isInstancedMesh && mesh.count === 0) { mesh.count = 1; filled.push(mesh); }
+      // A material hidden until it is needed (the floodlight wash after dark) is drawn now too, not first at dusk.
+      for (const m of [mesh.material].flat()) if (m && !m.visible) { m.visible = true; unhidden.push(m); }
     });
     torch.visible = flashlight;
     const size = renderer.getSize(new THREE.Vector2());
@@ -5121,6 +5140,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     for (const o of shown) o.visible = false;
     for (const o of culled) o.frustumCulled = true;
     for (const mesh of filled) mesh.count = 0;
+    for (const m of unhidden) m.visible = false;
   }
   function prewarm() {
     const round = ++warmed;

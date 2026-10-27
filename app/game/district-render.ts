@@ -22,7 +22,11 @@ import { LAND, RIVER_BED, WATER_LEVEL } from './map/consts';
 import { WATERS } from './map/districts';
 import type { RoadEdge, RoadNode } from './map/roads';
 import type { GenBuilding, GenPlot, GenSign } from './map/gen/buildings';
-import type { GenProp } from './map/gen/dressing';
+import type { Eatery, GenProp } from './map/gen/dressing';
+import { FRONT_LIGHT } from './facades';
+import { lampSeed, scheduleIndex } from './night';
+import { ALL_NIGHT, LOBBY_HOURS, buildingLight, kioskCode, timedCode, windowCode } from './night-hours';
+import { HEAD, TONES, aimedLight, bulbGlass, districtTone, makeLight, poolRim, type NightLight, type Tone } from './street-lights';
 import {
   DISTRICT_BLOCKS, DISTRICT_BUILDINGS, DISTRICT_DECKS, DISTRICT_PLOTS, DISTRICT_POIS, DISTRICT_SCENERY, DISTRICT_SIGNS, DISTRICT_STAMPS, DISTRICT_WATERS,
   CURB_FLEET, EDGE_INFO, RINGS, SLICES, SLICE_EXTRA, TOWERS, WORKS, WORLD_ROADS, isWired, sliceAt, type SliceKey,
@@ -78,8 +82,19 @@ export type DistrictKit = Kit & {
   seat(x: number, z: number, w: number, d: number, yaw: number, top: number): void;
   /** A signal lens (red, amber, green from the top) of approach `a`, slot 0..2, for the tile's lens mesh. */
   lens(a: RoadApproach, slot: number, x: number, y: number, z: number, yaw: number): void;
-  /** A light pool on the ground at night (street lamps). */
-  lamp(x: number, z: number, size: number): void;
+  /**
+   * A lamp's or bulb's light at night (street-lights.ts tones): its pool on the ground under (x, z), Ø the tone's size ×
+   * `scale` and strength × `gain` (0: a halo alone), and a halo at the world height `headY` (none less than 0.5 m over
+   * the pool); `groundY` puts the pool on a pier's deck, `color` lights pool and halo in a colour of its own (a coloured
+   * bulb). Under the lit scope's code, else the street-lamp switch seeded by (x, z), as a lamp head drawn at (x, z) is:
+   * pass the head's own position.
+   */
+  light(tone: Tone, x: number, z: number, headY: number, scale?: number, gain?: number, groundY?: number, color?: string): void;
+  /**
+   * A street lamp's light: the halo at its head (hx, hz) `headY` high, the pool out over the road from the pole (px, pz),
+   * `scale` times its size (a lamp by the water keeps its pool on the land).
+   */
+  streetLamp(tone: Tone, px: number, pz: number, hx: number, hz: number, headY: number, scale?: number): void;
   /** A low-detail stand-in (a building's box, a tree's crown) shown in place of the tile's detail beyond its near distance. */
   far(kind: 'box' | 'puff' | 'pyramid' | 'cylinder' | 'gable', color: ColorLike, x: number, y: number, z: number, sx: number, sy: number, sz: number, yaw?: number): void;
 };
@@ -325,6 +340,7 @@ export function planDistricts(k: DistrictKit): DistrictItem[] {
   works(k, add);
   extras(k, add);
   timed(k, add);
+  festoons(k, add);
 
   // ---- Beyond the playable land: the ground, the waters nobody built, their far banks ----
   tag = 'outer';
@@ -456,7 +472,8 @@ function timed(k: DistrictKit, add: Add) {
   const q1 = SLICE_EXTRA['quan-1-south'];
   const authored = new Set<string>();
   if (q1) {
-    for (const s of q1.market.night.stalls) add(s.x, s.z, 'quan-1-south', false, () => stall(k, s, true), q1.market.night.hours);
+    const market = timedCode(q1.market.night.hours);
+    for (const s of q1.market.night.stalls) add(s.x, s.z, 'quan-1-south', false, () => k.lit(market, () => stall(k, s, true)), q1.market.night.hours);
     for (const s of q1.market.day.stalls) add(s.x, s.z, 'quan-1-south', false, () => stall(k, s, false), q1.market.day.hours);
     for (const s of q1.bookstalls.stalls) add(s.x, s.z, 'quan-1-south', true, () => bookstall(k, s), q1.bookstalls.hours);
 
@@ -496,6 +513,77 @@ function timed(k: DistrictKit, add: Add) {
     }
   }
 }
+/** All night (night-hours.ts ALL_NIGHT), registered once. */
+let allNightCode = -1;
+const allNight = () => (allNightCode >= 0 ? allNightCode : (allNightCode = scheduleIndex(ALL_NIGHT)));
+/** Festoon bulbs by street: Bùi Viện's in colours, Vĩnh Khánh's warm, the night market's on Phan Bội Châu white. */
+const FESTOON: Record<string, readonly string[]> = {
+  'bui-vien': ['#ff5a5a', '#ffd23d', '#5ad2ff', '#7dff6a', '#ff7ad9'],
+  'vinh-khanh': ['#ffe2a8'],
+  'phan-boi-chau': ['#fff1c8'],
+};
+/** Vertical light boxes (the generator's `:v` signs) a festoon's ends keep clear of, in 8 m cells. */
+let boxCells: Map<string, { x: number; z: number }[]> | null = null;
+function nearBox(x: number, z: number) {
+  if (!boxCells) {
+    boxCells = new Map();
+    for (const g of DISTRICT_SIGNS) {
+      if (g.kind !== 'vertical') continue;
+      const key = `${Math.floor(g.x / 8)}:${Math.floor(g.z / 8)}`, list = boxCells.get(key);
+      if (list) list.push(g); else boxCells.set(key, [g]);
+    }
+  }
+  for (let i = Math.floor(x / 8) - 1; i <= Math.floor(x / 8) + 1; i++) for (let j = Math.floor(z / 8) - 1; j <= Math.floor(z / 8) + 1; j++) {
+    for (const g of boxCells.get(`${i}:${j}`) ?? []) if (hyp(g.x - x, g.z - z) < 0.8) return true;
+  }
+  return false;
+}
+/**
+ * Festoons over the streets closed to traffic at night (EDGE_INFO closed: Bùi Viện, Vĩnh Khánh, Phan Bội Châu): a
+ * cable of bulbs across the street, facade to facade at 5.6 m, every 9 m (on a street with lantern strings, halfway
+ * between them), lit in the street's hours, with a soft glow below. Timed items: they stand only in those hours.
+ */
+function festoons(k: DistrictKit, add: Add) {
+  // Where the night streets' lantern strings hang (every 10 m from 5 m along their edges): festoons go between.
+  const lanterned = new Set(nightStreets().filter(([, ns]) => ns.arches.length >= 2).map(([slice, ns]) => `${slice}|${ns.road}`));
+  for (const e of WORLD_ROADS.edges) {
+    const info = EDGE_INFO[e.id];
+    if (!info.closed || !isDistrictEdge(e)) continue;
+    // (closed carries a [from, to] pair: EDGE_INFO's type says Hours)
+    const span = info.closed as unknown as [number, number], code = timedCode(span), colors = FESTOON[info.art] ?? ['#ffe9c0'];
+    const lantern = lanterned.has(`${info.slice}|${info.art}`);
+    const a = WORLD_ROADS.nodes[e.a], b = WORLD_ROADS.nodes[e.b];
+    const from = lantern ? 10 : a.radius + 3, to = e.len - (lantern ? 4 : b.radius + 3), step = lantern ? 10 : 9;
+    const w = e.half + e.sidewalk - 0.1;
+    for (let s = from; s <= to; s += step) {
+      // A string whose end would run through a light box slides along the street (up to 3 m) to clear it: Bùi Viện is
+      // lined with them, and dropping those strings left its west end bare.
+      let p: ReturnType<typeof along> | null = null;
+      for (const ds of [0, 1.5, -1.5, 3, -3]) {
+        const q = along(e.pts, e.cum, Math.min(to, Math.max(from, s + ds)));
+        if (!nearBox(q.x + q.hz * w, q.z - q.hx * w) && !nearBox(q.x - q.hz * w, q.z + q.hx * w)) { p = q; break; }
+      }
+      if (!p) continue;
+      const at = p, rx = -at.hz, rz = at.hx, seed = Math.round(s * 7 + e.id * 13);
+      add(at.x, at.z, info.slice, false, () => k.lit(code, () => festoon(k, at.x, at.z, rx, rz, w, colors, seed)), [span[0], span[1]]);
+    }
+  }
+}
+/** One festoon: the cable across, bulbs hanging on it every metre or so, each with its glow, the light on the street. */
+function festoon(k: DistrictKit, x: number, z: number, rx: number, rz: number, w: number, colors: readonly string[], seed: number) {
+  const y = 5.6, sag = 0.35, n = Math.max(5, Math.round((2 * w) / 1.1));
+  // Coloured strings (Bùi Viện's) have bigger bulbs and halos: at the 15–25 m they are seen from, the small warm ones'
+  // size left them pastel specks.
+  const big = colors.length > 1, r = big ? 0.09 : 0.06, halo = big ? 1.6 : 0.95;
+  k.cable(x - rx * w, y, z - rz * w, x + rx * w, y, z + rz * w, sag, 0.02, '#2a2a2a', false);
+  for (let i = 1; i < n; i++) {
+    const t = i / n, bx = x + rx * w * (2 * t - 1), bz = z + rz * w * (2 * t - 1), by = y - sag * 4 * t * (1 - t) - 0.1;
+    const color = colors[(seed + i) % colors.length];
+    k.shape('ball', bulbGlass(color), bx, by, bz, r, r * 1.25, r, 0, 0, false, 'lamp');
+    k.light('bulb', bx, bz, by, halo, 0, undefined, color);
+  }
+  k.light('bulb', x, z, 0, 7 / TONES.bulb.size, 0.6 / TONES.bulb.strength);
+}
 /** Every wired slice's night seating (EXTRA.nightSeats): the walking street, its tables, hours and gateways. */
 type NightSeating = { road: string; hours: [number, number]; tables: { x: number; z: number; yaw: number; stools: number }[]; arches: { ax: number; az: number; bx: number; bz: number; text: string; sub: string }[] };
 function nightStreets(): [string, NightSeating][] {
@@ -515,6 +603,8 @@ function lanternString(k: DistrictKit, e: RoadEdge, s: number) {
     const t = i / n, x = p.x + rx * w * (2 * t - 1), z = p.z + rz * w * (2 * t - 1), y = y0 - Math.sin(t * PI) * 0.6;
     k.shape('ball', i % 2 ? '#ff4f8b' : '#d8402c', x, y, z, 0.2, 0.26, 0.2, 0, 0, false, 'lantern');
   }
+  // Their red glow on the street below (with the lamps).
+  k.pool(p.x, p.z, 7.5, -1, '#ff9a78', 0.55);
 }
 /** A walking street's gateway: two posts behind the curbs, a beam across with its name both ways, framed in neon. */
 function neonArch(k: DistrictKit, a: { ax: number; az: number; bx: number; bz: number; text: string; sub: string }) {
@@ -550,7 +640,14 @@ function stall(k: DistrictKit, s: { x: number; z: number; w: number; d: number; 
     F.solid('cylinder', lx, 0.87, 0, 0.32, 0.04, 0.32, '#b8925a', 0, false);
     F.solid('ball', lx, 0.98, 0, 0.26, 0.16, 0.26, pickOf(r, goods), 0, false);
   }
-  if (night) F.part(0, 2.45, 0, 0.5, 0.06, 0.12, '#fff4d8', 'lamp', false);
+  if (night) {
+    // Bare bulbs along the tarp's front edge and one hanging over the goods (lit by the market's hours: the scope).
+    for (let i = 0; i < 6; i++) F.solid('ball', -s.w / 2 + 0.25 + (i * (s.w - 0.5)) / 5, 2.52, s.d / 2 + 0.25, 0.055, 0.07, 0.055, TONES.bulb.head, 0, false, 0, 'lamp');
+    F.part(0, 2.45, 0, 0.02, 0.24, 0.02, '#2a2a2a', 'solid', false);
+    F.solid('ball', 0, 2.3, 0, 0.065, 0.08, 0.065, TONES.bulb.head, 0, false, 0, 'lamp');
+    const lift = districtLift(s.x, s.z);
+    k.light('bulb', s.x, s.z, 2.3 + lift, 4.5 / TONES.bulb.size);
+  }
   k.lift(0);
 }
 /** A book kiosk on the book street: a counter with spines on shelves under a little roof. */
@@ -858,6 +955,32 @@ function bank(k: DistrictKit, ax: number, az: number, bx: number, bz: number, nx
   k.box(RAIL, rx + ux * len / 2, 0.55, rz + uz * len / 2, len, 0.1, 0.16, -yaw, false);
   k.box(RAIL, rx + ux * len / 2, 1.05, rz + uz * len / 2, len, 0.1, 0.14, -yaw, false);
   for (let t = 0; t <= len; t += 2.5) k.box('#d6c4a1', rx + ux * t, 0.55, rz + uz * t, 0.14, 1.0, 0.14, -yaw, false);
+  // Globe lamps along the promenade every 18 m, 1.2 m inland of the railing (unless a street lamp of the layout stands
+  // near), their pools further in, on the land (night plan A7).
+  for (let t = Math.min(9, len / 2); t < len; t += 18) {
+    const x = ax + ux * t - nx * 1.45, z = az + uz * t - nz * 1.45;
+    if (lampNear(x, z, 12)) continue;
+    k.shape('cylinder', '#3f5a52', x, 1.9, z, 0.07, 3.8, 0.07);
+    k.shape('cylinder', '#3f5a52', x, 0.15, z, 0.2, 0.3, 0.2);
+    k.shape('cone', '#3f5a52', x, 4.38, z, 0.36, 0.25, 0.36);
+    k.lit(lampSeed(x, z), () => {
+      k.shape('ball', TONES.park.head, x, HEAD.post, z, 0.32, 0.36, 0.32, 0, 0, false, 'lamp');
+      k.light('park', x, z, HEAD.post, 1, 0);
+      k.light('park', ax + ux * t - nx * 3.6, az + uz * t - nz * 3.6, 0, 7 / TONES.park.size);
+    });
+  }
+}
+/** Layout lamps (DISTRICT_SCENERY.lamps) in 16 m cells, for the promenade posts to keep their distance from. */
+let lampCells: Map<string, { x: number; z: number }[]> | null = null;
+function lampNear(x: number, z: number, r: number) {
+  if (!lampCells) {
+    lampCells = new Map();
+    for (const l of DISTRICT_SCENERY.lamps) { const key = `${Math.floor(l.x / 16)}:${Math.floor(l.z / 16)}`, list = lampCells.get(key); if (list) list.push(l); else lampCells.set(key, [l]); }
+  }
+  for (let i = Math.floor((x - r) / 16); i <= Math.floor((x + r) / 16); i++) for (let j = Math.floor((z - r) / 16); j <= Math.floor((z + r) / 16); j++) {
+    for (const l of lampCells.get(`${i}:${j}`) ?? []) if (hyp(l.x - x, l.z - z) < r) return true;
+  }
+  return false;
 }
 /** A bridge deck's body over the water: girders under both edges, piers every 12 m down to the bed, railings. */
 /** A straight member from a to b (a box along it, `t` thick): truss chords, posts, braces. */
@@ -914,6 +1037,20 @@ function bridge(k: DistrictKit, e: RoadEdge, d: DeckOn) {
       k.surf.quad('solid', '#8f8a80', L(-half, q, yq - 0.9), L(half, q, yq - 0.9), L(half, p, yp - 0.9), L(-half, p, yp - 0.9), 'down');
     }
   }
+  // LED lamp posts on the fascia every 24 m, alternating sides (outside the railing: no collider); the head on an arm
+  // over the footway, its pool 2.5 m further in, so no light hangs beside the deck over the water (night plan A7).
+  if (!mong) for (let s = s0 + Math.min(12, (s1 - s0) / 2), i = 0; s < s1 - 4; s += 24, i++) {
+    const p = along(e.pts, e.cum, s), side = i % 2 ? 1 : -1, rx = -p.hz * side, rz = p.hx * side, yp = Y_ROAD + deckLift(e.id, s);
+    const px = p.x + rx * (half + 0.05), pz = p.z + rz * (half + 0.05), top = yp + CURB_HEIGHT + 6.3;
+    const hx = p.x + rx * (half - 1.35), hz = p.z + rz * (half - 1.35), yaw = Math.atan2(hx - px, hz - pz);
+    k.shape('cylinder', '#586c65', px, (yp - 0.9 + top) / 2, pz, 0.075, top - (yp - 0.9), 0.075, 0, 0, false);
+    k.box('#586c65', (px + hx) / 2, top - 0.05, (pz + hz) / 2, 0.13, 0.13, 1.55, yaw, false);
+    k.lit(lampSeed(hx, hz), () => {
+      k.box(TONES.led.head, hx, top - 0.15, hz, 0.35, 0.12, 0.65, yaw, false, 'lamp');
+      k.light('led', hx, hz, top - 0.15, 1, 0);
+      k.light('led', p.x + rx * (half - 3.85), p.z + rz * (half - 3.85), 0, 7.5 / TONES.led.size);
+    });
+  }
   // Piers in the water (the trusses of Cầu Mống span the canal on their own).
   for (let s = s0 + 6; !mong && s < s1 - 4; s += 12) {
     const p = along(e.pts, e.cum, s), yaw = Math.atan2(p.hx, p.hz);
@@ -942,23 +1079,31 @@ if (q1) for (const s of q1.skyline) CBD.set(s.stamp, s.tower);
 const TOWER_OF: Record<string, NonNullable<Plot['tower']>> = {
   'thap-bo-song': { form: 'bundle', floor: 3.8, glass: '#7f9fb4', frame: '#c9d2d8', pattern: 1, crown: 'spire', podium: 14 },
 };
+/** The TowerSpec a district plot's tall building is drawn with (landmark(), the apartment typology), or null: none. */
+export function towerSpecOf(p: GenPlot, stamp: string | null): NonNullable<Plot['tower']> | null {
+  const id = stamp ?? '';
+  return CBD.get(id) ?? TOWER_OF[id] ?? p.tower ?? null;
+}
 
 function building(k: DistrictKit, b: GenBuilding, p: GenPlot, stamp: string | null) {
-  farBuilding(k, b, p, stamp);
+  // Its stand-in's windows at night keep the hours of what it is (none for a warehouse, pagoda, church, market, school).
+  k.lit(windowCode(b.id), () => farBuilding(k, b, p, stamp));
   switch (p.typology) {
-    case 'church': church(k, b, p, stamp); return;
+    case 'church': k.lit(scheduleIndex(LOBBY_HOURS), () => church(k, b, p, stamp)); return;
     case 'pagoda': k.pagoda(p, b); compoundGate(k, b, p, 'pagoda'); return;
     case 'school': k.school(p, b); compoundGate(k, b, p, 'school'); return;
-    case 'market-hall': marketHall(k, b, p, stamp); return;
+    case 'market-hall': k.lit(buildingLight(b.id).code, () => marketHall(k, b, p, stamp)); return;
     case 'warehouse': warehouse(k, b, p); return;
-    case 'apartment': k.towers([{ plot: p, building: b }]); kiosks(k, p); return;
+    case 'apartment': k.towers([{ plot: p, building: b }]); kiosks(k, p, sliceOfId(b.id)); return;
     case 'villa': villa(k, b, p); return;
     case 'police': k.police(p, b); return;
     case 'hospital': k.hospital(p, b); return;
-    case 'landmark': landmark(k, b, p, stamp); return;
+    case 'landmark': k.lit(buildingLight(b.id).code, () => landmark(k, b, p, stamp)); return;
     default: k.house(p, b);
   }
 }
+/** The slice that built a district building (by its id range). */
+const sliceOfId = (id: number) => SLICES.find((s) => id >= s.ids[0] && id < s.ids[1])?.key ?? '';
 
 /**
  * A building's stand-in: its box (roofs as a gable or a darker cap), a church's towers; towers drawn by skyline.ts need
@@ -1041,24 +1186,36 @@ function church(k: DistrictKit, b: GenBuilding, p: GenPlot, stamp: string | null
   const towers = list.length ? list : [{ kind: 'bell tower', x: F.at(0, front - 3).x, z: F.at(0, front - 3).z, w: 5, d: 5, h: H + 12 }];
   for (const t of towers) churchTower(k, t, facing, wall, trim, roof, brick);
   // The name board over the doors.
-  const sp = F.at(0, front - 0.68);
-  k.sign(b.name, b.subtitle, brick ? '#7a2e22' : '#3f3a6a', sp.x, 5.4, sp.z, Math.min(naveW + aisleW - 1, 11), 1.1, facing, '#f6efe2');
-  if (stamp === 'nha-tho-duc-ba') uplights(k, F, naveW + aisleW + 6, front + 3.4, { lz: front - 0.8, w: naveW + aisleW, h: fh + 1 });
+  const sp = F.at(0, front - 0.68), floodlit = stamp === 'nha-tho-duc-ba';
+  nameBoard(k, floodlit, b.name, b.subtitle, brick ? '#7a2e22' : '#3f3a6a', sp.x, 5.4, sp.z, Math.min(naveW + aisleW - 1, 11), 1.1, facing, '#f6efe2');
+  if (floodlit) uplights(k, F, naveW + aisleW + 6, front + 3.4, { lz: front - 0.8, w: naveW + aisleW, h: fh + 1 });
 }
 /**
  * Floodlights for a heritage front after dark (Đức Bà, the post office, Bến Thành's gate): a row of lamps at the foot
  * of the front, aimed up, and warm light on the paving before it (lit all night).
  */
 function uplights(k: DistrictKit, F: Frame, width: number, lz: number, wash?: { lz: number; w: number; h: number; y0?: number }) {
-  // The warm light the lamps throw up the front (shows after dark only: the 'wash' role).
-  if (wash) F.part(0, (wash.y0 ?? 0) + wash.h / 2, wash.lz + 0.06, wash.w, wash.h, 0.02, '#ffffff', 'wash', false);
-  const n = Math.max(3, Math.round(width / 3.2));
-  for (let i = 0; i < n; i++) {
-    const lx = -width / 2 + (i + 0.5) * (width / n);
-    F.part(lx, 0.22, lz, 0.32, 0.28, 0.32, '#3b3f42', 'solid', false);
-    F.part(lx, 0.4, lz - 0.05, 0.26, 0.06, 0.2, '#fff1c8', 'lamp', false);
-    if (i % 2 === 0) { const p = F.at(lx, lz + 1.2); k.pool(p.x, p.z, 4.2, -1, '#ffcf8a'); }
-  }
+  // Floodlights burn dusk to dawn with the street lamps, whatever the building's own hours (the lit scope it is drawn
+  // in: a post office's, a market's, a church's lobby): code 0 gives the lamp boxes and their pools the lamp switch.
+  k.lit(0, () => {
+    // The warm light the lamps throw up the front (shows after dark only: the 'wash' role).
+    if (wash) F.part(0, (wash.y0 ?? 0) + wash.h / 2, wash.lz + 0.06, wash.w, wash.h, 0.02, '#ffffff', 'wash', false);
+    const n = Math.max(3, Math.round(width / 3.2));
+    for (let i = 0; i < n; i++) {
+      const lx = -width / 2 + (i + 0.5) * (width / n);
+      F.part(lx, 0.22, lz, 0.32, 0.28, 0.32, '#3b3f42', 'solid', false);
+      F.part(lx, 0.4, lz - 0.05, 0.26, 0.06, 0.2, '#fff1c8', 'lamp', false);
+      if (i % 2 === 0) { const p = F.at(lx, lz + 1.2); k.pool(p.x, p.z, 4.2, -1, '#ffcf8a'); }
+    }
+  });
+}
+/**
+ * A heritage front's name board: lit with its floodlights all night where the front has them (code 0: on with the
+ * night), else by the building's hours like any shop board (the lit scope it is drawn in).
+ */
+function nameBoard(k: DistrictKit, floodlit: boolean, ...a: Parameters<DistrictKit['sign']>) {
+  if (floodlit) k.lit(0, () => k.sign(...a));
+  else k.sign(...a);
 }
 function churchTower(k: DistrictKit, t: { kind: string; x: number; z: number; w: number; d: number; h: number }, facing: number, wall: string, trim: string, roof: string, slate: boolean) {
   const spire = t.kind === 'spire';
@@ -1124,9 +1281,9 @@ function marketHall(k: DistrictKit, b: GenBuilding, p: GenPlot, stamp: string | 
   for (const s of [-1, 1]) F.part(0, 3.5, s * (front + 0.6), w, 0.15, 1.8, s > 0 ? '#3f7fa8' : '#c8553d', 'solid', false);
   const gate = F.at(0, front + 0.05);
   k.box('#4a3a2a', gate.x, 1.8, gate.z, 4.2, 3.6, 0.1, facing, false);
-  const sp = F.at(0, front + 0.12);
-  k.sign(b.name, b.subtitle, '#8e2b20', sp.x, Math.min(H * 0.8 - 0.8, 6), sp.z, Math.min(w - 2, 14), 1.4, facing, '#fff2c4');
-  if (stamp === 'cho-ben-thanh') uplights(k, F, Math.min(w, 24), front + 2.2, { lz: front + 0.15, w: w - 1.4, h: H * 0.8 });
+  const sp = F.at(0, front + 0.12), floodlit = stamp === 'cho-ben-thanh';
+  nameBoard(k, floodlit, b.name, b.subtitle, '#8e2b20', sp.x, Math.min(H * 0.8 - 0.8, 6), sp.z, Math.min(w - 2, 14), 1.4, facing, '#fff2c4');
+  if (floodlit) uplights(k, F, Math.min(w, 24), front + 2.2, { lz: front + 0.15, w: w - 1.4, h: H * 0.8 });
   for (const t of towersOf(stamp)) {
     const T = k.frame(t.x, t.z, facing);
     T.part(0, t.h / 2, 0, t.w, t.h, t.d, '#f0e3b8', 'solid');
@@ -1235,7 +1392,8 @@ function colonial(k: DistrictKit, b: GenBuilding, p: GenPlot, id: string) {
     // The moon on a short post at mid-ridge, its disc to the street.
     F.solid('cylinder', 0, ridge + 0.75, 0, 0.12, 1.5, 0.12, gold, 0, false);
     F.solid('cylinder', 0, ridge + 2.25, 0, 0.85, 0.12, 0.85, gold, HALF_PI, true, HALF_PI);
-    F.solid('cylinder', 0, ridge + 2.25, 0.07, 0.66, 0.12, 0.66, '#f2d27a', HALF_PI, false, HALF_PI, 'lamp');
+    // (lit dusk to dawn like the floodlights, not by the museum's hours)
+    k.lit(0, () => F.solid('cylinder', 0, ridge + 2.25, 0.07, 0.66, 0.12, 0.66, '#f2d27a', HALF_PI, false, HALF_PI, 'lamp'));
   } else F.solid('hip', 0, H + 1.6, 0, w + 1, 3.2, d + 1, '#b65d3d', 0, true, 0, 'roofTile');
   const floors = Math.max(1, Math.floor(H / 4.5));
   for (let fl = 0; fl < floors; fl++) {
@@ -1250,9 +1408,9 @@ function colonial(k: DistrictKit, b: GenBuilding, p: GenPlot, id: string) {
   // A central pediment over the entrance.
   F.part(0, H + 0.9, front + 0.3, Math.min(w * 0.35, 14), 1.8, 0.8, trim);
   F.solid('gable', 0, H + 2.4, front + 0.3, Math.min(w * 0.38, 15), 1.6, 0.9, trim, 0, true, 0);
-  const sp = F.at(0, front + 0.75);
-  k.sign(b.name, b.subtitle, '#7a2e22', sp.x, Math.min(H - 1.2, 6.2), sp.z, Math.min(w * 0.5, 14), 1.3, facing, '#fbf5e6');
-  if (id === 'buu-dien-thanh-pho' || id === 'ubnd-thanh-pho' || id === 'nha-rong') uplights(k, F, w * 0.8, front + 1.2, { lz: front + 0.3, w: w - 0.4, h: H, y0: 0.8 });
+  const sp = F.at(0, front + 0.75), floodlit = id === 'buu-dien-thanh-pho' || id === 'ubnd-thanh-pho' || id === 'nha-rong';
+  nameBoard(k, floodlit, b.name, b.subtitle, '#7a2e22', sp.x, Math.min(H - 1.2, 6.2), sp.z, Math.min(w * 0.5, 14), 1.3, facing, '#fbf5e6');
+  if (floodlit) uplights(k, F, w * 0.8, front + 1.2, { lz: front + 0.3, w: w - 0.4, h: H, y0: 0.8 });
   for (const t of towersOf(id)) {
     const T = k.frame(t.x, t.z, facing);
     T.part(0, t.h / 2, 0, t.w, t.h, t.d, wall, 'solid');
@@ -1320,14 +1478,19 @@ function pavilion(k: DistrictKit, b: GenBuilding, p: GenPlot, id: string) {
   k.sign(b.name, b.subtitle, p.signColor, sp.x, H - 0.55, sp.z, Math.min(w - 0.4, 8), 0.8, facing);
 }
 
-/** Kiosk fronts in a chung cư's ground floor: an awning over each counter (their boards are the generator's signs). */
-function kiosks(k: DistrictKit, p: GenPlot) {
+/**
+ * Kiosk fronts in a chung cư's ground floor: an awning over each counter (their boards are the generator's signs); lit
+ * by their counter's hours (game.ts pulls no shutter over a kiosk: a closed one goes dark by its code).
+ */
+function kiosks(k: DistrictKit, p: GenPlot, slice: string) {
   for (const q of p.kiosks) {
-    const F = k.frame(q.x, q.z, q.yaw), r = seeded(strHash(q.key));
-    F.part(0, 1.5, -0.05, 3.4, 2.6, 0.08, '#6a8a86', 'glassLit', false);
-    const awning = pickOf(r, ['#cf795d', '#5e927c', '#d9a441', '#4f7fa8']);
-    for (let i = 0; i < 4; i++) F.part(-1.5 + i, 2.85, 0.6, 1, 0.08, 1.3, i % 2 ? '#f3e6ca' : awning, 'solid', false);
-    k.pool(F.at(0, 1.6).x, F.at(0, 1.6).z, 4, -1);
+    const F = k.frame(q.x, q.z, q.yaw), r = seeded(strHash(q.key)), light = FRONT_LIGHT[q.kind === 'food' ? 'food' : q.kind === 'cafe' ? 'cafe' : 'goods'];
+    k.lit(kioskCode(slice, q.key), () => {
+      F.part(0, 1.5, -0.05, 3.4, 2.6, 0.08, '#6a8a86', 'glassLit', false);
+      const awning = pickOf(r, ['#cf795d', '#5e927c', '#d9a441', '#4f7fa8']);
+      for (let i = 0; i < 4; i++) F.part(-1.5 + i, 2.85, 0.6, 1, 0.08, 1.3, i % 2 ? '#f3e6ca' : awning, 'solid', false);
+      k.pool(F.at(0, 1.6).x, F.at(0, 1.6).z, 4.5, -1, light.pool, light.s);
+    });
   }
 }
 
@@ -1335,30 +1498,64 @@ function kiosks(k: DistrictKit, p: GenPlot) {
 // Dressing
 // ---------------------------------------------------------------------------------------------------------------
 
-function lamp(k: DistrictKit, l: { x: number; z: number; hx: number; hz: number; kind: string }) {
+/**
+ * A layout lamp (street-lights.ts tones): a hẻm wall lamp warm, a globe post in a park or yard, a street lamp white LED
+ * on an arterial and in Quận 1 south and Thủ Thiêm, warm sodium on the other streets. Its head glows in the tone's
+ * colour, with a halo, and its pool lies under it; each lamp switches on at its own moment at dusk.
+ */
+function lamp(k: DistrictKit, l: { x: number; z: number; hx: number; hz: number; kind: string; slice: string }) {
   if (l.kind === 'wall') {
     // A bracket lamp on a house front over a hẻm: (x, z) on the wall, the head out over the lane, 3 m up.
     const yaw = Math.atan2(l.hx - l.x, l.hz - l.z), len = hyp(l.hx - l.x, l.hz - l.z);
     k.box('#3f4446', (l.x + l.hx) / 2, 3.1, (l.z + l.hz) / 2, 0.05, 0.05, len, yaw, false);
-    k.box('#fff2c8', l.hx, 2.98, l.hz, 0.28, 0.12, 0.2, yaw, false, 'lamp');
-    k.lamp(l.hx, l.hz, 5);
+    k.box(TONES.warm.head, l.hx, HEAD.wall, l.hz, 0.28, 0.12, 0.2, yaw, false, 'lamp');
+    k.light('warm', l.hx, l.hz, HEAD.wall, dryScale(makeLight(l.hx, 0, l.hz, TONES.warm.size, 0, 0, '#000000', 0, '#000000', 0)));
     return;
   }
-  k.lift(districtLift(l.x, l.z));
+  const lift = districtLift(l.x, l.z);
+  k.lift(lift);
   if (l.kind === 'street') {
+    const tone = districtTone('street', l.slice, WORLD_ROADS.edgesNear(l.hx, l.hz, 14)[0]?.edge.cls ?? null);
     k.shape('cylinder', '#586c65', l.x, 3.2, l.z, 0.075, 6.4, 0.075);
     const yaw = Math.atan2(l.hx - l.x, l.hz - l.z), len = hyp(l.hx - l.x, l.hz - l.z);
     k.box('#586c65', (l.x + l.hx) / 2 + (l.hx - l.x) * 0.05, 6.35, (l.z + l.hz) / 2 + (l.hz - l.z) * 0.05, 0.13, 0.13, len + 0.15, yaw);
-    k.box('#e9d8a7', l.hx, 6.25, l.hz, 0.35, 0.12, 0.65, yaw, false, 'lamp');
-    k.lamp(l.hx, l.hz, 10.5);
+    k.box(TONES[tone].head, l.hx, HEAD.street, l.hz, 0.35, 0.12, 0.65, yaw, false, 'lamp');
+    k.streetLamp(tone, l.x, l.z, l.hx, l.hz, HEAD.street + lift, dryScale(aimedLight(tone, l.x, l.z, l.hx, l.hz, 0, 0, 0)));
   } else {
     k.shape('cylinder', '#3f5a52', l.x, 1.9, l.z, 0.07, 3.8, 0.07);
     k.shape('cylinder', '#3f5a52', l.x, 0.15, l.z, 0.2, 0.3, 0.2);
-    k.shape('ball', '#fff3d2', l.x, 3.95, l.z, 0.32, 0.36, 0.32, 0, 0, false, 'lamp');
+    k.shape('ball', TONES.park.head, l.x, HEAD.post, l.z, 0.32, 0.36, 0.32, 0, 0, false, 'lamp');
     k.shape('cone', '#3f5a52', l.x, 4.38, l.z, 0.36, 0.25, 0.36);
-    k.lamp(l.x, l.z, 6.5);
+    k.light('park', l.x, l.z, HEAD.post + lift, dryScale(makeLight(l.x, 0, l.z, TONES.park.size, 0, 0, '#000000', 0, '#000000', 0)));
   }
   k.lift(0);
+}
+/** Waterways (design 1's and the wired slices') with their bounding boxes, for the pools to keep off. */
+let waterBoxes: { poly: readonly number[]; minX: number; maxX: number; minZ: number; maxZ: number }[] | null = null;
+function overWater(x: number, z: number) {
+  if (!waterBoxes) {
+    waterBoxes = [...WATERS, ...DISTRICT_WATERS].map((w) => {
+      let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+      for (let i = 0; i < w.poly.length; i += 2) { minX = Math.min(minX, w.poly[i]); maxX = Math.max(maxX, w.poly[i]); minZ = Math.min(minZ, w.poly[i + 1]); maxZ = Math.max(maxZ, w.poly[i + 1]); }
+      return { poly: w.poly, minX, maxX, minZ, maxZ };
+    });
+  }
+  for (const w of waterBoxes) if (x >= w.minX && x <= w.maxX && z >= w.minZ && z <= w.maxZ && inPoly(w.poly, x, z)) return true;
+  return false;
+}
+/**
+ * How far a lamp's pool must shrink to stay on land (night plan A7: no light disc hangs over the water, a metre above
+ * it): 1 when its rim is dry, else the largest of 0.9, 0.8 … 0.3 that is (0.3 at the least).
+ */
+function dryScale(l: NightLight) {
+  const centre = { x: l.x, z: l.z };
+  for (let k = 1; k > 0.25; k -= 0.1) {
+    const probe: NightLight = { ...l, size: l.size * k, len: l.len * k };
+    // (an aimed pool shrinks toward its head as its reach does)
+    if (l.hx !== l.x || l.hz !== l.z) { probe.x = l.hx + (centre.x - l.hx) * k; probe.z = l.hz + (centre.z - l.hz) * k; }
+    if (!poolRim(probe).some(([x, z]) => overWater(x, z))) return k;
+  }
+  return 0.3;
 }
 
 const FIXTURE_COLORS = ['#c8553d', '#2f6fb5', '#3d8a5a', '#d9a441', '#8e959a', '#b14635', '#245b4f', '#e07a1f'];
@@ -1419,7 +1616,7 @@ function prop(k: DistrictKit, pr: GenProp & { slice: string }, index: number) {
       break;
     case 'booth':
       F.part(0, 1.25, 0, pr.w, 2.5, pr.d, '#e8e2d0', 'solid');
-      F.part(0, 1.5, pr.d / 2 + 0.02, pr.w * 0.7, 0.9, 0.05, '#5d8580', 'glassLit', false);
+      k.lit(allNight(), () => F.part(0, 1.5, pr.d / 2 + 0.02, pr.w * 0.7, 0.9, 0.05, '#5d8580', 'glassLit', false));
       F.part(0, 2.65, 0, pr.w + 0.4, 0.2, pr.d + 0.4, '#2f5d8a');
       break;
     case 'crane-leg':
@@ -1437,7 +1634,7 @@ function prop(k: DistrictKit, pr: GenProp & { slice: string }, index: number) {
       F.solid('cylinder', 0, 2.2, 0, 0.12, 1.2, 0.12, '#bfe3e6', 0, false, 0, 'water');
       break;
     }
-    default: k.prop({ kind: pr.kind as Prop['kind'], x: pr.x, z: pr.z, sx: pr.sx, sz: pr.sz, yaw: pr.yaw, tint: pr.tint }, -1 - index);
+    default: k.lit(pr.hours ? timedCode(pr.hours) : 0, () => k.prop({ kind: pr.kind as Prop['kind'], x: pr.x, z: pr.z, sx: pr.sx, sz: pr.sz, yaw: pr.yaw, tint: pr.tint }, -1 - index));
   }
   k.lift(0);
 }
@@ -1461,8 +1658,11 @@ function hoardingPanel(k: DistrictKit, F: Frame, len: number, h: number, tint: n
   F.part(-len / 2, h / 2, 0, 0.1, h + 0.1, 0.1, '#6b7275');
 }
 
-/** A plastic-stool eatery: its low table, a stool at every seat, and by variant a grill, a hot pot or a coffee glass. */
-function eatery(k: DistrictKit, e: { x: number; z: number; yaw: number; variant: string; key: string }, seats: { x: number; z: number }[]) {
+/**
+ * A plastic-stool eatery: its low table, a stool at every seat, and by variant a grill, a hot pot or a coffee glass;
+ * a bare bulb on a cord from its shop's door over the table, lit while it sells (night plan §6.8).
+ */
+function eatery(k: DistrictKit, e: Eatery & { slice: string }, seats: { x: number; z: number }[]) {
   const lift = districtLift(e.x, e.z), r = seeded(strHash(e.key));
   k.lift(lift);
   const F = k.frame(e.x, e.z, e.yaw);
@@ -1476,6 +1676,17 @@ function eatery(k: DistrictKit, e: { x: number; z: number; yaw: number; variant:
   else if (e.variant === 'hotpot') { F.solid('cylinder', 0, top + 0.1, 0, 0.17, 0.18, 0.17, '#c7ccce', 0, false); F.smoke('steam', 0, top + 0.3, 0); }
   else if (e.variant === 'coffee') for (const lx of [-0.2, 0.2]) F.solid('cylinder', lx, top + 0.06, 0, 0.04, 0.12, 0.04, '#7a4a2a', 0, false);
   else for (const lx of [-0.22, 0.12]) F.solid('cylinder', lx, top + 0.05, 0.05, 0.09, 0.08, 0.09, '#f4f1e6', 0, false);
+  const b = e.building ? BUILDING_BY_KEY.get(`${e.slice}|${e.building}`) : undefined;
+  if (b) k.lit(timedCode(e.hours), () => {
+    // The cord leaves the wall over the door (the door stands 0.8 m out from the front).
+    const f = Math.sin(b.facing), g = Math.cos(b.facing), ax = b.door.x - f * 0.8, az = b.door.z - g * 0.8;
+    k.lift(0);
+    k.cable(ax, 3.3, az, e.x, lift + 2.97, e.z, 0.25, 0.018, '#2a2a2a', false);
+    k.lift(lift);
+    k.shape('cylinder', '#2a2a2a', e.x, 2.9, e.z, 0.01, 0.16, 0.01, 0, 0, false);
+    k.shape('ball', TONES.bulb.head, e.x, 2.75, e.z, 0.06, 0.075, 0.06, 0, 0, false, 'lamp');
+    k.light('bulb', e.x, e.z, lift + 2.75);
+  });
   k.lift(0);
 }
 
@@ -1580,6 +1791,12 @@ function neonFrame(k: DistrictKit, x: number, y: number, z: number, w: number, h
   }
 }
 function genSign(k: DistrictKit, s: GenSign & { slice: string }) {
+  // Lit by its building's hours (a kiosk board by its kiosk's counter); a hẻm arch with the lamps.
+  const owner = s.building && s.kind !== 'arch' ? BUILDING_BY_KEY.get(`${s.slice}|${s.building}`) : undefined;
+  const kiosk = s.kind === 'board' && /:k\d+:s$/.test(s.key) ? kioskCode(s.slice, s.key.slice(s.slice.length + 1, -2)) : 0;
+  k.lit(kiosk || (owner ? buildingLight(owner.id).code : 0), () => drawGenSign(k, s));
+}
+function drawGenSign(k: DistrictKit, s: GenSign & { slice: string }) {
   const venue = s.kind === 'board' || s.kind === 'vertical' ? nightVenue(s) : null;
   if (venue) {
     neonFrame(k, s.x, s.y, s.z, s.w, s.h, s.yaw, s.color);
@@ -1757,11 +1974,11 @@ function truckBody(k: DistrictKit, b: { x: number; z: number; yaw: number; len: 
 /** The slices' extras: Quận 4's gantry cranes, cargo ship and Bến Nhà Rồng pier; Thủ Thiêm's tower crane and piers; the bảo tháp. */
 function extras(k: DistrictKit, add: (x: number, z: number, slice: string, signs: boolean, draw: () => void) => void) {
   for (const r of RINGS) add(r.x, r.z, r.slice, true, () => island(k, r));
-  for (const b of CURB_FLEET) add(b.x, b.z, b.kind === 'coach' ? 'binh-thanh' : 'quan-4', b.kind === 'coach', () => (b.kind === 'coach' ? coachBody(k, b) : truckBody(k, b)));
+  for (const b of CURB_FLEET) add(b.x, b.z, b.kind === 'coach' ? 'binh-thanh' : 'quan-4', b.kind === 'coach', () => (b.kind === 'coach' ? k.lit(-1, () => coachBody(k, b)) : truckBody(k, b)));
   const q4 = SLICE_EXTRA['quan-4'];
   if (q4) {
-    for (const c of q4.cranes) add(c.x, c.z, 'quan-4', true, () => gantry(k, c));
-    add(q4.ship.x, q4.ship.z, 'quan-4', true, () => ship(k, q4.ship));
+    for (const c of q4.cranes) add(c.x, c.z, 'quan-4', true, () => k.lit(allNight(), () => gantry(k, c)));
+    add(q4.ship.x, q4.ship.z, 'quan-4', true, () => k.lit(allNight(), () => ship(k, q4.ship)));
     for (const d of q4.docks) add(d.x, -140, 'quan-4', true, () => pier(k, d.pier, d.steps, d.name, 'TÀU BUÝT SÔNG • BẠCH ĐẰNG – THỦ THIÊM'));
   }
   // Bến Bình Thạnh: the standard waterbus pier on the south bank (consts.ts Dock shape at its x).
@@ -1864,7 +2081,8 @@ function pier(k: DistrictKit, pier: { minX: number; maxX: number; minZ: number; 
   k.box('#8a6a4c', px, deckY - 0.09, (from + to) / 2, pw, 0.18, from - to, 0, true);
   for (let z = from - 1.5; z > to; z -= 3) for (const s of [-1, 1]) k.shape('cylinder', '#5a4330', px + s * (pw / 2 - 0.2), -1.4, z, 0.16, 3.4, 0.16, 0, 0, false);
   for (const s of [-1, 1]) { k.box('#6e5238', px + s * (pw / 2 - 0.05), deckY + 0.95, (from + to) / 2 - 1, 0.08, 0.08, from - to - 2.4, 0, false); for (let z = from - 0.6; z > to + 2.4; z -= 2) k.box('#6e5238', px + s * (pw / 2 - 0.05), deckY + 0.5, z, 0.1, 0.95, 0.1, 0, false); }
-  for (const s of [-1, 1]) { k.shape('cylinder', '#2b2f33', px + s * (pw / 2 - 0.2), deckY + 1.3, to + 1, 0.06, 2.6, 0.06, 0, 0, false); k.shape('ball', '#fff2c8', px + s * (pw / 2 - 0.2), deckY + 2.7, to + 1, 0.22, 0.25, 0.22, 0, 0, false, 'lamp'); }
+  for (const s of [-1, 1]) { k.shape('cylinder', '#2b2f33', px + s * (pw / 2 - 0.2), deckY + 1.3, to + 1, 0.06, 2.6, 0.06, 0, 0, false); k.shape('ball', '#fff2c8', px + s * (pw / 2 - 0.2), deckY + 2.7, to + 1, 0.22, 0.25, 0.22, 0, 0, false, 'lamp'); k.light('park', px + s * (pw / 2 - 0.2), to + 1, deckY + 2.7, 1, 0, deckY + 0.02); }
+  k.lit(lampSeed(px - pw / 2 + 0.2, to + 1), () => k.light('park', px, to + 1.6, 0, Math.min(6, pw - 0.4) / TONES.park.size, 1, deckY + 0.02));
   const sx = (steps.minX + steps.maxX) / 2, sw = steps.maxX - steps.minX;
   for (let i = 0; i < 9; i++) { const z0 = steps.maxZ - 1.4 - i * 0.5, top = 0.1 - i * 0.5 * 0.4; k.box('#c2b59a', sx, (top - 2.9) / 2, z0 - 0.25, sw, top + 2.9, 0.5, 0, false); }
   for (const s of [-1, 1]) k.box('#7a4a2e', px + s * (pw / 2 + 0.25), 1.6, from - 0.8, 0.3, 3.2, 0.3);
@@ -1879,6 +2097,14 @@ function northPier(k: DistrictKit, w: { name: string; x?: number; pier?: { minX:
   k.box('#8a6a4c', px, deckY - 0.09, (p.minZ + p.maxZ) / 2, pw, 0.18, p.maxZ - p.minZ, 0, true);
   for (let z = p.minZ + 1.5; z < p.maxZ; z += 3) for (const s of [-1, 1]) k.shape('cylinder', '#5a4330', px + s * (pw / 2 - 0.2), -1.4, z, 0.16, 3.4, 0.16, 0, 0, false);
   for (const s of [-1, 1]) k.box('#6e5238', px + s * (pw / 2 - 0.05), deckY + 0.95, (p.minZ + p.maxZ) / 2 + 1, 0.08, 0.08, p.maxZ - p.minZ - 2.4, 0, false);
+  // Two lamps at its end over the water, as the south bank's piers have: halos at their heads, one pool on the deck.
+  for (const s of [-1, 1]) {
+    const lx = px + s * (pw / 2 - 0.2), lz = p.maxZ - 1;
+    k.shape('cylinder', '#2b2f33', lx, deckY + 1.3, lz, 0.06, 2.6, 0.06, 0, 0, false);
+    k.shape('ball', '#fff2c8', lx, deckY + 2.7, lz, 0.22, 0.25, 0.22, 0, 0, false, 'lamp');
+    k.light('park', lx, lz, deckY + 2.7, 1, 0, deckY + 0.02);
+  }
+  k.lit(lampSeed(px - pw / 2 + 0.2, p.maxZ - 1), () => k.light('park', px, p.maxZ - 1.6, 0, Math.min(6, pw - 0.4) / TONES.park.size, 1, deckY + 0.02));
   for (const s of [-1, 1]) k.box('#7a4a2e', px + s * (pw / 2 + 0.25), 1.6, p.minZ + 0.8, 0.3, 3.2, 0.3);
   k.box('#7a4a2e', px, 3.25, p.minZ + 0.8, pw + 1.2, 0.35, 0.4);
   k.sign(w.name, 'TÀU BUÝT SÔNG • ĐÒ NGANG', '#8e2b20', px, 3.9, p.minZ + 0.6, Math.max(pw + 1.4, 6.2), 0.9, 0, '#f6efe0');
@@ -1925,7 +2151,7 @@ function petrol(k: DistrictKit, p: { canopy: { x0: number; x1: number; z0: numbe
   k.box('#f4f1e6', cx, 5.3, cz, c.x1 - c.x0, 0.6, c.z1 - c.z0);
   k.box('#c8322a', cx, 5.3, cz, c.x1 - c.x0 + 0.1, 0.25, c.z1 - c.z0 + 0.1, 0, false);
   for (let x = c.x0 + 2; x < c.x1; x += (c.x1 - c.x0 - 4) / 2) k.box('#d9d9d2', x, 2.5, cz, 0.4, 5, 0.4);
-  for (const q of p.pumps) { k.box('#e8e2d0', q.x, 0.9, q.z, 1.2, 1.8, 0.6); k.box('#c8322a', q.x, 1.5, q.z, 1.25, 0.4, 0.62, 0, false); k.box('#d8e8f0', q.x, 5.0, q.z, 1.5, 0.08, 1.5, 0, false, 'lamp'); }
+  for (const q of p.pumps) { k.box('#e8e2d0', q.x, 0.9, q.z, 1.2, 1.8, 0.6); k.box('#c8322a', q.x, 1.5, q.z, 1.25, 0.4, 0.62, 0, false); k.box('#d8e8f0', q.x, 5.0, q.z, 1.5, 0.08, 1.5, 0, false, 'lamp'); k.light('led', q.x, q.z, 5.0, 9 / TONES.led.size); }
   k.sign('XĂNG DẦU', 'RON 95 • E5 • DẦU DO', '#ffffff', cx, 5.3, c.z1 + 0.06, 8, 0.55, 0, '#c8322a');
 }
 function stupa(k: DistrictKit, t: { x: number; z: number; w: number; h: number }) {

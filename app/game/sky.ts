@@ -67,6 +67,8 @@ export function createSky(scene: THREE.Scene) {
   root.add(clouds);
   const cloudData = Array.from({ length: CLOUDS }, (_, i) => ({ x: (i * 97) % 500 - 250, z: (i * 61) % 500 - 250, y: 95 + (i % 5) * 12, size: 70 + (i * 37) % 80 }));
   const matrix = new THREE.Matrix4();
+  /** The grey heavy cloud turns (allocated once, not every frame). */
+  const cloudGrey = new THREE.Color('#6d7378');
   const quat = new THREE.Quaternion();
   const pos = new THREE.Vector3();
   const size = new THREE.Vector3();
@@ -82,7 +84,7 @@ export function createSky(scene: THREE.Scene) {
       sun.visible = sunDirection.y > -0.08 && sunGlow > 0.02;
       sunMaterial.opacity = sunGlow;
       domeMaterial.color.copy(tint);
-      cloudMaterial.color.copy(tint).lerp(new THREE.Color('#6d7378'), cover * 0.6);
+      cloudMaterial.color.copy(tint).lerp(cloudGrey, cover * 0.6);
       cloudMaterial.opacity = 0.55 + cover * 0.4;
       cloudData.forEach((cloud, i) => {
         // Clouds drift slowly and wrap around the dome.

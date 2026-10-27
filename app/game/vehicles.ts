@@ -14,6 +14,7 @@ import {
 import {
   FLOORBOARD, MOTO_RIDER, ModelParts, carGeometry, carGlassGeometry, carSpec, glassMaterial, motoGeometry, vehicleMaterial, type CarStyle, type MotoStyle, type Vec3,
 } from './vehicle-models';
+import { OWN, SIREN_A, SIREN_B, vehicleLights } from './vehicle-lights';
 
 /**
  * Traffic on the live road graph (map/world-types.ts: today's grid plus the wired districts): cars and motorbikes in
@@ -1120,13 +1121,12 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   };
   const models = new Map<string, Model>();
   const modelOf: Model[] = [];
-  const slotOf: number[] = [];
   for (const car of fleet) {
     const style = vehicleStyle(car);
     let model = models.get(style);
     if (!model) models.set(style, (model = makeModel(style, car.kind === 'moto', material, fleet.filter((c) => vehicleStyle(c) === style).length + SPARE)));
     modelOf.push(model);
-    slotOf.push(model.size++);
+    model.size++;
   }
   // Parked vehicles: their own models (lamps off), packed each frame with what is in view, and the far layer.
   const curbModels = new Map<string, Model>();
@@ -1155,7 +1155,9 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   /** Ground under each spot (it never changes). */
   const spotY = SPOTS.map((s) => groundHeight(s.x, s.z));
   const color = new THREE.Color();
-  for (const [n, car] of fleet.entries()) modelOf[n].body.setColorAt(slotOf[n], color.set(paintOf(car)));
+  /** Each fleet vehicle's paint (dusty or burnt as a wreck), written with it into whichever slot it is drawn in. */
+  const fleetPaint = fleet.map((car) => new THREE.Color(paintOf(car)));
+  for (const m of models.values()) m.body.setColorAt(0, color.set('#ffffff'));
   for (const m of curbModels.values()) m.body.setColorAt(0, color.set('#ffffff'));
   for (const mesh of Object.values(far)) mesh.setColorAt(0, color.set('#ffffff'));
   const curbMeshes = [...curbModels.values()].flatMap((m) => (m.glass ? [m.body, m.glass] : [m.body]));
@@ -1180,7 +1182,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   const headYaw = new Float32Array(cars.length * 2);
   const bodyPose = [0, 0, 0, 0], legPose = [0, 0, 0, 0];
   const bodyMatrix = new THREE.Matrix4(), limb = new THREE.Matrix4();
-  let solvesLeft = 0;
+  let solvesLeft = 0, solveUntil = 0;
   /** An idle glance to one side now and then (radians of head yaw), different for every seat. */
   function glance(key: number, time: number) {
     const phase = time * 0.21 + key * 0.37, k = Math.floor(phase), f = phase - k;
@@ -1203,7 +1205,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       const style = styleOf(look);
       // A few new IK solves per frame at most (a full street at start-up would otherwise stall a frame); the
       // rest take their seats over the next frames.
-      if (!isSolved(kind, style) && solvesLeft-- <= 0) return;
+      if (!isSolved(kind, style) && (solvesLeft-- <= 0 || performance.now() > solveUntil)) return;
       o = { look, kind, looks: palettesOf(seatedStyle(style)), pose: seatPose(kind, style) };
       seated.set(key, o);
     }
@@ -1260,7 +1262,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     if (mesh.instanceColor) { mesh.instanceColor.setUsage(THREE.DynamicDrawUsage); mesh.instanceColor.needsUpdate = true; }
     scene.add(mesh);
   }
-  for (const mesh of [...curbMeshes, far.moto, far.car, shadows]) { mesh.count = 0; mesh.visible = false; }
+  for (const mesh of [...meshes, ...curbMeshes, far.moto, far.car, lights, shadows]) { mesh.count = 0; mesh.visible = false; }
   shadows.receiveShadow = false;
   for (const model of [...models.values(), ...curbModels.values()]) if (model.glass) model.glass.renderOrder = 2;
   const seatMatrix = new THREE.Matrix4();
@@ -1298,8 +1300,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     color.set(paintOf(car));
     if (wreck === 'dusty') color.lerp(DUST, 0.45).multiplyScalar(0.8);
     else if (wreck === 'burnt') color.set('#2b2724');
-    modelOf[n].body.setColorAt(slotOf[n], color);
-    modelOf[n].body.instanceColor!.needsUpdate = true;
+    fleetPaint[n].copy(color);
   }
   /**
    * A random point on the traffic roads between rMin and rMax of (cx, cz), uniform over their length (edges near the
@@ -1827,6 +1828,19 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   }
   /** What stands ahead of a lane vehicle (s0, s1 along the road, lo, hi across it for its centre, bay or not), gathered per vehicle per frame. */
   const bands: number[] = [];
+  /** How near the centre line a lane state's traffic comes (its innermost lane for cars, 1.6 m out), per lane net: lanes never change on a net. */
+  let farNet: unknown = null, farLanes = new Float64Array(0);
+  function farLaneOf(k: number) {
+    if (farNet !== net) { farNet = net; farLanes = new Float64Array(roads.edges.length * 2).fill(NaN); }
+    let f = farLanes[k];
+    if (Number.isNaN(f)) {
+      const back = net.lanesOf(k);
+      let m = back.length ? back[0].off : 0;
+      for (const l of back) if (l.use !== 'moto' && l.off > m) m = l.off;
+      f = farLanes[k] = back.length ? m + 1.6 : 0;
+    }
+    return f;
+  }
   /**
    * One lane vehicle's frame: wait for the light (looking a node ahead across short streets), give way at junctions
    * without lights and to whoever is already in the box, keep out of a box it could not leave, follow the vehicle
@@ -1863,8 +1877,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     };
     const half = e.half, reach = Math.max(10, car.speed * 1.8 + 6) + hl;
     // The other way: whether it has lanes, and how near the centre line its traffic comes (its innermost lanes).
-    const back = net.lanesOf(k ^ 1), twoWay = back.length > 0;
-    const farLane = twoWay ? Math.max(...back.filter((l) => l.use !== 'moto').map((l) => l.off), back[0].off) + 1.6 : 0;
+    const twoWay = net.lanesOf(k ^ 1).length > 0, farLane = farLaneOf(k ^ 1);
     let wait: Wait = null, waitFor: Car | null = null, stopGap = Infinity, hard = false, oncoming = false, abandoned = false, tail = Infinity;
     let lead = Infinity, leadCar: Car | null = null, leadAlong = false;
     // Its way through the node ahead (the connector it is on or will take), and how far off its start is.
@@ -1963,10 +1976,13 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
         continue;
       }
       // A bus in traffic, measured to the nearest point of its centre line: queue behind it like a lane vehicle, keep
-      // clear of it coming the other way, wait while it crosses.
+      // clear of it coming the other way, wait while it crosses. (Every bus on the map is here: the far ones are passed
+      // over before any trigonometry.)
+      const adx = Math.abs(o.x - car.x), adz = Math.abs(o.z - car.z), beyond = adx > reach + o.hz + 3 || adz > reach + o.hz + 3;
+      if (beyond && (conn || adx >= 45 + o.hz || adz >= 45 + o.hz)) continue;
       const ox = Math.sin(o.yaw), oz = Math.cos(o.yaw), dot = ox * fx + oz * fz;
-      if (Math.abs(o.x - car.x) > reach + o.hz + 3 || Math.abs(o.z - car.z) > reach + o.hz + 3) {
-        if (dot < -0.7 && !conn && Math.abs(o.x - car.x) < 45 + o.hz && Math.abs(o.z - car.z) < 45 + o.hz && comesAt(o.x, o.z, o.hz)) oncoming = true;
+      if (beyond) {
+        if (dot < -0.7 && comesAt(o.x, o.z, o.hz)) oncoming = true;
         continue;
       }
       const at = (car.x - o.x) * ox + (car.z - o.z) * oz, u = THREE.MathUtils.clamp(at, -o.hz, o.hz), px = o.x + ox * u, pz = o.z + oz * u;
@@ -2475,15 +2491,23 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     // The spots within draw range of the eye (the spot index), or every spot when there is no camera.
     if (eyeKnown) {
       const ix0 = Math.floor((eye.x - DRAW_FAR) / DRAW_CELL), ix1 = Math.floor((eye.x + DRAW_FAR) / DRAW_CELL), iz0 = Math.floor((eye.z - DRAW_FAR) / DRAW_CELL), iz1 = Math.floor((eye.z + DRAW_FAR) / DRAW_CELL);
+      // A whole cell out of view (or out of range) is passed over at once: most of the cells round the eye are.
+      const half = DRAW_CELL / 2, reachCell = half * Math.SQRT2 + 3;
       for (let ix = ix0; ix <= ix1; ix++) for (let iz = iz0; iz <= iz1; iz++) {
         const list = drawCells.get(cellKey(ix, iz));
-        if (list) for (let k = 0; k < list.length; k++) drawSpot(list[k]);
+        if (!list) continue;
+        const cx = ix * DRAW_CELL + half, cz = iz * DRAW_CELL + half;
+        if (Math.hypot(cx - eye.x, cz - eye.z) > DRAW_FAR + reachCell) continue;
+        if (view && !view.intersectsSphere(sphere.set(sphere.center.set(cx, 1, cz), reachCell + 1))) continue;
+        for (let k = 0; k < list.length; k++) drawSpot(list[k]);
       }
     } else for (let i = 0; i < curbCars.length; i++) drawSpot(i);
     // The parked vehicles that are entities (promoted, ridden, knocked about): every one is in activeCurb.
     for (const car of activeCurb) {
       if (car.impounded || car.mode === 'off') continue;
       pose(car, ordinal.get(car)!, dt);
+      // A parked vehicle the player drives has its lamps on (vehicle-lights.ts); parked ones have them off.
+      if (car.mode === 'player') vehicleLights.vehicle(car, matrix, vehicleStyle(car), car.speed, OWN);
       const e = matrix.elements, d = eyeKnown ? Math.hypot(e[12] - eye.x, e[14] - eye.z) : 0;
       if (d > DRAW_FAR || (view && !view.intersectsSphere(sphere.set(sphere.center.set(e[12], e[13] + 0.8, e[14]), car.kind === 'moto' ? 1.3 : 2.6)))) continue;
       place(car, car.mode === 'player' || car.mode === 'knocked' ? 'fleet' : d > LOD_NEAR ? 'far' : 'near');
@@ -2492,8 +2516,8 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       color.copy(paintColor(paintOf(car)));
       const style = vehicleStyle(car);
       const fleetModel = where === 'fleet' ? models.get(style) : undefined;
-      if (fleetModel && fleetModel.used < SPARE) {
-        const slot = fleetModel.size + fleetModel.used++;
+      if (fleetModel && fleetModel.used < fleetModel.size + SPARE) {
+        const slot = fleetModel.used++;
         fleetModel.body.setMatrixAt(slot, matrix);
         fleetModel.body.setColorAt(slot, color);
         fleetModel.glass?.setMatrixAt(slot, matrix);
@@ -2717,19 +2741,31 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
       flash += dt;
       const phase = Math.floor(flash * 6) % 2 === 0;
       for (const b of occupantBatches) b.begin();
+      // New seat solves: at most six a frame and none once 2 ms have gone on them (one takes 1–8 ms on a loaded integrated
+      // machine: six at the start of a game made 30–50 ms frames); the riders still to solve take their seats in the next frames.
       solvesLeft = 6;
-      let caped = 0;
+      solveUntil = performance.now() + 2;
+      let caped = 0, lit = 0;
       for (const model of models.values()) model.used = 0;
+      // Past the fog's far end (and the margin the world draws to) a vehicle is the fog's colour: not drawn.
+      const fogNow = scene.fog as THREE.Fog | null, fogCull = eyeKnown && fogNow && 'far' in fogNow ? (fogNow.far + 20) ** 2 : Infinity;
       fleet.forEach((car, n) => {
-        const model = modelOf[n], slot = slotOf[n];
-        model.glass?.setMatrixAt(slot, hidden);
-        if (car.mode === 'off') {
-          model.body.setMatrixAt(slot, hidden);
-          if (car.kind === 'police') { lights.setMatrixAt(car.index * 2, hidden); lights.setMatrixAt(car.index * 2 + 1, hidden); }
-          return;
-        }
+        if (car.mode === 'off') return;
         const yawRate = pose(car, n, dt);
+        // Its lamps at night (vehicle-lights.ts: beams, tail spill, glints, a cruiser's flashing bar), before the body's
+        // culling below: a beam reaches past the body, so the lights cull with their own spheres. The player's own
+        // vehicle runs on its battery in zombie mode too.
+        if (car.mode !== 'parked' && car.mode !== 'knocked') {
+          vehicleLights.vehicle(car, matrix, vehicleStyle(car), car.speed, car.mode === 'player' ? OWN : car.kind === 'police' && (car.mode === 'chase' || car.mode === 'hold') ? (phase ? SIREN_A : SIREN_B) : 0);
+        }
+        // Drawn only where the camera can see it, packed from the front of its model (a model with nothing in view
+        // costs no draw, and vehicles out of view no vertex work): its rider, poncho and roof lights likewise.
+        const e = matrix.elements;
+        if (view && !view.intersectsSphere(sphere.set(sphere.center.set(e[12], e[13] + 0.8, e[14]), car.kind === 'moto' ? 1.3 : 2.6))) return;
+        if ((e[12] - eye.x) ** 2 + (e[13] - eye.y) ** 2 + (e[14] - eye.z) ** 2 > fogCull) return;
+        const model = modelOf[n], slot = model.used++;
         model.body.setMatrixAt(slot, matrix);
+        model.body.setColorAt(slot, fleetPaint[n]);
         // Only a vehicle that still has its own driver shows one; a stolen or parked one does not.
         const occupied = (car.mode === 'lane' || (car.mode === 'knocked' && !car.fallen)) && !!car.driver;
         if (car.kind === 'moto') {
@@ -2737,7 +2773,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
           if (occupied) seat(n, car.driver!, vehicleStyle(car) as MotoStyle, matrix, yawRate, car.speed, footDown[n], time, dt);
           if (occupied && wet > 0.3 && caped < COUNTS.moto) { ponchos.setMatrixAt(caped, matrix); ponchos.setColorAt(caped, PONCHO_COLORS[car.index % PONCHO_COLORS.length]); caped++; }
         } else {
-          if (wrecks.get(car) !== 'burnt') model.glass!.setMatrixAt(slot, matrix);
+          model.glass!.setMatrixAt(slot, wrecks.get(car) !== 'burnt' ? matrix : hidden);
           const crewed = occupied || (car.kind === 'police' && (car.mode === 'chase' || car.mode === 'leave'));
           if (crewed) {
             const at = seatOf(car);
@@ -2752,24 +2788,28 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
         }
         if (car.kind === 'police') {
           const siren = car.mode === 'chase' || car.mode === 'hold';
-          for (const side of [0, 1]) {
+          for (let side = 0; side < 2; side++) {
             lightMatrix.makeTranslation(side ? 0.26 : -0.26, policeRoof.roof + 0.13, policeRoof.roofMid).premultiply(matrix);
-            lights.setMatrixAt(car.index * 2 + side, lightMatrix);
-            lights.setColorAt(car.index * 2 + side, !siren ? dim : (phase === (side === 0)) ? red : blue);
+            lights.setMatrixAt(lit, lightMatrix);
+            lights.setColorAt(lit++, !siren ? dim : (phase === (side === 0)) ? red : blue);
           }
         }
       });
       drawParked(dt);
       for (const b of occupantBatches) b.end();
       for (const model of models.values()) {
-        for (const mesh of model.glass ? [model.body, model.glass] : [model.body]) {
-          mesh.count = model.size + model.used;
-          mesh.instanceMatrix.needsUpdate = true;
+        model.body.count = model.used;
+        model.body.visible = model.used > 0;
+        if (model.used) uploadUsed(model.body, model.used);
+        if (model.glass) {
+          model.glass.count = model.used;
+          model.glass.visible = model.used > 0;
+          if (model.used) uploadUsed(model.glass, model.used);
         }
-        if (model.used && model.body.instanceColor) model.body.instanceColor.needsUpdate = true;
       }
-      lights.instanceMatrix.needsUpdate = true;
-      if (lights.instanceColor) lights.instanceColor.needsUpdate = true;
+      lights.count = lit;
+      lights.visible = lit > 0;
+      if (lit) uploadUsed(lights, lit);
       ponchos.count = caped;
       ponchos.visible = caped > 0;
       if (caped) uploadUsed(ponchos, caped);
