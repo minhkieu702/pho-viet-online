@@ -2476,7 +2476,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     /** A parked vehicle only drawn, standing in its spot. */
     const drawSpot = (i: number) => {
       const car = curbCars[i];
-      if (car.impounded || car.mode !== 'off' || !occ[i] || !car.home) return;
+      if (car === hiddenVehicle || car.impounded || car.mode !== 'off' || !occ[i] || !car.home) return;
       const s = SPOTS[i];
       const d = eyeKnown ? Math.hypot(s.x - eye.x, s.z - eye.z) : 0;
       if (d > DRAW_FAR || (view && !view.intersectsSphere(sphere.set(sphere.center.set(s.x, 0.8, s.z), car.kind === 'moto' ? 1.3 : 2.6)))) return;
@@ -2504,7 +2504,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
     } else for (let i = 0; i < curbCars.length; i++) drawSpot(i);
     // The parked vehicles that are entities (promoted, ridden, knocked about): every one is in activeCurb.
     for (const car of activeCurb) {
-      if (car.impounded || car.mode === 'off') continue;
+      if (car === hiddenVehicle || car.impounded || car.mode === 'off') continue;
       pose(car, ordinal.get(car)!, dt);
       // A parked vehicle the player drives has its lamps on (vehicle-lights.ts); parked ones have them off.
       if (car.mode === 'player') vehicleLights.vehicle(car, matrix, vehicleStyle(car), car.speed, OWN);
@@ -2559,7 +2559,11 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
   rebuildActive();
 
   let flash = 0;
+  // First-person view hides only this local vehicle's draw instances. Physics, traffic,
+  // damage and the shared vehicle state continue unchanged.
+  let hiddenVehicle: Car | null = null;
   return {
+    setHiddenVehicle(car: Car | null) { hiddenVehicle = car; },
     /** Every vehicle: the fleet, then one per parking spot (most of those only drawn, mode 'off'). */
     cars,
     /**
@@ -2758,6 +2762,8 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
         if (car.mode !== 'parked' && car.mode !== 'knocked') {
           vehicleLights.vehicle(car, matrix, vehicleStyle(car), car.speed, car.mode === 'player' ? OWN : car.kind === 'police' && (car.mode === 'chase' || car.mode === 'hold') ? (phase ? SIREN_A : SIREN_B) : 0);
         }
+        // First-person view hides the body of the vehicle the player sits in (camera-mode.ts); its lamps still light the road.
+        if (car === hiddenVehicle) return;
         // Drawn only where the camera can see it, packed from the front of its model (a model with nothing in view
         // costs no draw, and vehicles out of view no vertex work): its rider, poncho and roof lights likewise.
         const e = matrix.elements;
@@ -2951,6 +2957,7 @@ export function createVehicles(scene: THREE.Scene, worldClear: (x: number, z: nu
      * spot, the impound list and the last vehicle are forgotten (call before setTraffic, which then respawns or wrecks them).
      */
     resetPlayer() {
+      hiddenVehicle = null;
       const mine = new Set<Car>([...owned, ...impounds.map((i) => i.car), ...(lastCar ? [lastCar] : []), ...cars.filter((c) => c.role === 'owned' || c.role === 'loose')]);
       impounds.length = 0;
       owned = [];

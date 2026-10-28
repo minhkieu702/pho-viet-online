@@ -59,6 +59,8 @@ export type CoopPlayer = {
   riding: boolean; inCar: boolean; swimming: boolean; reach: number; health: number;
   /** game.ts' own down states (knocked over, wasted, busted). */
   knocked: boolean;
+  /** Flying high (a hero power): out of the horde's reach. */
+  airborne?: boolean;
   sprint: boolean; quiet: boolean; firing: boolean; aimX: number; aimZ: number;
   /** Input active (no overlay open): solo pauses when it is not. */
   active: boolean;
@@ -716,7 +718,7 @@ export function createZombieCoop(deps: CoopDeps) {
     const speed = Math.hypot(me.vx, me.vz);
     prey.push({
       x: me.x, z: me.z, down: zd !== 0 || me.knocked, inVehicle: me.riding, reach: me.reach, night, slot: selfSlot, local: true,
-      vx: me.vx, vz: me.vz, camYaw, quiet: me.quiet, firing: me.firing, sprint: me.sprint, speed, away: me.swimming || nowMs < invulnerableUntil,
+      vx: me.vx, vz: me.vz, camYaw, quiet: me.quiet, firing: me.firing, sprint: me.sprint, speed, away: me.swimming || !!me.airborne || nowMs < invulnerableUntil,
     });
     targets.push({ slot: selfSlot, dog: false, x: me.x, z: me.z, vx: me.vx, vz: me.vz, down: zd !== 0 || me.swimming, inVehicle: me.riding, camYaw, lag: 0 });
     const dog = companions.own();

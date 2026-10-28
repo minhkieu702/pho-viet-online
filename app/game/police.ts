@@ -44,6 +44,7 @@ export type PoliceShot = { from: THREE.Vector3; hit: boolean; damage: number; ki
 export type PlayerView = {
   x: number; z: number; car: Car | null; riding: boolean; heading: number; speed: number; down: boolean; stunned: boolean;
   armed: boolean; surrendered: boolean; pinned: boolean; night: number;
+  altitude?: number;
 };
 export type GasThrow = { fromX: number; fromZ: number; x: number; z: number };
 /** A spike strip across a road: its middle, the road's heading there, half its length (the asphalt's half width) and until when. */
@@ -664,8 +665,9 @@ export function createPolice(
               tz = cover.z + cz / cd * 2.4 - Math.sin(slot) * 0.8;
             }
             // A runner on foot gets tackled by whoever is close and not holding a long gun.
-            const lunging = time - o.lunge < 0.45;
-            if (!inVehicle && !player.down && !player.surrendered && player.speed > 3.5 && d > 1 && d < 3.4 && time - o.lunge > 4 && (o.weapon === 'baton' || o.weapon === 'taser' || o.weapon === 'pistol')) {
+            const withinReach = (player.altitude ?? 0) < 1.3;
+            const lunging = withinReach && time - o.lunge < 0.45;
+            if (withinReach && !inVehicle && !player.down && !player.surrendered && player.speed > 3.5 && d > 1 && d < 3.4 && time - o.lunge > 4 && (o.weapon === 'baton' || o.weapon === 'taser' || o.weapon === 'pistol')) {
               o.lunge = time;
             }
             if (lunging) {
@@ -691,11 +693,11 @@ export function createPolice(
             }
             const reach = inVehicle ? 2.0 : 1.05;
             // Officers have to be right next to the player; a pinned, stunned or surrendering player is cuffed quickly.
-            const canCuff = (!player.down || player.pinned) && d < reach && (!inVehicle || player.speed < 1.5);
+            const canCuff = withinReach && (!player.down || player.pinned) && d < reach && (!inVehicle || player.speed < 1.5);
             o.arrest = canCuff ? o.arrest + dt * (player.stunned || player.pinned || player.surrendered ? 2.5 : 1) : Math.max(0, o.arrest - dt);
             if (o.arrest > 1.3) arrested = true;
             // Up close they swing a baton, which also stops the player from simply walking off.
-            if (!player.down && !player.surrendered && !inVehicle && d < 1.3 && time > o.nextShot && (o.weapon === 'baton' || Math.random() < 0.4)) {
+            if (withinReach && !player.down && !player.surrendered && !inVehicle && d < 1.3 && time > o.nextShot && (o.weapon === 'baton' || Math.random() < 0.4)) {
               o.nextShot = time + 1.1 + Math.random() * 0.5;
               o.swingAt = time;
               strikes++;

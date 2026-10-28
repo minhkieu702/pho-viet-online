@@ -16,6 +16,8 @@ Bản thử nghiệm game thế giới mở 3D trên trình duyệt, lấy bối
 - **Đài quan sát & nhảy dù:** cửa **THÁP PHƯƠNG NAM** (tòa 232 m, ô vuông tím trên bản đồ) nhấn **E** mua vé 50.000đ lên nóc tháp, đi dạo ngắm thành phố. **Space** nhảy xuống rơi tự do, **Space** lần nữa để bung dù (dù tự bung nếu để quá lâu); **A / D** lái, **W** lao nhanh, **S** hãm. Dù lượn qua được nóc nhà thấp, bị tòa nhà cao chặn lại; tiếp đất an toàn được cộng điểm, rơi tự do chạm đất thì bị thương nặng, rơi xuống sông thì bơi. **E** trên nóc tháp để đi thang máy xuống.
 - **Cướp ngân hàng:** cầm súng tới cửa **NGÂN HÀNG PHƯƠNG NAM** (ô tròn xanh lá) nhấn **E**, rồi đứng gần quầy khoảng 9 giây cho két mở. Đi xa là thất bại. Vét két được 1,2–2,1 triệu đồng nhưng bị truy nã 4 sao; ngân hàng bị phong tỏa 5 phút sau mỗi vụ.
 - **Chuột phải kéo / Z, C:** xoay camera. **Lăn chuột:** zoom. **V:** đặt lại góc nhìn. Điện thoại: kéo một ngón để xoay, chụm hai ngón để zoom.
+- **B:** đổi giữa góc nhìn thứ nhất và góc nhìn thứ ba; cũng có nút đổi góc nhìn trên HUD. Góc nhìn thứ nhất dùng được trong Dạo phố, phòng multiplayer, Zombie và Cốt truyện, khi đi bộ, lái xe, bơi, đi thuyền, nhảy dù hoặc bay bằng sức mạnh. Camera trong cửa hàng và các cảnh dàn dựng tạm dùng góc quay riêng, rồi trở về lựa chọn của bạn.
+- **J:** đổi bộ sức mạnh. **K:** dùng kỹ năng. **G:** bật/tắt bay khi chọn Iron Man. Có thể chọn và dùng kỹ năng bằng bảng sức mạnh trên màn hình; **H** vẫn là đầu hàng và **R** vẫn là nạp đạn.
 - **Click chuột / F:** bắn theo con trỏ (hoặc đấm). **1–6 / Q** đổi vũ khí. **R** nạp đạn. **Giữ Tab:** túi súng, thời gian chậm lại.
 - **Ngắm bắn:** tâm ngắm đi theo chuột, chuyển đỏ khi đang nhắm trúng một mục tiêu không bị tường che; đạn bay từ nòng súng tới đúng điểm dưới tâm ngắm (trỏ vào đầu là bắn vào đầu, sát thương gấp 2,5 lần, với zombie gấp 3). Bắn liên tục thì tâm nở ra (độ giật), bắn từ xe thì kém chính xác hơn. **Không có tự ngắm:** click hoặc F bắn đúng vào điểm dưới con trỏ chuột, chỉ trúng khi con trỏ nằm trên mục tiêu; trên điện thoại nút bắn bắn thẳng theo hướng nhân vật đang nhìn. Có vệt đạn bay và dấu ✕ khi trúng (đỏ khi trúng đầu); súng phóng lựu tự tính đường cầu vồng để rơi đúng chỗ ngắm.
 - **Chế độ Zombie** (nút ở màn hình chính): khu phố hậu tận thế, mất điện, xe cháy bỏ hoang, đổ nát, chướng ngại cát và thùng lửa; toàn bộ người dân đã thành zombie. Zombie bò lên từ mặt đất hoặc lảo đảo bước ra từ nhà, nghe tiếng súng thì kéo đến, đi vòng theo vỉa hè khi có nhà chắn. Có zombie đi bộ, zombie chạy (nhiều hơn về đêm) và zombie khổng lồ từ đợt 3. Sống sót qua từng đợt; hết đợt được tiếp tế đạn, máu, tiền và nghỉ 20 giây. Có đèn pin khi trời tối, chấm zombie trên bản đồ, kỷ lục đợt được lưu lại. Bấm **Về phố** để quay lại khu phố bình thường.
@@ -32,6 +34,23 @@ Bản thử nghiệm game thế giới mở 3D trên trình duyệt, lấy bối
 - **Phòng chung:** người chơi đấm, bắn, tông được nhau (và bị truy nã); máu, vũ khí, phương tiện và trạng thái gục được đồng bộ qua máy chủ.
 - Nút **FPS** trên thanh trên cùng mở cài đặt đồ họa (Tự động / Cao / Cân bằng / Hiệu năng) và cho biết trình duyệt đang vẽ bằng GPU nào.
 - Điện thoại có các nút cảm ứng. Trên máy tính nên dùng trình duyệt hỗ trợ WebGL và bật tăng tốc phần cứng.
+
+Ở góc nhìn thứ nhất, nhấp vào khung game để giữ chuột và nhìn quanh; **Esc** thả chuột. Tâm ngắm nằm giữa màn hình. Nếu trình duyệt không cho giữ chuột, dùng chuột phải kéo để nhìn quanh và click hoặc **F** để bắn. Điện thoại kéo một ngón trên cảnh để nhìn quanh, rồi dùng các nút di chuyển và bắn. Góc nhìn là lựa chọn riêng của mỗi người, không đổi góc nhìn của người khác trong phòng.
+
+## Sức mạnh siêu anh hùng
+
+Chọn miễn phí một trong bốn bộ sức mạnh lấy cảm hứng từ Avengers, hoặc **Người dân** để tiếp tục chơi như trước:
+
+| Bộ sức mạnh | Kỹ năng |
+| --- | --- |
+| Iron Man | Bắn năng lượng và bay bằng năng lượng có giới hạn |
+| Thor | Gọi sét xuống vị trí mục tiêu |
+| Hulk | Đập đất, tạo sóng xung kích quanh người |
+| Captain America | Ném khiên bay đi rồi quay về |
+
+Các kỹ năng có thời gian hồi riêng và dùng chung một thanh năng lượng; đổi nhân vật không xóa thời gian hồi hay nạp lại năng lượng. Xuống xe và đóng các bảng tạm dừng để dùng sức mạnh. Khi bay cần hạ cánh trước khi đổi anh hùng, tương tác nhiệm vụ hoặc lên xe. Bảng sức mạnh hiển thị trạng thái sẵn sàng, thời gian hồi và năng lượng. Iron Man bay dọc các khoảng trống trên phố, chưa bay xuyên hoặc vượt qua mái công trình; hết năng lượng sẽ tự hạ cánh.
+
+Phòng chung đồng bộ bộ sức mạnh, độ cao bay và hiệu ứng ra chiêu. Đòn đánh trúng người chơi đi qua cơ chế xác nhận/chống trùng hiện có. Hiệu ứng hình học được dựng trong game; không sử dụng clip phim hoặc mô hình tải từ phim. Người đi đường, cảnh sát và xe trên phố vẫn được mô phỏng riêng ở mỗi máy.
 
 ## Nhiệm vụ
 
@@ -105,4 +124,6 @@ npm run test:realtime
 
 Bộ kiểm tra bao phủ vòng đời phòng, xác thực, giới hạn 8 người, hết hạn, nội suy và tự nối lại. Kiểm tra tích hợp dùng HTTP/WebSocket thật qua Worker và Durable Object local: hai chiều chuyển động, phòng riêng biệt, bản tin cũ/lỗi, thay thế kết nối, xác nhận đòn đánh và nhường chỗ sau mất mạng. Có thể đặt `TEST_BASE_URL` để đổi cổng local; bộ kiểm tra từ chối host remote. Giới hạn 8 người là giới hạn logic đã kiểm tra, không phải kết quả benchmark mạng Internet.
 
-Kiểm thử nhiệm vụ bao phủ thứ tự mục tiêu, khoảng cách tương tác, yêu cầu lên/xuống xe, hết giờ/ngã xe, thưởng một lần, đổi nhiệm vụ và chơi lại.
+Kiểm thử nhiệm vụ bao phủ thứ tự mục tiêu, khoảng cách tương tác, yêu cầu lên/xuống xe, hết giờ/ngã xe, thưởng một lần, đổi nhiệm vụ và chơi lại. Kiểm thử sức mạnh bao phủ năng lượng, hồi chiêu khi đổi anh hùng, bay/hạ cánh, giới hạn độ cao, quỹ đạo khiên, phạm vi đòn đánh và bản tin multiplayer tương thích máy khách cũ.
+
+Kiểm thử camera bao phủ đổi góc nhìn, giới hạn nhìn lên/xuống, vị trí mắt theo phương tiện/độ cao và giữ hướng nhìn tương đối khi xe rẽ. Kiểm thử mô hình xe và xe buýt xác nhận chế độ góc nhìn thứ nhất chỉ ẩn hình vẽ của phương tiện đang ngồi, giữ nguyên mô phỏng và hiện lại khi đổi về góc nhìn thứ ba.

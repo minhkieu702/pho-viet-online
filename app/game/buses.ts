@@ -911,10 +911,12 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
   const busMatrix = new THREE.Matrix4(), wheelMatrix = new THREE.Matrix4(), part = new THREE.Matrix4(), turn = new THREE.Matrix4(), spinM = new THREE.Matrix4();
   const up = new THREE.Vector3(0, 1, 0), one = new THREE.Vector3(1, 1, 1), at3 = new THREE.Vector3(), q = new THREE.Quaternion();
   const busBound = new THREE.Sphere();
+  let firstPersonRideHidden = false;
   function draw() {
     for (const run of runs) run.counts.fill(0);
     const nw = [0, 0];
     for (const bus of buses) {
+      if (firstPersonRideHidden && aboard?.kind === 'bus' && aboard.bus === bus) continue;
       if (bus.phase === 'off' || zombie || Math.hypot(bus.x - viewer.x, bus.z - viewer.z) > 330) continue;
       // Only the buses the camera sees (body and wheels): a 12 m bus within a 7.5 m sphere round its middle.
       const gy = groundHeight(bus.x, bus.z);
@@ -942,6 +944,14 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
   let walking: readonly Walking[] = [];
   return {
     network, transit, buses, walkers,
+    /** Rendering only: the passenger's opaque bus body must not enclose the first-person camera. */
+    setFirstPersonRideHidden(on: boolean) {
+      if (firstPersonRideHidden === on) return;
+      firstPersonRideHidden = on;
+      draw();
+    },
+    /** Hide this Object3D for the local first-person render, then restore its ordinary visibility. */
+    get firstPersonOccluder() { return aboard && aboard.kind !== 'bus' ? aboard.boat.group : null; },
     /** The game wires the registry and its passenger API in here: shelters, piers, the đò and ghe, bus doors. */
     register(registry: Registry, p: Passengers) {
       passengers = p;

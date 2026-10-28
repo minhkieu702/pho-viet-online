@@ -12,11 +12,15 @@ export type RoomRequest =
   | { action: 'create'; name: string; world?: number; mode?: RoomMode; zv?: number; ff?: boolean }
   | { action: 'join'; name: string; code: string; world?: number; zv?: number }
   | ({ action: 'leave' } & Session);
+export type HeroPower = 'none' | 'ironman' | 'thor' | 'hulk' | 'captain';
 export type PlayerState = {
   x: number; z: number; angle: number; riding: boolean; speed: number; score: number;
   health?: number; weapon?: 'fists' | 'pistol' | 'shotgun' | 'smg' | 'grenade' | 'rpg';
   vehicle?: 'foot' | 'scooter' | 'car' | 'police' | 'boat' | 'swim';
   down?: boolean; firing?: boolean; wanted?: number;
+  hero?: HeroPower; altitude?: number; flying?: boolean;
+  /** Latest cast only: receivers seed the first sequence without replaying it. */
+  powerSeq?: number; powerKind?: HeroPower; powerX?: number; powerY?: number; powerZ?: number;
 } & ZombiePlayerFields;
 export type PeerState = PlayerState & {
   id: string; name: string; color: string;

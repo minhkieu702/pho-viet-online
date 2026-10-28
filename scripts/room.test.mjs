@@ -253,6 +253,47 @@ test('HTTP rejects invalid input/origin/binding without reaching a room', async 
   assert.equal((await handleRoomSocket(new Request('https://example.test/api/room/socket?room=ABCDEF', { headers: { upgrade: 'websocket', origin: 'https://evil.test' } }), rooms)).status, 403);
 });
 
+test('rejected cross-origin uploads are consumed without revoking the authenticated session', async t => {
+  const { rooms, actors } = namespace(t);
+  const session = (await call(rooms, { action: 'create', name: 'Host' })).body;
+  const rejected = request({ action: 'leave', ...credentials(session) }, { origin: 'https://evil.test' });
+  assert.equal((await handleRoom(rejected, rooms)).status, 403);
+  assert.equal(rejected.bodyUsed, true, 'a completed rejected upload must not remain unread');
+  const authenticated = await connect(actors.get(session.room).room, session);
+  assert.equal(authenticated.messages[0].type, 'ready');
+
+  const malformed = request('{broken', { origin: 'https://evil.test' });
+  assert.equal((await handleRoom(malformed, rooms)).status, 403);
+  assert.equal(malformed.bodyUsed, true);
+});
+
+test('cross-origin rejection cancels oversized uploads without waiting for their remainder', { timeout: 2_000 }, async () => {
+  let reads = 0, cancelled = false;
+  const body = new ReadableStream({
+    pull(controller) {
+      reads++;
+      controller.enqueue(new Uint8Array(16_384));
+    },
+    cancel() { cancelled = true; },
+  }, { highWaterMark: 0 });
+  const rejected = new Request('https://example.test/api/room', {
+    method: 'POST', headers: { origin: 'https://evil.test' }, body, duplex: 'half',
+  });
+  assert.equal((await handleRoom(rejected)).status, 403);
+  assert.equal(cancelled, true);
+  assert.equal(reads, 1, 'oversized uploads must not be read indefinitely');
+});
+
+test('cross-origin rejection remains bounded when the client never finishes uploading', { timeout: 2_000 }, async () => {
+  let cancelled = false;
+  const body = new ReadableStream({ cancel() { cancelled = true; } });
+  const rejected = new Request('https://example.test/api/room', {
+    method: 'POST', headers: { origin: 'https://evil.test' }, body, duplex: 'half',
+  });
+  assert.equal((await handleRoom(rejected)).status, 403);
+  assert.equal(cancelled, true);
+});
+
 test('state and hit validation keep numerical bounds and reject NaN/impersonation', () => {
   assert.throws(() => playerState({ ...state, x: NaN }));
   assert.throws(() => playerState({ ...state, riding: 1 }));
@@ -265,6 +306,7 @@ test('state and hit validation keep numerical bounds and reject NaN/impersonatio
   assert.equal(bounded.weapon, 'fists');
   assert.equal(bounded.vehicle, 'foot');
 });
+
 
 test('peer positions are clamped to the shared world bounds, which cover the playable world with slack', async () => {
   // Per wiring step (WIRING-PLAN §3): today's rectangle x -138..352, z -203.6..137.5 (accepted as x -140..355,
@@ -338,4 +380,67 @@ test('room joins carry the world version; old clients count as version 1', async
   t.after(() => legacy.room.reset());
   assert.equal((await call(legacyRooms, { action: 'join', name: 'Old', code: 'OLD123' })).status, 200);
   assert.equal((await call(legacyRooms, { action: 'join', name: 'Newer', code: 'OLD123', world: WORLD_VERSION + 1 })).status, 409);
+});
+
+test('legacy states get safe power defaults and new hero casts survive snapshots', async t => {
+  const legacy = playerState(state);
+  assert.equal(legacy.hero, 'none');
+  assert.equal(legacy.altitude, 0);
+  assert.equal(legacy.flying, false);
+  assert.equal(legacy.powerSeq, 0);
+  assert.equal(legacy.powerKind, 'none');
+  assert.equal(legacy.powerX, state.x);
+  assert.equal(legacy.powerY, 1.1);
+  assert.equal(legacy.powerZ, state.z);
+  const { rooms, actors } = namespace(t);
+  const host = (await call(rooms, { action: 'create', name: 'Host' })).body;
+  const guest = (await call(rooms, { action: 'join', name: 'Guest', code: host.room })).body;
+  const { room } = actors.get(host.room);
+  const source = await connect(room, host);
+  const recipient = await connect(room, guest);
+  const powers = { hero: 'ironman', altitude: 4.5, flying: true, powerSeq: 23, powerKind: 'ironman', powerX: 600, powerY: 6.25, powerZ: -400 };
+  await room.message(source.value, { type: 'state', seq: 1, state: { ...state, ...powers } });
+  room.broadcast(Date.now());
+  const peer = recipient.messages.filter(message => message.type === 'snapshot').at(-1).peers[0];
+  for (const [key, value] of Object.entries(powers)) assert.equal(peer[key], value, key);
+});
+
+test('hero payloads bound altitude and targets, reject invalid numbers, and normalize impossible flight', () => {
+  const powers = { ...state, hero: 'ironman', altitude: 4, flying: true, powerSeq: 1, powerKind: 'thor', powerX: 900, powerY: 99, powerZ: -900 };
+  const bounded = playerState({ ...powers, altitude: 900 });
+  assert.equal(bounded.altitude, 8);
+  assert.equal(bounded.powerX, PEER_BOUNDS.maxX);
+  assert.equal(bounded.powerY, 48);
+  assert.equal(bounded.powerZ, PEER_BOUNDS.minZ);
+  assert.equal(playerState({ ...powers, powerY: -99 }).powerY, -32);
+  assert.equal(playerState({ ...powers, powerY: 34.75 }).powerY, 34.75);
+  assert.equal(playerState({ ...powers, powerY: -24.5 }).powerY, -24.5);
+  assert.equal(playerState({ ...powers, altitude: -1 }).altitude, 0);
+  assert.equal(playerState({ ...powers, flying: false }).altitude, 4, 'allow gradual landing');
+  for (const incompatible of [{ hero: 'hulk' }, { hero: 'thor' }, { hero: 'captain' }, { riding: true }, { vehicle: 'car' }, { vehicle: 'boat' }, { vehicle: 'swim' }, { down: true }]) {
+    const value = playerState({ ...powers, ...incompatible });
+    assert.equal(value.altitude, 0);
+    assert.equal(value.flying, false);
+  }
+  for (const field of ['altitude', 'powerX', 'powerY', 'powerZ']) {
+    for (const value of [NaN, Infinity, -Infinity, null, '4']) assert.throws(() => playerState({ ...powers, [field]: value }), `${field}: ${value}`);
+  }
+  for (const powerSeq of [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, null, '1']) assert.throws(() => playerState({ ...powers, powerSeq }));
+  assert.equal(playerState({ ...powers, powerSeq: Number.MAX_SAFE_INTEGER }).powerSeq, Number.MAX_SAFE_INTEGER);
+  assert.equal(playerState({ ...powers, hero: 'unknown' }).hero, 'none');
+  assert.equal(playerState({ ...powers, powerKind: 'unknown' }).powerKind, 'none');
+
+});
+
+test('expanded weapons and water modes survive validation alongside hero metadata', () => {
+  for (const weapon of ['grenade', 'rpg']) for (const vehicle of ['boat', 'swim']) {
+    const value = playerState({ ...state, x: 600, z: -400, hero: 'ironman', altitude: 4, flying: true, weapon, vehicle, riding: vehicle === 'boat' });
+    assert.equal(value.weapon, weapon);
+    assert.equal(value.vehicle, vehicle);
+    assert.equal(value.hero, 'ironman');
+    assert.equal(value.altitude, 0);
+    assert.equal(value.flying, false);
+    assert.equal(value.powerX, 600);
+    assert.equal(value.powerZ, -400);
+  }
 });

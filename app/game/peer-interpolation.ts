@@ -6,8 +6,8 @@ const MAX_SAMPLES = 32;
 const MAX_SAMPLE_GAP_MS = 1000;
 const MAX_VELOCITY = 50;
 
-export type PeerPose = { x: number; z: number; angle: number; speed: number };
-type Sample = PeerPose & { time: number; vx: number; vz: number; down: boolean; vehicle: string };
+export type PeerPose = { x: number; z: number; angle: number; speed: number; altitude: number };
+type Sample = PeerPose & { time: number; vx: number; vz: number; down: boolean; vehicle: string; hero: string };
 
 /** Map the server epoch onto the browser's monotonic clock, without using Date.now().
  * The least delayed recent arrival estimates the offset; slow corrections prevent
@@ -43,7 +43,7 @@ export function createSnapshotClock() {
 }
 
 function pose(sample: Sample): PeerPose {
-  return { x: sample.x, z: sample.z, angle: sample.angle, speed: sample.speed };
+  return { x: sample.x, z: sample.z, angle: sample.angle, speed: sample.speed, altitude: sample.altitude };
 }
 
 /** A small per-peer history. Rendering is timestamp based, independent of frame
@@ -54,7 +54,7 @@ export function createPeerInterpolator() {
   return {
     push(peer: PeerState, serverTime: number): boolean {
       const time = Number.isFinite(peer.updatedAt) ? Math.min(peer.updatedAt!, serverTime) : serverTime;
-      if (![time, peer.x, peer.z, peer.angle, peer.speed].every(Number.isFinite)) return false;
+      if (![time, peer.x, peer.z, peer.angle, peer.speed, peer.altitude ?? 0].every(Number.isFinite)) return false;
       const previous = samples.at(-1);
       if (previous && time <= previous.time) return false;
       const elapsed = previous ? (time - previous.time) / 1000 : 0;
@@ -63,8 +63,13 @@ export function createPeerInterpolator() {
       const distance = Math.hypot(dx, dz);
       const vehicle = peer.vehicle ?? (peer.riding ? 'scooter' : 'foot');
       const down = Boolean(peer.down);
+      const hero = peer.hero ?? 'none';
+      // Landing may retain altitude while flying is false. Incompatible modes
+      // always use ground level, including older clients without power fields.
+      const altitude = hero === 'ironman' && !peer.riding && vehicle === 'foot' && !down
+        ? Math.min(8, Math.max(0, peer.altitude ?? 0)) : 0;
       const discontinuity = previous && (
-        down !== previous.down || vehicle !== previous.vehicle ||
+        down !== previous.down || vehicle !== previous.vehicle || hero !== previous.hero ||
         time - previous.time > MAX_SAMPLE_GAP_MS ||
         distance > Math.max(8, elapsed * MAX_VELOCITY)
       );
@@ -76,7 +81,7 @@ export function createPeerInterpolator() {
       const velocity = Math.hypot(vx, vz);
       if (velocity > MAX_VELOCITY) { vx *= MAX_VELOCITY / velocity; vz *= MAX_VELOCITY / velocity; }
       if (discontinuity) samples = [];
-      samples.push({ time, x: peer.x, z: peer.z, angle: peer.angle, speed: peer.speed, vx, vz, vehicle, down });
+      samples.push({ time, x: peer.x, z: peer.z, angle: peer.angle, speed: peer.speed, altitude, vx, vz, vehicle, down, hero });
       if (samples.length > MAX_SAMPLES) samples.shift();
       return true;
     },
@@ -95,6 +100,7 @@ export function createPeerInterpolator() {
           z: previous.z + (next.z - previous.z) * amount,
           angle: previous.angle + angle * amount,
           speed: previous.speed + (next.speed - previous.speed) * amount,
+          altitude: previous.altitude + (next.altitude - previous.altitude) * amount,
         };
       }
       const latest = samples[samples.length - 1];
@@ -104,6 +110,8 @@ export function createPeerInterpolator() {
         x: latest.x + latest.vx * seconds,
         z: latest.z + latest.vz * seconds,
         angle: latest.angle,
+        // Never project upward/downward forever during packet loss.
+        altitude: latest.altitude,
         speed: age >= MAX_EXTRAPOLATION_MS || Math.hypot(latest.vx, latest.vz) < 0.001 ? 0 : latest.speed,
       };
     },
