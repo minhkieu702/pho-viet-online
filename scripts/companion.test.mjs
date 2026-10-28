@@ -102,7 +102,7 @@ test('follow: heels 1–3 m from a walking or sprinting owner and settles beside
   assert.ok(d >= 0.9 && d <= 3, `standing owner: ${d.toFixed(2)} m`);
   assert.equal(ctx.dogs.own().mode, 'follow');
   assert.equal(ctx.dogs.hud(0).label, 'Đang theo');
-  assert.match(ctx.dogs.hud(0).hint, /G gọi\/ngồi · T cắn · X băng bó/);
+  assert.match(ctx.dogs.hud(0).hint, /Y gọi\/ngồi · T cắn · X băng bó/);
   const h = heelSpot({ x: 0, z: 0, yaw: 0 });
   assert.ok(h.z < -1 && h.x > 0, 'heel spot is behind-left (left of a figure facing +z is +x)');
 });

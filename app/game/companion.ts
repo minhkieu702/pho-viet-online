@@ -1125,7 +1125,7 @@ export function createCompanions(scene: THREE.Scene, world: CompanionWorld) {
         : d.life === 'away' ? 'Sẽ quay lại khi hết đợt'
         : d.petting && d.hp < DOG_MAX_HP ? 'Đang vuốt ve · +6 máu mỗi giây'
         : d.hp < DOG_MAX_HP * HURT ? (close ? 'Đứng yên để vuốt ve · X băng bó' : 'Lại gần để vuốt ve · X băng bó')
-        : 'G gọi/ngồi · T cắn · X băng bó';
+        : 'Y gọi/ngồi · T cắn · X băng bó';
       return {
         name: n, coat: DOG_COATS[d.coat][0], hp: clamp(Math.round(d.hp / DOG_MAX_HP * 100), 0, 100), state: m, label: LABELS[m], hint,
         reviveIn: d.life === 'down' ? Math.max(0, Math.ceil(REVIVE_WINDOW - (clock - d.downAt))) : null,

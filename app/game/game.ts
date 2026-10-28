@@ -3485,9 +3485,9 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       // Riding along, F (the fire key) also asks to get off.
       if (normalized === 'f' && ride && active) ride.onLeave();
       else if (normalized === 'f') { triggerQueued = true; unlockAudio(); }
-      // ---- zombie co-op (MODE): the dog, bandages, and whom a dead player watches ----
+      // ---- zombie co-op (MODE): the dog (Y call/sit, T attack; G is hero flight), bandages, and whom a dead player watches ----
       if (zombieMode && coop.running) {
-        if (normalized === 'g') coop.dogCommand('call');
+        if (normalized === 'y') coop.dogCommand('call');
         if (normalized === 't') coop.dogCommand('attack');
         if (normalized === 'x') { const text = coop.bandage(); if (text) notify(text, 2200); }
         if (coop.downed === 2 && (normalized === 'q' || normalized === 'e')) coop.spectateNext(normalized === 'q' ? -1 : 1);
