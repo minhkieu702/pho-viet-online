@@ -1,12 +1,64 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPowerState, initialPowerHud, HEROES, POWER_COST, MAX_ALTITUDE, POWER_HEIGHT_BOUNDS, SHIELD_DURATION, clipPowerTarget, distanceToPowerSegment, resolvePowerTarget, shieldPosition } from '../app/game/powers.ts';
+import { createPowerState, initialPowerHud, HEROES, POWER_COST, MAX_ALTITUDE, POWER_HEIGHT_BOUNDS, SHIELD_DURATION, clipPowerTarget, distanceToPowerSegment, resolvePowerTarget, shieldPosition, withoutHeroPowers } from '../app/game/powers.ts';
 
 function tick(state, seconds, clear = true) { for (let i = 0; i < seconds * 100; i++) state.step(0.01, clear); }
 
-test('civilian is opt-in default; no cast or flight before choosing a hero', () => {
+test('ordinary mode disables hero selection, casting and flight even through direct API calls', () => {
   const state = createPowerState();
+  assert.equal(state.enabled, false);
+  for (const { id } of HEROES) assert.equal(state.select(id), false);
+  assert.equal(state.cast(), null);
+  assert.equal(state.toggleFlight(), false);
+  tick(state, 2, false);
   assert.deepEqual(state.hud(), initialPowerHud());
+  state.reset();
+  assert.equal(state.enabled, false, 'reset must not unlock powers in an ordinary mode');
+  assert.equal(state.select('ironman'), false);
+});
+
+test('leaving superhero mode cancels flight and clears every hero cooldown and shared energy debt', () => {
+  const state = createPowerState(true);
+  state.select('thor'); state.cast();
+  state.select('ironman'); state.cast(); state.toggleFlight(); tick(state, 0.3);
+  assert.ok(state.altitude > 0 && state.flying);
+  assert.ok(state.hud().cooldown > 0 && state.hud().energy < 100);
+  state.setEnabled(false);
+  assert.deepEqual(state.hud(), initialPowerHud());
+  assert.equal(state.cast(), null);
+  assert.equal(state.toggleFlight(), false);
+  assert.equal(state.select('hulk'), false);
+  tick(state, 2, false);
+  assert.deepEqual(state.hud(), initialPowerHud());
+  state.setEnabled(true);
+  assert.deepEqual(state.hud(), initialPowerHud(true), 'reentry starts grounded with full energy and no old hero');
+  assert.equal(state.select('thor'), true);
+  assert.equal(state.cast(), 'thor', 'the old Thor cooldown was cleared too');
+  state.select('ironman');
+  assert.equal(state.cast(), 'ironman');
+  assert.equal(state.flying, false, 'old flight input must not carry into the new session');
+});
+
+test('enabling an already enabled controller cannot refill energy or bypass cooldown', () => {
+  const state = createPowerState(true); state.select('captain'); state.cast();
+  const before = state.hud();
+  state.setEnabled(true);
+  assert.deepEqual(state.hud(), before);
+  assert.equal(state.cast(), null);
+});
+
+test('ordinary room snapshots clear hero events and elevation while preserving normal multiplayer state', () => {
+  const original = { id: 'peer-a', x: 15, z: -20, angle: 1, speed: 4, vehicle: 'foot', health: 75, score: 90, weapon: 'pistol', updatedAt: 12345,
+    hero: 'ironman', altitude: 5.5, flying: true, powerSeq: 12, powerKind: 'captain', powerX: 30, powerY: 20, powerZ: 40 };
+  const neutral = withoutHeroPowers(original);
+  assert.deepEqual(neutral, { ...original, hero: 'none', altitude: 0, flying: false, powerSeq: 0, powerKind: 'none', powerX: 0, powerY: 1.1, powerZ: 0 });
+  assert.equal(original.hero, 'ironman', 'normalizing a peer must not mutate a shared network snapshot');
+  assert.equal(original.altitude, 5.5);
+});
+
+test('civilian is opt-in default; no cast or flight before choosing a hero', () => {
+  const state = createPowerState(true);
+  assert.deepEqual(state.hud(), initialPowerHud(true));
   assert.equal(state.cast(), null);
   assert.equal(state.toggleFlight(), false);
   assert.equal(state.select('bogus'), false);
@@ -14,7 +66,7 @@ test('civilian is opt-in default; no cast or flight before choosing a hero', () 
 
 test('each hero casts its own power and uses shared energy', () => {
   for (const hero of HEROES.filter((h) => h.id !== 'none')) {
-    const state = createPowerState(); state.select(hero.id);
+    const state = createPowerState(true); state.select(hero.id);
     assert.equal(state.cast(), hero.id);
     assert.equal(state.hud().energy, 100 - POWER_COST[hero.id]);
     assert.equal(state.hud().cooldownTotal, hero.cooldown);
@@ -23,7 +75,7 @@ test('each hero casts its own power and uses shared energy', () => {
 });
 
 test('switching away and back does not reset cooldown or refill energy', () => {
-  const state = createPowerState(); state.select('thor'); state.cast();
+  const state = createPowerState(true); state.select('thor'); state.cast();
   state.select('none'); state.select('thor');
   assert.equal(state.cast(), null);
   assert.equal(state.hud().energy, 74);
@@ -32,21 +84,21 @@ test('switching away and back does not reset cooldown or refill energy', () => {
 });
 
 test('blocked controls do not spend energy, change flight, or begin cooldown', () => {
-  const state = createPowerState(); state.select('ironman');
+  const state = createPowerState(true); state.select('ironman');
   assert.equal(state.cast(true), null); assert.equal(state.toggleFlight(true), false);
   assert.equal(state.hud(true).blocked, true);
   assert.equal(state.hud().energy, 100); assert.equal(state.hud().cooldown, 0);
 });
 
 test('rapidly cycling all heroes cannot bypass shared energy requirement', () => {
-  const state = createPowerState();
+  const state = createPowerState(true);
   for (const hero of ['ironman', 'thor', 'hulk', 'captain']) { state.select(hero); assert.equal(state.cast(), hero); }
   assert.equal(state.hud().energy, 10);
   state.select('ironman'); assert.equal(state.toggleFlight(), false);
 });
 
 test('only Iron Man flies, at bounded height; flight drains then automatically lands', () => {
-  const state = createPowerState(); state.select('thor'); assert.equal(state.toggleFlight(), false);
+  const state = createPowerState(true); state.select('thor'); assert.equal(state.toggleFlight(), false);
   state.select('ironman'); assert.equal(state.toggleFlight(), true);
   tick(state, 3);
   assert.ok(state.altitude > 3 && state.altitude <= MAX_ALTITUDE);
@@ -57,7 +109,7 @@ test('only Iron Man flies, at bounded height; flight drains then automatically l
 });
 
 test('hero cannot be changed while airborne, and landing is independent of cast cooldown', () => {
-  const state = createPowerState(); state.select('ironman'); state.toggleFlight(); tick(state, 1);
+  const state = createPowerState(true); state.select('ironman'); state.toggleFlight(); tick(state, 1);
   assert.equal(state.select('hulk'), false); assert.equal(state.hero, 'ironman');
   state.cast(); assert.equal(state.toggleFlight(), true); tick(state, 1.2);
   assert.equal(state.altitude, 0); assert.ok(state.hud().cooldown > 0);
@@ -65,19 +117,19 @@ test('hero cannot be changed while airborne, and landing is independent of cast 
 });
 
 test('obstructed landing holds above ground until the landing point is safe', () => {
-  const state = createPowerState(); state.select('ironman'); state.toggleFlight(); tick(state, 1); state.stopFlight();
+  const state = createPowerState(true); state.select('ironman'); state.toggleFlight(); tick(state, 1); state.stopFlight();
   tick(state, 2, false); assert.ok(state.altitude >= 1);
   tick(state, 1, true); assert.equal(state.altitude, 0);
   state.step(0.1, false); assert.equal(state.altitude, 0, 'a grounded civilian must never be lifted by an obstruction');
 });
 
 test('invalid or huge frame times stay bounded; reset and forced land clean flight state', () => {
-  const state = createPowerState(); state.select('ironman'); state.toggleFlight();
+  const state = createPowerState(true); state.select('ironman'); state.toggleFlight();
   state.step(NaN); assert.equal(state.altitude, 0);
   state.step(Infinity); assert.equal(state.altitude, 0);
   state.step(5000); assert.ok(state.altitude <= 0.5);
   state.land(); assert.equal(state.altitude, 0); assert.equal(state.flying, false);
-  state.reset(); assert.deepEqual(state.hud(), initialPowerHud());
+  state.reset(); assert.deepEqual(state.hud(), initialPowerHud(true));
 });
 
 test('finite beam targeting excludes targets behind, past the endpoint, or far above it', () => {

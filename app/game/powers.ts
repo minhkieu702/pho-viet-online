@@ -8,7 +8,7 @@ export const HEROES: { id: HeroId; name: string; powerName: string; description:
   { id: 'captain', name: 'Captain America', powerName: 'Khiên boomerang', description: 'Ném khiên về phía trước rồi thu về; mỗi mục tiêu bị trúng một lần.', color: '#80b7ff', cooldown: 3.8 },
 ];
 export type PowerHud = { hero: HeroId; cooldown: number; cooldownTotal: number; energy: number; flying: boolean; altitude: number; blocked: boolean };
-export function initialPowerHud(): PowerHud { return { hero: 'none', cooldown: 0, cooldownTotal: 0, energy: 100, flying: false, altitude: 0, blocked: false }; }
+export function initialPowerHud(enabled = false): PowerHud { return { hero: 'none', cooldown: 0, cooldownTotal: 0, energy: 100, flying: false, altitude: 0, blocked: !enabled }; }
 export const POWER_COST: Record<HeroPower, number> = { ironman: 16, thor: 26, hulk: 30, captain: 18 };
 export const POWER_RANGE: Record<HeroPower, number> = { ironman: 24, thor: 22, hulk: 7, captain: 18 };
 export const SHIELD_DURATION = 1.25;
@@ -16,6 +16,11 @@ export const MAX_ALTITUDE = 8;
 // Room snapshots accept the same endpoint heights: flight plus a full upward/downward cast.
 export const POWER_HEIGHT_BOUNDS = { min: -32, max: 48 };
 export type PowerPoint = { x: number; y: number; z: number };
+
+/** Ordinary rooms retain their normal player state while ignoring legacy hero metadata. */
+export function withoutHeroPowers<T extends object>(state: T) {
+  return { ...state, hero: 'none' as const, altitude: 0, flying: false, powerSeq: 0, powerKind: 'none' as const, powerX: 0, powerY: 1.1, powerZ: 0 };
+}
 
 /** Preserve elevation while limiting a cast by its true 3D reach and obstacle ray. */
 export function resolvePowerTarget(from: PowerPoint, target: PowerPoint, range: number, trace: (direction: PowerPoint, distance: number) => number = (_direction, distance) => distance): PowerPoint {
@@ -41,27 +46,30 @@ export function clipPowerTarget(from: PowerPoint, to: PowerPoint, min: PowerPoin
 }
 
 /** Simulation seconds keep cooldown/energy consistent when a frame is delayed. */
-export function createPowerState() {
+export function createPowerState(enabled = false) {
   let hero: HeroId = 'none', energy = 100, flying = false, altitude = 0;
   const remaining: Record<HeroId, number> = { none: 0, ironman: 0, thor: 0, hulk: 0, captain: 0 };
+  const reset = () => { hero = 'none'; energy = 100; altitude = 0; flying = false; for (const id of Object.keys(remaining) as HeroId[]) remaining[id] = 0; };
   return {
-    get hero() { return hero; }, get altitude() { return altitude; }, get flying() { return flying; },
+    get enabled() { return enabled; }, get hero() { return hero; }, get altitude() { return altitude; }, get flying() { return flying; },
+    setEnabled(value: boolean) { enabled = value; if (!enabled) reset(); },
     select(id: HeroId) {
-      if (!HEROES.some((entry) => entry.id === id) || altitude > 0.05) return false;
+      if (!enabled || !HEROES.some((entry) => entry.id === id) || altitude > 0.05) return false;
       hero = id; flying = false; return true;
     },
     cast(blocked = false): HeroPower | null {
-      if (blocked || hero === 'none' || remaining[hero] > 0 || energy < POWER_COST[hero]) return null;
+      if (!enabled || blocked || hero === 'none' || remaining[hero] > 0 || energy < POWER_COST[hero]) return null;
       remaining[hero] = HEROES.find((entry) => entry.id === hero)!.cooldown;
       energy -= POWER_COST[hero]; return hero;
     },
     toggleFlight(blocked = false) {
-      if (blocked || hero !== 'ironman' || (!flying && energy < 15)) return false;
+      if (!enabled || blocked || hero !== 'ironman' || (!flying && energy < 15)) return false;
       flying = !flying; return true;
     },
     stopFlight() { flying = false; },
     land() { flying = false; altitude = 0; },
     step(seconds: number, landingClear = true) {
+      if (!enabled) return;
       const dt = Math.max(0, Math.min(0.1, Number.isFinite(seconds) ? seconds : 0));
       for (const id of Object.keys(remaining) as HeroId[]) remaining[id] = Math.max(0, remaining[id] - dt);
       energy = Math.max(0, Math.min(100, energy + (flying ? -9 : altitude > 0 ? 0 : 13) * dt));
@@ -70,9 +78,9 @@ export function createPowerState() {
       altitude = Math.max(0, Math.min(MAX_ALTITUDE, altitude + Math.sign(target - altitude) * Math.min(Math.abs(target - altitude), dt * 5)));
     },
     hud(blocked = false): PowerHud {
-      return { hero, cooldown: Math.ceil(remaining[hero] * 10) / 10, cooldownTotal: HEROES.find((entry) => entry.id === hero)!.cooldown, energy: Math.round(energy), flying, altitude: Math.round(altitude * 10) / 10, blocked };
+      return { hero, cooldown: Math.ceil(remaining[hero] * 10) / 10, cooldownTotal: HEROES.find((entry) => entry.id === hero)!.cooldown, energy: Math.round(energy), flying, altitude: Math.round(altitude * 10) / 10, blocked: !enabled || blocked };
     },
-    reset() { hero = 'none'; energy = 100; altitude = 0; flying = false; for (const id of Object.keys(remaining) as HeroId[]) remaining[id] = 0; },
+    reset,
   };
 }
 

@@ -35,7 +35,7 @@ import { worldRoads } from './map/world-types';
 import { WEAPONS, weaponById, type WeaponId } from './weapons';
 import { MISSION_DEFS, createMissions, type MissionEvent, type MissionId, type MissionView } from './missions';
 import { createPeerInterpolator, createSnapshotClock } from './peer-interpolation';
-import { createPowerState, HEROES, POWER_RANGE, POWER_HEIGHT_BOUNDS, SHIELD_DURATION, clipPowerTarget, distanceToPowerSegment, resolvePowerTarget, shieldPosition, type HeroId, type HeroPower, type PowerHud, type PowerPoint } from './powers';
+import { createPowerState, HEROES, POWER_RANGE, POWER_HEIGHT_BOUNDS, SHIELD_DURATION, clipPowerTarget, distanceToPowerSegment, resolvePowerTarget, shieldPosition, withoutHeroPowers, type HeroId, type HeroPower, type PowerHud, type PowerPoint } from './powers';
 import { createHeroLook, createPowerEffects } from './power-effects';
 import { createCameraMode, firstPersonAllowed, firstPersonPose, type CameraMode, type EyeKind } from './camera-mode';
 import type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
@@ -56,6 +56,7 @@ import { MODE_LEVEL, QUALITY_LEVELS, createFrameMonitor, detectStartLevel, gpuNa
 export type VehicleKind = 'foot' | 'scooter' | 'car' | 'police' | 'boat' | 'swim';
 export type { PlayerState, PeerState, OutgoingHit, IncomingHit } from '../../lib/multiplayer-protocol';
 export type Hud = {
+  mode: GameMode;
   speed: number; riding: boolean; score: number; mission: string; missionStep: number; missionInfo: MissionView; hint: string; x: number; z: number;
   cash: number; deliveries: number; weapon: WeaponId; owned: WeaponId[]; down: boolean; fps: number; quality: string; qualityMode: QualityMode;
   gpu: string; softwareGpu: boolean;
@@ -93,8 +94,8 @@ export type PassengerProvider = {
   seat(): { x: number; y: number; z: number; yaw: number }; label: string; onLeave(): void;
   pose?: 'chair' | 'pillion' | 'hidden'; card?: () => RideView;
 };
-/** The normal living city, or the zombie apocalypse. */
-export type GameMode = 'city' | 'zombie';
+/** Normal city play, a solo superhero sandbox, or the zombie apocalypse. */
+export type GameMode = 'city' | 'superhero' | 'zombie';
 export type GameEvent = { type: 'store' } | { type: 'bikeshop' } | { type: 'hospital' } | { type: 'bag'; open: boolean } | { type: 'product'; id: string } | { type: 'venue'; kind: VenueRoom }
   | { type: 'menu'; menu: MenuView } | { type: 'menu-close' };
 export type { MenuView, PromptView } from './interact';
@@ -949,6 +950,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     ground: groundHeight,
     route: (fx, fz, tx, tz) => nav.route(fx, fz, tx, tz),
   }, (zb, text) => sayAt(`zombie${zb.index}`, text, () => (zb.state === 'off' || zb.state === 'down' ? null : { x: zb.x, y: groundHeight(zb.x, zb.z) + 2, z: zb.z })));
+  let gameMode: GameMode = 'city';
   let zombieMode = false;
   // Shop interiors: while one is open the camera is inside it, looking at the shop or at one product.
   const interiors = createInteriors(scene, {
@@ -1798,9 +1800,18 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     equip(weapon === 'fists' ? 'pistol' : weapon);
   }
 
-  /** Switches between the living city and the zombie apocalypse. */
+  /** Each new session starts with its own power rules and no effects or peers from the previous mode. */
   function setMode(mode: GameMode) {
     const zombie = mode === 'zombie';
+    gameMode = zombie ? 'zombie' : mode === 'superhero' ? 'superhero' : 'city';
+    powers.reset();
+    powers.setEnabled(gameMode === 'superhero');
+    if (powers.enabled) powers.select('ironman');
+    shieldFlight = null;
+    powerEffects.clear();
+    Object.assign(lastPower, { kind: 'none', x: state.x, y: bodyY + 1.1, z: state.z, seq: 0 });
+    heroLook.update(powers.hero, false, performance.now() / 1000);
+    setPeers([]);
     zombieMode = zombie;
     npcs.setEnabled(!zombie);
     police.setEnabled(!zombie);
@@ -1816,7 +1827,13 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       zombies.start(performance.now() / 1000);
       showBanner('ZOMBIE TRÀN NGẬP KHU PHỐ', performance.now(), 4000);
       notify('Cả khu phố đã biến thành zombie · Sống sót qua từng đợt! Bắn vào đầu để hạ nhanh.', 6000);
-    } else zombies.stop();
+    } else {
+      zombies.stop();
+      if (gameMode === 'superhero') {
+        showBanner('CHẾ ĐỘ SIÊU ANH HÙNG', performance.now(), 4000);
+        notify('Iron Man sẵn sàng · J đổi anh hùng · K dùng sức mạnh · G bay hoặc hạ cánh · B đổi góc nhìn', 6500);
+      }
+    }
   }
 
   function teleport(at: { x: number; z: number }) {
@@ -3502,7 +3519,8 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     if (!peerClock.observe(snapshotTime, receivedAt)) return;
     const incomingIds = new Set(nextPeers.map((p) => p.id));
     for (const [id, peer] of peers) if (!incomingIds.has(id)) removePeer(id, peer);
-    for (const peer of nextPeers) {
+    for (const incoming of nextPeers) {
+      const peer = gameMode === 'superhero' ? incoming : withoutHeroPowers(incoming);
       if (![peer.x, peer.z, peer.angle, peer.speed, peer.score].every(Number.isFinite)) continue;
       let existing = peers.get(peer.id);
       if (existing && (existing.name !== peer.name || existing.color !== peer.color)) {
@@ -3538,7 +3556,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
       if (sequence < existing.powerSeq) existing.powerSeq = sequence;
       if (sequence > existing.powerSeq) {
         existing.powerSeq = sequence;
-        if (!peer.down && peer.powerKind && peer.powerKind !== 'none' && peer.powerX !== undefined && peer.powerZ !== undefined) {
+        if (powers.enabled && !peer.down && peer.powerKind && peer.powerKind !== 'none' && peer.powerX !== undefined && peer.powerZ !== undefined) {
           const origin = { x: peer.x, y: groundHeight(peer.x, peer.z) + 1.1 + (peer.altitude ?? 0), z: peer.z };
           const target = { x: peer.powerX, y: peer.powerY ?? groundHeight(peer.powerX, peer.powerZ) + 1.1, z: peer.powerZ };
           powerEffects.cast(peer.powerKind, origin, target, receivedAt, peer.powerKind === 'captain' ? () => ({ x: existing!.group.position.x, y: existing!.group.position.y + 1.1, z: existing!.group.position.z }) : undefined);
@@ -3689,7 +3707,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     reticleHit.style.color = headMark ? '#ff5648' : '#fff';
   }
 
-  function powerBlocked() { return !active || !!down || state.riding || bagOpen || swimming || !!boat || !!glide || !!interior || activityBusy() || surrendered || performance.now() < stunUntil; }
+  function powerBlocked() { return !powers.enabled || !active || !!down || state.riding || bagOpen || swimming || !!boat || !!glide || !!interior || activityBusy() || surrendered || performance.now() < stunUntil; }
 
   function selectHero(id: HeroId) {
     if (powerBlocked()) return;
@@ -3814,6 +3832,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
   }
 
   function updatePowers(seconds: number, now: number) {
+    if (!powers.enabled) return;
     if (powers.altitude > 0 && !powers.flying && !clearAt(state.x, state.z, 0.5)) {
       // A traffic car may have moved under us. Move to the nearest clear patch before descending.
       let found = false;
@@ -4262,7 +4281,7 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     const vehicle = vehicleKind();
     const vehicleHealth = playerCar ? playerCar.health / carMax(playerCar) : state.riding ? bikeHealth / bikeById(bikeId).health : -1;
     const hud: Hud = {
-      powers: powers.hud(powerBlocked()), cameraMode: cameraMode.mode,
+      mode: gameMode, powers: powers.hud(powerBlocked()), cameraMode: cameraMode.mode,
       speed: Math.round(velocity * 10) / 10, riding: state.riding, score: state.score,
       mission: missionInfo.objective, missionStep: missionInfo.step, missionInfo, hint: hint === focusText ? '' : hint,
       prompt, pins: mapPins(), ride: ride ? ride.card?.() ?? { title: ride.label, next: '', hint: 'E hoặc F · xin xuống ở trạm tới', stops: [] } : null,
@@ -5552,11 +5571,12 @@ export function createGame(container: HTMLElement, onHud: (hud: Hud) => void, on
     /** An opaque overlay covers the whole street (the big map): skips drawing until it closes. */
     setCovered(value: boolean) { covered = value; },
     getState(): PlayerState {
-      return {
+      const snapshot: PlayerState = {
         ...state, health: Math.ceil(health), weapon, vehicle: vehicleKind(), down: down === 'wasted',
         firing: performance.now() < firingUntil, wanted: police.wanted,
         hero: powers.hero, altitude: powers.altitude, flying: powers.flying, powerSeq: lastPower.seq, powerKind: lastPower.kind, powerX: lastPower.x, powerY: lastPower.y, powerZ: lastPower.z,
       };
+      return gameMode === 'superhero' ? snapshot : withoutHeroPowers(snapshot);
     },
     /** Hits this player dealt since the last sync, at most eight. */
     takeHits() { return pendingHits.splice(0, 8); },
