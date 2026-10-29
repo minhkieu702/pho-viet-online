@@ -781,8 +781,10 @@ export function createTransit(network: TransitNetwork = buildNetwork(), opts: { 
           return mk(trip, at.phase, at.s, at.speed, at.visit, at.phase === 'dwell' ? at.visit : (at.visit + line.visits.length - 1) % line.visits.length);
         }
         // Waiting at the terminus for this trip: since the last one ended, or come from the depot a layover before it.
+        // (continues(prev) === trip, without its search: the vehicle's trips are in departure order, so the first of them
+        // to leave after prev ends is this one exactly when this one leaves after prev ends.)
         const prev = last && last.day === trip.day ? last : null;
-        const before = prev && continues(prev) === trip ? prev.end : trip.depart - line.spec.layover / sph;
+        const before = prev && trip.depart >= prev.end - 1e-9 && trip.depart - prev.end <= maxWait(line) + 1e-9 ? prev.end : trip.depart - line.spec.layover / sph;
         if (t >= before && t < trip.depart) return mk(trip, 'layover', 0, 0, 0, 0);
         last = trip;
       }
@@ -834,12 +836,17 @@ export function createTransit(network: TransitNetwork = buildNetwork(), opts: { 
       const l = lineOf(st), n = l.visits.length;
       return st.phase === 'run' ? visitTime(st.trip!, l, (st.visit + n - 1) % n, 'depart') : Infinity;
     };
+    // (Each vehicle's line looked up once, and pairs apart along either axis passed over before any square root.)
+    const lens = out.map((st) => lineOf(st).spec.length), modes = out.map((st) => lineOf(st).mode);
     for (let pass = 0; pass < 3; pass++) {
       for (let i = 0; i < out.length; i++) {
         for (let j = i + 1; j < out.length; j++) {
-          const a = out[i], b = out[j], need = (lineOf(a).spec.length + lineOf(b).spec.length) / 2 + 2;
-          const dx = b.x - a.x, dz = b.z - a.z, d = Math.hypot(dx, dz);
-          if (lineOf(a).mode !== lineOf(b).mode || d >= need - 1e-6 || a.hx * b.hx + a.hz * b.hz < 0.2) continue;
+          if (modes[i] !== modes[j]) continue;
+          const a = out[i], b = out[j], need = (lens[i] + lens[j]) / 2 + 2;
+          const dx = b.x - a.x, dz = b.z - a.z;
+          if (dx >= need || dx <= -need || dz >= need || dz <= -need) continue;
+          const d = Math.hypot(dx, dz);
+          if (d >= need - 1e-6 || a.hx * b.hx + a.hz * b.hz < 0.2) continue;
           const along = dx * (a.hx + b.hx) + dz * (a.hz + b.hz), behind = Math.abs(along) > 1 ? (along > 0 ? a : b) : left(a) > left(b) ? a : b;
           place(behind, behind.s - (need - d));
           behind.speed = 0;
@@ -1065,16 +1072,28 @@ export type SignalPoint = { s: number; node: number; group: number };
  */
 export function signalPoints(line: TransitLine, graph: RoadGraph = LEGACY_ROADS, path: Path = line.path, probe = (s: number) => pathPoint(path, s)): SignalPoint[] {
   const out: SignalPoint[] = [];
+  // The probe along the whole path once (every 0.25 m), not once per signalled approach (a city line has dozens: that
+  // was seconds of the game's load); each approach then looks only at the samples within reach of its node, the only
+  // place the probe can be level with its stop line (a sample there and the one before it are always looked at).
+  let samples: Float64Array | null = null, count = 0;
   for (const step of line.plan) {
     const e = graph.edges[step.edge], node = step.dir > 0 ? e.b : e.a;
     const a = graph.approaches.find((q) => q.node === node && q.edge === e.id && q.dir === step.dir);
     if (!a) continue;
+    if (!samples) {
+      const list: number[] = [];
+      for (let s = 0; s <= path.len; s += 0.25) { const p = probe(s); list.push(p.x, p.z, p.hx, p.hz); }
+      samples = Float64Array.from(list);
+      count = list.length / 4;
+    }
     // Along the path, where the distance to the node centre (measured along the road) drops through the stop line.
-    const n = graph.nodes[node];
-    let prev = Infinity;
-    for (let s = 0; s <= path.len; s += 0.25) {
-      const p = probe(s), h = graph.project(e, p.x, p.z);
-      const along = (n.x - p.x) * a.hx + (n.z - p.z) * a.hz, aligned = p.hx * a.hx + p.hz * a.hz > 0.9;
+    const n = graph.nodes[node], reach = Math.max(0, a.stop) + e.half + 30, reach2 = reach * reach;
+    let prev = Infinity, s = 0;
+    for (let k = 0; k < count; k++, s += 0.25) {
+      const px = samples[k * 4], pz = samples[k * 4 + 1];
+      if ((n.x - px) * (n.x - px) + (n.z - pz) * (n.z - pz) > reach2) { prev = Infinity; continue; }
+      const h = graph.project(e, px, pz);
+      const along = (n.x - px) * a.hx + (n.z - pz) * a.hz, aligned = samples[k * 4 + 2] * a.hx + samples[k * 4 + 3] * a.hz > 0.9;
       if (aligned && Math.abs(h.off) < e.half && prev > a.stop && along <= a.stop && along > a.stop - 2) { out.push({ s, node, group: a.group }); break; }
       prev = aligned ? along : Infinity;
     }

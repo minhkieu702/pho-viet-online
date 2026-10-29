@@ -7,6 +7,7 @@
  * from behind (the old double-sided quads showed mirrored text there). Built once, in the browser (needs a 2D canvas).
  */
 import * as THREE from 'three';
+import { NIGHT, NIGHT_GLSL } from '../night.ts';
 
 /**
  * The CSS weights the old canvas cells used: titles and plate numbers 900 (Arial Black on Windows), plate labels 700,
@@ -154,18 +155,27 @@ function fieldInSlices(atlas: THREE.DataTexture, cover: Uint8Array, field: Uint8
   setTimeout(slice, 0);
 }
 
-/** Emissive follows each instance's colour (`tint`) times its glow (the material's intensity is the night level). */
+/**
+ * Emissive follows each instance's colour (`tint`) times its glow (the material's intensity is the night level). The
+ * glow float packs a strength 0..1 and an opening-hours schedule 0..95 (night.ts packGlow: 2·code + strength): the sign
+ * of a shop goes nearly dark (a tenth) while its shop is closed; code 0 glows with the night as before.
+ */
 function glowing(material: THREE.MeshStandardMaterial, key: string, tint: string, extra: (shader: THREE.WebGLProgramParametersWithUniforms) => void) {
   material.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, NIGHT);
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\nattribute float signGlow;\nvarying float vSignGlow;')
-      .replace('#include <uv_vertex>', '#include <uv_vertex>\n\tvSignGlow = signGlow;');
+      .replace('#include <common>', `#include <common>\nattribute float signGlow;\nvarying float vSignGlow;\n#define nightDayBase 0.0\n${NIGHT_GLSL}`)
+      .replace('#include <uv_vertex>', `#include <uv_vertex>
+	{
+		float signCode = floor(signGlow * 0.5 + 1e-4), signStrength = signGlow - 2.0 * signCode;
+		vSignGlow = signStrength * (signCode < 0.5 ? 1.0 : mix(0.1, 1.0, nightOpenAt(signCode)));
+	}`);
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', '#include <common>\nvarying float vSignGlow;')
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\n\ttotalEmissiveRadiance *= ${tint} * vSignGlow;`);
     extra(shader);
   };
-  material.customProgramCacheKey = () => key;
+  material.customProgramCacheKey = () => `${key}|night`;
   return material;
 }
 function boardShader(shader: THREE.WebGLProgramParametersWithUniforms) {
@@ -326,10 +336,13 @@ function measureAndDraw(boards: Board[]) {
 export function createSigns() {
   const boards: Board[] = [];
   return {
-    /** A sign board, as world.ts' sign(): title and subtitle in `color` on `background`, with a border in `color`. */
-    sign(text: string, subtitle: string, color: string, x: number, y: number, z: number, w: number, h: number, yaw = 0, background = '#f3e4c7') {
+    /**
+     * A sign board, as world.ts' sign(): title and subtitle in `color` on `background`, with a border in `color`; `glow`
+     * its night glow (a strength, or one packed with a schedule: night.ts packGlow).
+     */
+    sign(text: string, subtitle: string, color: string, x: number, y: number, z: number, w: number, h: number, yaw = 0, background = '#f3e4c7', glow = 0.5) {
       boards.push({
-        x, y, z, yaw, w, h, depth: 0.03, cellW: 1024, cellH: 256, background, border: color, frame: [16, 16, 992, 224], line: 7, glow: 0.5, twoSided: true,
+        x, y, z, yaw, w, h, depth: 0.03, cellW: 1024, cellH: 256, background, border: color, frame: [16, 16, 992, 224], line: 7, glow, twoSided: true,
         runs: [
           { text, face: '900', size: 94, cx: 512, cy: 107, maxWidth: 930, color },
           { text: subtitle, face: '500', size: 31, cx: 512, cy: 194, maxWidth: 900, color },

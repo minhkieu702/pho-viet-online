@@ -4,6 +4,11 @@ import type { WeaponId } from './weapons';
 let context: AudioContext | null = null;
 let noise: AudioBuffer | null = null;
 
+// ---- zombie co-op (design.md §5, MUTANTS) ----
+/** The shared output for other synth modules (horror-audio.ts, dog-audio.ts); null until unlockAudio() ran. */
+export function audioBus() { return context && noise && context.state === 'running' ? { context, noise } : null; }
+// ---- end zombie co-op ----
+
 export function unlockAudio() {
   try {
     if (!context) {

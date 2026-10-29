@@ -47,8 +47,10 @@ test('enabling an already enabled controller cannot refill energy or bypass cool
   assert.equal(state.cast(), null);
 });
 
-test('ordinary room snapshots clear hero events and elevation while preserving normal multiplayer state', () => {
+test('city and zombie room snapshots clear hero events while preserving multiplayer and co-op state', () => {
   const original = { id: 'peer-a', x: 15, z: -20, angle: 1, speed: 4, vehicle: 'foot', health: 75, score: 90, weapon: 'pistol', updatedAt: 12345,
+    slot: 3, zd: 1, bleed: 12, rv: 2, rvp: 0.6, cam: 1.2, quiet: true,
+    dog: { x: 14, z: -19, a: 1, m: 0, h: 80, t: -1, c: 0 },
     hero: 'ironman', altitude: 5.5, flying: true, powerSeq: 12, powerKind: 'captain', powerX: 30, powerY: 20, powerZ: 40 };
   const neutral = withoutHeroPowers(original);
   assert.deepEqual(neutral, { ...original, hero: 'none', altitude: 0, flying: false, powerSeq: 0, powerKind: 'none', powerX: 0, powerY: 1.1, powerZ: 0 });

@@ -1,22 +1,27 @@
 import * as THREE from 'three';
 // First, before city.ts: starts the P1 map generation in its worker (map/world-map-start.ts) while city.ts evaluates.
 import './map/world-map-start';
-import { BUILDINGS, COLLIDERS, DOWNTOWN_X, LAMPS, LAND, PLOTS, RIVER, RIVER_BED, ROADS_X, ROADS_Z, SCENERY, VENUES, inRect, pathClearance, pointClear, type Building, type Plot, type Pole, type Prop, type Rect, type Tree } from './city';
-import { buildSkyline } from './skyline';
+import { BUILDINGS, COLLIDERS, DOWNTOWN_X, LAND, LIFE, PLOTS, RIVER, RIVER_BED, ROADS_X, ROADS_Z, SCENERY, VENUES, inRect, pathClearance, pointClear, type Building, type Plot, type Pole, type Prop, type Rect, type Tree } from './city';
+import { buildSkyline, towerWindows } from './skyline';
 import { APPROACHES, districtApproaches, lightFor, nodeLight, type Light } from './signals';
 import { createSigns } from './map/signs';
 import { STREETS_H, STREETS_V } from './map/consts';
 import { ASPHALT_HALF, CURB_HEIGHT, PIER_DECK, SIDEWALK_EDGE, STEPS_DROP, STEPS_TOP, groundHeight, onSidewalk } from './map/terrain';
-import { COUNTERS, PLACES, counterKeyOf, isOpen, type Hours } from './counters';
+import { COUNTERS, PLACES, counterKeyOf } from './counters';
 import { LOTS, SPOTS } from './parking';
 import { MODE_LEVEL, detectStartLevel } from './quality';
 import { CLOTH, DECAL, type ClothCell, type ClothOpts, type ColorLike, type DecalCell, type DecalOpts, type Frame, type Kind, type Role, type SmokeKind, type TagStyle } from './kit';
 import { patchGlow, patchRoofTiles, patchTiles, patchWall, surfaceDetail, surfaceNoise } from './surfaces';
 import { buildCables, buildCloth, buildDecals, buildSmoke, cableUniforms, clothAtlas, clothMaterial, decalAtlas, type Cable, type ClothItem, type DecalQuad, type Emitter } from './street-dressing';
-import { FRONT_OF, IRON, LAUNDRY, LED_COLORS, LIGHT_BOXES, ROOF_TILES, TON, acUnit, cage, grille, houseFlag, laundry, ledBorder, maiThai, openFront, pillarWidth, railing, rooftop, thoThien, verticalSign, type FrontKind } from './facades';
+import { FRONT_LIGHT, FRONT_OF, IRON, LAUNDRY, LED_COLORS, LIGHT_BOXES, ROOF_TILES, TON, acUnit, cage, frontDraws, grille, houseFlag, laundry, ledBorder, maiThai, openFront, pillarWidth, railing, rooftop, thoThien, verticalSign, type FrontKind } from './facades';
 import { DISTRICT_BUILDINGS, DISTRICT_COLLIDERS, DISTRICT_PLOTS, DISTRICT_STAMPS, DISTRICT_WATERS, LEGACY_HIDDEN, WIRED_KEYS, WORLD_MAP_INFO, isWired, sliceAt, type WorldSolid } from './map/world-map';
 import { WATERS } from './map/districts';
-import { districtLift, planDistricts, type DistrictItem, type DistrictKit, type SurfRole } from './district-render';
+import { districtLift, planDistricts, towerSpecOf, type DistrictItem, type DistrictKit, type SurfRole } from './district-render';
+import { lampsAt, sunElevation } from './atmosphere';
+import { HOME, NIGHT, OFFICE, FLATS, OPEN_SLOTS, lampSeed, packGlow, patchFarWindows, patchNight, scheduleIndex, writeNight, writeNightDetail, writeNightFog } from './night';
+import { ALL_NIGHT, LOTTERY_HOURS, OFFICE_LOBBY_HOURS, VENUE_HOURS, buildingLight } from './night-hours';
+import { HEAD, TONES, addLensHalos, aimedLight, createHaloMaterial, createLightMaterials, createLightStore, legacyTone, makeLight, toneLight, type NightLight, type Tone } from './street-lights';
+import type { VenueRoom } from './venues';
 
 export type Collider = { minX: number; maxX: number; minZ: number; maxZ: number; top?: number };
 // Range fog: by distance from the eye, not by view depth, so a thing past fog far is fully fogged wherever it is on the
@@ -39,13 +44,17 @@ class Floats {
     this.a = b;
   }
   push3(x: number, y: number, z: number) { this.room(3); const a = this.a, n = this.length; a[n] = x; a[n + 1] = y; a[n + 2] = z; this.length = n + 3; }
+  push1(v: number) { this.room(1); this.a[this.length++] = v; }
   /** `count` values of `src` from `from`. */
   pushFrom(src: ArrayLike<number>, from: number, count: number) { this.room(count); for (let i = 0; i < count; i++) this.a[this.length + i] = src[from + i]; this.length += count; }
   /** The values, in an array of their own size (for a buffer attribute). */
   trimmed() { return this.length === this.a.length ? this.a : this.a.slice(0, this.length); }
 }
-/** Instances collected per primitive kind, material role, shadow and fine flags (one InstancedMesh each). */
-type Batch = { kind: Kind; role: Role; shadow: boolean; fine: boolean; m: Floats; c: Floats; big: boolean[] };
+/**
+ * Instances collected per primitive kind, material role, shadow and fine flags (one InstancedMesh each): matrices,
+ * colours, and each instance's light code (night.ts; the night-lit roles carry it as `aLit`).
+ */
+type Batch = { kind: Kind; role: Role; shadow: boolean; fine: boolean; m: Floats; c: Floats; l: Floats; big: boolean[] };
 type Batches = Map<string, Batch>;
 /** Everything one drawing pass collects before it becomes meshes: today's world, or one district tile. */
 type Sink = {
@@ -54,9 +63,12 @@ type Sink = {
   cloths: { base: ClothItem[]; fine: ClothItem[] };
   cables: { base: Cable[]; fine: Cable[] };
   emitters: Emitter[];
-  pools: { x: number; z: number; size: number; shop: number; color?: string }[];
+  /** Lamp pools and halos, shop spill, neon and bulb light (street-lights.ts): the sink's share of the world's light mesh. */
+  lights: NightLight[];
 };
-const newSink = (): Sink => ({ batches: new Map(), decals: { base: [], fine: [] }, cloths: { base: [], fine: [] }, cables: { base: [], fine: [] }, emitters: [], pools: [] });
+const newSink = (): Sink => ({ batches: new Map(), decals: { base: [], fine: [] }, cloths: { base: [], fine: [] }, cables: { base: [], fine: [] }, emitters: [], lights: [] });
+/** Roles lit by each instance's light code (night.ts patchNight): their meshes carry `aLit`. */
+const NIGHT_ROLES = new Set<Role>(['lamp', 'lantern', 'glassLit', 'tube', 'led', 'neon']);
 /** What sign(), plate() and tag() write to (map/signs.ts createSigns, or a recorder). */
 type SignWriter = Pick<ReturnType<typeof createSigns>, 'sign' | 'tag' | 'plate'>;
 
@@ -81,8 +93,6 @@ const LEAVES = ['#689b6b', '#87b477', '#4f875c', '#5e9a5a', '#76a86a'];
 const BAY_COLORS = ['#e9cf8f', '#f0dcae', '#cfe0c8', '#e3b9a3', '#c9d7e3', '#efe6d2', '#d9a6a0', '#bcd0b5', '#f2c47a', '#d7c4dd', '#a9c9c2', '#e6c3a0'];
 /** Buildings with a counter: game.ts pulls a roller shutter over their front outside opening hours (with its drum). */
 const COUNTERED = new Set(PLACES.filter((p) => p.kind === 'counter' && p.building >= 0).map((p) => p.building));
-/** Each counter building's opening hours (its light pool goes dark when it is closed). */
-const HOURS = new Map<number, Hours>(PLACES.filter((p) => p.kind === 'counter' && p.building >= 0 && COUNTERS[p.key]).map((p) => [p.building, COUNTERS[p.key].hours]));
 const VENUE_OF = new Map(VENUES.map((v) => [v.building.id, v]));
 /** Decals that light up after dark: what is inside a lit shop front, and the vé số board in its glass case. */
 const GLOWING = new Set<DecalCell>([DECAL.goods, DECAL.snacks, DECAL.menu, DECAL.fridge, DECAL.familyAltar, DECAL.poster, DECAL.lottery, DECAL.thanTai]);
@@ -216,7 +226,8 @@ export function buildWorld(scene: THREE.Scene) {
     ground: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.9 }),
     glass: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.45, emissive: '#ffbf73', emissiveIntensity: 0 }),
     glassLit: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.45, emissive: '#ffc77f', emissiveIntensity: 0 }),
-    lamp: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.5, emissive: '#ffdca0', emissiveIntensity: 0 }),
+    // Lamp heads and bulbs glow in their own (instance) colour after dark (patchNight tint).
+    lamp: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.5, emissive: '#ffffff', emissiveIntensity: 0 }),
     lantern: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.6, emissive: '#ff5a2c', emissiveIntensity: 0 }),
     water: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.22, metalness: 0.08 }),
     // Neon tubes glow in their own (instance) colour, brighter at night.
@@ -227,7 +238,7 @@ export function buildWorld(scene: THREE.Scene) {
     tiles: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.88 }),
     roofTile: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.8 }),
     // Shop fluorescent tubes and blinking LED borders, lit in their instance colour after dark.
-    tube: new THREE.MeshStandardMaterial({ color: '#d8dde0', roughness: 0.5, emissive: '#e8f4ff', emissiveIntensity: 0 }),
+    tube: new THREE.MeshStandardMaterial({ color: '#d8dde0', roughness: 0.5, emissive: '#ffffff', emissiveIntensity: 0 }),
     led: new THREE.MeshStandardMaterial({ color: '#3a3a3a', roughness: 0.4, emissive: '#ffffff', emissiveIntensity: 0 }),
     // Floodlight washes on the heritage fronts: warm light added over the wall after dark (invisible by day).
     wash: new THREE.MeshStandardMaterial({ color: '#000000', roughness: 1, emissive: '#ffcf96', emissiveIntensity: 1, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, visible: false }),
@@ -272,9 +283,12 @@ export function buildWorld(scene: THREE.Scene) {
     let verts = 0, indices = 0, shadow = false;
     for (const b of list) { const g = primitives[b.kind], n = b.c.length / 3; verts += g.attributes.position.count * n; indices += (g.index?.count ?? g.attributes.position.count) * n; shadow ||= b.shadow; }
     let pos: Float32Array, nrm: Float32Array, col: Float32Array, index: Uint16Array | Uint32Array;
+    /** Each vertex's light code (the night-lit roles: aLit, as the instanced meshes carry it per instance). */
+    let codes: Float32Array | null = null;
+    const coded = NIGHT_ROLES.has(list[0].role);
     let bi = 0, ii = 0, v = 0, k = 0;
     const fill = () => {
-      if (!pos) { pos = new Float32Array(verts * 3); nrm = new Float32Array(verts * 3); col = new Float32Array(verts * 3); index = verts > 65535 ? new Uint32Array(indices) : new Uint16Array(indices); }
+      if (!pos) { pos = new Float32Array(verts * 3); nrm = new Float32Array(verts * 3); col = new Float32Array(verts * 3); index = verts > 65535 ? new Uint32Array(indices) : new Uint16Array(indices); if (coded) codes = new Float32Array(verts); }
       let budget = stepVerts;
       while (bi < list.length && budget > 0) {
         const b = list[bi], g = primitives[b.kind], gp = g.attributes.position.array as ArrayLike<number>, gn = g.attributes.normal.array as ArrayLike<number>, gi = g.index?.array as ArrayLike<number> | undefined;
@@ -284,6 +298,7 @@ export function buildWorld(scene: THREE.Scene) {
           bakeNormal.getNormalMatrix(bakeMatrix);
           const e = bakeMatrix.elements, q = bakeNormal.elements;
           const r = b.c.a[ii * 3], gg = b.c.a[ii * 3 + 1], bb = b.c.a[ii * 3 + 2], base = v;
+          if (codes) codes.fill(b.l.a[ii], v, v + gv);
           for (let j = 0; j < gv; j++, v++) {
             const x = gp[j * 3], y = gp[j * 3 + 1], z = gp[j * 3 + 2];
             pos[v * 3] = e[0] * x + e[4] * y + e[8] * z + e[12];
@@ -308,6 +323,7 @@ export function buildWorld(scene: THREE.Scene) {
       geometry.setAttribute('position', new THREE.BufferAttribute(pos, 3));
       geometry.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
       geometry.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      if (codes) geometry.setAttribute('aLit', new THREE.BufferAttribute(codes, 1));
       geometry.setIndex(new THREE.BufferAttribute(index, 1));
       geometry.computeBoundingSphere();
       geometry.computeBoundingBox();
@@ -332,10 +348,30 @@ export function buildWorld(scene: THREE.Scene) {
   patchTiles(roles.paving, surfNoise, 'surf-paving', false);
   patchTiles(roles.tiles, surfNoise, 'surf-tiles', true);
   patchRoofTiles(roles.roofTile, surfNoise);
-  /** Seconds (wrapped) for everything that moves in a shader: LEDs, cloth, cables, smoke. */
-  const shaderTime = { value: 0 };
+  /** Seconds (wrapped) for everything that moves in a shader: LEDs, cloth, cables, smoke, the TV flicker (night.ts). */
+  const shaderTime = NIGHT.nightTime;
   patchGlow(roles.tube, 'tube-glow');
   patchGlow(roles.led, 'led-glow', shaderTime);
+  // Night light by each instance's light code (night plan §6.1): lamp heads, lanterns and lit windows share one program
+  // (their options are uniforms); tubes, LED borders and neon keep their own, with their daytime glow as before.
+  patchNight(roles.lamp, 'night-role', { tint: true });
+  patchNight(roles.lantern, 'night-role');
+  patchNight(roles.glassLit, 'night-role', { cool: true });
+  patchNight(roles.tube, 'night-tube', { dayBase: 0.1 / 2.3 });
+  patchNight(roles.led, 'night-led', { dayBase: 0.25 / 2.05 });
+  patchNight(roles.neon, 'night-neon', { dayBase: 0.45 / 2.35 });
+  // (the baked clones were made before any patch: Material.copy does not copy onBeforeCompile)
+  patchNight(bakedRoles.lamp, 'night-role', { tint: true });
+  patchNight(bakedRoles.lantern, 'night-role');
+  patchNight(bakedRoles.glassLit, 'night-role', { cool: true });
+  /** The far stand-ins' boxes: plain by day, a grid of lit windows at night (night.ts patchFarWindows). */
+  const farSolid = roles.solid.clone();
+  farSolid.name = 'far windows';
+  patchFarWindows(farSolid);
+  materials.push(farSolid);
+  /** The night's light pools and halos (one program, two blends), and the signal halos (street-lights.ts): never cut away. */
+  const lightMaterials = createLightMaterials(), haloMaterial = createHaloMaterial();
+  materials.push(...lightMaterials, haloMaterial);
   for (const [name, material] of Object.entries(roles)) material.name = name;
   materials.push(...Object.values(roles));
 
@@ -352,18 +388,42 @@ export function buildWorld(scene: THREE.Scene) {
   let mergeFine = false;
   /** The far (low detail) instances of the district tile being drawn, or null. */
   let farBatches: Batches | null = null;
+  /**
+   * The light code of what is drawn now (Kit.lit, night.ts): 0 lets every part take its default, a schedule (1..95)
+   * or -1 holds for every part, a rhythm base (HOME, OFFICE, FLATS) gives each part its own seed.
+   */
+  let litCtx = 0;
+  function lit<T>(code: number, draw: () => T): T {
+    const saved = litCtx;
+    litCtx = code;
+    try { return draw(); } finally { litCtx = saved; }
+  }
+  /**
+   * A part's light code: the scope's, else windows the home rhythm and lamps the street-lamp switch (seeded by
+   * position). Lamps and lanterns in a rhythm scope (a family altar's lantern, an office's or a ward block's lamp
+   * heads) keep the lamp switch: they burn all night, and a rhythm code would give one in ten the windows' TV blue.
+   */
+  const codeOf = (role: Role, x: number, y: number, z: number) =>
+    litCtx >= HOME ? (role === 'lamp' || role === 'lantern' ? lampSeed(x, z) : litCtx + 0.998 * hash(x + 17.3, y, z))
+      : litCtx !== 0 ? litCtx
+        : role === 'glassLit' ? HOME + 0.998 * hash(x + 17.3, y, z)
+          : role === 'lamp' || role === 'lantern' ? lampSeed(x, z)
+            : 0;
   /** A low-detail stand-in shown instead of a district tile's detail beyond its near distance (a building's box, a tree's crown). */
   function farShape(kind: Kind, color: ColorLike, x: number, y: number, z: number, sx: number, sy: number, sz: number, yaw = 0) {
     if (dry || !farBatches) return;
     const key = `${kind}|far`;
     let batch = farBatches.get(key);
-    if (!batch) { batch = { kind, role: 'solid', shadow: false, fine: false, m: new Floats(64), c: new Floats(12), big: [] }; farBatches.set(key, batch); }
+    if (!batch) { batch = { kind, role: 'solid', shadow: false, fine: false, m: new Floats(64), c: new Floats(12), l: new Floats(16), big: [] }; farBatches.set(key, batch); }
     rotation.set(0, yaw, 0);
     quaternion.setFromEuler(rotation);
     matrix.compose(position.set(x, y, z), quaternion, scale.set(sx, sy, sz));
     batch.m.pushFrom(matrix.elements, 0, 16);
     const col = toColor(color);
     batch.c.push3(col.r, col.g, col.b);
+    // Its windows' rhythm (district-render.ts building(): HOME, OFFICE or FLATS); anything else (a crown, a crane, a
+    // hull, a warehouse) shows none.
+    batch.l.push1(litCtx >= HOME ? litCtx : -1);
     batch.big.push(false);
   }
   const colorCache = new Map<string, THREE.Color>();
@@ -394,7 +454,7 @@ export function buildWorld(scene: THREE.Scene) {
     const layer = fine && !mergeFine;
     const key = mergeShadows ? `${kind}|${role}|m|${layer ? 1 : 0}` : `${kind}|${role}|${shadow ? 1 : 0}|${layer ? 1 : 0}`;
     let batch = batches.get(key);
-    if (!batch) { batch = { kind, role, shadow, fine: layer, m: new Floats(64), c: new Floats(12), big: [] }; batches.set(key, batch); }
+    if (!batch) { batch = { kind, role, shadow, fine: layer, m: new Floats(64), c: new Floats(12), l: new Floats(16), big: [] }; batches.set(key, batch); }
     else if (shadow && !batch.shadow) batch.shadow = true;
     rotation.set(0, yaw, tilt);
     quaternion.setFromEuler(rotation);
@@ -402,6 +462,7 @@ export function buildWorld(scene: THREE.Scene) {
     batch.m.pushFrom(matrix.elements, 0, 16);
     const col = toColor(color);
     batch.c.push3(col.r, col.g, col.b);
+    batch.l.push1(codeOf(role, x, y, z));
     batch.big.push(sx > 60 || sz > 60);
   }
   function box(color: ColorLike, x: number, y: number, z: number, w: number, h: number, d: number, yaw = 0, shadow = true, role: Role = 'solid') {
@@ -413,13 +474,17 @@ export function buildWorld(scene: THREE.Scene) {
   let cloths: Sink['cloths'] = { base: [], fine: [] };
   let cables: Sink['cables'] = { base: [], fine: [] };
   let emitters: Emitter[] = [];
-  /** Shop light pools on the pavement: where, how big, and the building whose hours switch it (-1: always). */
-  let shopPools: Sink['pools'] = [];
+  /** Light on the ground at night (lamp pools and halos, shop spill, bulbs) of the sink being drawn. */
+  let lights: Sink['lights'] = [];
   /** Today's world's sink (the variables above), kept to switch back to after a district tile. */
-  const legacySink: Sink = { batches, decals, cloths, cables, emitters, pools: shopPools };
+  const legacySink: Sink = { batches, decals, cloths, cables, emitters, lights };
+  /** The ground under a light: today's terrain, or a district tile's surface (districtLift; set while one is drawn). */
+  const legacyGround = (x: number, z: number) => groundHeight(x, z) + 0.035, districtGround = (x: number, z: number) => districtLift(x, z) + 0.135;
+  let groundAt = legacyGround;
   /** Routes every drawing call that follows into `s` (a district tile's sink, or legacySink). */
   function drawInto(s: Sink) {
-    batches = s.batches; decals = s.decals; cloths = s.cloths; cables = s.cables; emitters = s.emitters; shopPools = s.pools;
+    batches = s.batches; decals = s.decals; cloths = s.cloths; cables = s.cables; emitters = s.emitters; lights = s.lights;
+    groundAt = s === legacySink ? legacyGround : districtGround;
   }
   function decal(cell: DecalCell, x: number, y: number, z: number, w: number, h: number, yaw: number, opts: DecalOpts = {}) {
     if (dry) return;
@@ -430,10 +495,42 @@ export function buildWorld(scene: THREE.Scene) {
     ((opts.fine ?? fine) && !mergeFine ? cloths.fine : cloths.base).push({ x, y: y + lift, z, w, h, yaw, cell, mode: opts.mode, amp: opts.amp ?? 0.05, color: opts.tint ? toColor(opts.tint) : WHITE });
   }
   const smoke = (kind: SmokeKind, x: number, y: number, z: number) => { if (!dry) emitters.push({ kind, x, y: y + lift, z }); };
-  /** A light pool on the pavement (white shop light, or a venue's neon colour), switched by `shop`'s hours. */
-  const pool = (x: number, z: number, size: number, shop: number, color?: string) => { if (!dry) shopPools.push(color ? { x, z, size, shop, color } : { x, z, size, shop }); };
+  /** The code a light at (x, z) takes from the lit scope (a rhythm scope seeds it by position), else `fallback`. */
+  const lightCode = (x: number, z: number, fallback: number) => (litCtx >= HOME ? litCtx + 0.998 * hash(x + 17.3, 1.1, z) : litCtx !== 0 ? litCtx : fallback);
+  /**
+   * A pool of light on the pavement at night (Kit.pool): shop spill under the lit scope's code, else `shop`'s opening
+   * hours (-1: with the street lamps); its colour × strength, else the shop's kind of light.
+   */
+  const pool = (x: number, z: number, size: number, shop: number, color?: string, strength?: number) => {
+    if (dry) return;
+    const L = shop >= 0 ? buildingLight(shop) : null, look = FRONT_LIGHT[L?.kind ?? 'home'];
+    lights.push(makeLight(x, groundAt(x, z), z, size, 0, lightCode(x, z, L ? L.code : lampSeed(x, z)), color ?? (L ? look.pool : '#ffe2b8'), strength ?? (color ? 0.8 : L ? look.s : 0.7), '#000000', 0));
+  };
+  /**
+   * A lamp's or bulb's light (street-lights.ts tones): its pool on the ground under (x, z), Ø the tone's size × `scale`,
+   * and a halo at `headY` (world height of the head; the halo needs 0.5 m and more above the pool), under the lit scope's
+   * code, else the street-lamp switch seeded by (x, z) as its head is. `gain` scales the pool (0: a halo alone).
+   */
+  function light(tone: Tone, x: number, z: number, headY: number, scale = 1, gain = 1, groundY?: number, color?: string) {
+    if (dry) return;
+    const y = groundY ?? groundAt(x, z), code = lightCode(x, z, lampSeed(x, z));
+    if (!color) { lights.push(toneLight(tone, x, y, z, Math.max(0, headY - y), code, scale, gain)); return; }
+    const t = TONES[tone];
+    lights.push(makeLight(x, y, z, t.size * scale, Math.max(0, headY - y), code, color, t.strength * gain, color, t.haloStrength));
+  }
+  /**
+   * A street lamp's light (street-lights.ts aimedLight): the halo at its head (hx, hz) `headY` high, the pool thrown
+   * out over the road from the pole at (px, pz) and drawn out along the street; switched with its head (its seed).
+   */
+  function streetLamp(tone: Tone, px: number, pz: number, hx: number, hz: number, headY: number, scale = 1) {
+    if (dry) return;
+    const probe = aimedLight(tone, px, pz, hx, hz, 0, 0, 0, scale), y = groundAt(probe.x, probe.z);
+    lights.push(aimedLight(tone, px, pz, hx, hz, y, Math.max(0, headY - y), lightCode(hx, hz, lampSeed(hx, hz)), scale));
+  }
+  /** A sign's or tag's night glow: in a shop's scope, packed with its schedule (night.ts packGlow), else as given. */
+  const glowOf = (strength: number) => (litCtx >= 1 && litCtx < OPEN_SLOTS && strength > 0 ? packGlow(strength, litCtx) : strength);
   function tag(style: TagStyle, text: string, fg: string, bg: string, x: number, y: number, z: number, w: number, h: number, yaw: number, glow = 0) {
-    signs.tag(style, text, fg, bg, x, y + lift, z, w, h, yaw, glow);
+    signs.tag(style, text, fg, bg, x, y + lift, z, w, h, yaw, glowOf(glow));
   }
   /** Local frame of a building or prop: lx along its front, lz towards its front. */
   function frame(x: number, z: number, facing: number): Frame {
@@ -451,7 +548,7 @@ export function buildWorld(scene: THREE.Scene) {
       cloth: (cell, lx, ly, lz, w, h, opts) => cloth(cell, wx(lx, lz), ly, wz(lx, lz), w, h, facing + (opts.yaw ?? 0), opts),
       smoke: (kind, lx, ly, lz) => smoke(kind, wx(lx, lz), ly, wz(lx, lz)),
       tag: (style, text, fg, bg, lx, ly, lz, w, h, opts = {}) => tag(style, text, fg, bg, wx(lx, lz), ly, wz(lx, lz), w, h, facing + (opts.yaw ?? 0), opts.glow ?? 0),
-      pool: (lx, lz, size, shop) => pool(wx(lx, lz), wz(lx, lz), size, shop),
+      pool: (lx, lz, size, shop, color, strength) => pool(wx(lx, lz), wz(lx, lz), size, shop, color, strength),
     };
   }
   const glassRole = (x: number, y: number, z: number): Role => (hash(x, y, z) < 0.55 ? 'glassLit' : 'glass');
@@ -466,8 +563,9 @@ export function buildWorld(scene: THREE.Scene) {
   const legacySigns = createSigns();
   /** Where sign(), plate() and tag() go: today's signs, the districts' sign pass, or nowhere (a district tile's real pass). */
   let signs: SignWriter = legacySigns;
+  /** A sign board; in a shop's lit scope its night glow follows the shop's hours (0.6, nearly dark while it is closed). */
   function sign(text: string, subtitle: string, color: string, x: number, y: number, z: number, w: number, h: number, yaw = 0, background = '#f3e4c7') {
-    signs.sign(text, subtitle, color, x, y, z, w, h, yaw, background);
+    signs.sign(text, subtitle, color, x, y, z, w, h, yaw, background, litCtx >= 1 && litCtx < OPEN_SLOTS ? packGlow(0.6, litCtx) : 0.5);
   }
   function plate(n: number, x: number, y: number, z: number, yaw: number) {
     signs.plate(n, x, y, z, yaw);
@@ -645,6 +743,8 @@ export function buildWorld(scene: THREE.Scene) {
   }
 
   // ---- Buildings ----
+  /** Fixed schedules (night-hours.ts): all night, an office lobby's 6:00–22:30. */
+  const allNight = scheduleIndex(ALL_NIGHT), officeLobby = scheduleIndex(OFFICE_LOBBY_HOURS);
   function localRect(r: Rect, x: number, z: number, facing: number) {
     const c = Math.cos(facing), s = Math.sin(facing);
     const p = [[r.minX, r.minZ], [r.maxX, r.maxZ]].map(([wx, wz]) => [(wx - x) * c - (wz - z) * s, (wx - x) * s + (wz - z) * c]);
@@ -671,6 +771,8 @@ export function buildWorld(scene: THREE.Scene) {
     const q = seeded(index * 131 + 17);
     const g = localRect(p.ground, x, z, facing);
     const AH = 3.2;
+    /** When its shop parts are lit (the counter's hours: Cà phê Cô Ba 6:00–22:30), night plan §6.2. */
+    const L = buildingLight(b.id);
     const cuts = { front: g.z1 < front - 0.05, back: g.z0 > -front + 0.05, left: g.x0 > -w / 2 + 0.05, right: g.x1 < w / 2 - 0.05 };
     const cut = cuts.front || cuts.back || cuts.left || cuts.right;
     const gw = g.x1 - g.x0, gd = g.z1 - g.z0, gx = (g.x0 + g.x1) / 2, gz = (g.z0 + g.z1) / 2;
@@ -682,7 +784,11 @@ export function buildWorld(scene: THREE.Scene) {
       // Beams under the overhang and a warm light for the covered walkway.
       if (cuts.front) {
         for (let k = -w / 2 + 0.4; k <= w / 2 - 0.3; k += 2.4) part(k, AH - 0.2, (g.z1 + front) / 2, 0.16, 0.4, front - g.z1, '#e7d9bd');
-        part(0, AH - 0.05, (g.z1 + front) / 2, 0.5, 0.06, 0.3, '#fff1c9', 'lamp', false);
+        lit(L.code, () => {
+          part(0, AH - 0.05, (g.z1 + front) / 2, 0.5, 0.06, 0.3, '#fff1c9', 'lamp', false);
+          const lp = at(0, (g.z1 + front) / 2);
+          light('warm', lp.x, lp.z, AH - 0.05, 5 / TONES.warm.size);
+        });
       }
       if (cuts.back) for (let k = -w / 2 + 0.4; k <= w / 2 - 0.3; k += 2.4) part(k, AH - 0.2, (g.z0 - front) / 2, 0.16, 0.4, g.z0 + front, '#e7d9bd');
       for (const [on, edge, outer] of [[cuts.left, g.x0, -w / 2], [cuts.right, g.x1, w / 2]] as const) {
@@ -690,6 +796,8 @@ export function buildWorld(scene: THREE.Scene) {
         const width = Math.abs(outer - edge), mid = (outer + edge) / 2;
         for (let k = -front + 0.5; k <= front - 0.4; k += 2.4) part(mid, AH - 0.2, k, width, 0.4, 0.16, '#e7d9bd');
         part(mid, AH - 0.05, 0, 0.3, 0.06, 0.5, '#fff1c9', 'lamp', false);
+        const lp = at(mid, 0);
+        light('warm', lp.x, lp.z, AH - 0.05, 5 / TONES.warm.size);
       }
     }
     part(gx, 0.25, gz, gw + 0.12, 0.5, gd + 0.1, '#d1bea5');
@@ -701,13 +809,24 @@ export function buildWorld(scene: THREE.Scene) {
     // Shop entrance and folding shutters on the ground floor.
     const gf = g.z1;
     part(gx, 1.8, gf + 0.035, gw - 0.9, 3.25, 0.12, '#365d57');
-    part(gx - gw * 0.22, 1.8, gf + 0.13, gw * 0.27, 2.8, 0.06, '#7caaa1');
-    part(gx + gw * 0.16, 1.8, gf + 0.13, gw * 0.32, 2.8, 0.06, '#90b5a8');
+    // The door panels are glass: teal by day, the shop's warm light behind them while it is open (A11); a frame
+    // round their panes.
+    lit(L.code, () => {
+      part(gx - gw * 0.22, 1.8, gf + 0.13, gw * 0.27, 2.8, 0.06, '#7caaa1', 'glassLit', false);
+      part(gx + gw * 0.16, 1.8, gf + 0.13, gw * 0.32, 2.8, 0.06, '#90b5a8', 'glassLit', false);
+    });
+    for (const [cx, pw] of [[gx - gw * 0.22, gw * 0.27], [gx + gw * 0.16, gw * 0.32]]) {
+      for (const y of [1.05, 2.2]) part(cx, y, gf + 0.17, pw, 0.05, 0.03, '#3d6660', 'solid', false);
+      part(cx, 1.8, gf + 0.17, 0.045, 2.8, 0.03, '#3d6660', 'solid', false);
+    }
     part(gx, 1.8, gf + 0.2, 0.12, 3.1, 0.08, '#e7d9bd');
     part(gx - gw * 0.09, 1.6, gf + 0.26, 0.08, 0.45, 0.08, '#e7d9bd');
-    // A fluorescent tube over the entrance and its light on the pavement after dark.
-    part(gx, 3.05, gf + 0.3, 1.2, 0.05, 0.1, '#eef8ff', 'tube', false);
-    { const pp = at(gx, gf + 2.4); pool(pp.x, pp.z, 4.6, b.id); }
+    // A fluorescent tube over the entrance and its light on the pavement after dark (the shop's hours).
+    lit(L.code, () => {
+      part(gx, 3.05, gf + 0.3, 1.2, 0.05, 0.1, '#eef8ff', 'tube', false);
+      const pp = at(gx, gf + 2.4);
+      pool(pp.x, pp.z, 5.2, b.id);
+    });
     const balconies = index % 3 !== 1;
     const spot = signSpot(p);
     for (let floor = 5.2; floor < h - 0.8; floor += 3.2) {
@@ -740,8 +859,11 @@ export function buildWorld(scene: THREE.Scene) {
     }
     if (!spot.balcony) part(0, spot.y, front + 0.23, w - 0.45, 1.25, 0.22, '#e7d9bd');
     else part(0, spot.y, spot.lz - 0.13, spot.w + 0.2, spot.h + 0.15, 0.06, '#e7d9bd');
-    { const sp = at(0, spot.lz); sign(b.name, b.subtitle, p.signColor, sp.x, spot.y, sp.z, spot.w, spot.h, facing); }
-    if (!VENUE_OF.has(b.id) && q() < 0.3) ledBorder(F, 0, spot.y, spot.lz + 0.02, spot.w + 0.2, spot.h + 0.15, pickOf(q, LED_COLORS));
+    lit(L.code, () => {
+      const sp = at(0, spot.lz);
+      sign(b.name, b.subtitle, p.signColor, sp.x, spot.y, sp.z, spot.w, spot.h, facing);
+      if (!VENUE_OF.has(b.id) && q() < 0.3) ledBorder(F, 0, spot.y, spot.lz + 0.02, spot.w + 0.2, spot.h + 0.15, pickOf(q, LED_COLORS));
+    });
     if (!cuts.front) {
       // Segmented striped shop canopy.
       for (let aw = 0; aw < 8; aw++) {
@@ -753,7 +875,7 @@ export function buildWorld(scene: THREE.Scene) {
     // A light box beside the shop sign, the national flag, and the roof: tiles, a stair hut, the inox tank.
     const look = FRONT_OF[counterKeyOf(b) ?? ''];
     const flagSide = q() < 0.5 ? -1 : 1;
-    if (look) verticalSign(F, look[1], -flagSide * (w / 2 - 0.35), Math.min(h - 1.0, spot.balcony ? 6.0 : 5.6), front, ...pickOf(q, LIGHT_BOXES));
+    if (look) lit(L.code, () => verticalSign(F, look[1], -flagSide * (w / 2 - 0.35), Math.min(h - 1.0, spot.balcony ? 6.0 : 5.6), front, ...pickOf(q, LIGHT_BOXES)));
     if (q() < 0.6) houseFlag(F, flagSide * (w / 2 - 0.7), front + 0.15, balconies ? 5.6 : 4.9);
     rooftop(F, q, { lx: 0, w: w - 0.3, d: d - 0.6, front: front - 0.3, floor: h + 0.37, wall: color, trim: '#e7d9bd' }, setFine);
     if (q() < 0.25) maiThai(F, 0, w + 0.2, h + 0.2, front + 0.1, pickOf(q, ROOF_TILES));
@@ -764,15 +886,17 @@ export function buildWorld(scene: THREE.Scene) {
       const wallZ = e.z < 0 ? p.ground.minZ : e.z > 0 ? p.ground.maxZ : b.door.z;
       const side = frame(e.x ? wallX : b.door.x, e.z ? wallZ : b.door.z, b.facing);
       side.part(0, 1.6, 0.04, 3.4, 3.0, 0.12, '#365d57');
-      side.part(-0.8, 1.4, 0.1, 1.4, 2.5, 0.06, '#527a73', 'glassLit', false);
-      side.part(0.8, 1.4, 0.1, 1.4, 2.5, 0.06, '#527a73', 'glassLit', false);
+      lit(L.code, () => {
+        side.part(-0.8, 1.4, 0.1, 1.4, 2.5, 0.06, '#527a73', 'glassLit', false);
+        side.part(0.8, 1.4, 0.1, 1.4, 2.5, 0.06, '#527a73', 'glassLit', false);
+      });
       const sy = Math.min(h - 0.65, 3.8);
       const fx = e.x < 0 ? p.full.minX : e.x > 0 ? p.full.maxX : b.door.x;
       const fz = e.z < 0 ? p.full.minZ : e.z > 0 ? p.full.maxZ : b.door.z;
       const signAt = frame(e.x ? fx : x, e.z ? fz : z, b.facing);
       const pos = signAt.at(0, 0.36);
       signAt.part(0, sy, 0.23, Math.min(b.w, 9.4), 1.25, 0.22, '#e7d9bd');
-      sign(b.name, b.subtitle, p.signColor, pos.x, sy, pos.z, Math.min(b.w, 9.4) - 0.3, 1.1, b.facing);
+      lit(L.code, () => sign(b.name, b.subtitle, p.signColor, pos.x, sy, pos.z, Math.min(b.w, 9.4) - 0.3, 1.1, b.facing));
     }
   }
 
@@ -793,7 +917,11 @@ export function buildWorld(scene: THREE.Scene) {
     const doorX = THREE.MathUtils.clamp(local(b.door.x, b.door.z).x, -w / 2 + 1, w / 2 - 1);
     const venue = VENUE_OF.get(b.id);
     const shopFront = p.style === 'shop' || b.kind === 'food' || !!venue;
-    const look = venue ? (venue.kind === 'beer' ? FRONT_OF.biahoi : undefined) : FRONT_OF[counterKeyOf(b) ?? ''];
+    const legacyLook = venue ? (venue.kind === 'beer' ? FRONT_OF.biahoi : undefined) : FRONT_OF[counterKeyOf(b) ?? ''];
+    // When its shop parts are lit (the counter's or the venue's hours); a district business's front shows what its
+    // counter sells (night plan A2) instead of the food fallback, and carries no light box of ours (the generator's).
+    const L = buildingLight(b.id);
+    const look: readonly [FrontKind, string | null] | undefined = legacyLook ?? (isDistrictPlot(p) && !venue && L.kind ? [L.kind, L.words] : undefined);
     const floors = Math.max(2, Math.round((h - 0.6) / 3.2));
     const iron = pickOf(q, IRON);
     // Bays: the door bay, and on a wide home a neighbour bay (42-58 % of the width, the door well inside its own).
@@ -817,8 +945,14 @@ export function buildWorld(scene: THREE.Scene) {
       // ---- Ground floor ----
       if (bay.open) {
         const kind: FrontKind = bay.door && look ? look[0] : shopFront ? 'food' : 'home';
+        const before: FrontKind = bay.door && legacyLook ? legacyLook[0] : shopFront ? 'food' : 'home';
         const counter = bay.door && COUNTERED.has(b.id);
-        openFront(F, q, { lx, w: bw, h: bh, d, front, wall: bay.wall, kind, shop: bay.door && look ? b.id : -1, drum: !counter, maxOpening: counter ? Math.min(b.w - 0.7, 9) - 0.1 : undefined, fine: setFine });
+        // A front of a new kind draws from a stream of its own, and the house's skips what the old front took, so
+        // nothing drawn after it on the building moves.
+        let fr = q;
+        if (kind !== before) { fr = seeded(p.seed * 13 + 5); for (let k = frontDraws(before); k > 0; k--) q(); }
+        // A business's front is lit by its hours; a family's room behind its folding gate by the home rhythm.
+        lit(bay.door && shopFront ? L.code : HOME, () => openFront(F, fr, { lx, w: bw, h: bh, d, front, wall: bay.wall, kind, shop: bay.door && look ? b.id : -1, drum: !counter, maxOpening: counter ? Math.min(b.w - 0.7, 9) - 0.1 : undefined, fine: setFine }));
       } else {
         part(lx, bh / 2, 0, bw, bh, d, bay.wall, 'wall');
         if (bay.door) {
@@ -861,8 +995,10 @@ export function buildWorld(scene: THREE.Scene) {
         // The shop sign over the opening; the first floor above it keeps clear (no balcony there).
         const pos = at(0, front + 0.25);
         part(0, 4.05, front + 0.12, w - 0.4, 1.3, 0.2, '#e7d9bd');
-        sign(b.name, b.subtitle, p.signColor, pos.x, 4.05, pos.z, w - 0.6, 1.1, p.facing);
-        if (!venue && q() < 0.3) ledBorder(F, 0, 4.05, front + 0.24, w - 0.4, 1.3, pickOf(q, LED_COLORS));
+        lit(L.code, () => {
+          sign(b.name, b.subtitle, p.signColor, pos.x, 4.05, pos.z, w - 0.6, 1.1, p.facing);
+          if (!venue && q() < 0.3) ledBorder(F, 0, 4.05, front + 0.24, w - 0.4, 1.3, pickOf(q, LED_COLORS));
+        });
       }
       // ---- Upper floors ----
       const bf = Math.max(2, Math.round((bh - 0.6) / 3.2));
@@ -942,10 +1078,13 @@ export function buildWorld(scene: THREE.Scene) {
     // The national flag from the first floor, and a light box beside the shop sign.
     const flagSide = doorX > 0 ? -1 : 1;
     if (q() < 0.6) houseFlag(F, flagSide * (w / 2 - 0.7), front + 0.12, signed ? 5.5 : 4.7);
-    if (shopFront && look) verticalSign(F, look[1], -flagSide * (w / 2 - 0.35), Math.min(h - 1.0, signed ? 5.75 : 4.6), front, ...pickOf(q, LIGHT_BOXES));
+    const words = look?.[1];
+    if (shopFront && words) lit(L.code, () => verticalSign(F, words, -flagSide * (w / 2 - 0.35), Math.min(h - 1.0, signed ? 5.75 : 4.6), front, ...pickOf(q, LIGHT_BOXES)));
   }
 
-  function hospitalBuilding(p: Plot, b: Building) {
+  /** A hospital's wards keep the flats' hours; its entrance and canopy are lit all night. */
+  function hospitalBuilding(p: Plot, b: Building) { lit(FLATS, () => hospitalBody(p, b)); }
+  function hospitalBody(p: Plot, b: Building) {
     const { x, z, w, d } = dims(p);
     const h = p.h, front = d / 2;
     const { part, at } = frame(x, z, p.facing);
@@ -953,13 +1092,19 @@ export function buildWorld(scene: THREE.Scene) {
     part(0, 0.25, 0, w + 0.2, 0.5, d + 0.2, '#cfd3cc');
     part(0, h + 0.3, 0, w + 0.4, 0.6, d + 0.4, '#dfe3dc');
     // Entrance hall, canopy and sign band.
-    part(0, 1.7, front + 0.05, 8.4, 3.2, 0.1, '#527a73', 'glassLit', false);
-    part(0, 1.7, front + 0.1, 0.12, 3.2, 0.06, '#d9ddd6');
-    part(0, 3.75, front + 2.1, 10, 0.32, 4.2, '#f6f6f2');
-    part(0, 3.95, front + 4.15, 10, 0.35, 0.12, '#2f8f83');
-    for (const k of [-3, 0, 3]) part(k, 3.56, front + 2.1, 0.6, 0.06, 0.6, '#fff4d8', 'lamp', false);
-    const signPos = at(0, front + 0.06);
-    sign(b.name, b.subtitle, p.signColor, signPos.x, 5.0, signPos.z, 15, 1.8, p.facing, '#ffffff');
+    lit(allNight, () => {
+      part(0, 1.7, front + 0.05, 8.4, 3.2, 0.1, '#527a73', 'glassLit', false);
+      part(0, 1.7, front + 0.1, 0.12, 3.2, 0.06, '#d9ddd6');
+      part(0, 3.75, front + 2.1, 10, 0.32, 4.2, '#f6f6f2');
+      part(0, 3.95, front + 4.15, 10, 0.35, 0.12, '#2f8f83');
+      for (const k of [-3, 0, 3]) {
+        part(k, 3.56, front + 2.1, 0.6, 0.06, 0.6, '#fff4d8', 'lamp', false);
+        const lp = at(k, front + 2.1);
+        light('park', lp.x, lp.z, 3.56, 0.7, 0.8);
+      }
+      const signPos = at(0, front + 0.06);
+      sign(b.name, b.subtitle, p.signColor, signPos.x, 5.0, signPos.z, 15, 1.8, p.facing, '#ffffff');
+    });
     for (let k = 0; k < 3; k++) {
       const y = 7.4 + k * 2.6;
       for (let i = 0; i < 7; i++) {
@@ -985,7 +1130,9 @@ export function buildWorld(scene: THREE.Scene) {
     for (const k of [-8, 8]) part(k, h + 1.0, -2, 3, 1.4, 2.4, '#c9cfcb');
   }
 
-  function policeStation(p: Plot, b: Building) {
+  /** A police station's office windows keep office hours; its front is lit all night. */
+  function policeStation(p: Plot, b: Building) { lit(OFFICE, () => policeBody(p, b)); }
+  function policeBody(p: Plot, b: Building) {
     const { x, z, w, d } = dims(p);
     const h = p.h, front = d / 2;
     const { part, at, solid } = frame(x, z, p.facing);
@@ -993,11 +1140,15 @@ export function buildWorld(scene: THREE.Scene) {
     part(0, 0.3, 0, w + 0.2, 0.6, d + 0.2, '#c9b28a');
     part(0, h + 0.25, 0, w + 0.4, 0.5, d + 0.4, '#f4ecd6');
     for (const k of [-1, 1]) part(k * (w / 2 - 0.3), h / 2, front + 0.1, 0.6, h, 0.2, '#f4ecd6');
-    part(0, 1.6, front + 0.05, 4.2, 3.0, 0.1, '#527a73', 'glassLit', false);
-    part(0, 3.55, front + 1.6, 7, 0.3, 3.2, '#f4ecd6');
-    part(0, 3.4, front + 1.6, 0.6, 0.06, 0.6, '#fff4d8', 'lamp', false);
-    const signPos = at(0, front + 0.08);
-    sign(b.name, b.subtitle, '#ffd75e', signPos.x, 4.55, signPos.z, 11, 1.5, p.facing, '#a8322a');
+    lit(allNight, () => {
+      part(0, 1.6, front + 0.05, 4.2, 3.0, 0.1, '#527a73', 'glassLit', false);
+      part(0, 3.55, front + 1.6, 7, 0.3, 3.2, '#f4ecd6');
+      part(0, 3.4, front + 1.6, 0.6, 0.06, 0.6, '#fff4d8', 'lamp', false);
+      const lp = at(0, front + 1.6);
+      light('park', lp.x, lp.z, 3.4, 0.8, 0.8);
+      const signPos = at(0, front + 0.08);
+      sign(b.name, b.subtitle, '#ffd75e', signPos.x, 4.55, signPos.z, 11, 1.5, p.facing, '#a8322a');
+    });
     for (let k = 0; k < 3; k++) {
       const y = k === 0 ? 1.8 : 3.1 * k + 3.2;
       for (let i = 0; i < 6; i++) {
@@ -1020,7 +1171,9 @@ export function buildWorld(scene: THREE.Scene) {
     flag.cloth(CLOTH.flag, 0.87, h + 4.45, 0, 1.65, 1.1, { mode: 0, amp: 0.1 });
   }
 
-  function schoolBuilding(p: Plot, b: Building) {
+  /** A school is dark at night (no rhythm for a school: its windows are never lit). */
+  function schoolBuilding(p: Plot, b: Building) { lit(-1, () => schoolBody(p, b)); }
+  function schoolBody(p: Plot, b: Building) {
     const { x, z, w, d } = dims(p);
     const h = p.h, front = d / 2;
     const { part, at, solid } = frame(x, z, p.facing);
@@ -1101,14 +1254,22 @@ export function buildWorld(scene: THREE.Scene) {
     }
   }
 
-  function officeBuilding(p: Plot, b: Building) {
+  /** An office keeps office hours: its lobby and canopy are lit 6:00–22:30, its windows by the office rhythm. */
+  function officeBuilding(p: Plot, b: Building) { lit(OFFICE, () => officeBody(p, b)); }
+  function officeBody(p: Plot, b: Building) {
     const { x, z, w, d } = dims(p);
     const h = p.h, front = d / 2;
     const { part, at } = frame(x, z, p.facing);
     part(0, h / 2, 0, w, h, d, '#c9d4d6', 'wall');
-    part(0, 2.2, front + 0.06, w - 1, 4.2, 0.1, '#5f8a8f', 'glassLit', false);
-    part(0, 4.6, front + 2.0, 12, 0.35, 4.0, '#e4e9ea');
-    for (const k of [-4, 0, 4]) part(k, 4.4, front + 2.0, 0.6, 0.06, 0.6, '#fff4d8', 'lamp', false);
+    lit(officeLobby, () => {
+      part(0, 2.2, front + 0.06, w - 1, 4.2, 0.1, '#5f8a8f', 'glassLit', false);
+      part(0, 4.6, front + 2.0, 12, 0.35, 4.0, '#e4e9ea');
+      for (const k of [-4, 0, 4]) {
+        part(k, 4.4, front + 2.0, 0.6, 0.06, 0.6, '#fff4d8', 'lamp', false);
+        const lp = at(k, front + 2.0);
+        light('park', lp.x, lp.z, 4.4, 0.75, 0.8);
+      }
+    });
     const signPos = at(0, front + 4.02);
     sign(b.name, b.subtitle, p.signColor, signPos.x, 5.35, signPos.z, 10, 1.3, p.facing, '#f4f7f8');
     for (let y = 6.2; y < h - 1; y += 3.4) {
@@ -1141,7 +1302,7 @@ export function buildWorld(scene: THREE.Scene) {
     for (let k = 0; k < 5; k++) part(-w / 2 + (k + 0.5) * w / 5, 2.75, front + 0.6, w / 5, 0.12, 1.4, k % 2 ? '#f3e6ca' : '#3e7a3a');
     part(0, 2.75, -0.2, w + 0.3, 0.2, d + 0.2, '#e7d9bd');
     const pos = at(0, front + 0.06);
-    sign(b.name, b.subtitle, p.signColor, pos.x, 3.35, pos.z, w - 0.2, 0.8, p.facing);
+    lit(buildingLight(b.id).code, () => sign(b.name, b.subtitle, p.signColor, pos.x, 3.35, pos.z, w - 0.2, 0.8, p.facing));
     for (let k = 0; k < 6; k++) {
       const sp = at(w / 2 + 0.25, -0.8 + k * 0.3);
       shape('cylinder', '#8fae5c', sp.x, 1.2, sp.z, 0.05, 2.4, 0.05, 0, (k - 2.5) * 0.04, false);
@@ -1161,7 +1322,7 @@ export function buildWorld(scene: THREE.Scene) {
     else if (p.style === 'tower' || p.style === 'midrise') downtown.push({ plot: p, building: b });
     else newHouse(p, b);
   });
-  const skyline = buildSkyline({ root, materials, geometries, textures, shape, sign, frame, fine: setFine }, downtown, { hazeEast: !isWired('quan-4'), hazeNorth: !isWired('thu-thiem') });
+  const skyline = buildSkyline({ root, materials, geometries, textures, shape, sign, frame, fine: setFine, lit }, downtown, { hazeEast: !isWired('quan-4'), hazeNorth: !isWired('thu-thiem') });
   {
     // The walking-street plaza: pale granite in a grid, and the city park's lawn with gravel paths.
     const { plaza, cityPark: park } = SCENERY;
@@ -1360,52 +1521,29 @@ export function buildWorld(scene: THREE.Scene) {
   });
   lift = 0;
 
-  // ---- Street lamps and their night-time light pools. ----
+  // ---- Street lamps and their night-time light: warm sodium on the old streets, white LED downtown, globes in the
+  // parks and on the promenade (street-lights.ts tones). Each head switches on at its own moment between 17:45 and
+  // 18:15 with its pool and halo (the same seed, from the head's position). ----
   for (const [i, l] of SCENERY.lamps.entries()) {
     if (LEGACY_HIDDEN.lamps.has(i)) continue;
     lift = onPavement(l.x, l.z);
+    const tone = legacyTone(l.kind, l.hx, DOWNTOWN_X), head = TONES[tone].head;
     if (l.kind === 'street') {
       shape('cylinder', '#586c65', l.x, 3.2, l.z, 0.075, 6.4, 0.075);
       const yaw = Math.atan2(l.hx - l.x, l.hz - l.z);
       const len = Math.hypot(l.hx - l.x, l.hz - l.z);
       box('#586c65', (l.x + l.hx) / 2 + (l.hx - l.x) * 0.05, 6.35, (l.z + l.hz) / 2 + (l.hz - l.z) * 0.05, 0.13, 0.13, len + 0.15, yaw);
-      box('#e9d8a7', l.hx, 6.25, l.hz, 0.35, 0.12, 0.65, yaw, false, 'lamp');
+      box(head, l.hx, HEAD.street, l.hz, 0.35, 0.12, 0.65, yaw, false, 'lamp');
+      streetLamp(tone, l.x, l.z, l.hx, l.hz, HEAD.street + lift);
     } else {
       shape('cylinder', '#3f5a52', l.x, 1.9, l.z, 0.07, 3.8, 0.07);
       shape('cylinder', '#3f5a52', l.x, 0.15, l.z, 0.2, 0.3, 0.2);
-      shape('ball', '#fff3d2', l.x, 3.95, l.z, 0.32, 0.36, 0.32, 0, 0, false, 'lamp');
+      shape('ball', head, l.x, HEAD.post, l.z, 0.32, 0.36, 0.32, 0, 0, false, 'lamp');
       shape('cone', '#3f5a52', l.x, 4.38, l.z, 0.36, 0.25, 0.36);
+      light(tone, l.x, l.z, HEAD.post + lift);
     }
   }
   lift = 0;
-  const poolCanvas = document.createElement('canvas');
-  poolCanvas.width = poolCanvas.height = 64;
-  {
-    const ctx = poolCanvas.getContext('2d')!;
-    const gradient = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
-    gradient.addColorStop(0, 'rgba(255,255,255,1)');
-    gradient.addColorStop(0.45, 'rgba(255,255,255,0.45)');
-    gradient.addColorStop(1, 'rgba(255,255,255,0)');
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, 64, 64);
-  }
-  const poolTexture = new THREE.CanvasTexture(poolCanvas);
-  textures.push(poolTexture);
-  const poolGeometry = new THREE.PlaneGeometry(1, 1).rotateX(-HALF_PI);
-  const poolMaterial = new THREE.MeshBasicMaterial({ map: poolTexture, color: '#ffc477', transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false, toneMapped: false });
-  geometries.push(poolGeometry);
-  materials.push(poolMaterial);
-  const pools = new THREE.InstancedMesh(poolGeometry, poolMaterial, LAMPS.length);
-  SCENERY.lamps.forEach((l, i) => {
-    const size = LEGACY_HIDDEN.lamps.has(i) ? 0 : l.kind === 'street' ? 10.5 : 6.5;
-    matrix.compose(position.set(l.hx, groundHeight(l.hx, l.hz) + 0.035, l.hz), quaternion.identity(), scale.set(size, 1, size));
-    pools.setMatrixAt(i, matrix);
-  });
-  pools.instanceMatrix.needsUpdate = true;
-  pools.computeBoundingSphere();
-  pools.visible = false;
-  pools.renderOrder = 2;
-  root.add(pools);
 
   // ---- Traffic lights: a pole at the near right-hand corner of each approach, an arm over the lane with a
   // signal head, and a second head low on the pole. The lenses are one instanced mesh recoloured as they change.
@@ -1451,6 +1589,9 @@ export function buildWorld(scene: THREE.Scene) {
   });
   lenses.computeBoundingSphere();
   root.add(lenses);
+  /** The glow round lit signal lenses at night (street-lights.ts), each a child of its lens mesh. */
+  const halos = new Set<THREE.InstancedMesh>();
+  { const h = addLensHalos(lenses, haloMaterial); if (h) halos.add(h); }
   const shown: (Light | 'off')[] = APPROACHES.map(() => 'off');
   /** Lights each approach's lenses for the current phase (dark when the power is out). */
   function updateSignals(time: number) {
@@ -1470,8 +1611,7 @@ export function buildWorld(scene: THREE.Scene) {
 
   // ---- The nightlife strip ("phố đèn đỏ"): banners across the road at both ends, strings of red lanterns,
   // neon frames on every venue's sign, canopy and door, "18+" badges, and coloured light pools at night. ----
-  const neonPools: { x: number; z: number; color: string; size: number }[] = [];
-  for (const v of VENUES) {
+  for (const v of VENUES) lit(scheduleIndex(VENUE_HOURS[v.kind as VenueRoom] ?? COUNTERS.biahoi.hours), () => {
     const b = v.building, f = b.facing, s = Math.sin(f), c = Math.cos(f);
     const front = b.d / 2;
     const at = (lx: number, lz: number) => ({ x: b.x + lx * c + lz * s, z: b.z - lx * s + lz * c });
@@ -1496,15 +1636,15 @@ export function buildWorld(scene: THREE.Scene) {
       sign('18+', 'NGƯỜI LỚN', '#ffffff', badge.x, sy + half + 0.4, badge.z, 0.9, 0.5, f, v.neon);
     }
     const glow = at(doorLx, front + 1.6);
-    neonPools.push({ x: glow.x, z: glow.z, color: v.neon, size: 5.5 });
-  }
+    pool(glow.x, glow.z, 5.5, -1, v.neon, 0.9);
+  });
   const STRIP_Z = 54;
   // Banners across the road, hung between the facades at each end of the strip.
   for (const bx of [63, 94]) {
     box('#22121c', bx, 6.6, STRIP_Z + 4, 0.25, 0.9, 20.6, 0, false);
     sign('PHỐ ĐÊM PHƯỢNG VĨ', 'ẨM THỰC • BIA • KARAOKE • ÂM NHẠC', '#ff4f8b', bx - 0.14, 6.6, STRIP_Z + 4, 9.5, 1.4, -HALF_PI, '#1a0b16');
     sign('PHỐ ĐÊM PHƯỢNG VĨ', 'ẨM THỰC • BIA • KARAOKE • ÂM NHẠC', '#ff4f8b', bx + 0.14, 6.6, STRIP_Z + 4, 9.5, 1.4, HALF_PI, '#1a0b16');
-    for (const dy of [-0.5, 0.5]) for (const dx of [-0.16, 0.16]) box('#ff3d7f', bx + dx, 6.6 + dy, STRIP_Z + 4, 0.06, 0.06, 20.4, 0, false, 'neon');
+    lit(scheduleIndex(VENUE_HOURS.bar), () => { for (const dy of [-0.5, 0.5]) for (const dx of [-0.16, 0.16]) box('#ff3d7f', bx + dx, 6.6 + dy, STRIP_Z + 4, 0.06, 0.06, 20.4, 0, false, 'neon'); });
   }
   // Strings of lanterns sagging across the road between the banners.
   for (let lx = 68; lx <= 90; lx += 5.5) {
@@ -1514,24 +1654,12 @@ export function buildWorld(scene: THREE.Scene) {
       shape('ball', t * 12 % 2 < 1 ? '#d8402c' : '#ff4f8b', lx, ly, lz, 0.2, 0.26, 0.2, 0, 0, false, 'lantern');
     }
   }
-  const neonPoolMaterial = new THREE.MeshBasicMaterial({ map: poolTexture, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false, toneMapped: false });
-  materials.push(neonPoolMaterial);
-  const neonPoolMesh = new THREE.InstancedMesh(poolGeometry, neonPoolMaterial, neonPools.length);
-  neonPools.forEach((pool, i) => {
-    matrix.compose(position.set(pool.x, groundHeight(pool.x, pool.z) + 0.04, pool.z), quaternion.identity(), scale.set(pool.size, 1, pool.size));
-    neonPoolMesh.setMatrixAt(i, matrix);
-    neonPoolMesh.setColorAt(i, tmpColor.set(pool.color));
-  });
-  neonPoolMesh.instanceMatrix.needsUpdate = true;
-  if (neonPoolMesh.instanceColor) neonPoolMesh.instanceColor.needsUpdate = true;
-  neonPoolMesh.computeBoundingSphere();
-  neonPoolMesh.visible = false;
-  neonPoolMesh.renderOrder = 2;
-  root.add(neonPoolMesh);
 
   // ---- Solid props from the layout. ----
   /** What each food cart sells (counters.ts places), so the cart shows that dish. */
   const cartKeys = new Map(PLACES.filter((p) => p.id.startsWith('cart')).map((p) => [Number(p.id.slice(4)), p.key]));
+  /** The vé số seller's light box is lit while the tickets sell (6:00–21:00). */
+  const lotteryCode = scheduleIndex(LOTTERY_HOURS);
   function prop(pr: Prop, index: number) {
     const F = frame(pr.x, pr.z, pr.yaw);
     const { part, at, solid } = F;
@@ -1601,6 +1729,7 @@ export function buildWorld(scene: THREE.Scene) {
         for (const sx of [-2.15, 2.15]) part(sx, 1.35, 0, 0.12, 2.7, 0.14, '#3f5a6a');
         part(0, 2.75, 0.95, 4.7, 0.12, 2.3, '#3f6f9a');
         part(0, 2.66, 0.95, 0.4, 0.05, 1.4, '#fff4d8', 'lamp', false);
+        { const lp = at(0, 0.95); light('park', lp.x, lp.z, 2.66 + lift, 5 / TONES.park.size); }
         bench(at(0, 1.15).x, at(0, 1.15).z, pr.yaw);
         const sp = at(0, 2.12);
         // Line 03 loops An Hòa only; 08 and 15 also call at the Bạch Đằng shelter downtown (transit.ts LINE_SPECS).
@@ -1621,7 +1750,14 @@ export function buildWorld(scene: THREE.Scene) {
       case 'scooter': break; // a real vehicle (vehicles.ts curb spots)
       case 'cart': {
         // A street-food cart: what it shows matches what its counter sells (bánh mì in a glass case, a pot of soup...).
+        // A bare bulb under its umbrella and its light box keep the cart's hours (a district cart's come from its scope).
         const key = cartKeys.get(index) ?? 'banhmi';
+        lit(index >= 0 ? scheduleIndex(COUNTERS[key]?.hours ?? ALL_NIGHT) : litCtx, () => {
+          const bp = at(-0.25, 0);
+          shape('ball', TONES.bulb.head, bp.x, 2.5, bp.z, 0.06, 0.075, 0.06, 0, 0, false, 'lamp');
+          light('bulb', bp.x, bp.z, 2.5 + lift);
+          F.tag('box', FRONT_OF[key]?.[1] ?? 'BÁNH MÌ', '#c8322a', '#fff6dc', 0, 1.2, 0.39, 1.5, 0.32, { glow: 0.6 });
+        });
         const tint = pickOf(r, ['#4f7fa8', '#c9493b', '#d9a441', '#c8ccc9']);
         part(0, 0.55, 0, 1.8, 0.75, 0.9, tint);
         part(0, 1.2, 0, 1.6, 0.55, 0.75, '#bcd3d6', 'glass', false);
@@ -1630,7 +1766,6 @@ export function buildWorld(scene: THREE.Scene) {
         part(-0.6, 1.95, 0, 0.05, 2.0, 0.05, '#6b6b6b');
         const u = at(-0.6, 0);
         shape('cone', pickOf(r, ['#e5484d', '#3f8fc9', '#f5c84a', '#5e927c']), u.x, 2.95, u.z, 1.35, 0.55, 1.35, pr.yaw, 0, true);
-        F.tag('box', FRONT_OF[key]?.[1] ?? 'BÁNH MÌ', '#c8322a', '#fff6dc', 0, 1.2, 0.39, 1.5, 0.32, { glow: 0.6 });
         if (key === 'banhmi') for (let i = 0; i < 5; i++) solid('ball', -0.55 + i * 0.27, 1.06, -0.05, 0.05, 0.05, 0.2, '#e3a957', 0, false, HALF_PI);
         else if (key === 'che' || key === 'xoi') for (let i = 0; i < 4; i++) solid('cylinder', -0.5 + i * 0.33, 1.1, -0.05, 0.11, 0.18, 0.11, pickOf(r, ['#7fb04a', '#e8c04a', '#c8504a', '#f1e6c8', '#6a4fa0']), 0, false);
         else {
@@ -1657,7 +1792,7 @@ export function buildWorld(scene: THREE.Scene) {
         part(0, 1.12, 0, 0.54, 0.32, 0.4, '#cfe0e4', 'glass', false);
         F.decal(DECAL.lottery, 0, 1.12, 0.205, 0.5, 0.3);
         F.decal(DECAL.lottery, 0, 1.12, -0.205, 0.5, 0.3, { yaw: PI });
-        F.tag('box', 'VÉ SỐ', '#ffffff', '#c8322a', 0, 1.42, 0, 0.56, 0.2, { glow: 0.5 });
+        lit(lotteryCode, () => F.tag('box', 'VÉ SỐ', '#ffffff', '#c8322a', 0, 1.42, 0, 0.56, 0.2, { glow: 0.5 }));
         break;
       }
     }
@@ -1743,7 +1878,40 @@ export function buildWorld(scene: THREE.Scene) {
     for (const sx of [-1.6, 1.6]) for (const sz of [-2.3, 2.3]) box('#6b6f70', tx + sx, 2.15, 31.5 + sz, 0.05, 4.3, 0.05, 0, false);
   }
   box('#3d3a35', -31, 3.74, 31.5, 34, 0.02, 0.02, 0, false);
-  for (let lx = -47.5; lx <= -14.5; lx += 1.5) shape('ball', '#fff2c8', lx, 3.66, 31.5, 0.07, 0.09, 0.07, 0, 0, false, 'lamp');
+  lit(scheduleIndex(COUNTERS.sap?.hours ?? [[5, 18]]), () => {
+    for (let lx = -47.5; lx <= -14.5; lx += 1.5) shape('ball', '#fff2c8', lx, 3.66, 31.5, 0.07, 0.09, 0.07, 0, 0, false, 'lamp');
+    for (let lx = -44; lx <= -16; lx += 7) light('bulb', lx, 31.5, 3.66, 1.6, 0.8);
+  });
+
+  /**
+   * A quán's bare bulb: a cord from the shop front (ax, ay, az) to above the table at (x, z), the bulb 2.75 m over the
+   * ground there and its light under it, lit by the scope's code (the quán's hours).
+   */
+  function quanBulb(ax: number, ay: number, az: number, x: number, z: number) {
+    const y = groundHeight(x, z) + 2.75;
+    cables.base.push({ ax, ay, az, bx: x, by: y + 0.22, bz: z, sag: 0.25, width: 0.018, color: toColor('#2a2a2a') });
+    shape('cylinder', '#2a2a2a', x, y + 0.15, z, 0.01, 0.16, 0.01, 0, 0, false);
+    shape('ball', TONES.bulb.head, x, y, z, 0.06, 0.075, 0.06, 0, 0, false, 'lamp');
+    light('bulb', x, z, y);
+  }
+  for (const g of LIFE.groups) {
+    if ((g.kind !== 'eatery' && g.kind !== 'beer') || g.building < 0 || !g.hours || !g.tables.length) continue;
+    const b = BUILDINGS[g.building], f = Math.sin(b.facing), c = Math.cos(b.facing);
+    // The wall is 0.8 m behind the door (city.ts): the cord hangs off it at the door's top.
+    const ax = b.door.x - f * 0.8, az = b.door.z - c * 0.8, ay = groundHeight(ax, az) + 3.3;
+    lit(scheduleIndex(g.hours), () => { for (const t of g.tables) quanBulb(ax, ay, az, t.x, t.z); });
+  }
+  {
+    // The café tables on the corner: a bulb over each from the nearest café, on its hours.
+    const cafes = BUILDINGS.filter((b) => buildingLight(b.id).kind === 'cafe');
+    for (const t of SCENERY.tables) {
+      let best: Building | null = null, bd = 14;
+      for (const b of cafes) { const d = Math.hypot(b.door.x - t.x, b.door.z - t.z); if (d < bd) { bd = d; best = b; } }
+      if (!best) continue;
+      const f = Math.sin(best.facing), c = Math.cos(best.facing), ax = best.door.x - f * 0.8, az = best.door.z - c * 0.8;
+      lit(buildingLight(best.id).code, () => quanBulb(ax, groundHeight(ax, az) + 3.3, az, t.x, t.z));
+    }
+  }
 
   // ---- Street dressing: concrete power poles carrying sagging bundles of cables, with service drops to the
   // houses and bundles across the street; civic banners, street-name plates and flags on the downtown lamp posts. ----
@@ -1983,7 +2151,9 @@ export function buildWorld(scene: THREE.Scene) {
     for (const side of [-1, 1]) {
       shape('cylinder', '#2b2f33', px + side * (pw / 2 - 0.2), PIER_DECK + 1.3, deckTo + 1, 0.06, 2.6, 0.06, 0, 0, false);
       shape('ball', '#fff2c8', px + side * (pw / 2 - 0.2), PIER_DECK + 2.7, deckTo + 1, 0.22, 0.25, 0.22, 0, 0, false, 'lamp');
+      lights.push(makeLight(px + side * (pw / 2 - 0.2), PIER_DECK + 0.02, deckTo + 1, TONES.park.size, 2.7, lampSeed(px + side * (pw / 2 - 0.2), deckTo + 1), '#000000', 0, TONES.park.halo, TONES.park.haloStrength));
     }
+    lights.push(makeLight(px, PIER_DECK + 0.02, deckTo + 1.6, Math.min(6, pw - 0.4), 0, lampSeed(px - pw / 2 + 0.2, deckTo + 1), TONES.park.pool, TONES.park.strength, '#000000', 0));
     if (dock.rental) {
       // The rental kiosk at the head of the pier and a stack of life rings.
       box('#e8e2d0', px - pw / 2 - 2.6, 1.2, -132.4, 2.4, 2.4, 1.8);
@@ -2146,11 +2316,12 @@ export function buildWorld(scene: THREE.Scene) {
    */
   const halfOf = (batch: Batch, i: number) => (batch.m.a[i * 16 + 12] < DOWNTOWN_X ? 'w' : 'e');
   const halfBatch = (batch: Batch, half: 'w' | 'e'): Batch | null => {
-    const out: Batch = { ...batch, m: new Floats(64), c: new Floats(12), big: [] }, n = batch.c.length / 3;
+    const out: Batch = { ...batch, m: new Floats(64), c: new Floats(12), l: new Floats(16), big: [] }, n = batch.c.length / 3;
     for (let i = 0; i < n; i++) {
       if (batch.big[i] || halfOf(batch, i) !== half) continue;
       out.m.pushFrom(batch.m.a, i * 16, 16);
       out.c.pushFrom(batch.c.a, i * 3, 3);
+      out.l.push1(batch.l.a[i]);
       out.big.push(false);
     }
     return out.c.length ? out : null;
@@ -2182,6 +2353,7 @@ export function buildWorld(scene: THREE.Scene) {
       // meshes sharing one geometry but not their instance buffers re-bind every attribute on every draw.
       const geometry = primitives[batch.kind].clone();
       geometries.push(geometry);
+      if (NIGHT_ROLES.has(batch.role)) geometry.setAttribute('aLit', new THREE.InstancedBufferAttribute(Float32Array.from(list, (i) => batch.l.a[i]), 1));
       const mesh = new THREE.InstancedMesh(geometry, roles[batch.role], list.length);
       mesh.name = `${batch.kind} ${batch.role}${batch.shadow ? ' shadow' : ''}${batch.fine ? ' fine' : ''}`;
       list.forEach((i, k) => {
@@ -2203,6 +2375,7 @@ export function buildWorld(scene: THREE.Scene) {
       // One batch alone stays instanced, as it was.
       const batch = list[0], geometry = primitives[batch.kind].clone(), count = batch.c.length / 3;
       geometries.push(geometry);
+      if (NIGHT_ROLES.has(batch.role)) geometry.setAttribute('aLit', new THREE.InstancedBufferAttribute(batch.l.trimmed(), 1));
       const mesh = new THREE.InstancedMesh(geometry, roles[batch.role], count);
       mesh.name = `${batch.kind} ${batch.role}${batch.shadow ? ' shadow' : ''}${batch.fine ? ' fine' : ''}`;
       mesh.instanceMatrix = new THREE.InstancedBufferAttribute(batch.m.trimmed(), 16);
@@ -2219,6 +2392,67 @@ export function buildWorld(scene: THREE.Scene) {
     mesh.name = `legacy ${mesh.name}`;
     (list[0].fine ? fineRoot : root).add(mesh);
     if (mesh.geometry.boundingBox) legacyTiles.push({ mesh, box: mesh.geometry.boundingBox });
+  }
+  /**
+   * On a discrete GPU a draw call costs more than the vertices it saves culling: today's tiled batches are merged 2 × 2
+   * into 320 m tiles (attach), about half the draws of today's street, still hidden by the frustum and beyond the fog.
+   * The meshes they replace are freed (their own copy of the primitive, their instance buffers).
+   */
+  function coarsenLegacyTiles() {
+    const groups = new Map<string, THREE.InstancedMesh[]>();
+    for (const t of legacyTiles) {
+      const m = t.mesh as THREE.InstancedMesh;
+      if (!m.isInstancedMesh || !m.instanceColor || !m.parent || !m.count) continue;
+      const cx = (t.box.min.x + t.box.max.x) / 2, cz = (t.box.min.z + t.box.max.z) / 2;
+      const cell = `${Math.floor(Math.floor((cx + 80) / TILE) / 2)}:${Math.floor(Math.floor((cz + 80) / TILE) / 2)}`;
+      const key = `${m.parent.id}|${m.name}|${(m.material as THREE.Material).uuid}|${m.castShadow ? 1 : 0}${m.receiveShadow ? 1 : 0}|${cell}`;
+      const list = groups.get(key);
+      if (list) list.push(m); else groups.set(key, [m]);
+    }
+    const gone = new Set<THREE.Object3D>();
+    for (const list of groups.values()) {
+      if (list.length < 2) continue;
+      let total = 0;
+      for (const m of list) total += m.count;
+      const first = list[0], parent = first.parent!;
+      // Per-instance attributes of the primitive (a night code, say) are joined in the same order; a group whose
+      // meshes do not all carry the same ones stays as it is.
+      const extra = Object.entries(first.geometry.attributes).filter(([, a]) => (a as THREE.InstancedBufferAttribute).isInstancedBufferAttribute).map(([name]) => name);
+      if (extra.some((name) => list.some((m) => !(m.geometry.attributes[name] as THREE.InstancedBufferAttribute | undefined)?.isInstancedBufferAttribute || m.geometry.attributes[name].itemSize !== first.geometry.attributes[name].itemSize))) continue;
+      for (const name of extra) {
+        const size = first.geometry.attributes[name].itemSize, joined = new Float32Array(total * size);
+        let k = 0;
+        for (const m of list) { joined.set((m.geometry.attributes[name].array as Float32Array).subarray(0, m.count * size), k * size); k += m.count; }
+        first.geometry.setAttribute(name, new THREE.InstancedBufferAttribute(joined, size));
+      }
+      const mesh = new THREE.InstancedMesh(first.geometry, first.material, total);
+      const mat = new Float32Array(total * 16), col = new Float32Array(total * 3);
+      let at = 0;
+      for (const m of list) {
+        mat.set((m.instanceMatrix.array as Float32Array).subarray(0, m.count * 16), at * 16);
+        col.set((m.instanceColor!.array as Float32Array).subarray(0, m.count * 3), at * 3);
+        at += m.count;
+      }
+      mesh.instanceMatrix = new THREE.InstancedBufferAttribute(mat, 16);
+      mesh.instanceColor = new THREE.InstancedBufferAttribute(col, 3);
+      mesh.name = first.name;
+      mesh.castShadow = first.castShadow;
+      mesh.receiveShadow = first.receiveShadow;
+      mesh.renderOrder = first.renderOrder;
+      mesh.computeBoundingSphere();
+      mesh.computeBoundingBox();
+      mesh.matrixAutoUpdate = false;
+      parent.add(mesh);
+      mesh.updateMatrixWorld(true);
+      for (const m of list) {
+        m.removeFromParent();
+        if (m !== first) m.geometry.dispose();
+        m.dispose();
+        gone.add(m);
+      }
+      if (mesh.boundingBox) legacyTiles.push({ mesh, box: mesh.boundingBox });
+    }
+    for (let i = legacyTiles.length - 1; i >= 0; i--) if (gone.has(legacyTiles[i].mesh)) legacyTiles.splice(i, 1);
   }
   // Decals (grilles, railings, AC fronts, shutters, goods...) and cloth (flags, washing), base and fine layers.
   const decalTexture = decalAtlas();
@@ -2253,30 +2487,29 @@ export function buildWorld(scene: THREE.Scene) {
     geometries.push(built.geometry);
     clothMeshes.push(built.mesh);
   }
-  // Shop light pools on the pavement after dark, each switched by its shop's opening hours.
-  const shopPoolMaterial = new THREE.MeshBasicMaterial({ map: poolTexture, color: '#d9ecff', transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, fog: false, toneMapped: false });
-  materials.push(shopPoolMaterial);
-  /** District shop pools: white light and venues' neon colours in one mesh (instance colours under a white material). */
-  const districtPoolMaterial = shopPoolMaterial.clone();
-  districtPoolMaterial.color.set('#ffffff');
-  materials.push(districtPoolMaterial);
-  const shopPoolMesh = new THREE.InstancedMesh(poolGeometry, shopPoolMaterial, Math.max(1, shopPools.length));
-  shopPoolMesh.name = 'Shop light';
-  const placeShopPools = (hour: number | null) => {
-    shopPools.forEach((sp, i) => {
-      const hours = sp.shop >= 0 ? HOURS.get(sp.shop) : undefined;
-      const lit = hour === null || !hours || isOpen(hours, hour);
-      const size = lit ? sp.size : 0;
-      shopPoolMesh.setMatrixAt(i, matrix.compose(position.set(sp.x, groundHeight(sp.x, sp.z) + 0.037, sp.z), quaternion.identity(), scale.set(size, 1, size)));
-    });
-    shopPoolMesh.instanceMatrix.needsUpdate = true;
-  };
-  placeShopPools(null);
-  shopPoolMesh.count = shopPools.length;
-  shopPoolMesh.computeBoundingSphere();
-  shopPoolMesh.visible = false;
-  shopPoolMesh.renderOrder = 2;
-  root.add(shopPoolMesh);
+  // The world's light at night (lamp pools and halos, shop spill, neon and bulbs): one mesh, today's map's lights first,
+  // each district tile's added as it finishes, switched light by light in its shader by each one's code (the lamp switch,
+  // the shop's hours, a timed tile's hours), shown from dusk to dawn (setAtmosphere). Two draws for all of it.
+  const lightStore = createLightStore(lightMaterials, 'Night lights', legacySink.lights.length + 12288);
+  lightStore.append(legacySink.lights);
+  root.add(lightStore.mesh);
+  /** Whether the signal halos show (night, levels 0–3). */
+  let halosShown = true;
+  // The far stand-ins' program (instanced, with the zombie torch too) compiles at load with everything else: one hidden
+  // instance in the root (game.ts drawEverything shows hidden meshes for that one draw), made as the district far
+  // batches are (instance colours, receiving shadows), so the program it compiles is theirs.
+  {
+    const g = primitives.box.clone();
+    g.setAttribute('aLit', new THREE.InstancedBufferAttribute(new Float32Array([-1]), 1));
+    geometries.push(g);
+    const warmFar = new THREE.InstancedMesh(g, farSolid, 1);
+    warmFar.setMatrixAt(0, matrix.makeTranslation(0, -60, 0));
+    warmFar.setColorAt(0, tmpColor.set('#ffffff'));
+    warmFar.receiveShadow = true;
+    warmFar.name = 'far windows (compiled at load)';
+    warmFar.visible = false;
+    root.add(warmFar);
+  }
   // ---- The wired P1 districts (map/world-map.ts, district-render.ts; WIRING-PLAN §2 Rendering) ----
   // District items are drawn tile by tile into their own sinks, a few milliseconds a frame (pumpDistricts), nearest the
   // player first; before that, a dry pass lays out every district sign so all of them share one glyph atlas.
@@ -2287,17 +2520,43 @@ export function buildWorld(scene: THREE.Scene) {
     solid: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.88, vertexColors: true }),
     wall: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.93, vertexColors: true }),
     water: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.22, metalness: 0.08, vertexColors: true }),
+    // Paint and hẻm concrete a few millimetres above the asphalt: the offset keeps them on top at any distance.
+    mark: new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.9, vertexColors: true, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 }),
   };
   patchTiles(surfMats.paving, surfNoise, 'surf-paving', false);
   patchWall(surfMats.wall, surfNoise);
   for (const [name, material] of Object.entries(surfMats)) material.name = `district ${name}`;
   materials.push(...Object.values(surfMats));
+  // Every variant a district tile draws (instanced as batchMesh makes them, baked as bakeJob does, its surfaces as
+  // surfaceMesh does), one hidden instance each in the root: game.ts's warm pass (prewarm, at the page's final quality)
+  // draws them before play. A variant only a district shows, and only after dark (the heritage fronts' floodlight wash),
+  // would otherwise be drawn first in the game at the first dusk: 0.7-0.85 s on Intel/ANGLE (measured), its program
+  // compiled ahead or not (the driver finishes a program at its first draw).
+  {
+    const tri = new THREE.BufferGeometry();
+    tri.setAttribute('position', new THREE.Float32BufferAttribute([0, -60, 0, 1, -60, 0, 0, -60, 1], 3));
+    tri.setAttribute('normal', new THREE.Float32BufferAttribute([0, 1, 0, 0, 1, 0, 0, 1, 0], 3));
+    tri.setAttribute('color', new THREE.Float32BufferAttribute([1, 1, 1, 1, 1, 1, 1, 1, 1], 3));
+    tri.setAttribute('aLit', new THREE.Float32BufferAttribute([-1, -1, -1], 1));
+    const one = primitives.box.clone();
+    one.setAttribute('aLit', new THREE.InstancedBufferAttribute(new Float32Array([-1]), 1));
+    geometries.push(tri, one);
+    const hidden = (mesh: THREE.Mesh, name: string, receive: boolean) => { mesh.name = `${name} (drawn at load)`; mesh.receiveShadow = receive; mesh.visible = false; root.add(mesh); };
+    for (const [role, m] of Object.entries(roles)) {
+      const mesh = new THREE.InstancedMesh(one, m, 1);
+      mesh.setMatrixAt(0, matrix.makeTranslation(0, -60, 0));
+      mesh.setColorAt(0, tmpColor.set('#ffffff'));
+      hidden(mesh, role, role !== 'lamp');
+    }
+    for (const [role, m] of Object.entries(bakedRoles)) hidden(new THREE.Mesh(tri, m), `baked ${role}`, role !== 'lamp');
+    for (const [role, m] of Object.entries(surfMats)) hidden(new THREE.Mesh(tri, m), `district ${role}`, true);
+  }
   type SurfBuf = { pos: Floats; nrm: Floats; col: Floats };
   /** The surfaces of the tile being drawn (null outside a district tile: nothing to collect). */
   let surfTarget: Map<SurfRole, SurfBuf> | null = null;
   const surfBuf = (role: SurfRole) => { let b = surfTarget!.get(role); if (!b) { b = { pos: new Floats(3072), nrm: new Floats(3072), col: new Floats(3072) }; surfTarget!.set(role, b); } return b; };
   /** Surfaces share three materials (fewer draw calls a tile): kerbs, beds and bank walls go with the ground. */
-  const SURF_MERGE: Record<SurfRole, SurfRole> = { ground: 'ground', solid: 'ground', wall: 'ground', paving: 'paving', water: 'water' };
+  const SURF_MERGE: Record<SurfRole, SurfRole> = { ground: 'ground', solid: 'ground', wall: 'ground', paving: 'paving', water: 'water', mark: 'mark' };
   function surfTri(role0: SurfRole, color: ColorLike, a: number[], b: number[], c: number[], face?: 'down') {
     if (dry || !surfTarget) return;
     const role = SURF_MERGE[role0];
@@ -2323,9 +2582,9 @@ export function buildWorld(scene: THREE.Scene) {
       for (const [i, j, k] of THREE.ShapeUtils.triangulateShape(contour, hs)) surfTri(role, color, [all[i].x, y, all[i].y], [all[j].x, y, all[j].y], [all[k].x, y, all[k].y]);
     },
   };
-  /** Signal lenses, lamp pools and towers of the tile being drawn. */
+  /** Signal lenses and towers of the tile being drawn. */
   type LensSpot = { node: number; group: number; slot: number; x: number; y: number; z: number; yaw: number; key?: string };
-  let lensTarget: LensSpot[] = [], lampTarget: { x: number; z: number; size: number }[] = [];
+  let lensTarget: LensSpot[] = [];
   let towerTarget: THREE.Object3D | null = null;
   const dkit: DistrictKit = {
     shape, box, sign, tag, decal, cloth, smoke, pool, frame, fine: setFine, surf,
@@ -2336,7 +2595,9 @@ export function buildWorld(scene: THREE.Scene) {
     cable: (ax, ay, az, bx, by, bz, sag, width, color, fineLayer) => { if (!dry) (fineLayer && !mergeFine ? cables.fine : cables.base).push({ ax, ay, az, bx, by, bz, sag, width, color: toColor(color).clone() }); },
     seat: (x, z, w, d, yaw, top) => { if (!dry) seatBox(x, z, w, d, yaw, top); },
     lens: (a, slot, x, y, z, yaw) => { if (!dry) lensTarget.push({ node: a.node, group: a.group, slot, x, y, z, yaw }); },
-    lamp: (x, z, size) => { if (!dry) lampTarget.push({ x, z, size }); },
+    light,
+    streetLamp,
+    lit,
     far: farShape,
   };
   const planStart = performance.now();
@@ -2347,14 +2608,19 @@ export function buildWorld(scene: THREE.Scene) {
   type DistrictTile = {
     key: string; x: number; z: number; slice: string; items: DistrictItem[]; next: number;
     state: 'queued' | 'drawing' | 'meshing' | 'done';
-    sink: Sink; surf: Map<SurfRole, SurfBuf>; surfMeshes: THREE.Mesh[]; lenses: LensSpot[]; lamps: { x: number; z: number; size: number }[];
+    sink: Sink; surf: Map<SurfRole, SurfBuf>; surfMeshes: THREE.Mesh[]; lenses: LensSpot[];
     group: THREE.Group; near: THREE.Group; far: THREE.Group; detail: THREE.Group; fineGroup: THREE.Group; farSink: Batches; steps: (() => void)[];
     /** box: everything the tile draws (its ground can reach far off, out over the river); core: its buildings and dressing. */
     box: { minX: number; maxX: number; minZ: number; maxZ: number }; core: { minX: number; maxX: number; minZ: number; maxZ: number }; signs: THREE.Object3D[];
-    lensMesh: THREE.InstancedMesh | null; lampMesh: THREE.InstancedMesh | null; poolMesh: THREE.InstancedMesh | null; poolList: Sink['pools']; smoke: { mesh: THREE.Mesh; light: { value: number } } | null;
+    /** Its signal lenses (with their halos); its light at night (lamps, shops, bulbs: street-lights.ts) until the world's light mesh takes it. */
+    lensMesh: THREE.InstancedMesh | null; lights: NightLight[]; smoke: { mesh: THREE.Mesh; light: { value: number } } | null;
     emitters: Emitter[];
     /** Game hours [from, to) the tile shows (wrapping past midnight), or null: always. */
     hours: [number, number] | null;
+    /** Within the fog and its hours (stand-ins and cell lights go by this); group.visible is that and in the camera's view. */
+    shown: boolean;
+    /** Height of the top of everything the tile draws (the box tested against the camera's view). */
+    top: number;
   };
   const tiles = new Map<string, DistrictTile>();
   /** The tile of (x, z); things that stand only at some hours get a tile of their own, shown in those hours. */
@@ -2370,8 +2636,9 @@ export function buildWorld(scene: THREE.Scene) {
       group.add(near, far);
       t = {
         key, x: (Math.floor(x / TILE_D) + 0.5) * TILE_D, z: (Math.floor(z / TILE_D) + 0.5) * TILE_D, slice: '', items: [], next: 0, state: 'queued',
-        sink: newSink(), surf: new Map(), surfMeshes: [], lenses: [], lamps: [], group, near, far, detail: detailGroup, fineGroup, farSink: new Map(), steps: [],
-        box: { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity }, core: { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity }, signs: [], lensMesh: null, lampMesh: null, poolMesh: null, poolList: [], smoke: null, emitters: [], hours: hours ?? null,
+        sink: newSink(), surf: new Map(), surfMeshes: [], lenses: [], group, near, far, detail: detailGroup, fineGroup, farSink: new Map(), steps: [],
+        box: { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity }, core: { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity }, signs: [], lensMesh: null, lights: [], smoke: null, emitters: [], hours: hours ?? null,
+        shown: false, top: 0,
       };
       tiles.set(key, t);
     }
@@ -2395,16 +2662,18 @@ export function buildWorld(scene: THREE.Scene) {
     const f = Math.sin(b.facing), g = Math.cos(b.facing);
     const tile = tiles.get(`${Math.floor((p.box.cx + f * p.box.hz) / TILE_D)}:${Math.floor((p.box.cz + g * p.box.hz) / TILE_D)}`);
     if (!tile) return;
-    const building = (stampIdOf.get(b.id) ?? b.stamp ?? '').startsWith('thap-doi');
+    const stamp = stampIdOf.get(b.id) ?? b.stamp ?? null, building = (stamp ?? '').startsWith('thap-doi');
     standInOf.push({ tile, near: building });
-    standInList.push({ x: p.box.cx, z: p.box.cz, w: p.box.hx * 2, d: p.box.hz * 2, h: p.h, yaw: p.box.yaw, seed: p.seed, lit: building ? 0 : 0.45,
+    // Its windows keep the real tower's share and hours (flats or offices), so nothing switches on as its tile takes over.
+    const windows = towerWindows(towerSpecOf(p, stamp)?.form, b.kind);
+    standInList.push({ x: p.box.cx, z: p.box.cz, w: p.box.hx * 2, d: p.box.hz * 2, h: p.h, yaw: p.box.yaw, seed: p.seed, lit: building ? 0 : windows.lit, kind: windows.kind,
       glass: building ? '#4a4f52' : STAND_IN_GLASS[p.seed % STAND_IN_GLASS.length], frame: building ? '#a7a69e' : STAND_IN_FRAME[(p.seed >> 3) % STAND_IN_FRAME.length] });
   });
   const standIns = skyline.standIns(standInList);
   function syncStandIns() {
     for (let i = 0; i < standInOf.length; i++) {
       const { tile, near } = standInOf[i];
-      const drawn = tile.state === 'done' && tile.group.visible && (!near || tile.near.visible);
+      const drawn = tile.state === 'done' && tile.shown && (!near || tile.near.visible);
       standIns.show(i, !drawn);
     }
   }
@@ -2415,7 +2684,8 @@ export function buildWorld(scene: THREE.Scene) {
   const inked = (text: string) => Array.from(text.normalize('NFC')).filter((ch) => ch.trim() !== '').length;
   let signTile: DistrictTile | null = null;
   const recorder: SignWriter = {
-    sign(text, subtitle, color, x, y, z, w, h, yaw, background) { boardTile.push(signTile!); boardQuads.push((inked(text) + inked(subtitle)) * 2); districtSigns.sign(text, subtitle, color, x, y, z, w, h, yaw, background); },
+    // (the glow carries the shop's hours, packed by sign(): a district board goes dark when its shop closes)
+    sign(text, subtitle, color, x, y, z, w, h, yaw, background, glow) { boardTile.push(signTile!); boardQuads.push((inked(text) + inked(subtitle)) * 2); districtSigns.sign(text, subtitle, color, x, y, z, w, h, yaw, background, glow); },
     tag(style, text, color, background, x, y, z, w, h, yaw, glow) {
       const lines = style === 'vertical' ? text.split(/[ |]+/) : text.split('|');
       boardTile.push(signTile!); boardQuads.push(lines.reduce((n, l) => n + inked(l), 0) * (style === 'paint' ? 1 : 2));
@@ -2484,7 +2754,7 @@ export function buildWorld(scene: THREE.Scene) {
   // Cutaway: when a building stands between the camera and the player, everything in front of the player
   // inside a soft circle around them on screen is discarded (dithered at the rim), so they stay visible.
   const cut = { center: { value: new THREE.Vector2() }, depth: { value: 0 }, radius: { value: 0 }, aspect: { value: 1 } };
-  const uncut = new Set<THREE.Material>([roles.ground, roles.paving, surfMats.ground, surfMats.paving, poolMaterial, neonPoolMaterial, shopPoolMaterial, districtPoolMaterial, puddleMaterial, waveMaterial]);
+  const uncut = new Set<THREE.Material>([roles.ground, roles.paving, surfMats.ground, surfMats.paving, surfMats.mark, ...lightMaterials, haloMaterial, puddleMaterial, waveMaterial]);
   for (const material of materials) {
     if (uncut.has(material)) continue;
     const previous = material.onBeforeCompile.bind(material);
@@ -2559,6 +2829,7 @@ export function buildWorld(scene: THREE.Scene) {
     if (!count) return;
     const geometry = primitives[batch.kind].clone();
     geometries.push(geometry);
+    if (NIGHT_ROLES.has(batch.role)) geometry.setAttribute('aLit', new THREE.InstancedBufferAttribute(batch.l.trimmed(), 1));
     const mesh = new THREE.InstancedMesh(geometry, roles[batch.role], count);
     mesh.name = `${batch.kind} ${batch.role}${batch.shadow ? ' shadow' : ''}${batch.fine ? ' fine' : ''}`;
     mesh.instanceMatrix = new THREE.InstancedBufferAttribute(batch.m.trimmed(), 16);
@@ -2601,7 +2872,9 @@ export function buildWorld(scene: THREE.Scene) {
     if (!count) return;
     const geometry = primitives[batch.kind].clone();
     geometries.push(geometry);
-    const mesh = new THREE.InstancedMesh(geometry, roles.solid, count);
+    // Lit windows at night by each box's code (night.ts patchFarWindows; -1 for crowns, cranes and the like).
+    geometry.setAttribute('aLit', new THREE.InstancedBufferAttribute(batch.l.trimmed(), 1));
+    const mesh = new THREE.InstancedMesh(geometry, farSolid, count);
     mesh.name = `${batch.kind} far`;
     mesh.instanceMatrix = new THREE.InstancedBufferAttribute(batch.m.trimmed(), 16);
     mesh.instanceColor = new THREE.InstancedBufferAttribute(batch.c.trimmed(), 3);
@@ -2707,43 +2980,24 @@ export function buildWorld(scene: THREE.Scene) {
         mesh.computeBoundingSphere();
         t.near.add(mesh);
         t.lensMesh = mesh;
+        addHalos(mesh);
       }
-      // Lamp pools (night) and shop light (night, by the shop's hours).
-      if (t.lamps.length) {
-        const mesh = new THREE.InstancedMesh(poolGeometry, poolMaterial, t.lamps.length);
-        mesh.name = 'Lamp pools';
-        t.lamps.forEach((l, i) => mesh.setMatrixAt(i, matrix.compose(position.set(l.x, districtLift(l.x, l.z) + 0.135, l.z), quaternion.identity(), scale.set(l.size, 1, l.size))));
-        mesh.computeBoundingSphere();
-        mesh.renderOrder = 2;
-        mesh.visible = poolMaterial.opacity > 0.01 && !apocalypse;
-        t.detail.add(mesh);
-        t.lampMesh = mesh;
-      }
-      if (s.pools.length) {
-        t.poolList = s.pools;
-        const mesh = new THREE.InstancedMesh(poolGeometry, districtPoolMaterial, s.pools.length);
-        mesh.name = 'Shop pools';
-        placeTilePools(mesh, s.pools, poolHour >= 0 ? poolHour : null, true);
-        mesh.computeBoundingSphere();
-        mesh.renderOrder = 2;
-        mesh.visible = shopPoolMaterial.opacity > 0.01 && !apocalypse && detail <= 3;
-        t.detail.add(mesh);
-        t.poolMesh = mesh;
-      }
+      // Its light at night (lamps, shop spill, bulbs, festoons), switched in the shader by each light's code (a timed
+      // tile's by its hours): it joins the world's light mesh when the tile shows (finishTile). Pools fade out in the fog
+      // the tile hides in, shop light at detailLimit (A8), halos at nightHaloFar.
+      t.lights = s.lights;
       if (t.signs.length) t.detail.add(...t.signs);
     });
   }
-  const SHOP_LIGHT = new THREE.Color('#d9ecff');
-  function placeTilePools(mesh: THREE.InstancedMesh, list: Sink['pools'], hour: number | null, colours = false) {
-    list.forEach((sp, i) => {
-      const hours = sp.shop >= 0 ? HOURS.get(sp.shop) : undefined;
-      const size = hour === null || !hours || isOpen(hours, hour) ? sp.size : 0;
-      mesh.setMatrixAt(i, matrix.compose(position.set(sp.x, districtLift(sp.x, sp.z) + 0.137, sp.z), quaternion.identity(), scale.set(size, 1, size)));
-      // (a neon pool is brighter: the material's opacity is the white light's)
-      if (colours) mesh.setColorAt(i, sp.color ? tmpColor.set(sp.color).multiplyScalar(1.6) : SHOP_LIGHT);
-    });
-    mesh.instanceMatrix.needsUpdate = true;
-    if (colours && mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  /** The halos round a lens mesh's lit lenses (its child), shown at night on levels 0–3. */
+  function addHalos(lens: THREE.InstancedMesh) {
+    const h = addLensHalos(lens, haloMaterial);
+    if (!h) return;
+    h.visible = halosShown;
+    halos.add(h);
+  }
+  function dropHalos(lens: THREE.InstancedMesh) {
+    for (const c of lens.children) halos.delete(c as THREE.InstancedMesh);
   }
   function finishTile(t: DistrictTile) {
     const b = t.box, c = t.core;
@@ -2757,6 +3011,7 @@ export function buildWorld(scene: THREE.Scene) {
       if (!sphere || !Number.isFinite(sphere.radius) || sphere.radius > 2000) return;
       b.minX = Math.min(b.minX, sphere.center.x - sphere.radius); b.maxX = Math.max(b.maxX, sphere.center.x + sphere.radius);
       b.minZ = Math.min(b.minZ, sphere.center.z - sphere.radius); b.maxZ = Math.max(b.maxZ, sphere.center.z + sphere.radius);
+      t.top = Math.max(t.top, sphere.center.y + sphere.radius);
       // The near/detail switch goes by the buildings and dressing alone, boxed tightly: a tile's ground or water can
       // reach hundreds of metres out (the river, the outer grass), and its spheres would make a tile 500 m off "near".
       if (o.parent === t.group) return;
@@ -2775,6 +3030,7 @@ export function buildWorld(scene: THREE.Scene) {
     });
     if (!Number.isFinite(b.minX)) Object.assign(b, { minX: t.x - TILE_D / 2, maxX: t.x + TILE_D / 2, minZ: t.z - TILE_D / 2, maxZ: t.z + TILE_D / 2 });
     if (!Number.isFinite(c.minX)) Object.assign(c, b);
+    if (!(t.top > 0)) t.top = 400;
     t.fineGroup.visible = detail <= 3;
     showTile(t);
     districtRoot.add(t.group);
@@ -2791,10 +3047,14 @@ export function buildWorld(scene: THREE.Scene) {
     if (shadowRenderer) shadowRenderer.shadowMap.needsUpdate = true;
     t.group.traverse((o) => {
       const m = o as THREE.Mesh;
-      if (!m.isMesh) return;
+      // (the halos go by the hour: they are not revealed, and their buffers are a few kilobytes)
+      if (!m.isMesh || halos.has(m as THREE.InstancedMesh)) return;
       if (!warmEnabled) { if (!m.visible) return; m.visible = false; m.userData.reveal = true; }
       warmQueue.push(m);
     });
+    checkLit(t.group, `district tile ${t.key}`);
+    lightStore.append(t.lights);
+    t.lights = [];
     const cell = cellOfTile.get(t);
     if (cell && cell.tiles.every((q) => q.state === 'done')) mergeQueue.push(cell);
   }
@@ -2804,8 +3064,19 @@ export function buildWorld(scene: THREE.Scene) {
    * detailLimit.
    */
   const away = (b: DistrictTile['box']) => Math.hypot(Math.max(b.minX - eye.x, 0, eye.x - b.maxX), Math.max(b.minZ - eye.z, 0, eye.z - b.maxZ), Math.max(0, eye.y - 20));
+  // A tile wholly outside the camera's view is hidden for the frame, so the renderer neither walks it nor tests its meshes
+  // one by one (most tiles in range are behind or beside the camera). Not on a frame that re-renders the shadow map:
+  // what stands behind the camera casts shadows into view.
+  const tileFrustum = new THREE.Frustum(), tileBox = new THREE.Box3(), tileView = new THREE.Matrix4();
+  let viewCamera: THREE.Camera | null = null, cullTiles = false;
+  const inView = (t: DistrictTile) => {
+    tileBox.min.set(t.box.minX, -5, t.box.minZ);
+    tileBox.max.set(t.box.maxX, t.top + 1, t.box.maxZ);
+    return tileFrustum.intersectsBox(tileBox);
+  };
   function showTile(t: DistrictTile) {
-    t.group.visible = away(t.box) < farLimit && (!t.hours || inHours(t.hours, nowHour));
+    t.shown = away(t.box) < farLimit && (!t.hours || inHours(t.hours, nowHour));
+    t.group.visible = t.shown && (!cullTiles || inView(t));
     const d = away(t.core), near = d < nearLimit;
     t.near.visible = near;
     t.far.visible = !near;
@@ -2878,8 +3149,8 @@ export function buildWorld(scene: THREE.Scene) {
   const CELL_TILES = 3;
   type SurfCell = {
     key: string; tiles: DistrictTile[]; box: DistrictTile['box']; merged: { mesh: THREE.Mesh; parts: THREE.Mesh[] }[]; state: 'building' | 'warming' | 'merged';
-    /** The cell's signal lenses, lamp and shop pools and smoke, one mesh each for its tiles (once they are all built). */
-    lit: { lenses: LensSpot[]; lensMesh: THREE.InstancedMesh | null; lampMesh: THREE.InstancedMesh | null; poolMesh: THREE.InstancedMesh | null; poolList: Sink['pools']; smoke: { mesh: THREE.Mesh; light: { value: number } } | null } | null;
+    /** The cell's signal lenses (and their halos) and smoke, one mesh each for its tiles (once they are all built). */
+    lit: { lenses: LensSpot[]; lensMesh: THREE.InstancedMesh | null; smoke: { mesh: THREE.Mesh; light: { value: number } } | null } | null;
   };
   const surfCells: SurfCell[] = [], cellOfTile = new Map<DistrictTile, SurfCell>(), mergeQueue: SurfCell[] = [], unwarmed = new Set<THREE.Mesh>();
   for (const t of tileList) {
@@ -2915,14 +3186,14 @@ export function buildWorld(scene: THREE.Scene) {
     mergeLights(c);
   }
   /**
-   * The cell's tiles' signal lenses, lamp pools, shop pools and smoke become one mesh each (four draws a near tile
-   * fewer); they show while one of the cell's tiles does (cellLights).
+   * The cell's tiles' signal lenses (with their halos) and smoke become one mesh each (two draws a near tile fewer); they
+   * show while one of the cell's tiles does (cellLights). (Their light at night is in the world's light mesh already.)
    */
   function mergeLights(c: SurfCell) {
-    const tiles = c.tiles.filter((t) => t.lensMesh || t.lampMesh || t.poolMesh || t.smoke);
+    const tiles = c.tiles.filter((t) => t.lensMesh || t.smoke);
     if (tiles.length < 2) return;
-    const lenses = tiles.flatMap((t) => t.lenses), lamps = tiles.flatMap((t) => t.lamps), pools = tiles.flatMap((t) => t.poolList), emitters = tiles.flatMap((t) => t.emitters);
-    const lit: NonNullable<SurfCell['lit']> = { lenses, lensMesh: null, lampMesh: null, poolMesh: null, poolList: pools, smoke: null };
+    const lenses = tiles.flatMap((t) => t.lenses), emitters = tiles.flatMap((t) => t.emitters);
+    const cl: NonNullable<SurfCell['lit']> = { lenses, lensMesh: null, smoke: null };
     if (lenses.length) {
       const mesh = new THREE.InstancedMesh(lensGeometry, lensMaterial, lenses.length);
       mesh.name = `Signal lenses ${c.key}`;
@@ -2931,30 +3202,18 @@ export function buildWorld(scene: THREE.Scene) {
         mesh.setMatrixAt(i, matrix.compose(position.set(l.x, l.y, l.z), quaternion.setFromEuler(rotation), scale.set(1, 1, 1)));
         mesh.setColorAt(i, LENS_OFF[l.slot]);
       });
-      lit.lensMesh = mesh;
-    }
-    if (lamps.length) {
-      const mesh = new THREE.InstancedMesh(poolGeometry, poolMaterial, lamps.length);
-      mesh.name = `Lamp pools ${c.key}`;
-      lamps.forEach((l, i) => mesh.setMatrixAt(i, matrix.compose(position.set(l.x, districtLift(l.x, l.z) + 0.135, l.z), quaternion.identity(), scale.set(l.size, 1, l.size))));
-      mesh.renderOrder = 2;
-      lit.lampMesh = mesh;
-    }
-    if (pools.length) {
-      const mesh = new THREE.InstancedMesh(poolGeometry, districtPoolMaterial, pools.length);
-      mesh.name = `Shop pools ${c.key}`;
-      placeTilePools(mesh, pools, poolHour >= 0 ? poolHour : null, true);
-      mesh.renderOrder = 2;
-      lit.poolMesh = mesh;
+      mesh.computeBoundingSphere();
+      addHalos(mesh);
+      cl.lensMesh = mesh;
     }
     if (emitters.length) {
       const built = buildSmoke(emitters, smokeTime);
       materials.push(built.material);
       geometries.push(built.geometry);
-      lit.smoke = { mesh: built.mesh, light: built.light };
+      cl.smoke = { mesh: built.mesh, light: built.light };
       built.light.value = 1 - 0.55 * Math.max(0, lastNight);
     }
-    for (const mesh of [lit.lensMesh, lit.lampMesh, lit.poolMesh, lit.smoke?.mesh]) {
+    for (const mesh of [cl.lensMesh, cl.smoke?.mesh]) {
       if (!mesh) continue;
       if ((mesh as THREE.InstancedMesh).isInstancedMesh) (mesh as THREE.InstancedMesh).computeBoundingSphere();
       mesh.matrixAutoUpdate = false;
@@ -2962,27 +3221,26 @@ export function buildWorld(scene: THREE.Scene) {
       cellGroup.add(mesh);
       mesh.updateMatrixWorld(true);
     }
-    // The tiles' own go (lens geometry and pool geometry are shared: only their instance buffers are freed).
+    // The tiles' own go (the lens geometry is shared: only their instance buffers are freed; the halos go with their lenses).
     for (const t of tiles) {
-      for (const mesh of [t.lensMesh, t.lampMesh, t.poolMesh]) if (mesh) { mesh.removeFromParent(); mesh.dispose(); }
+      if (t.lensMesh) { dropHalos(t.lensMesh); t.lensMesh.removeFromParent(); t.lensMesh.dispose(); }
       if (t.smoke) { t.smoke.mesh.removeFromParent(); disposeQueue.push(t.smoke.mesh.geometry); }
-      t.lensMesh = t.lampMesh = t.poolMesh = null; t.smoke = null; t.lenses = []; t.lamps = []; t.poolList = []; t.emitters = [];
+      t.lensMesh = null; t.smoke = null; t.lenses = []; t.emitters = [];
     }
-    c.lit = lit;
+    c.lit = cl;
     cellLights(c);
   }
-  /** A cell's lights show with its tiles: lenses while one is near, pools at night and smoke while one is shown in detail. */
+  /** A cell's lights show with its tiles: lenses while one is near, smoke while one is shown in detail. */
   function cellLights(c: SurfCell) {
-    const lit = c.lit;
-    if (!lit) return;
-    let shown = false, near = false, detailed = false;
-    for (const t of c.tiles) { if (!t.group.visible) continue; shown = true; if (t.near.visible) near = true; if (t.detail.visible) detailed = true; }
-    if (lit.lensMesh) lit.lensMesh.visible = near;
-    if (lit.lampMesh) lit.lampMesh.visible = shown && poolMaterial.opacity > 0.01 && !apocalypse;
-    if (lit.poolMesh) lit.poolMesh.visible = shown && shopPoolMaterial.opacity > 0.01 && !apocalypse && detail <= 3;
-    if (lit.smoke) lit.smoke.mesh.visible = detailed && detail <= 2 && !apocalypse;
+    const cl = c.lit;
+    if (!cl) return;
+    let near = false, detailed = false;
+    for (const t of c.tiles) { if (!t.shown) continue; if (t.near.visible) near = true; if (t.detail.visible) detailed = true; }
+    if (cl.lensMesh) cl.lensMesh.visible = near;
+    if (cl.smoke) cl.smoke.mesh.visible = detailed && detail <= 2 && !apocalypse;
   }
-  const MERGE_BYTES = 0.45e6;
+  // (A discrete GPU takes 1.8 MB in a frame without a stall: a quarter of the surface draws.)
+  let MERGE_BYTES = 0.45e6;
   function mergeParts(c: SurfCell, role: SurfRole, parts: THREE.Mesh[]) {
     {
       if (parts.length < 2) return;
@@ -3058,6 +3316,16 @@ export function buildWorld(scene: THREE.Scene) {
     tri.setAttribute('normal', new THREE.Float32BufferAttribute([0, 1, 0, 0, 1, 0, 0, 1, 0], 3));
     tri.setAttribute('color', new THREE.Float32BufferAttribute([1, 1, 1, 1, 1, 1, 1, 1, 1], 3));
     for (const m of new Set([...Object.values(surfMats), ...Object.values(bakedRoles)])) { const mesh = new THREE.Mesh(tri, m); mesh.receiveShadow = true; mesh.castShadow = true; warm.add(mesh); }
+    // The tiles' instanced batches too, as batchMesh makes them (instance colours; all but the lamps receive shadows):
+    // a role only the districts draw (the heritage fronts' floodlight wash, hidden by day) would otherwise compile the
+    // first time it shows, at dusk. Variants today's map has compiled already cost nothing here.
+    for (const [role, m] of Object.entries(roles)) {
+      const mesh = new THREE.InstancedMesh(tri, m, 1);
+      mesh.setMatrixAt(0, matrix.identity());
+      mesh.setColorAt(0, tmpColor.set('#ffffff'));
+      mesh.receiveShadow = role !== 'lamp';
+      warm.add(mesh);
+    }
     renderer.compileAsync(warm, camera, scene).catch(() => { /* compiled on first use instead */ }).finally(() => tri.dispose());
   }
   /** Builds district tiles for up to `budget` ms (drawing their items, then their meshes a few at a time). */
@@ -3072,7 +3340,7 @@ export function buildWorld(scene: THREE.Scene) {
       }
       const t = current;
       if (t.state === 'drawing') {
-        drawInto(t.sink); surfTarget = t.surf; lensTarget = t.lenses; lampTarget = t.lamps; towerTarget = t.group; farBatches = t.farSink; mergeShadows = true; mergeFine = detail <= 3;
+        drawInto(t.sink); surfTarget = t.surf; lensTarget = t.lenses; towerTarget = t.group; farBatches = t.farSink; mergeShadows = true; mergeFine = detail <= 3;
         while (t.next < t.items.length && performance.now() - t0 < budget) {
           const s = performance.now(), item = t.items[t.next++];
           item.draw();
@@ -3080,7 +3348,7 @@ export function buildWorld(scene: THREE.Scene) {
           const took = performance.now() - s;
           if (took > longestStep) { longestStep = took; longestWhat = `${item.tag ?? 'item'} in ${t.key}`; }
         }
-        drawInto(legacySink); surfTarget = null; towerTarget = null; lensTarget = []; lampTarget = []; farBatches = null; mergeShadows = false; mergeFine = false;
+        drawInto(legacySink); surfTarget = null; towerTarget = null; lensTarget = []; farBatches = null; mergeShadows = false; mergeFine = false; litCtx = 0;
         if (t.next >= t.items.length) { t.state = 'meshing'; planMeshing(t); }
       } else if (t.state === 'meshing') {
         while (t.steps.length && performance.now() - t0 < budget) {
@@ -3183,6 +3451,22 @@ export function buildWorld(scene: THREE.Scene) {
     return false;
   }
 
+  /**
+   * Dev check (localhost, night plan A20): a mesh drawn with a night-lit material must carry `aLit`. A missing one does
+   * not read 0 (a disabled attribute reads whatever generic value another program left at its location), so it would
+   * light by a random schedule.
+   */
+  const devHost = typeof location !== 'undefined' && /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+  const nightLit = new Set<THREE.Material>([...[...NIGHT_ROLES].map((r) => roles[r]), bakedRoles.lamp, bakedRoles.lantern, bakedRoles.glassLit, farSolid]);
+  function checkLit(group: THREE.Object3D, what: string) {
+    if (!devHost) return;
+    group.traverse((o) => {
+      const m = o as THREE.Mesh;
+      if (m.isMesh && nightLit.has(m.material as THREE.Material) && !m.geometry.getAttribute('aLit')) console.error(`world: ${what}: '${m.name}' is lit at night but carries no aLit`);
+    });
+  }
+  checkLit(root, "today's map");
+
   // Nothing in the neighbourhood moves, so skip per-frame matrix recomputation for the whole tree.
   root.traverse((object) => { object.updateMatrix(); object.matrixAutoUpdate = false; });
   root.updateMatrixWorld(true);
@@ -3192,7 +3476,7 @@ export function buildWorld(scene: THREE.Scene) {
 
   const identity = new THREE.Quaternion();
   const groundBase = new THREE.Color('#ffffff');
-  let lastNight = -1, lastWet = -1, poolHour = -1;
+  let lastNight = -1, lastWet = -1;
 
   // ---- Zombie mode: the power is out, everything is dusty, and the streets are full of debris. ----
   let apocalypse = false;
@@ -3314,6 +3598,9 @@ export function buildWorld(scene: THREE.Scene) {
         warmDistricts();
         pumpCells();
       }
+      const shadows = shadowRenderer?.shadowMap;
+      cullTiles = !!viewCamera && !(shadows && shadows.enabled && shadows.needsUpdate);
+      if (cullTiles) tileFrustum.setFromProjectionMatrix(tileView.multiplyMatrices(viewCamera!.projectionMatrix, viewCamera!.matrixWorldInverse));
       for (const t of doneTiles) showTile(t);
       syncStandIns();
       for (const c of surfCells) { if (c.merged.length) showCell(c); if (c.lit) cellLights(c); }
@@ -3335,6 +3622,7 @@ export function buildWorld(scene: THREE.Scene) {
     focus(camera: THREE.PerspectiveCamera, x: number, y: number, z: number, dt: number, enabled = true) {
       const { x: cx, y: cy, z: cz } = camera.position;
       eye.x = cx; eye.y = cy; eye.z = cz; focusAt.x = x; focusAt.z = z;
+      viewCamera = camera;
       let hidden = false;
       if (enabled) for (const p of PLOTS) if (segmentHitsBlock(cx, cy, cz, x, y, z, p.full, p.h + 3.8)) { hidden = true; break; }
       if (enabled && !hidden && DISTRICT_PLOTS.length) hidden = districtBlocks(cx, cy, cz, x, y, z);
@@ -3347,12 +3635,16 @@ export function buildWorld(scene: THREE.Scene) {
       cut.aspect.value = camera.aspect;
       cut.radius.value = (CUT_RADIUS * cutStrength) / Math.max(1, depth * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
     },
-    /** Zombie mode on or off: power cut, dust over everything, debris and fire barrels in the streets. */
-    setApocalypse(on: boolean) {
+    /**
+     * Zombie mode on or off: power cut, dust over everything, debris and fire barrels in the streets. `debris` false
+     * leaves the legacy street debris and its barrels out (apocalypse.ts draws the ruins and their fires instead).
+     */
+    setApocalypse(on: boolean, debris = true) {
       apocalypse = on;
-      if (on && !wreckage) wreckage = buildWreckage();
-      if (wreckage) wreckage.visible = on;
+      if (on && debris && !wreckage) wreckage = buildWreckage();
+      if (wreckage) wreckage.visible = on && debris;
       roles.solid.color.set(on ? '#b9af9d' : '#ffffff');
+      farSolid.color.copy(roles.solid.color);
       roles.glass.color.set(on ? '#8c8b86' : '#ffffff');
       roles.glassLit.color.set(on ? '#8c8b86' : '#ffffff');
       for (const role of [roles.wall, roles.tiles, roles.roofTile, surfMats.solid, surfMats.wall] as const) role.color.set(on ? '#b9af9d' : '#ffffff');
@@ -3363,17 +3655,16 @@ export function buildWorld(scene: THREE.Scene) {
     },
     /**
      * Quality level (game.ts applyLevel, 0 best .. 5): the fine layer (washing, antennas, service drops, stickers) and
-     * shop light pools show up to level 3, smoke up to 2; from level 4 flags, cables and LEDs hold still and walls,
-     * paving and roofs drop their painted patterns for plain colours; the last level hides the cables too.
+     * the signal halos show up to level 3, smoke up to 2; from level 4 flags, cables and LEDs hold still and walls,
+     * paving and roofs drop their painted patterns for plain colours; the last level hides the cables too, and its
+     * shops throw no light on the pavement (the light decal's shader: nightDetail). Lamp halos fade nearer on the
+     * lower levels (night.ts HALO_FAR), shop light where the tiles' signs stop (detailLimit).
      */
     setDetail(level: number) {
       detail = level;
       fineRoot.visible = level <= 3;
-      const flat = level >= 4;
-      if ((surfaceDetail.value < 0.5) !== flat) {
-        surfaceDetail.value = flat ? 0 : 1;
-        for (const m of [roles.wall, roles.paving, roles.tiles, roles.roofTile]) m.needsUpdate = true;
-      }
+      // (a shared uniform the patched walls, paving, tiles and roofs branch on: nothing recompiles; surfaces.ts)
+      surfaceDetail.value = level >= 4 ? 0 : 1;
       smokeBuilt.mesh.visible = level <= 2 && !apocalypse;
       cableShared.sway.value = level >= 4 ? 0 : 1;
       for (const mesh of cableMeshes) if (mesh.parent === root || (mesh.parent && mesh.parent !== fineRoot && mesh.parent.name === 'detail')) mesh.visible = level <= 4;
@@ -3383,17 +3674,16 @@ export function buildWorld(scene: THREE.Scene) {
       // Fog starts at 120 m: past about that a building reads as its box (the stand-in), its signs and dressing as nothing.
       nearLimit = [135, 130, 125, 120, 105, 90][lv];
       detailLimit = [110, 105, 100, 90, 70, 55][lv];
-      for (const t of doneTiles) { t.fineGroup.visible = level <= 3; if (t.smoke) t.smoke.mesh.visible = level <= 2 && !apocalypse; if (t.poolMesh) t.poolMesh.visible = shopPoolMaterial.opacity > 0.01 && !apocalypse && level <= 3; }
-      if (flat !== (surfMats.paving.userData.flat === true)) {
-        surfMats.paving.userData.flat = flat;
-        for (const m of [surfMats.paving, surfMats.wall]) m.needsUpdate = true;
-        // Their new variant compiles now, before a district tile needs it.
-        precompileDistricts();
-      }
+      writeNightDetail(lv, detailLimit);
+      for (const t of doneTiles) { t.fineGroup.visible = level <= 3; if (t.smoke) t.smoke.mesh.visible = level <= 2 && !apocalypse; }
+      // The districts' variants compile now for this level (its shadows: game.ts applyLevel sets the sun's shadows
+      // before this), before a district tile needs them: one shown only after dark (the floodlight wash) would
+      // otherwise compile at the first dusk when the page's saved level differs from the one the game started on.
+      precompileDistricts();
       lastNight = -1;
     },
     /** Burning barrels of zombie mode (empty in the normal city). */
-    get fires() { return apocalypse ? fires : []; },
+    get fires() { return apocalypse && wreckage?.visible ? fires : []; },
     /**
      * The wired districts' solids (map/world-map.ts DISTRICT_COLLIDERS: oriented boxes with yaw, the edge works' lô cốt
      * and hoardings included) and their signal poles; game.ts files them in its collision index with addBox.
@@ -3407,6 +3697,7 @@ export function buildWorld(scene: THREE.Scene) {
         tiles: tileList.length, done: tilesDone, building: current?.slice ?? null, ms: Math.round(districtMs), longestStepMs: Math.round(longestStep * 10) / 10, longestStep: longestWhat,
         planMs: Math.round(planMs), signPassMs: Math.round(signPassMs), signBuildMs: Math.round(signBuildMs), items: districtItems.length, visible: doneTiles.filter((t) => t.group.visible).length, ready: tilesDone === tileList.length,
         wired: WIRED_KEYS, generation: WORLD_MAP_INFO.generation, cells: surfCells.length, cellsMerged: surfCells.filter((c) => c.state === 'merged').length,
+        lights: lightStore.count,
       };
     },
     /** Builds every remaining district tile now (tests and tools; the game builds them a few ms a frame). */
@@ -3427,60 +3718,65 @@ export function buildWorld(scene: THREE.Scene) {
       // discrete one alike (measured, WIRING step 15): off unless asked for; the meshes go up when first shown.
       warmEnabled = opts.warm ?? false;
       discreteGpu = opts.discrete ?? false;
+      if (discreteGpu) { MERGE_BYTES = 1.8e6; coarsenLegacyTiles(); }
       if (!camera || !districtItems.length) return;
       warmCamera = camera;
       precompileDistricts();
     },
-    /** `night` 0..1 lights windows, lamps, signs and light pools; `wet` 0..1 darkens and glosses the paving. */
-    setAtmosphere(a: { night: number; wet: number; sky?: THREE.Color; hours?: number }) {
+    /**
+     * `night` 0..1 lights windows, lamps, signs and light pools; `wet` 0..1 darkens and glosses the paving; `hours` the
+     * clock (shops by their hours, windows by the rhythm); `lamps` the street-lamp switch (atmosphere.ts lamps: from
+     * the clock when not given); `rain` how hard it rains (halos and pools in the rain; else `wet`).
+     */
+    setAtmosphere(a: { night: number; wet: number; sky?: THREE.Color; hours?: number; lamps?: number; rain?: number }) {
       if (a.sky) sky.copy(a.sky);
       const night = Math.min(1, Math.max(0, a.night || 0));
       const wet = Math.min(1, Math.max(0, a.wet || 0));
-      // Shop light pools follow their shops' hours when the clock is given (a closed shop's shutter is down).
-      if (a.hours !== undefined) {
-        nowHour = a.hours;
-        const hour = Math.floor(a.hours * 4) / 4;
-        if (hour !== poolHour) {
-          poolHour = hour; placeShopPools(hour);
-          for (const t of doneTiles) if (t.poolMesh) placeTilePools(t.poolMesh, t.poolList, hour);
-          for (const c of surfCells) if (c.lit?.poolMesh) placeTilePools(c.lit.poolMesh, c.lit.poolList, hour);
-        }
-      }
+      if (a.hours !== undefined) nowHour = a.hours;
+      // No electricity in zombie mode: dark windows, lamps and signs.
+      const power = apocalypse ? 0 : 1;
+      // The shared night uniforms (night.ts) every frame: the night, the lamp switch, which shops are open and how many
+      // windows are lit this hour, the weather, and the fog the light decals fade with (after game.ts's glide change).
+      writeNight({ night, lamps: Math.min(1, Math.max(0, a.lamps ?? lampsAt(sunElevation(nowHour)))), power, hours: nowHour, wet, rain: a.rain ?? wet });
+      const fog = scene.fog as THREE.Fog | null;
+      if (fog && 'near' in fog) writeNightFog(fog.near, fog.far);
+      lightStore.mesh.visible = NIGHT.nightLevel.value > 0.02 || NIGHT.nightLamps.value > 0.02;
+      const haloOn = NIGHT.nightLevel.value > 0.05 && detail <= 3;
+      if (haloOn !== halosShown) { halosShown = haloOn; for (const h of halos) h.visible = haloOn; }
+      // Curtained windows (the dim 'glass' role) follow the home rhythm: at 2:00 a tenth of them still glow (A10).
+      roles.glass.emissiveIntensity = night * 0.28 * power * Math.min(1, NIGHT.nightRhythm.value.x / 0.85);
+      skyline.setAtmosphere(night, power, sky, nowHour);
       if (Math.abs(night - lastNight) < 0.004 && Math.abs(wet - lastWet) < 0.004) return;
       lastNight = night;
       lastWet = wet;
-      // No electricity in zombie mode: dark windows, lamps and signs.
-      const power = apocalypse ? 0 : 1;
-      roles.glass.emissiveIntensity = night * 0.28 * power;
-      roles.glassLit.emissiveIntensity = night * 1.25 * power;
-      roles.lamp.emissiveIntensity = night * 2.6 * power;
-      roles.lantern.emissiveIntensity = night * 1.1 * power;
-      for (const g of glowMaterials) g.material.emissiveIntensity = night * g.strength * power;
-      poolMaterial.opacity = night * 0.5;
-      pools.visible = night > 0.02 && !apocalypse;
-      for (const t of doneTiles) { if (t.lampMesh) t.lampMesh.visible = night > 0.02 && !apocalypse; if (t.poolMesh) t.poolMesh.visible = night > 0.02 && !apocalypse && detail <= 3; if (t.smoke) t.smoke.light.value = 1 - 0.55 * night; }
+      // The night-lit roles carry the night in their codes (vNightL): their intensities are constant but for the power.
+      roles.glassLit.emissiveIntensity = 0.85 * power;
+      roles.lamp.emissiveIntensity = 3.2 * power;
+      roles.lantern.emissiveIntensity = 1.3 * power;
+      for (const g of glowMaterials) g.material.emissiveIntensity = night * 1.4 * g.strength * power;
+      for (const t of doneTiles) if (t.smoke) t.smoke.light.value = 1 - 0.55 * night;
       for (const c of surfCells) if (c.lit?.smoke) c.lit.smoke.light.value = 1 - 0.55 * night;
-      roles.neon.emissiveIntensity = (0.45 + night * 1.9) * (apocalypse ? 0.03 : 1);
-      neonPoolMaterial.opacity = night * 0.75;
-      neonPoolMesh.visible = night > 0.02 && !apocalypse;
-      skyline.setAtmosphere(night, power, sky);
+      // Neon by its venue's hours; in zombie mode every schedule reads open (writeNight) and neon keeps its old dim glow
+      // (0.03 of what it had), through the day base its code gives it there.
+      roles.neon.emissiveIntensity = apocalypse ? (0.03 * (0.45 + night * 1.9)) / (0.45 / 2.35) : 2.35;
       roles.ground.color.copy(groundBase).multiplyScalar(1 - 0.38 * wet);
       roles.ground.roughness = 0.9 - 0.62 * wet;
       roles.ground.metalness = 0.12 * wet;
       surfMats.ground.color.copy(roles.ground.color);
       surfMats.ground.roughness = roles.ground.roughness;
       surfMats.ground.metalness = roles.ground.metalness;
+      // Paint and hẻm concrete darken and shine with the road in the rain.
+      surfMats.mark.color.setScalar(1 - 0.3 * wet);
+      surfMats.mark.roughness = 0.9 - 0.55 * wet;
       puddleMaterial.opacity = wet * 0.6;
       puddles.visible = wet > 0.02;
-      // Shop tubes and LED borders, the pools of shop light, and the unlit cables and smoke dimmed at night.
-      roles.tube.emissiveIntensity = (0.1 + night * 2.2) * power;
+      // Shop tubes and LED borders (lit by their codes, their daytime glow kept: nightDayBase), what glows inside the
+      // fronts, and the unlit cables and smoke dimmed at night.
+      roles.tube.emissiveIntensity = 2.3 * power;
       roles.wash.opacity = night * 0.3 * power;
       roles.wash.visible = roles.wash.opacity > 0.01;
-      roles.led.emissiveIntensity = (0.25 + night * 1.8) * power;
-      shopPoolMaterial.opacity = night * 0.45;
-      districtPoolMaterial.opacity = shopPoolMaterial.opacity;
-      decalNight.value = night * 0.75 * power;
-      shopPoolMesh.visible = night > 0.02 && !apocalypse && detail <= 3;
+      roles.led.emissiveIntensity = 2.05 * power;
+      decalNight.value = night * 0.9 * power;
       cableShared.shade.value = 1 - 0.78 * night;
       smokeBuilt.light.value = 1 - 0.55 * night;
       // Rain darkens and glosses the paving, the roof decks and tiles, and soaks the walls a little.
@@ -3495,6 +3791,7 @@ export function buildWorld(scene: THREE.Scene) {
     },
     dispose() {
       scene.remove(root);
+      lightStore.dispose();
       textures.forEach((t) => t.dispose());
       materials.forEach((m) => m.dispose());
       geometries.forEach((g) => g.dispose());
@@ -3503,7 +3800,7 @@ export function buildWorld(scene: THREE.Scene) {
   };
   // Until game.ts passes its quality level (applyLevel -> setDetail), start at the level it will start at.
   api.setDetail(startDetail());
-  root.userData.build = { ms: Math.round(performance.now() - buildStart), decals: decals.base.length + decals.fine.length, cloth: cloths.base.length + cloths.fine.length, cables: cables.base.length + cables.fine.length, smoke: emitters.length, pools: shopPools.length };
+  root.userData.build = { ms: Math.round(performance.now() - buildStart), decals: decals.base.length + decals.fine.length, cloth: cloths.base.length + cloths.fine.length, cables: cables.base.length + cables.fine.length, smoke: emitters.length, lights: legacySink.lights.length };
   return api;
 }
 

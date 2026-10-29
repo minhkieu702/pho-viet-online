@@ -42,7 +42,8 @@ export type Frame = {
   cloth: (cell: ClothCell, lx: number, ly: number, lz: number, w: number, h: number, opts: ClothOpts & { yaw?: number }) => void;
   smoke: (kind: SmokeKind, lx: number, ly: number, lz: number) => void;
   tag: (style: TagStyle, text: string, fg: string, bg: string, lx: number, ly: number, lz: number, w: number, h: number, opts?: { yaw?: number; glow?: number }) => void;
-  pool: (lx: number, lz: number, size: number, shop: number) => void;
+  /** A pool of light on the pavement at night (Kit.pool), in the frame: `color` × `strength` (display colour) when given. */
+  pool: (lx: number, lz: number, size: number, shop: number, color?: string, strength?: number) => void;
 };
 
 /**
@@ -61,8 +62,18 @@ export type Kit = {
   /** A piece of cloth: pinned on its left edge (mode 0, a flag) or along its top (mode 1, laundry). */
   cloth: (cell: ClothCell, x: number, y: number, z: number, w: number, h: number, yaw: number, opts: ClothOpts) => void;
   smoke: (kind: SmokeKind, x: number, y: number, z: number) => void;
-  /** A pool of shop light on the pavement at night; `shop` is the building id whose opening hours switch it. */
-  pool: (x: number, z: number, size: number, shop: number, color?: string) => void;
+  /**
+   * A pool of light on the pavement at night: switched by the light code of the lit() scope it is drawn in, else by
+   * the opening hours of building `shop` (-1: with the street lamps); `color` × `strength` its display colour (else
+   * the shop's kind of light).
+   */
+  pool: (x: number, z: number, size: number, shop: number, color?: string, strength?: number) => void;
   frame: (x: number, z: number, facing: number) => Frame;
   fine: (on: boolean) => void;
+  /**
+   * Draws what `draw` draws under a light code (night.ts): a schedule (1..95: lit while it is open), a rhythm base
+   * (HOME, OFFICE, FLATS: each window its own seed), -1 never lit; 0 leaves each part its default (windows the home
+   * rhythm, lamps the street-lamp switch). Lit parts (windows, tubes, LEDs, neon, lamps), signs and light pools carry it.
+   */
+  lit: <T>(code: number, draw: () => T) => T;
 };

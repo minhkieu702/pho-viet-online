@@ -16,6 +16,7 @@ import {
 import { SAMPAN_SEAT, WATERBUS_SEAT, type Boat, type Boats } from './boats';
 import type { Car, CarKind } from './vehicles';
 import type { Entry, PromptView, Registry } from './interact';
+import { vehicleLights } from './vehicle-lights';
 
 /**
  * Public transport on the street and the river (design-real 7), on transit.ts's timetables:
@@ -909,6 +910,7 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
   // ---- Drawing ----
   const busMatrix = new THREE.Matrix4(), wheelMatrix = new THREE.Matrix4(), part = new THREE.Matrix4(), turn = new THREE.Matrix4(), spinM = new THREE.Matrix4();
   const up = new THREE.Vector3(0, 1, 0), one = new THREE.Vector3(1, 1, 1), at3 = new THREE.Vector3(), q = new THREE.Quaternion();
+  const busBound = new THREE.Sphere();
   let firstPersonRideHidden = false;
   function draw() {
     for (const run of runs) run.counts.fill(0);
@@ -916,11 +918,16 @@ export function createBuses(scene: THREE.Scene, host: TransitHost) {
     for (const bus of buses) {
       if (firstPersonRideHidden && aboard?.kind === 'bus' && aboard.bus === bus) continue;
       if (bus.phase === 'off' || zombie || Math.hypot(bus.x - viewer.x, bus.z - viewer.z) > 330) continue;
+      // Only the buses the camera sees (body and wheels): a 12 m bus within a 7.5 m sphere round its middle.
+      const gy = groundHeight(bus.x, bus.z);
+      // Head lamps, beam, tail lamps at night (vehicle-lights.ts culls them itself: the beam reaches past this sphere).
+      vehicleLights.place(bus, bus.x, gy, bus.z, bus.yaw, 0, 'bus', bus.speed);
+      if (frustum && !frustum.intersectsSphere(busBound.set(busBound.center.set(bus.x, gy + 1.6, bus.z), 7.5))) continue;
       const open = bus.doors > 0.5 ? 1 : 0, run = bus.run, mesh = run.meshes[open];
-      busMatrix.compose(at3.set(bus.x, groundHeight(bus.x, bus.z) - 0.02, bus.z), q.setFromAxisAngle(up, bus.yaw), one);
+      busMatrix.compose(at3.set(bus.x, gy - 0.02, bus.z), q.setFromAxisAngle(up, bus.yaw), one);
       mesh.setMatrixAt(run.counts[open]++, busMatrix);
       axles.forEach((a, i) => {
-        for (const side of [-1, 1]) {
+        for (let side = -1; side <= 1; side += 2) {
           part.makeTranslation((side * a.track) / 2, a.r, a.z);
           wheelMatrix.multiplyMatrices(busMatrix, part);
           if (a.steer) wheelMatrix.multiply(turn.makeRotationY(bus.steer));

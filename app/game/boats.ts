@@ -7,6 +7,7 @@ import type { Entry, Registry } from './interact';
 import { BODY_SCALE, FIGURE, HAND, bakeFigure, chestMatrix, deriveStyle, palettesOf, sideX, type FigureLook, type FigureStyle } from './figures';
 import { ModelParts, vehicleMaterial, type Vec3 } from './vehicle-models';
 import { plantFoot, reachGrip } from './vehicles';
+import { OWN, vehicleLights } from './vehicle-lights';
 
 /**
  * Boats on the river (map/terrain.ts water): sampans rowed by someone in a conical hat, the river bus (driven on its
@@ -1249,6 +1250,8 @@ export function createBoats(scene: THREE.Scene, host: BoatHost | null = null) {
         } else if (b.mode === 'moored' && b.moor && b.speed === 0) b.yaw = b.moor.yaw + Math.sin(time * 0.09 + b.phase) * b.moor.swing;
         pose(b, time);
       }
+      // Navigation lights and their reflections at night (vehicle-lights.ts); the hire boat the player drives on its battery.
+      for (const b of boats) if (b.group.visible) vehicleLights.boat(b.group, b.kind, b.crew, b === rental && rental.mode === 'player' ? OWN : 0);
       syncWakes();
     },
     /** Cabin windows, deck lights and bulbs glow after dark. */

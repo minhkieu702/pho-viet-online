@@ -197,6 +197,18 @@ export function createEffects(scene: THREE.Scene, ground: (x: number, z: number)
   }
 
   return {
+    // ---- zombie co-op (design.md §5, MUTANTS) ----
+    /**
+     * Tints every blood droplet and pool from now on (zombie mode: the undead bleed a dark brown ichor, not red);
+     * null restores the red. Horror, not gore.
+     */
+    bloodTint(color: THREE.ColorRepresentation | null) {
+      dropMaterial.color.set(color ?? '#9a1616');
+      // The splat texture is red; a multiplier toward the tint's luminance turns it brown-black.
+      if (color === null) splatMaterial.color.set('#ffffff');
+      else { const c = new THREE.Color(color); splatMaterial.color.setRGB(c.r * 2.2, c.g * 3.2, c.b * 3.2); }
+    },
+    // ---- end zombie co-op ----
     /** Sprays `amount` droplets from a wound, biased along `dir`. */
     blood(at: THREE.Vector3, dir: THREE.Vector3, amount: number) {
       for (let n = 0; n < amount && drops.count < MAX_DROPS; n++) {

@@ -1,8 +1,8 @@
 "use client";
-import {Clock,Cloud,CloudRain,MapIcon,MapPin,Navigation,Sun} from 'lucide-react';
+import {Clock,Cloud,CloudRain,MapIcon,MapPin,Moon,Navigation,Sun} from 'lucide-react';
 import type {Area,Street} from './game/map/districts';
 
-const WEATHER_ICON={'Nắng':Sun,'Nhiều mây':Cloud,'Mưa':CloudRain};
+const WEATHER_ICON={'Nắng':Sun,'Trời quang':Moon,'Nhiều mây':Cloud,'Mưa':CloudRain};
 /** The engine's clock line ("10:33 · Nhiều mây") as the time and a weather icon, so it fits beside a street name. */
 function GameClock({clock}:{clock:string}){
   const [time,weather='']=clock.split(' · '),Icon=WEATHER_ICON[weather as keyof typeof WEATHER_ICON];

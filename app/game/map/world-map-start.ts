@@ -27,7 +27,7 @@ const browser = typeof g.window !== 'undefined' && typeof g.document !== 'undefi
  * root-relative URL in dev and the bundled asset's URL in a build.
  */
 async function fromWorker(req: MapRequest): Promise<MapPayload> {
-  // @ts-expect-error Vite's worker import (this project does not load vite/client types)
+  // Vite's worker import (typed by the '*?worker' declaration in app/vite-env.d.ts)
   const imported = (await import('./world-map-worker.ts?worker')) as { default: new (options?: { name?: string }) => Worker };
   const MapWorker = imported.default;
   return new Promise((resolve, reject) => {

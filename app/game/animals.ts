@@ -367,3 +367,8 @@ export function createAnimals(
     dispose() { scene.remove(mesh); mesh.dispose(); geometry.dispose(); material.dispose(); },
   };
 }
+
+// ---- zombie co-op (design.md §5, DOG) ----
+/** The street dog's proportions (body parts, legs) and coats [coat, dark, light], for the companion dog (companion.ts). */
+export const DOG_SHAPE = { parts: PARTS.dog, legs: LEGS.dog!, coats: COATS.dog };
+// ---- end zombie co-op ----
